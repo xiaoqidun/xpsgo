@@ -1,6 +1,11 @@
 # XPSGo [![PkgGoDev](https://pkg.go.dev/badge/github.com/xiaoqidun/xpsgo)](https://pkg.go.dev/github.com/xiaoqidun/xpsgo)
 首个原生、全平台、纯 Go 语言高性能 XPS 引擎
 
+# 实施标准
+- 文档标准：XPS 1.0（.xps）、OpenXPS（.oxps）
+- 图像格式：PNG、JPEG、TIFF、JPEG XR（.wdp、.jxr）
+- 字体格式：TrueType（.ttf、.ttc）、CFF1（.otf）、混淆字体（.odttf）
+
 # 安装指南
 ```shell
 go get -u github.com/xiaoqidun/xpsgo
