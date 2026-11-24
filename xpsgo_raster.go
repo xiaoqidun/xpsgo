@@ -329,7 +329,7 @@ func rasterRegionsCoverageBudget(regions []rasterRegion, bounds image.Rectangle,
 			}
 			skip := uint64(jump - row)
 			work += skip * uint64(len(regions)) * 2
-			if work > rasterMaxWork {
+			if work > maxWork {
 				return nil, fmt.Errorf("%w: raster scan work", ErrLimit)
 			}
 			row = jump - 1
@@ -352,12 +352,12 @@ func rasterRegionsCoverageBudget(regions []rasterRegion, bounds image.Rectangle,
 		}
 		cost := 3 + bits.Len(uint(len(active)))
 		work += (uint64(len(active))*uint64(cost) + uint64(len(regions))) * uint64(len(divisions))
-		if work > rasterMaxWork {
+		if work > maxWork {
 			return nil, fmt.Errorf("%w: raster scan work", ErrLimit)
 		}
 		for i := 1; i < len(divisions); i++ {
-			if err := rasterBandSpans(active, band, divisions[i-1], divisions[i], regions, required, winding, &work, &exact, func(lower, upper rasterBandPosition, left, right rasterBandEdge) error {
-				return rasterAreaSpan(difference, bounds.Min.X, left.lo, left.hi, right.lo, right.hi, upper.distance(lower), &work)
+			if err := rasterBandSpans(active, band, divisions[i-1], divisions[i], regions, required, winding, &work, maxWork, &exact, func(lower, upper rasterBandPosition, left, right rasterBandEdge) error {
+				return rasterAreaSpan(difference, bounds.Min.X, left.lo, left.hi, right.lo, right.hi, upper.distance(lower), &work, maxWork)
 			}); err != nil {
 				return nil, err
 			}
@@ -658,14 +658,14 @@ func rasterExactCharge(remaining *int) error {
 	return nil
 }
 
-// rasterAreaSpan 将非交叉梯形与单位像素的精确相交面积累加到差分行
-// 入参: difference 带末尾哨兵的差分行, origin 行起点, left0 上端左边界, left1 下端左边界, right0 上端右边界, right1 下端右边界, height 正且不超过1的扫描带高度, work 累计工作量
+// rasterAreaSpan 在指定扫描工作上限内将非交叉梯形与单位像素的精确相交面积累加到差分行
+// 入参: difference 带末尾哨兵的差分行, origin 行起点, left0 上端左边界, left1 下端左边界, right0 上端右边界, right1 下端右边界, height 正且不超过1的扫描带高度, work 累计工作量, maxWork 扫描工作预算上限
 // 返回: error 参数、数值表示或工作预算错误
-func rasterAreaSpan(difference []float64, origin int, left0, left1, right0, right1, height float64, work *uint64) error {
+func rasterAreaSpan(difference []float64, origin int, left0, left1, right0, right1, height float64, work *uint64, maxWork uint64) error {
 	if work == nil {
 		return fmt.Errorf("%w: nil raster area work counter", ErrInvalid)
 	}
-	if err := rasterSweepCharge(work, 16); err != nil {
+	if err := rasterSweepCharge(work, 16, maxWork); err != nil {
 		return err
 	}
 	if len(difference) == 0 || !geometryFinite(left0, left1, right0, right1, height) || height <= 0 || height > 1 || left0 > right0 || left1 > right1 {
@@ -689,7 +689,7 @@ func rasterAreaSpan(difference []float64, origin int, left0, left1, right0, righ
 	rightStart := int(math.Floor(max(low, min(high, rightMin))) - low)
 	rightEnd := int(math.Ceil(max(low, min(high, rightMax))) - low)
 	if leftEnd < rightStart {
-		if err := rasterSweepCharge(work, 2); err != nil {
+		if err := rasterSweepCharge(work, 2, maxWork); err != nil {
 			return err
 		}
 		if err := rasterAreaAdd(difference, leftEnd, rightStart, height); err != nil {
@@ -705,7 +705,7 @@ func rasterAreaSpan(difference []float64, origin int, left0, left1, right0, righ
 	intervals := [2][2]int{{leftStart, leftEnd}, {rightStart, rightEnd}}
 	for _, interval := range intervals {
 		for i := interval[0]; i < interval[1]; i++ {
-			if err := rasterSweepCharge(work, 8); err != nil {
+			if err := rasterSweepCharge(work, 8, maxWork); err != nil {
 				return err
 			}
 			x := float64(origin + i)
@@ -722,7 +722,7 @@ func rasterAreaSpan(difference []float64, origin int, left0, left1, right0, righ
 					area = math.Ldexp(m*h, e+he-1)
 				}
 			} else {
-				if err := rasterSweepCharge(work, 32); err != nil {
+				if err := rasterSweepCharge(work, 32, maxWork); err != nil {
 					return err
 				}
 				var accepted bool
@@ -733,11 +733,11 @@ func rasterAreaSpan(difference []float64, origin int, left0, left1, right0, righ
 					}
 					continue
 				}
-				if err := rasterSweepCharge(work, 128); err != nil {
+				if err := rasterSweepCharge(work, 128, maxWork); err != nil {
 					return err
 				}
 				if !ready {
-					if err := rasterSweepCharge(work, 32); err != nil {
+					if err := rasterSweepCharge(work, 32, maxWork); err != nil {
 						return err
 					}
 					left.init(leftMin, leftMax)
@@ -914,14 +914,14 @@ func (b *rasterAreaBoundary) integral(result *big.Rat, x int64) {
 	result.Quo(result, &b.width)
 }
 
-// rasterBandSpans 按精确交叉事件划分扫描带，输出满足填充规则的非交叉梯形
-// 入参: active 候选边, band 可复用缓冲区, lo 起始纵坐标, hi 结束纵坐标, regions 独立区域, required 所需命中区域数, winding 绕数缓冲区, work 累计工作量, exact 精确计算预算, emit 梯形接收函数
+// rasterBandSpans 在指定扫描工作上限内按精确交叉事件划分扫描带，输出满足填充规则的非交叉梯形
+// 入参: active 候选边, band 可复用缓冲区, lo 起始纵坐标, hi 结束纵坐标, regions 独立区域, required 所需命中区域数, winding 绕数缓冲区, work 累计工作量, maxWork 扫描工作预算上限, exact 精确计算预算, emit 梯形接收函数
 // 返回: error 边集、数值、预算或接收函数错误
-func rasterBandSpans(active []rasterEdge, band []rasterBandEdge, lo, hi float64, regions []rasterRegion, required int, winding []int, work *uint64, exact *int, emit func(rasterBandPosition, rasterBandPosition, rasterBandEdge, rasterBandEdge) error) error {
+func rasterBandSpans(active []rasterEdge, band []rasterBandEdge, lo, hi float64, regions []rasterRegion, required int, winding []int, work *uint64, maxWork uint64, exact *int, emit func(rasterBandPosition, rasterBandPosition, rasterBandEdge, rasterBandEdge) error) error {
 	lower, upper := rasterBandPosition{value: lo}, rasterBandPosition{value: hi}
 	for lower.compare(upper) < 0 {
 		cost := uint64(len(active))*uint64(6+bits.Len(uint(len(active)))) + uint64(len(regions))
-		if err := rasterSweepCharge(work, cost); err != nil {
+		if err := rasterSweepCharge(work, cost, maxWork); err != nil {
 			return err
 		}
 		band = band[:0]
@@ -1182,11 +1182,11 @@ func rasterCrossingY(a, b rasterEdge, exact *int) (*big.Rat, error) {
 	return numerator.Quo(numerator, denominator), nil
 }
 
-// rasterSweepCharge 在执行扫描带或面积积分前检查并累计计算量
-// 入参: work 已使用计算量, cost 待执行计算量
-// 返回: error 计算量超过实现上限错误
-func rasterSweepCharge(work *uint64, cost uint64) error {
-	if *work > rasterMaxWork || cost > rasterMaxWork-*work {
+// rasterSweepCharge 在执行扫描带或面积积分前按指定上限检查并累计计算量
+// 入参: work 已使用计算量, cost 待执行计算量, maxWork 扫描工作预算上限
+// 返回: error 计算量超过预算上限错误
+func rasterSweepCharge(work *uint64, cost, maxWork uint64) error {
+	if *work > maxWork || cost > maxWork-*work {
 		return fmt.Errorf("%w: raster scan work", ErrLimit)
 	}
 	*work += cost

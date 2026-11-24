@@ -17,6 +17,7 @@ package xpsgo
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -202,6 +203,9 @@ func (r *Reader) renderPrint(ctx context.Context, pageIndex int, options *PrintR
 		return nil, fmt.Errorf("%w: signature error sheet requires a print job plan", ErrUnsupported)
 	}
 	printConfig := printSettingsConfig{PrintSettingsOptions: configuration.Print.Settings, context: ctx}
+	if configuration.Print.IgnoreUnsupportedFeatures {
+		ticket = printStripPrivateExtensions(ticket)
+	}
 	ticket = printSignatureLayoutSettings(ticket)
 	ticket, err = printSinglePosterSettings(ticket, printConfig)
 	if err != nil {
@@ -218,9 +222,14 @@ func (r *Reader) renderPrint(ctx context.Context, pageIndex int, options *PrintR
 	settings.outputColor = outputColor.Mode
 	ticket, colorPlan, err := printColorPlanSettings(ctx, ticket, &configuration.Print.Settings)
 	if err != nil {
-		return nil, err
+		if device == nil && configuration.Print.IgnoreUnsupportedFeatures && errors.Is(err, ErrUnsupported) {
+			ticket = printStripColorPlanFeatures(ticket)
+			colorPlan = nil
+		} else {
+			return nil, err
+		}
 	}
-	if device == nil && (colorPlan != nil || configuration.Color != nil) {
+	if device == nil && (configuration.Color != nil || colorPlan != nil && !configuration.Print.IgnoreUnsupportedFeatures) {
 		return nil, fmt.Errorf("%w: print color requires explicit device output", ErrUnsupported)
 	}
 	if err := validatePrintLayoutFeatures(ticket, configuration.Print.IgnoreUnsupportedFeatures); err != nil {
@@ -749,7 +758,7 @@ func (r *printWatermarkRenderer) bitmapPaths(source *fontSource, glyph positione
 		return nil, Point{}, false, fmt.Errorf("%w: bitmap watermark requires integral content ppem in 1..255", ErrUnsupported)
 	}
 	ppem := uint16(size)
-	selection, present, err := source.selectBitmapStrikeWithWork(ppem, ppem, r.charge)
+	selection, present, err := source.selectBitmapStrikeWithWork(ppem, ppem, false, r.charge)
 	if err != nil {
 		return nil, Point{}, false, err
 	}
@@ -924,12 +933,32 @@ func (r *printWatermarkRenderer) reserveGeometry(edges int) error {
 	return nil
 }
 
+// printStripColorPlanFeatures 从预览渲染票据视图中移除色彩计划相关的Feature与参数
+// 入参: settings 有效票据视图
+// 返回: *PrintSettings 过滤后的票据视图
+func printStripColorPlanFeatures(settings *PrintSettings) *PrintSettings {
+	if settings == nil {
+		return nil
+	}
+	result := &PrintSettings{Version: settings.Version, Elements: make([]PrintSetting, 0, len(settings.Elements))}
+	for _, value := range settings.Elements {
+		if value.Name.Space == printKeywordsNS {
+			switch value.Name.Local {
+			case "PageColorManagement", "PageDeviceColorSpaceUsage", "PageBlendColorSpace", "PageSourceColorProfile", "PageDestinationColorProfile", "PageICMRenderingIntent", "PageDeviceColorSpaceProfileURI":
+				continue
+			}
+		}
+		result.Elements = append(result.Elements, value)
+	}
+	return result
+}
+
 // printResourceMedia 识别Microsoft两代票据及能力媒体类型，不接受参数或猜测自定义票据
 // 入参: media 不含参数的部件内容类型
 // 返回: known 是否为已知Microsoft格式, capabilities 是否为能力文档
 func printResourceMedia(media string) (known bool, capabilities bool) {
 	switch strings.ToLower(media) {
-	case printTicketType, "application/vnd.ms-printschematicket+xml":
+	case printTicketType, printTicket2Type:
 		return true, false
 	case "application/vnd.ms-printing.printcapabilities+xml", "application/vnd.ms-printschemacapabilities+xml":
 		return true, true

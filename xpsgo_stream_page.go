@@ -379,8 +379,19 @@ func (p *streamPackage) emitReadyPages(name string) error {
 			return err
 		}
 		p.pageWait = nil
-		if wait, ok := p.streamPageTicketsReady(p.pages); !ok {
-			p.pageWait = map[string]bool{wait: true}
+		waits, hold, err := p.streamPageTicketsReady(p.pages)
+		if err != nil {
+			return err
+		}
+		if hold {
+			p.pageHold = true
+			return nil
+		}
+		if len(waits) != 0 {
+			p.pageWait = make(map[string]bool, len(waits))
+			for _, wait := range waits {
+				p.pageWait[wait] = true
+			}
 			return nil
 		}
 		if err := p.notifyPage(p.index, p.pages); err != nil {
@@ -406,6 +417,10 @@ func (p *streamPackage) notifyPage(source *Reader, index int) error {
 	if docPart == "" {
 		return fmt.Errorf("%w: streamed page document", ErrInvalid)
 	}
+	tickets, err := source.pageTicketTargets(p.context, index)
+	if err != nil {
+		return err
+	}
 	page := &StreamPage{Index: index, DocumentPart: docPart, Reference: reference, view: &streamPageView{reader: view, index: index, documentIndex: docIndex, pageIndex: pageIndex, context: p.context}}
 	if err := p.options.OnPage(p.context, page); err != nil {
 		return err
@@ -414,6 +429,7 @@ func (p *streamPackage) notifyPage(source *Reader, index int) error {
 		return err
 	}
 	view.Close()
+	p.pageTickets = append(p.pageTickets, tickets)
 	return p.releaseProcessed()
 }
 
@@ -443,9 +459,16 @@ func (p *streamPackage) finishPages(r *Reader) error {
 		if _, err := r.Page(p.context, index); err != nil {
 			return err
 		}
+		tickets, err := r.pageTicketTargets(p.context, index)
+		if err != nil {
+			return err
+		}
 		if index < p.pages {
 			if p.index == nil || index >= len(p.index.pages) || p.index.pages[index].Part != r.pages[index].Part || p.index.pages[index].Width != r.pages[index].Width || p.index.pages[index].Height != r.pages[index].Height || !slices.Equal(p.index.pages[index].LinkTargets, r.pages[index].LinkTargets) {
 				return fmt.Errorf("%w: streamed page reference conflict", ErrInvalid)
+			}
+			if index >= len(p.pageTickets) || !slices.Equal(p.pageTickets[index], tickets) {
+				return fmt.Errorf("%w: streamed page print ticket conflict", ErrInvalid)
 			}
 			continue
 		}
@@ -457,39 +480,200 @@ func (p *streamPackage) finishPages(r *Reader) error {
 	return p.releaseProcessed()
 }
 
-// streamPageTicketsReady 检查已到达或正在交错接收的关系及PrintTicket目标部件是否均已闭合就绪
+// streamPotentialPrintTicketMedia 判断内容类型声明在当前方言下是否可能表示打印票据部件
+// 入参: format 文档方言, media 已解析的媒体类型字符串
+// 返回: bool 是否可能用于打印票据
+func streamPotentialPrintTicketMedia(format Format, media string) bool {
+	base, _, _ := strings.Cut(media, ";")
+	base = strings.TrimSpace(base)
+	if strings.EqualFold(base, printTicketType) {
+		return true
+	}
+	if format != FormatOpenXPS || !xmlMedia(base) {
+		return false
+	}
+	for _, known := range []string{
+		fixedContentType("fixeddocumentsequence"),
+		fixedContentType("fixeddocument"),
+		fixedContentType("fixedpage"),
+		fixedContentType("documentstructure"),
+		fixedContentType("storyfragments"),
+		fixedContentType("discard-control"),
+		fixedContentType("signaturedefinitions"),
+		resourceDictionaryContentType,
+		opcRelsType,
+		opcCoreType,
+		opcSignatureType,
+		"application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
+	} {
+		if strings.EqualFold(base, known) {
+			return false
+		}
+	}
+	return true
+}
+
+// mayHavePrintTicket 检查内容类型流是否声明了任何可能作为打印票据的媒体类型
+// 返回: bool 包内是否可能存在打印票据
+func (p *streamPackage) mayHavePrintTicket() bool {
+	if p.types == nil || p.index == nil {
+		return false
+	}
+	for _, media := range p.types.defaults {
+		if streamPotentialPrintTicketMedia(p.index.format, media) {
+			return true
+		}
+	}
+	for _, media := range p.types.overrides {
+		if streamPotentialPrintTicketMedia(p.index.format, media) {
+			return true
+		}
+	}
+	return false
+}
+
+// pageTicketTargets 按作业、文档及页面顺序提取规范化打印票据目标URI切片，用于流式交付一致性复核
+// 入参: ctx 取消Context, index 全局页序号
+// 返回: []string 三级票据目标小写URI切片, error 关系、取消或预算错误
+func (r *Reader) pageTicketTargets(ctx context.Context, index int) ([]string, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if index < 0 || index >= len(r.pages) {
+		return nil, fmt.Errorf("%w: page index out of range: %d", ErrInvalid, index)
+	}
+	pagePart := r.pages[index].Part
+	docPart, _, _ := r.pageLocation(index)
+	if docPart == "" {
+		return nil, fmt.Errorf("%w: streamed page document", ErrInvalid)
+	}
+	result := make([]string, 3)
+	for level, source := range [3]string{r.sequence, docPart, pagePart} {
+		relations, err := r.pkg.relationshipsContext(ctx, source)
+		if err != nil {
+			return nil, err
+		}
+		target, err := printTicketTarget(source, relations, r.format)
+		if err != nil {
+			return nil, err
+		}
+		if target != "" {
+			result[level] = strings.ToLower(target)
+		}
+	}
+	return result, nil
+}
+
+// recordTicketTarget 登记已解析的打印票据目标小写URI，用于判断包内声明的票据是否已全部绑定
+// 入参: target 规范化票据目标绝对URI
+func (p *streamPackage) recordTicketTarget(target string) {
+	if p.ticketRefs == nil {
+		p.ticketRefs = make(map[string]bool)
+	}
+	p.ticketRefs[strings.ToLower(target)] = true
+}
+
+// pendingPrintTickets 检查包内是否仍存在尚未到达或尚未被关系绑定的潜在打印票据声明
+// 返回: bool 是否仍有待决票据, []string 尚未到达的票据覆盖部件键列表
+func (p *streamPackage) pendingPrintTickets() (bool, []string) {
+	for _, media := range p.types.defaults {
+		if streamPotentialPrintTicketMedia(p.index.format, media) {
+			return true, nil
+		}
+	}
+	pending := false
+	var waits []string
+	for key, media := range p.types.overrides {
+		if !streamPotentialPrintTicketMedia(p.index.format, media) {
+			continue
+		}
+		_, arrived := p.pagePkg.parts[key]
+		if !arrived || !p.ticketRefs[key] {
+			pending = true
+			if !arrived {
+				waits = append(waits, key)
+			}
+		}
+	}
+	return pending, waits
+}
+
+// streamPageTicketsReady 检查页面三级关系及打印票据部件是否均已就绪，避免交错未闭合或晚到关系静默丢失票据
 // 入参: index 待交付页面序号
-// 返回: string 等待的部件键, bool 是否已就绪
-func (p *streamPackage) streamPageTicketsReady(index int) (string, bool) {
+// 返回: []string 等待到达的部件键列表, bool 是否遇到确定错误需暂缓至最终校验, error 预算或取消错误
+func (p *streamPackage) streamPageTicketsReady(index int) ([]string, bool, error) {
 	pagePart := p.index.pages[index].Part
 	docPart, _, _ := p.index.pageLocation(index)
 	if docPart == "" {
-		return "", true
+		return nil, false, nil
 	}
+	mayTicket := p.mayHavePrintTicket()
+	var waits []string
+	var missingRels []string
 	for _, source := range []string{p.index.sequence, docPart, pagePart} {
+		if err := checkContext(p.context); err != nil {
+			return nil, false, err
+		}
 		relsKey := strings.ToLower(createdRelationshipPart(source))
-		var relations []Relationship
 		if _, complete := p.pagePkg.parts[relsKey]; complete {
-			var err error
-			relations, err = p.index.pkg.relationships(source)
+			relations, err := p.index.pkg.relationshipsContext(p.context, source)
 			if err != nil {
+				if errors.Is(err, ErrLimit) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return nil, false, err
+				}
+				return nil, true, nil
+			}
+			target, err := printTicketTarget(source, relations, p.index.format)
+			if err != nil {
+				return nil, true, nil
+			}
+			if target != "" {
+				p.recordTicketTarget(target)
+				targetKey := strings.ToLower(target)
+				if _, exists := p.pagePkg.parts[targetKey]; !exists {
+					waits = append(waits, targetKey)
+				}
+			}
+			continue
+		}
+		if relsPart := p.parts[relsKey]; relsPart != nil {
+			if relsPart.relations == nil || relsPart.relations.deferred {
+				if mayTicket {
+					waits = append(waits, relsKey)
+				}
 				continue
 			}
-		} else if relsPart := p.parts[relsKey]; relsPart != nil && relsPart.relations != nil {
-			relations = relsPart.relations.items
-		} else {
+			target, err := printTicketTarget(source, relsPart.relations.items, p.index.format)
+			if err != nil {
+				return nil, true, nil
+			}
+			if target != "" {
+				p.recordTicketTarget(target)
+				targetKey := strings.ToLower(target)
+				if _, exists := p.pagePkg.parts[targetKey]; !exists {
+					waits = append(waits, targetKey)
+				}
+			} else if !relsPart.relations.closed && mayTicket {
+				waits = append(waits, relsKey)
+			}
 			continue
 		}
-		target, err := printTicketTarget(source, relations, p.index.format)
-		if err != nil || target == "" {
-			continue
-		}
-		targetKey := strings.ToLower(target)
-		if _, exists := p.pagePkg.parts[targetKey]; !exists {
-			return targetKey, false
+		if mayTicket {
+			missingRels = append(missingRels, relsKey)
 		}
 	}
-	return "", true
+	if len(missingRels) != 0 {
+		pending, ticketWaits := p.pendingPrintTickets()
+		for _, relsKey := range missingRels {
+			if pending || p.types.overrides[relsKey] != "" {
+				waits = append(waits, relsKey)
+			}
+		}
+		if pending && len(ticketWaits) != 0 {
+			waits = append(waits, ticketWaits...)
+		}
+	}
+	return waits, false, nil
 }
 
 // streamPrintTicketHierarchy 在流式视图读锁内按作业、文档及页面顺序读取已关联票据
@@ -1105,14 +1289,26 @@ func (p *streamPackage) consumeRelationships(part *streamPart, event StreamXMLTo
 				return p.emitReadyPages(part.name)
 			}
 			needed := s.closed
-			if !needed {
-				requiredType := formatNamespace(p.index.format) + "/required-resource"
-				for _, item := range s.items[before:] {
-					if item.Type == requiredType {
-						needed = true
-						break
+			ticketBound := false
+			requiredType := formatNamespace(p.index.format) + "/required-resource"
+			ticketType := formatNamespace(p.index.format) + "/printticket"
+			source := relationshipSource(part.name)
+			for _, item := range s.items[before:] {
+				if item.Type == requiredType {
+					needed = true
+				}
+				if item.Type == ticketType {
+					needed = true
+					ticketBound = true
+					if item.TargetMode == TargetModeInternal {
+						if resolved, err := resolvePart(source, item.Target); err == nil {
+							p.recordTicketTarget(resolved)
+						}
 					}
 				}
+			}
+			if ticketBound {
+				p.pageWait = nil
 			}
 			if needed {
 				return p.emitReadyPages(part.name)

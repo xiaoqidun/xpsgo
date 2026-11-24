@@ -82,6 +82,7 @@ type sceneRenderOptions struct {
 	printProfiles *sceneColorCache
 	printSide     bool
 	workers       int
+	hdrPeakNits   float64
 	pageSubClip   *image.Rectangle
 }
 
@@ -152,29 +153,26 @@ type sceneWorkerState struct {
 
 // sceneRenderer 保存一次绘制的独立状态及共享预算
 type sceneRenderer struct {
-	options          sceneRenderOptions
-	active           map[Element]bool
-	elements         int
-	edges            int
-	work             uint64
-	live             int
-	glyphs           int
-	exact            int
-	printRuntime     *printColorRuntime
-	nativeSample     printNativeSample
-	printContext     map[*Canvas]*printColorRuntime
-	printSideSpace   *printWorkingSpace
-	brushMeta        sceneBrushMeta
-	visualCount      int
-	hasFiltered      bool
-	concurrent       bool
-	cancelled        atomic.Bool
-	budgetMu         sync.Mutex
-	visualMu         sync.Mutex
-	cleanups         []func()
-	printTargetReady atomic.Uint32
-	printSpaceIndex  map[*printWorkingSpace]int
-	printSpaceFlags  []atomic.Uint32
+	options        sceneRenderOptions
+	active         map[Element]bool
+	elements       int
+	edges          int
+	work           uint64
+	live           int
+	glyphs         int
+	exact          int
+	printRuntime   *printColorRuntime
+	nativeSample   printNativeSample
+	printContext   map[*Canvas]*printColorRuntime
+	printSideSpace *printWorkingSpace
+	brushMeta      sceneBrushMeta
+	visualCount    int
+	hasFiltered    bool
+	concurrent     bool
+	cancelled      atomic.Bool
+	budgetMu       sync.Mutex
+	visualMu       sync.Mutex
+	cleanups       []func()
 }
 
 // newSceneParser 创建独立页面的绘制数据解析器
@@ -1248,7 +1246,7 @@ func validateSceneOutput(bounds image.Rectangle, transform Matrix, options scene
 	if options.outputColor > PrintColorMonochrome {
 		return 0, fmt.Errorf("%w: print output color mode", ErrInvalid)
 	}
-	if options.workers < 0 || options.samples != 1 && options.samples != 2 && options.samples != 4 && options.samples != 8 || !geometryFinite(options.tolerance) || options.tolerance <= 0 || options.pixels < 0 || options.elements < 0 || options.edges < 0 || options.glyphs < 0 || options.fonts < 0 || options.fontBytes < 0 || options.images < 0 || options.imageBytes < 0 || options.profiles < 0 || options.profileBytes < 0 || !geometryFillMatrixFinite(transform) {
+	if options.workers < 0 || !geometryFinite(options.hdrPeakNits) || options.hdrPeakNits < 0 || options.samples != 1 && options.samples != 2 && options.samples != 4 && options.samples != 8 || !geometryFinite(options.tolerance) || options.tolerance <= 0 || options.pixels < 0 || options.elements < 0 || options.edges < 0 || options.glyphs < 0 || options.fonts < 0 || options.fontBytes < 0 || options.images < 0 || options.imageBytes < 0 || options.profiles < 0 || options.profileBytes < 0 || !geometryFillMatrixFinite(transform) {
 		return 0, fmt.Errorf("%w: scene render options", ErrInvalid)
 	}
 	if options.edges > int(^uint(0)>>1)/4 {
@@ -1640,7 +1638,11 @@ func (r *sceneRenderer) brushMode(brush *Brush, transform Matrix, aliased bool, 
 		if err != nil {
 			return nil, err
 		}
-		sampler, err := newImageSamplerMode(brush, data, transform, space, maskOnly)
+		sourceIntent := IntentDefault
+		if r.options.device != nil {
+			sourceIntent = r.options.device.sourceIntent
+		}
+		sampler, err := newImageSampler(brush, data, transform, space, maskOnly, sourceIntent, r.options.hdrPeakNits)
 		if err != nil {
 			return nil, err
 		}
@@ -1941,7 +1943,11 @@ func (r *sceneRenderer) tile(nodes []*sceneNode, surface *renderSurface, output 
 				}
 			} else {
 				var err error
-				outColor, err = renderColorToNRGBA(c, r.options.space)
+				if r.options.space == renderScRGB && r.options.hdrPeakNits > 0 {
+					outColor, err = renderColorToNRGBAToneMapped(c, r.options.hdrPeakNits)
+				} else {
+					outColor, err = renderColorToNRGBA(c, r.options.space)
+				}
 				if err != nil {
 					return err
 				}

@@ -33,17 +33,21 @@ type EncodeOptions struct {
 	Part   string
 }
 
-// pageEncoder 构造独立的固定页面标记，限制展开工作量并检测模型引用循环
+// pageEncoder 构造独立的固定页面标记，限制展开工作量、检测引用循环并隔离共享VisualBrush内联命名冲突
 type pageEncoder struct {
-	format Format
-	ns     string
-	part   string
-	limits Limits
-	ctx    context.Context
-	active map[any]bool
-	work   int
-	bytes  int64
-	scope  map[string]string
+	format           Format
+	ns               string
+	part             string
+	limits           Limits
+	ctx              context.Context
+	active           map[any]bool
+	seenNames        map[string]bool
+	emittedBrushes   map[*Brush]bool
+	emittedElements  map[Element]bool
+	visualBrushReuse int
+	work             int
+	bytes            int64
+	scope            map[string]string
 }
 
 // DefaultEncodeOptions 返回默认编码选项
@@ -77,7 +81,7 @@ func EncodePage(ctx context.Context, output io.Writer, page *Page, options *Enco
 	if formatNamespace(configuration.Format) == "" {
 		return 0, fmt.Errorf("%w: invalid page format", ErrInvalid)
 	}
-	p := pageEncoder{format: configuration.Format, ns: formatNamespace(configuration.Format), part: page.Part, limits: configuration.Limits, ctx: ctx, active: make(map[any]bool)}
+	p := pageEncoder{format: configuration.Format, ns: formatNamespace(configuration.Format), part: page.Part, limits: configuration.Limits, ctx: ctx, active: make(map[any]bool), seenNames: make(map[string]bool), emittedBrushes: make(map[*Brush]bool), emittedElements: make(map[Element]bool)}
 	p.scope = map[string]string{"": p.ns, "xml": xmlNamespace}
 	var err error
 	if p.part == "" {
@@ -229,6 +233,7 @@ func (p *pageEncoder) page(value *Page) (*xmlElement, error) {
 		if err := p.attr(root, "Name", value.Name); err != nil {
 			return nil, err
 		}
+		p.seenNames[value.Name] = true
 	}
 	for _, box := range []struct {
 		name    string
@@ -496,6 +501,12 @@ func (p *pageEncoder) brush(value *Brush, depth int) (*xmlElement, error) {
 	if contentProperties(value.Visual) == nil {
 		return nil, fmt.Errorf("%w: missing or unknown brush visual", ErrInvalid)
 	}
+	reused := p.emittedBrushes[value] || p.emittedElements[value.Visual]
+	p.emittedBrushes[value] = true
+	if reused {
+		p.visualBrushReuse++
+		defer func() { p.visualBrushReuse-- }()
+	}
 	visual, err := p.element(value.Visual, depth+2)
 	if err != nil {
 		return nil, err
@@ -590,6 +601,7 @@ func (p *pageEncoder) element(value Element, depth int) (*xmlElement, error) {
 	}
 	p.active[value] = true
 	defer delete(p.active, value)
+	p.emittedElements[value] = true
 	node, err := p.node(name, depth)
 	if err != nil {
 		return nil, err
@@ -638,8 +650,11 @@ func (p *pageEncoder) properties(node *xmlElement, value ElementProperties, dept
 		}
 	}
 	if value.Name != "" {
-		if err := p.attr(node, "Name", value.Name); err != nil {
-			return err
+		if p.visualBrushReuse == 0 || !p.seenNames[value.Name] {
+			if err := p.attr(node, "Name", value.Name); err != nil {
+				return err
+			}
+			p.seenNames[value.Name] = true
 		}
 	}
 	if value.Language != nil {
@@ -703,7 +718,7 @@ func (p *pageEncoder) path(node *xmlElement, value *Path, depth int) error {
 			return err
 		}
 	}
-	if value.Stroke != nil || value.StrokeMiterLimit != 0 {
+	if value.StrokeMiterLimit != 0 {
 		if err := p.attr(node, "StrokeMiterLimit", encodeNumber(value.StrokeMiterLimit)); err != nil {
 			return err
 		}

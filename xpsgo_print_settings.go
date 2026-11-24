@@ -51,10 +51,15 @@ const (
 
 // printFrameworkNS 等常量定义Print Schema命名空间、关键字与票据内容类型
 const (
-	printFrameworkNS = "http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework"
-	printKeywordsNS  = "http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords"
-	printValueNS     = "http://www.w3.org/2001/XMLSchema"
-	printTicketType  = "application/vnd.ms-printing.printticket+xml"
+	printFrameworkNS   = "http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework"
+	printFramework2NS  = "http://schemas.microsoft.com/windows/2013/12/printing/printschemaframework2"
+	printKeywordsNS    = "http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords"
+	printKeywordsV11NS = "http://schemas.microsoft.com/windows/2013/05/printing/printschemakeywordsv11"
+	printKeywordsV12NS = "http://schemas.microsoft.com/windows/2013/12/printing/printschemakeywordsv12"
+	printKeywords2NS   = "http://schemas.microsoft.com/windows/2015/02/printing/printschemakeywords2"
+	printValueNS       = "http://www.w3.org/2001/XMLSchema"
+	printTicketType    = "application/vnd.ms-printing.printticket+xml"
+	printTicket2Type   = "application/vnd.ms-printschematicket+xml"
 )
 
 const (
@@ -153,10 +158,11 @@ type PrintSettingsOptions struct {
 	MaxOptionComparisons int
 }
 
-// printSettingsConfig 保存已校验的打印设置预算、关联层级与取消Context
+// printSettingsConfig 保存已校验的打印设置预算、关联层级、忽略策略与取消Context
 type printSettingsConfig struct {
 	PrintSettingsOptions
-	context context.Context
+	context           context.Context
+	ignoreUnsupported bool
 }
 
 // printSettingsBuilder 将展开名称绑定到确定性前缀，并约束生成结构的规模
@@ -1210,19 +1216,32 @@ func mergePrintFeature(baseline, delta PrintSetting, ctx context.Context) (Print
 	if err := checkContext(ctx); err != nil {
 		return PrintSetting{}, err
 	}
-	deltaHasOption := false
-	for _, child := range delta.Children {
+	var baselineOption, deltaOption xml.Name
+	baselineHasOption, deltaHasOption := false, false
+	for _, child := range baseline.Children {
 		if child.Kind == PrintSettingOption {
-			deltaHasOption = true
+			baselineOption, baselineHasOption = child.Name, true
 			break
 		}
 	}
+	for _, child := range delta.Children {
+		if child.Kind == PrintSettingOption {
+			deltaOption, deltaHasOption = child.Name, true
+			break
+		}
+	}
+	watermark := baseline.Name == (xml.Name{Space: printKeywordsNS, Local: "PageWatermark"})
+	dropBaseSubfeatures := watermark && deltaHasOption && (!baselineHasOption || deltaOption != baselineOption)
+	dropDeltaLayering := watermark && !deltaHasOption && baselineHasOption && baselineOption == (xml.Name{Space: printKeywordsNS, Local: "None"})
 	elements := make([]PrintSetting, 0, len(baseline.Children)+len(delta.Children))
 	removed := make([]bool, 0, len(baseline.Children)+len(delta.Children))
 	indices := make(map[xml.Name]int, len(baseline.Children))
 	families := make(map[printPrefixKey]int, len(baseline.Children))
 	for _, child := range baseline.Children {
 		if child.Kind == PrintSettingOption && deltaHasOption {
+			continue
+		}
+		if child.Kind == PrintSettingFeature && dropBaseSubfeatures {
 			continue
 		}
 		index := len(elements)
@@ -1238,6 +1257,9 @@ func mergePrintFeature(baseline, delta PrintSetting, ctx context.Context) (Print
 	for _, child := range delta.Children {
 		if err := checkContext(ctx); err != nil {
 			return PrintSetting{}, err
+		}
+		if child.Kind == PrintSettingFeature && dropDeltaLayering && child.Name == (xml.Name{Space: printKeywordsNS, Local: "Layering"}) {
+			continue
 		}
 		if child.Kind == PrintSettingOption {
 			elements = append(elements, child)

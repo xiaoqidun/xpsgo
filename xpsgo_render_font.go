@@ -166,7 +166,7 @@ func (r *sceneRenderer) glyphBitmapStrike(source *fontSource, glyphs *Glyphs, tr
 	}
 	px, py := math.Round(x), math.Round(y)
 	if px >= 1 && py >= 1 && px <= 255 && py <= 255 && math.Abs(x-px) <= 1e-9 && math.Abs(y-py) <= 1e-9 {
-		selection, present, err := source.selectBitmapStrikeWithWork(uint16(px), uint16(py), r.charge)
+		selection, present, err := source.selectBitmapStrikeWithWork(uint16(px), uint16(py), glyphs.IsSideways, r.charge)
 		if err != nil || present {
 			return selection, present, err
 		}
@@ -180,14 +180,26 @@ func (r *sceneRenderer) glyphBitmapStrike(source *fontSource, glyphs *Glyphs, tr
 	if err := r.charge(uint64(len(source.bitmaps.strikes))); err != nil {
 		return fontBitmapSelection{}, false, err
 	}
+	wantFlag := uint8(fontBitmapFlagHorizontal)
+	if glyphs.IsSideways {
+		wantFlag = fontBitmapFlagVertical
+	}
 	best, bestDist := -1, math.Inf(1)
-	for i, candidate := range source.bitmaps.strikes {
-		if candidate.ppemX == 0 || candidate.ppemY == 0 {
-			continue
+	for _, matchDirection := range []bool{true, false} {
+		for i, candidate := range source.bitmaps.strikes {
+			if candidate.ppemX == 0 || candidate.ppemY == 0 {
+				continue
+			}
+			if matchDirection && candidate.flags&wantFlag == 0 {
+				continue
+			}
+			dist := math.Hypot(float64(candidate.ppemX)-x, float64(candidate.ppemY)-y)
+			if best < 0 || dist < bestDist {
+				best, bestDist = i, dist
+			}
 		}
-		dist := math.Hypot(float64(candidate.ppemX)-x, float64(candidate.ppemY)-y)
-		if best < 0 || dist < bestDist {
-			best, bestDist = i, dist
+		if best >= 0 {
+			break
 		}
 	}
 	if best < 0 {
@@ -565,7 +577,7 @@ func (r *sceneRenderer) bold(geometry *Geometry, radius float64, transform Matri
 				active = append(active, edge)
 			}
 		}
-		if err := rasterBandSpans(active, band, lo, hi, regions, 1, winding, &work, &r.exact, emit); err != nil {
+		if err := rasterBandSpans(active, band, lo, hi, regions, 1, winding, &work, rasterMaxWork, &r.exact, emit); err != nil {
 			return rasterRegion{}, err
 		}
 		if err := r.charge(work - charged); err != nil {

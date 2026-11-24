@@ -17,6 +17,8 @@ package xpsgo
 import (
 	"context"
 	"fmt"
+	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -510,7 +512,11 @@ func (g *contentGraph) positionGlyphs() error {
 		if err != nil {
 			return err
 		}
-		run, err := resolveGlyphRunWithStep(glyphs, font.metrics, font.glyphIndex, font.glyphYMax, count, func() error { return g.charge(1) })
+		yMax := font.glyphYMax
+		if fontIsBitmapOnly(font.face) {
+			yMax = g.bitmapGlyphYMax(font, glyphs, item.Transform)
+		}
+		run, err := resolveGlyphRunWithStep(glyphs, font.metrics, font.glyphIndex, yMax, count, func() error { return g.charge(1) })
 		if err != nil {
 			return &PartError{Part: item.Part, Element: "Glyphs", Err: err}
 		}
@@ -529,6 +535,107 @@ func (g *contentGraph) positionGlyphs() error {
 		item.Glyphs = positions
 	}
 	return nil
+}
+
+// bitmapGlyphYMax 为纯位图字体按方向选择strike并提取设计单位字形顶部坐标，缺失度量时安全回退
+// 入参: font 字体访问器, glyphs 字形元素, transform 元素有效页面变换
+// 返回: func(uint16) (float64, error) 字形顶部查询回调
+func (g *contentGraph) bitmapGlyphYMax(font *fontSource, glyphs *Glyphs, transform Matrix) func(uint16) (float64, error) {
+	ready := false
+	hasSelection := false
+	var selection fontBitmapSelection
+	fallback := float64(font.metrics.hhea.ascender)
+	return func(gid uint16) (float64, error) {
+		if gid >= font.metrics.numGlyphs {
+			return 0, fmt.Errorf("%w: font glyph index %d", ErrInvalid, gid)
+		}
+		if err := g.charge(0); err != nil {
+			return 0, err
+		}
+		if !ready {
+			ready = true
+			x, y := math.Hypot(transform.A, transform.B), math.Hypot(transform.C, transform.D)
+			if glyphs.IsSideways {
+				x, y = y, x
+			}
+			x, y = x*glyphs.FontRenderingEmSize, y*glyphs.FontRenderingEmSize
+			if geometryFinite(x, y) && x > 0 && y > 0 {
+				px, py := math.Round(x), math.Round(y)
+				if px >= 1 && py >= 1 && px <= 255 && py <= 255 && math.Abs(x-px) <= 1e-9 && math.Abs(y-py) <= 1e-9 {
+					selected, present, err := font.selectBitmapStrikeWithWork(uint16(px), uint16(py), glyphs.IsSideways, g.charge)
+					if err != nil {
+						if fontBitmapRetry(err) {
+							return 0, err
+						}
+					} else if present {
+						selection, hasSelection = selected, true
+					}
+				}
+			}
+			if !hasSelection {
+				if err := font.loadBitmaps(g.charge); err != nil {
+					if fontBitmapRetry(err) {
+						return 0, err
+					}
+				} else if font.bitmaps != nil && len(font.bitmaps.strikes) != 0 {
+					if err := g.charge(uint64(len(font.bitmaps.strikes))); err != nil {
+						return 0, err
+					}
+					wantFlag := uint8(fontBitmapFlagHorizontal)
+					if glyphs.IsSideways {
+						wantFlag = fontBitmapFlagVertical
+					}
+					best, bestDist := -1, math.Inf(1)
+					hasTarget := geometryFinite(x, y) && x > 0 && y > 0
+					for _, matchDirection := range []bool{true, false} {
+						for i, candidate := range font.bitmaps.strikes {
+							if candidate.ppemX == 0 || candidate.ppemY == 0 {
+								continue
+							}
+							if matchDirection && candidate.flags&wantFlag == 0 {
+								continue
+							}
+							dist := 0.0
+							if hasTarget {
+								dist = math.Hypot(float64(candidate.ppemX)-x, float64(candidate.ppemY)-y)
+							}
+							if best < 0 || dist < bestDist {
+								best, bestDist = i, dist
+							}
+						}
+						if best >= 0 {
+							break
+						}
+					}
+					if best >= 0 {
+						strike := font.bitmaps.strikes[best]
+						selection = fontBitmapSelection{strike: best, ppemX: strike.ppemX, ppemY: strike.ppemY, scaleX: 1, scaleY: 1}
+						hasSelection = true
+					}
+				}
+			}
+		}
+		if !hasSelection || font.bitmaps == nil {
+			return fallback, nil
+		}
+		strike := &font.bitmaps.strikes[selection.strike]
+		index := sort.Search(len(strike.entries), func(i int) bool { return strike.entries[i].gid >= gid })
+		if index == len(strike.entries) || strike.entries[index].gid != gid {
+			return fallback, nil
+		}
+		entry := strike.entries[index]
+		metrics, _, err := strike.imageMetrics(entry, font.bitmaps.data[entry.start:entry.end])
+		if err != nil {
+			return fallback, nil
+		}
+		if metrics.hasVertical {
+			return 0, nil
+		}
+		if metrics.hasHorizontal && selection.ppemY != 0 {
+			return math.Round(float64(metrics.horizontal.bearingY)*selection.scaleY) * float64(font.metrics.unitsPerEm) / float64(selection.ppemY), nil
+		}
+		return fallback, nil
+	}
 }
 
 // contentGlyphPosition 将局部定位结果映射到有效页面坐标，步进向量不通过巨大平移坐标相减求得

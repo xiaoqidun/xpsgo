@@ -24,6 +24,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -66,16 +67,18 @@ type RenderLimits struct {
 // RenderOptions 设置页面绘制参数，零值字段采用DefaultRenderOptions默认值，不修改页面内容
 // DPI默认96（先应用Transform再按DPI缩放），Region为nil取变换后整像素范围，Background为nil默认白色（color.Transparent输出透明底）
 // ColorSpace预览默认ColorSRGB、设备默认ColorScRGB，Samples可选1/2/4/8（默认8），Tolerance默认0.025像素，Workers零值自动按核数选择
+// HDRPeakNits设置HDR色调映射与HLG参考峰值亮度（单位cd/m²），零值时对PQ默认10000、对HLG默认1000且不影响普通SDR像素；非零值时同时对scRGB及线性图像输出按该峰值执行BT.2446色调映射
 type RenderOptions struct {
-	DPI        float64
-	Transform  *Matrix
-	Region     *image.Rectangle
-	Background color.Color
-	ColorSpace ColorSpace
-	Samples    int
-	Tolerance  float64
-	Workers    int
-	Limits     RenderLimits
+	DPI         float64
+	Transform   *Matrix
+	Region      *image.Rectangle
+	Background  color.Color
+	ColorSpace  ColorSpace
+	Samples     int
+	Tolerance   float64
+	Workers     int
+	HDRPeakNits float64
+	Limits      RenderLimits
 }
 
 // RenderingIntent 指定ICC转换意图，零值表示使用当前入口约定的缺省策略
@@ -113,7 +116,8 @@ type deviceRenderState struct {
 	prepareWork      uint64
 	pixelWork        uint64
 	result           *DeviceImage
-	printTarget      [4]*iccTargetTransform
+	printTarget      [4]atomic.Pointer[iccTargetTransform]
+	printTargetMu    sync.Mutex
 	diagnostics      []Diagnostic
 	printProfileHash [32]byte
 	diagMu           sync.Mutex
@@ -129,6 +133,7 @@ type renderSurface struct {
 
 // sceneColorCache 复用单次绘制的配置文件和渲染意图转换，不跨阅读器共享状态
 type sceneColorCache struct {
+	mu              sync.Mutex
 	pkg             *packageReader
 	profiles        map[string]*iccProfile
 	profileErrors   map[string]error
@@ -265,10 +270,11 @@ func (o RenderOptions) settings(ctx context.Context) (sceneRenderOptions, Matrix
 	if dpi == 0 {
 		dpi = 96
 	}
-	if !geometryFinite(dpi, o.Tolerance) || dpi < 0 || o.Tolerance < 0 || o.Workers < 0 || o.Samples != 0 && o.Samples != 1 && o.Samples != 2 && o.Samples != 4 && o.Samples != 8 {
+	if !geometryFinite(dpi, o.Tolerance, o.HDRPeakNits) || dpi < 0 || o.Tolerance < 0 || o.HDRPeakNits < 0 || o.Workers < 0 || o.Samples != 0 && o.Samples != 1 && o.Samples != 2 && o.Samples != 4 && o.Samples != 8 {
 		return settings, Matrix{}, fmt.Errorf("%w: render resolution or sampling", ErrInvalid)
 	}
 	settings.workers = o.Workers
+	settings.hdrPeakNits = o.HDRPeakNits
 	if o.Samples != 0 {
 		settings.samples = o.Samples
 	}
@@ -600,7 +606,7 @@ func (s *deviceRenderState) pixel(x, y int, c renderColor, space renderColorSpac
 		}
 		linear = [3]float64{luminance, luminance, luminance}
 	}
-	value, err := s.target.fromXYZChannels(iccMatrixColor(iccPCSFromLinearRGB, linear))
+	value, err := s.target.fromXYZ(iccMatrixColor(iccPCSFromLinearRGB, linear))
 	if err != nil {
 		return err
 	}
@@ -1009,6 +1015,8 @@ func (c *sceneColorCache) profileUsability(part, uri string, ctx context.Context
 // 入参: part 已解析的规范化部件名, ctx 可选取消Context
 // 返回: *iccProfile 只读配置文件, bool 是否为ICC内容不可用, error 读取或解析错误
 func (c *sceneColorCache) profileResolved(part string, ctx context.Context) (result *iccProfile, unusable bool, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	defer func() {
 		if err != nil {
 			err = wrapPartError(part, "", err)
@@ -1053,6 +1061,35 @@ func (c *sceneColorCache) profileResolved(part string, ctx context.Context) (res
 	return profile, false, nil
 }
 
+// cachedProfileData 按缓存键读取或计费缓存嵌入ICC数据，在互斥锁保护下完成查询与写入
+// 入参: key 规范化缓存键, data 完整ICC字节, charge 扣费回调
+// 返回: *iccProfile 只读配置文件, error 预算、取消或解析错误
+func (c *sceneColorCache) cachedProfileData(key string, data []byte, charge func(uint64) error) (*iccProfile, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if p := c.profiles[key]; p != nil {
+		return p, nil
+	}
+	if charge != nil {
+		if err := charge(uint64(len(data))); err != nil {
+			return nil, err
+		}
+	}
+	if len(c.profiles)+len(c.profileErrors) >= c.maxProfiles || int64(len(data)) > c.bytes {
+		return nil, fmt.Errorf("%w: print ICC budget", ErrLimit)
+	}
+	return c.cacheProfile(key, data)
+}
+
+// hasCachedProfile 判断规范化缓存键对应的配置文件是否已加载，供扣费判定使用
+// 入参: key 小写部件缓存键
+// 返回: bool 是否已缓存
+func (c *sceneColorCache) hasCachedProfile(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.profiles[key] != nil
+}
+
 // transform 选择并缓存指定意图的源转换，部件身份按OPC规则忽略大小写
 // 入参: part 定义部件, uri 配置文件引用, intent ICC渲染意图
 // 返回: *iccTransform 只读转换, error 配置文件、能力或意图错误
@@ -1076,6 +1113,8 @@ func (c *sceneColorCache) transform(part, uri string, intent uint32) (*iccTransf
 // 入参: key 配置文件缓存键, profile 只读配置文件, intent ICC渲染意图
 // 返回: *iccTransform 只读转换, error 配置文件、能力或意图错误
 func (c *sceneColorCache) profileTransform(key string, profile *iccProfile, intent uint32) (*iccTransform, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.sourceIntent != IntentDefault {
 		intent = uint32(c.sourceIntent - 1)
 	}

@@ -1347,7 +1347,7 @@ func compositionSignatureMarkupIDs(node *xmlElement, processor compatibilityProc
 	if err != nil {
 		return err
 	}
-	if _, err := processor.attributes(node, scope, branch); err != nil {
+	if err := processor.validateAttributes(node, scope, branch); err != nil {
 		return err
 	}
 	if node.Name.Space == mcNamespace {

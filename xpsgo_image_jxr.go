@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"image"
 	"math"
+	"sync"
 
 	"github.com/xiaoqidun/jxrgo"
 )
@@ -28,34 +29,58 @@ import (
 // jxrRowCacheMaxWidth 定义JPEG XR扫描行缓存支持的最大宽度
 const jxrRowCacheMaxWidth = 4096
 
-// jxrImage 保存独立解码图像的原生通道与线性转换视图，取样时处理非预乘，不复制整幅像素
+// jxrSampleNative 等常量表示JPEG XR渲染采样阶段选择的数据通道视图
+const (
+	jxrSampleNative jxrSampleMode = iota
+	jxrSampleRGB
+	jxrSampleLinear
+)
+
+// jxrSampleMode 表示JPEG XR采样器读取原生分量、设备域RGB或线性scRGB的模式
+type jxrSampleMode uint8
+
+// jxrLinearKey 唯一标识一组按需缓存的JPEG XR线性读取器参数
+type jxrLinearKey struct {
+	applyCICP   bool
+	applyICC    bool
+	intent      jxrgo.RenderingIntent
+	hdrPeakNits float64
+}
+
+// jxrImage 保存独立解码图像的原生通道与按需缓存读取器，取样时处理非预乘，不复制整幅像素
 type jxrImage struct {
 	bounds        image.Rectangle
 	raster        *jxrgo.Raster
+	info          jxrgo.Info
 	components    [iccMaxChannels + 1]jxrgo.Component
-	linearOptions jxrgo.LinearOptions
+	limits        jxrgo.Limits
 	channels      int
 	alpha         bool
 	premultiplied bool
 	linear        bool
-	useLinear     bool
-	yccOnly       bool
+	ycc           bool
 	units         uint64
+	readerMu      sync.Mutex
+	rgbReader     *jxrgo.RGBReader
+	linearReaders map[jxrLinearKey]*jxrgo.LinearReader
+	rowPool       sync.Pool
 }
 
-// jxrRowBuffer 保存JPEG XR单行批量读取的可复用通道、线性像素与位模式缓冲
+// jxrRowBuffer 保存JPEG XR单行批量读取的可复用通道、四分量行与位模式缓冲
 type jxrRowBuffer struct {
 	channels [iccMaxChannels][]float64
 	alpha    []float64
-	linear   []float64
+	rgba     []float64
 	bits     []uint32
 }
 
-// jxrRowCache 保存单工作Goroutine独占的两行滑动行缓存及线性读取器，避免双线性采样重复逐像素读取
+// jxrRowCache 保存单工作Goroutine独占的两行滑动行缓存及读取器引用，避免双线性采样重复逐像素读取
 type jxrRowCache struct {
 	source       *jxrImage
-	preferLinear bool
+	mode         jxrSampleMode
+	key          jxrLinearKey
 	linearReader *jxrgo.LinearReader
+	rgbReader    *jxrgo.RGBReader
 	rows         [2]jxrRowBuffer
 	ys           [2]int
 	valid        [2]bool
@@ -137,14 +162,54 @@ func selectJXRPrimaryImage(ctx context.Context, decoder *jxrgo.Decoder) (int, jx
 	return 0, jxrgo.Info{}, fmt.Errorf("%w: JPEG XR container has no primary image", ErrInvalid)
 }
 
-// jxrICCIsYCbCr 判断ICC配置文件头部声明的设备色彩空间是否为YCbr
-// 入参: profile 原始ICC字节
-// 返回: bool 是否为YCbr设备配置
-func jxrICCIsYCbCr(profile []byte) bool {
-	return len(profile) >= 20 && string(profile[16:20]) == "YCbr"
+// jxrImageCICP 将JXRGo的CICP色彩编码结构转换为文档图像统一的四元组描述
+// 入参: encoding 可选JPEG XR CICP编码声明
+// 返回: *imageCICP 统一CICP四元组，空指针保持nil
+func jxrImageCICP(encoding *jxrgo.ColorEncoding) *imageCICP {
+	if encoding == nil {
+		return nil
+	}
+	return &imageCICP{
+		primaries: encoding.Primaries,
+		transfer:  encoding.Transfer,
+		matrix:    encoding.Matrix,
+		fullRange: encoding.FullRange,
+	}
 }
 
-// decodeJXRImage 使用JXRGo重建主图原生分量及YCC或CICP线性视图，并结合预算推导工作内存上限
+// jxrIntentFromICC 将ICC头部标准意图编码映射为JXRGo渲染意图枚举
+// 入参: intent ICC意图编号，0感知、1相对、2饱和度、3绝对
+// 返回: jxrgo.RenderingIntent 对应的JXRGo渲染意图
+func jxrIntentFromICC(intent uint32) jxrgo.RenderingIntent {
+	switch intent {
+	case 0:
+		return jxrgo.IntentPerceptual
+	case 2:
+		return jxrgo.IntentSaturation
+	case 3:
+		return jxrgo.IntentAbsolute
+	default:
+		return jxrgo.IntentRelative
+	}
+}
+
+// jxrIntentFromRender 将公开RenderingIntent映射为JXRGo渲染意图枚举
+// 入参: intent 文档渲染意图
+// 返回: jxrgo.RenderingIntent 对应的JXRGo渲染意图
+func jxrIntentFromRender(intent RenderingIntent) jxrgo.RenderingIntent {
+	switch intent {
+	case IntentPerceptual:
+		return jxrgo.IntentPerceptual
+	case IntentSaturation:
+		return jxrgo.IntentSaturation
+	case IntentAbsoluteColorimetric:
+		return jxrgo.IntentAbsolute
+	default:
+		return jxrgo.IntentRelative
+	}
+}
+
+// decodeJXRImage 使用JXRGo重建主图原生分量并完整保留内嵌ICC及CICP元数据，不在解码期固化颜色管线
 // 入参: ctx 已规范化取消Context, data JPEG XR文件, maxPixels 剩余RGBA64等价容量, maxBytes 调用方图像字节上限
 // 返回: *rasterImage 独立原生图像, error 数据、能力、资源或取消错误
 func decodeJXRImage(ctx context.Context, data []byte, maxPixels, maxBytes uint64) (*rasterImage, error) {
@@ -183,6 +248,9 @@ func decodeJXRImage(ctx context.Context, data []byte, maxPixels, maxBytes uint64
 	switch info.ColorSpace {
 	case jxrgo.ColorGray, jxrgo.ColorRGB, jxrgo.ColorCMYK, jxrgo.ColorCMYKDirect, jxrgo.ColorMultiChannel:
 	case jxrgo.ColorYCC:
+		if info.Channels != 3 {
+			return nil, fmt.Errorf("%w: JPEG XR YCC component count", ErrUnsupported)
+		}
 		ycc = true
 	default:
 		return nil, fmt.Errorf("%w: JPEG XR document color interpretation", ErrUnsupported)
@@ -214,24 +282,17 @@ func decodeJXRImage(ctx context.Context, data []byte, maxPixels, maxBytes uint64
 	}
 	_ = decoder.Close()
 	premultiplied := info.Premultiplied && info.Alpha
-	view := &jxrImage{bounds: info.Bounds, raster: raster, channels: info.Channels, alpha: info.Alpha, premultiplied: premultiplied, linear: info.Linear, yccOnly: ycc, units: units}
-	profile := info.ICCProfile
-	if ycc {
-		applyYCCICC := jxrICCIsYCbCr(profile)
-		if applyYCCICC {
-			profile = nil
-		}
-		view.channels = 3
-		view.linear = true
-		view.useLinear = true
-		view.linearOptions = jxrgo.LinearOptions{Filter: jxrgo.ResampleBilinear, ApplyCICP: info.ColorEncoding != nil, ApplyICC: applyYCCICC, Unpremultiply: true, Limits: limits}
-		if _, err := raster.NewLinearReader(ctx, &view.linearOptions); err != nil {
-			return nil, jxrImageError(err)
-		}
-		if err := checkContext(ctx); err != nil {
-			return nil, err
-		}
-		return &rasterImage{jxr: view, dpi: Point{info.Resolution.X, info.Resolution.Y}, channels: 3, profile: profile, linear: true}, nil
+	view := &jxrImage{
+		bounds:        info.Bounds,
+		raster:        raster,
+		info:          info,
+		limits:        limits,
+		channels:      info.Channels,
+		alpha:         info.Alpha,
+		premultiplied: premultiplied,
+		linear:        info.Linear,
+		ycc:           ycc,
+		units:         units,
 	}
 	for index := range stride {
 		component, err := raster.Component(index)
@@ -242,27 +303,29 @@ func decodeJXRImage(ctx context.Context, data []byte, maxPixels, maxBytes uint64
 	}
 	for index := range stride {
 		isAlpha := view.alpha && index == view.channels
-		if view.components[index].Info().Format == jxrgo.SampleFloat || isAlpha && view.linear {
-			if err := validateJXRFiniteComponent(ctx, view.components[index], info.Bounds, isAlpha); err != nil {
+		compInfo := view.components[index].Info()
+		if compInfo.Format == jxrgo.SampleFloat || isAlpha && view.linear {
+			if err := validateJXRFiniteComponent(ctx, view.components[index], compInfo.Bounds, isAlpha); err != nil {
 				return nil, err
 			}
-		}
-	}
-	if info.ColorEncoding != nil && len(profile) == 0 {
-		view.useLinear = true
-		view.linearOptions = jxrgo.LinearOptions{Filter: jxrgo.ResampleBilinear, ApplyCICP: true, ApplyICC: false, Unpremultiply: true, Limits: limits}
-		if _, err := raster.NewLinearReader(ctx, &view.linearOptions); err != nil {
-			return nil, jxrImageError(err)
 		}
 	}
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	return &rasterImage{jxr: view, dpi: Point{info.Resolution.X, info.Resolution.Y}, channels: info.Channels, profile: profile, linear: info.Linear, multiChannel: info.ColorSpace == jxrgo.ColorMultiChannel}, nil
+	return &rasterImage{
+		jxr:          view,
+		dpi:          Point{info.Resolution.X, info.Resolution.Y},
+		channels:     info.Channels,
+		profile:      info.ICCProfile,
+		cicp:         jxrImageCICP(info.ColorEncoding),
+		linear:       info.Linear,
+		multiChannel: info.ColorSpace == jxrgo.ColorMultiChannel,
+	}, nil
 }
 
 // validateJXRFiniteComponent 批量校验浮点或线性透明分量的有限性，浮点通道使用位模式行读取避免逐像素转换
-// 入参: ctx 取消Context, component 分量视图, bounds 图像范围, isAlpha 是否为透明度分量
+// 入参: ctx 取消Context, component 分量视图, bounds 分量自身像素范围, isAlpha 是否为透明度分量
 // 返回: error 取消、读取或非有限数值错误
 func validateJXRFiniteComponent(ctx context.Context, component jxrgo.Component, bounds image.Rectangle, isAlpha bool) error {
 	label := "JPEG XR non-finite color"
@@ -280,7 +343,7 @@ func validateJXRFiniteComponent(ctx context.Context, component jxrgo.Component, 
 				mask = 0x7c00
 			}
 			row := make([]uint32, bounds.Dx())
-			for y := range bounds.Dy() {
+			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 				if err := checkContext(ctx); err != nil {
 					return err
 				}
@@ -297,7 +360,7 @@ func validateJXRFiniteComponent(ctx context.Context, component jxrgo.Component, 
 		}
 	}
 	row := make([]float64, bounds.Dx())
-	for y := range bounds.Dy() {
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
@@ -313,10 +376,10 @@ func validateJXRFiniteComponent(ctx context.Context, component jxrgo.Component, 
 	return nil
 }
 
-// jxrUnpremultiply 展开JPEG XR预乘颜色分量，线性空间保留扩展高光并统一拒绝非有限结果
-// 入参: value 源颜色分量, alpha 已校验的单位区间透明度, linear 是否为线性颜色空间
+// jxrUnpremultiply 展开JPEG XR预乘颜色分量，扩展范围通道保留原始域并统一拒绝非有限结果
+// 入参: value 源颜色分量, alpha 已校验的单位区间透明度, preserveExtended 是否保留超单位区间分量
 // 返回: float64 非预乘颜色分量, error 非有限颜色错误
-func jxrUnpremultiply(value, alpha float64, linear bool) (float64, error) {
+func jxrUnpremultiply(value, alpha float64, preserveExtended bool) (float64, error) {
 	if !geometryFinite(value) {
 		return 0, fmt.Errorf("%w: JPEG XR non-finite color", ErrUnsupported)
 	}
@@ -327,26 +390,150 @@ func jxrUnpremultiply(value, alpha float64, linear bool) (float64, error) {
 	if !geometryFinite(unpremultiplied) {
 		return 0, fmt.Errorf("%w: JPEG XR non-finite color", ErrUnsupported)
 	}
-	if linear {
+	if preserveExtended {
 		return unpremultiplied, nil
 	}
 	return colorClamp(unpremultiplied), nil
 }
 
-// sampleLinear 经JXRGo线性读取器按单行采样YCC或CICP线性scRGB颜色及透明度
-// 入参: x, y 像素位置, components 至少三通道颜色缓冲区
-// 返回: float64 有限且归一化的透明度, error 取样或数值错误
-func (source *jxrImage) sampleLinear(x, y int, components []float64) (float64, error) {
-	reader, err := source.raster.NewLinearReader(context.Background(), &source.linearOptions)
-	if err != nil {
-		return 0, jxrImageError(err)
+// jxrEffectiveChromaOffset 返回子采样分量的有效色度相位偏移，未知相位采用ITU-T T.832默认居中相位
+// 入参: offset 声明的相位偏移, step 下采样步长, known 是否显式声明相位
+// 返回: float64 有效相位偏移
+func jxrEffectiveChromaOffset(offset float64, step uint8, known bool) float64 {
+	if known {
+		return offset
 	}
-	row := make([]float64, source.bounds.Dx()*4)
-	if err := reader.ReadRow(context.Background(), y-source.bounds.Min.Y, row); err != nil {
+	return float64(step-1) * 0.5
+}
+
+// jxrResampleAxis 按源分量相位步长计算主网格坐标在子采样平面上的双线性邻点与权重
+// 入参: at 零起点主网格坐标, count 子采样轴长度, offset 有效相位偏移, step 下采样步长
+// 返回: int 低索引, int 高索引, float64 插值权重
+func jxrResampleAxis(at, count int, offset float64, step uint8) (int, int, float64) {
+	if count <= 1 || step <= 1 {
+		idx := max(0, min(count-1, at))
+		return idx, idx, 0
+	}
+	position := (float64(at) - offset) / float64(step)
+	position = max(0, min(float64(count-1), position))
+	low := int(math.Floor(position))
+	return low, min(low+1, count-1), position - float64(low)
+}
+
+// jxrSampleComponent 在主图网格读取单个源分量，子采样分量执行零分配相位双线性上采样
+// 入参: comp 源分量视图, x, y 主图坐标, bounds 主图范围
+// 返回: float64 原生源分量数值, error 取样或非有限插值错误
+func jxrSampleComponent(comp jxrgo.Component, x, y int, bounds image.Rectangle) (float64, error) {
+	info := comp.Info()
+	if info.XStep == 1 && info.YStep == 1 && info.Bounds == bounds {
+		value, err := comp.Sample(x, y)
+		if err != nil {
+			return 0, jxrImageError(err)
+		}
+		return value, nil
+	}
+	ox := jxrEffectiveChromaOffset(info.XOffset, info.XStep, info.XPositionKnown)
+	oy := jxrEffectiveChromaOffset(info.YOffset, info.YStep, info.YPositionKnown)
+	x0, x1, fx := jxrResampleAxis(x-bounds.Min.X, info.Bounds.Dx(), ox, info.XStep)
+	y0, y1, fy := jxrResampleAxis(y-bounds.Min.Y, info.Bounds.Dy(), oy, info.YStep)
+	bx, by := info.Bounds.Min.X, info.Bounds.Min.Y
+	if fx == 0 && fy == 0 {
+		value, err := comp.Sample(bx+x0, by+y0)
+		if err != nil {
+			return 0, jxrImageError(err)
+		}
+		return value, nil
+	}
+	var values [4]float64
+	for idx, pt := range [4]image.Point{{x0, y0}, {x1, y0}, {x0, y1}, {x1, y1}} {
+		if idx&1 != 0 && fx == 0 || idx&2 != 0 && fy == 0 {
+			continue
+		}
+		v, err := comp.Sample(bx+pt.X, by+pt.Y)
+		if err != nil {
+			return 0, jxrImageError(err)
+		}
+		if !geometryFinite(v) {
+			return 0, fmt.Errorf("%w: JPEG XR non-finite color", ErrUnsupported)
+		}
+		values[idx] = v
+	}
+	return (values[0]*(1-fx)+values[1]*fx)*(1-fy) + (values[2]*(1-fx)+values[3]*fx)*fy, nil
+}
+
+// getLinearReader 线程安全地按参数键复用或懒创建JXRGo线性读取器
+// 入参: key 线性读取配置键
+// 返回: *jxrgo.LinearReader 只读并发安全的线性读取器, error 构建失败错误
+func (source *jxrImage) getLinearReader(key jxrLinearKey) (*jxrgo.LinearReader, error) {
+	source.readerMu.Lock()
+	defer source.readerMu.Unlock()
+	if reader := source.linearReaders[key]; reader != nil {
+		return reader, nil
+	}
+	opts := jxrgo.LinearOptions{
+		Filter:        jxrgo.ResampleBilinear,
+		ApplyCICP:     key.applyCICP,
+		ApplyICC:      key.applyICC,
+		Intent:        key.intent,
+		HDRPeakNits:   key.hdrPeakNits,
+		Unpremultiply: true,
+		Limits:        source.limits,
+	}
+	reader, err := source.raster.NewLinearReader(context.Background(), &opts)
+	if err != nil {
+		return nil, jxrImageError(err)
+	}
+	if source.linearReaders == nil {
+		source.linearReaders = make(map[jxrLinearKey]*jxrgo.LinearReader)
+	}
+	source.linearReaders[key] = reader
+	return reader, nil
+}
+
+// getRGBReader 线程安全地复用或懒创建JXRGo设备域非线性RGB读取器
+// 返回: *jxrgo.RGBReader 只读并发安全的设备RGB读取器, error 构建失败错误
+func (source *jxrImage) getRGBReader() (*jxrgo.RGBReader, error) {
+	source.readerMu.Lock()
+	defer source.readerMu.Unlock()
+	if source.rgbReader != nil {
+		return source.rgbReader, nil
+	}
+	opts := jxrgo.RGBOptions{
+		Filter:          jxrgo.ResampleBilinear,
+		ApplyCICPMatrix: source.info.ColorEncoding != nil,
+		Unpremultiply:   true,
+		Limits:          source.limits,
+	}
+	reader, err := source.raster.NewRGBReader(context.Background(), &opts)
+	if err != nil {
+		return nil, jxrImageError(err)
+	}
+	source.rgbReader = reader
+	return reader, nil
+}
+
+// sampleRow4 复用对象池行缓冲经指定行读取函数提取单像素三通道与透明度
+// 入参: read 行读取回调, x, y 像素坐标, components 至少三通道输出缓冲
+// 返回: float64 有限且归一化的透明度, error 读取或非有限数值错误
+func (source *jxrImage) sampleRow4(read func(context.Context, int, []float64) error, x, y int, components []float64) (float64, error) {
+	need := source.bounds.Dx() * 4
+	var holder *[]float64
+	if pooled, ok := source.rowPool.Get().(*[]float64); ok && pooled != nil && cap(*pooled) >= need {
+		holder = pooled
+		*holder = (*holder)[:need]
+	} else {
+		buf := make([]float64, need)
+		holder = &buf
+	}
+	row := *holder
+	err := read(context.Background(), y, row)
+	if err != nil {
+		source.rowPool.Put(holder)
 		return 0, jxrImageError(err)
 	}
 	at := (x - source.bounds.Min.X) * 4
 	r, g, b, alpha := row[at], row[at+1], row[at+2], row[at+3]
+	source.rowPool.Put(holder)
 	if !geometryFinite(alpha) {
 		return 0, fmt.Errorf("%w: JPEG XR non-finite alpha", ErrUnsupported)
 	}
@@ -357,18 +544,40 @@ func (source *jxrImage) sampleLinear(x, y int, components []float64) (float64, e
 	return colorClamp(alpha), nil
 }
 
-// readLinearRow 使用调用方独占线性读取器批量读取整行线性scRGB颜色及透明度
-// 入参: reader 独占线性读取器, y 图像行坐标, buf 可复用行缓冲
+// sampleLinear 经缓存线性读取器按单行采样YCC或CICP线性scRGB颜色及透明度
+// 入参: x, y 像素位置, components 至少三通道颜色缓冲区, key 线性读取配置键
+// 返回: float64 有限且归一化的透明度, error 取样或数值错误
+func (source *jxrImage) sampleLinear(x, y int, components []float64, key jxrLinearKey) (float64, error) {
+	reader, err := source.getLinearReader(key)
+	if err != nil {
+		return 0, err
+	}
+	return source.sampleRow4(reader.ReadRow, x, y, components)
+}
+
+// sampleRGB 经缓存设备RGB读取器按单行采样YCC解码后的非线性设备RGB颜色及透明度
+// 入参: x, y 像素位置, components 至少三通道颜色缓冲区
+// 返回: float64 有限且归一化的透明度, error 取样或数值错误
+func (source *jxrImage) sampleRGB(x, y int, components []float64) (float64, error) {
+	reader, err := source.getRGBReader()
+	if err != nil {
+		return 0, err
+	}
+	return source.sampleRow4(reader.ReadRow, x, y, components)
+}
+
+// readRow4 经四分量行读取器批量读取整行颜色与透明度并校验有限性
+// 入参: read 行读取回调, y 图像行坐标, buf 可复用行缓冲
 // 返回: error 行读取或非有限数值错误
-func (source *jxrImage) readLinearRow(reader *jxrgo.LinearReader, y int, buf *jxrRowBuffer) error {
+func (source *jxrImage) readRow4(read func(context.Context, int, []float64) error, y int, buf *jxrRowBuffer) error {
 	width := source.bounds.Dx()
 	need := width * 4
-	if cap(buf.linear) < need {
-		buf.linear = make([]float64, need)
+	if cap(buf.rgba) < need {
+		buf.rgba = make([]float64, need)
 	} else {
-		buf.linear = buf.linear[:need]
+		buf.rgba = buf.rgba[:need]
 	}
-	if err := reader.ReadRow(context.Background(), y-source.bounds.Min.Y, buf.linear); err != nil {
+	if err := read(context.Background(), y, buf.rgba); err != nil {
 		return jxrImageError(err)
 	}
 	for channel := range 3 {
@@ -386,7 +595,7 @@ func (source *jxrImage) readLinearRow(reader *jxrgo.LinearReader, y int, buf *jx
 	rRow, gRow, bRow, aRow := buf.channels[0], buf.channels[1], buf.channels[2], buf.alpha
 	for x := range width {
 		at := x * 4
-		r, g, b, alpha := buf.linear[at], buf.linear[at+1], buf.linear[at+2], buf.linear[at+3]
+		r, g, b, alpha := buf.rgba[at], buf.rgba[at+1], buf.rgba[at+2], buf.rgba[at+3]
 		if !geometryFinite(alpha) {
 			return fmt.Errorf("%w: JPEG XR non-finite alpha", ErrUnsupported)
 		}
@@ -398,18 +607,24 @@ func (source *jxrImage) readLinearRow(reader *jxrgo.LinearReader, y int, buf *jx
 	return nil
 }
 
-// sample 读取原生分量并展开预乘，YCC图像走线性转换，非预乘线性颜色保留扩展范围
+// sample 忠实读取源空间原生分量并展开预乘，子采样YCC按源相位上采样，不套用ICC或显示颜色转换
 // 入参: x, y 像素位置, components 颜色分量缓冲区
 // 返回: float64 有限且归一化的透明度, error 取样或数值错误
 func (source *jxrImage) sample(x, y int, components []float64) (float64, error) {
-	if source.yccOnly {
-		return source.sampleLinear(x, y, components)
-	}
 	alpha := 1.0
 	if source.alpha {
-		value, err := source.components[source.channels].Sample(x, y)
+		var value float64
+		var err error
+		if source.ycc {
+			value, err = jxrSampleComponent(source.components[source.channels], x, y, source.bounds)
+		} else {
+			value, err = source.components[source.channels].Sample(x, y)
+			if err != nil {
+				err = jxrImageError(err)
+			}
+		}
 		if err != nil {
-			return 0, jxrImageError(err)
+			return 0, err
 		}
 		if !geometryFinite(value) {
 			return 0, fmt.Errorf("%w: JPEG XR non-finite alpha", ErrUnsupported)
@@ -417,7 +632,7 @@ func (source *jxrImage) sample(x, y int, components []float64) (float64, error) 
 		alpha = colorClamp(value)
 	}
 	premultiplied := source.premultiplied && source.alpha
-	if !premultiplied && source.linear {
+	if !premultiplied && source.linear && !source.ycc {
 		for channel := range source.channels {
 			value, err := source.components[channel].Sample(x, y)
 			if err != nil {
@@ -431,19 +646,30 @@ func (source *jxrImage) sample(x, y int, components []float64) (float64, error) 
 		return alpha, nil
 	}
 	for channel := range source.channels {
-		value, err := source.components[channel].Sample(x, y)
-		if err != nil {
-			return 0, jxrImageError(err)
+		comp := source.components[channel]
+		var value float64
+		var err error
+		if source.ycc {
+			value, err = jxrSampleComponent(comp, x, y, source.bounds)
+		} else {
+			value, err = comp.Sample(x, y)
+			if err != nil {
+				err = jxrImageError(err)
+			}
 		}
+		if err != nil {
+			return 0, err
+		}
+		preserveExtended := source.linear || comp.Info().Format != jxrgo.SampleUnsigned
 		if premultiplied {
-			value, err = jxrUnpremultiply(value, alpha, source.linear)
+			value, err = jxrUnpremultiply(value, alpha, preserveExtended)
 			if err != nil {
 				return 0, err
 			}
 		} else if !geometryFinite(value) {
 			return 0, fmt.Errorf("%w: JPEG XR non-finite color", ErrUnsupported)
 		}
-		if !source.linear {
+		if !preserveExtended {
 			value = math.Floor(colorClamp(value)*65535+0.5) / 65535
 		}
 		components[channel] = value
@@ -473,7 +699,17 @@ func (source *jxrImage) readRow(y int, buf *jxrRowBuffer) error {
 			buf.alpha = buf.alpha[:width]
 		}
 		alphaRow := buf.alpha[:width]
-		if err := source.components[source.channels].ReadRow(y, alphaRow); err != nil {
+		alphaComp := source.components[source.channels]
+		alphaInfo := alphaComp.Info()
+		if source.ycc && (alphaInfo.XStep != 1 || alphaInfo.YStep != 1 || alphaInfo.Bounds != source.bounds) {
+			for x := range width {
+				v, err := jxrSampleComponent(alphaComp, source.bounds.Min.X+x, y, source.bounds)
+				if err != nil {
+					return err
+				}
+				alphaRow[x] = v
+			}
+		} else if err := alphaComp.ReadRow(y, alphaRow); err != nil {
 			return jxrImageError(err)
 		}
 		for x, value := range alphaRow {
@@ -488,7 +724,9 @@ func (source *jxrImage) readRow(y int, buf *jxrRowBuffer) error {
 		row := buf.channels[channel][:width]
 		component := source.components[channel]
 		info := component.Info()
-		if !source.linear && !premultiplied && info.Format == jxrgo.SampleUnsigned && !info.Inverted && (info.Precision == 8 || info.Precision == 16) {
+		subsampled := source.ycc && (info.XStep != 1 || info.YStep != 1 || info.Bounds != source.bounds)
+		preserveExtended := source.linear || info.Format != jxrgo.SampleUnsigned
+		if !subsampled && !preserveExtended && !premultiplied && !info.Inverted && (info.Precision == 8 || info.Precision == 16) {
 			if cap(buf.bits) < width {
 				buf.bits = make([]uint32, width)
 			}
@@ -513,12 +751,20 @@ func (source *jxrImage) readRow(y int, buf *jxrRowBuffer) error {
 			}
 			continue
 		}
-		if err := component.ReadRow(y, row); err != nil {
+		if subsampled {
+			for x := range width {
+				v, err := jxrSampleComponent(component, source.bounds.Min.X+x, y, source.bounds)
+				if err != nil {
+					return err
+				}
+				row[x] = v
+			}
+		} else if err := component.ReadRow(y, row); err != nil {
 			return jxrImageError(err)
 		}
 		if premultiplied {
 			alphaRow := buf.alpha[:width]
-			if source.linear {
+			if preserveExtended {
 				for x, value := range row {
 					unpremultiplied, err := jxrUnpremultiply(value, alphaRow[x], true)
 					if err != nil {
@@ -535,7 +781,7 @@ func (source *jxrImage) readRow(y int, buf *jxrRowBuffer) error {
 					row[x] = math.Floor(colorClamp(unpremultiplied)*65535+0.5) / 65535
 				}
 			}
-		} else if source.linear {
+		} else if preserveExtended {
 			for _, value := range row {
 				if !geometryFinite(value) {
 					return fmt.Errorf("%w: JPEG XR non-finite color", ErrUnsupported)
@@ -559,58 +805,75 @@ func (source *jxrImage) readRow(y int, buf *jxrRowBuffer) error {
 	return nil
 }
 
-// sample 优先从两行滑动缓存返回整行批量读取的结果，支持按需走YCC或CICP线性管线
-// 入参: source 只读JPEG XR视图, x, y 像素坐标, components 输出颜色分量缓冲区, preferLinear 是否优先采用线性CICP视图
-// 返回: float64 有限且归一化的透明度, bool 是否输出线性scRGB三通道, error 取样或数值错误
-func (cache *jxrRowCache) sample(source *jxrImage, x, y int, components []float64, preferLinear bool) (float64, bool, error) {
-	useLinear := source.yccOnly || preferLinear && source.useLinear
+// sample 优先从两行滑动缓存返回整行批量读取的结果，支持原生、设备域RGB及线性scRGB三种模式
+// 入参: source 只读JPEG XR视图, x, y 像素坐标, components 输出颜色分量缓冲区, mode 采样模式, key 线性读取配置键
+// 返回: float64 有限且归一化的透明度, error 取样或数值错误
+func (cache *jxrRowCache) sample(source *jxrImage, x, y int, components []float64, mode jxrSampleMode, key jxrLinearKey) (float64, error) {
 	width := source.bounds.Dx()
 	if cache == nil || width <= 0 || width > jxrRowCacheMaxWidth || x < source.bounds.Min.X || x >= source.bounds.Max.X || y < source.bounds.Min.Y || y >= source.bounds.Max.Y {
-		if useLinear {
-			alpha, err := source.sampleLinear(x, y, components)
-			return alpha, true, err
+		switch mode {
+		case jxrSampleLinear:
+			return source.sampleLinear(x, y, components, key)
+		case jxrSampleRGB:
+			return source.sampleRGB(x, y, components)
+		default:
+			return source.sample(x, y, components)
 		}
-		alpha, err := source.sample(x, y, components)
-		return alpha, false, err
 	}
-	if cache.source != source || cache.preferLinear != useLinear {
+	if cache.source != source || cache.mode != mode || mode == jxrSampleLinear && cache.key != key {
 		cache.source = source
-		cache.preferLinear = useLinear
+		cache.mode = mode
+		cache.key = key
 		cache.linearReader = nil
+		cache.rgbReader = nil
 		cache.valid = [2]bool{}
 	}
 	slot := y & 1
 	if !cache.valid[slot] || cache.ys[slot] != y {
-		if useLinear {
+		switch mode {
+		case jxrSampleLinear:
 			if cache.linearReader == nil {
-				reader, err := source.raster.NewLinearReader(context.Background(), &source.linearOptions)
+				reader, err := source.getLinearReader(key)
 				if err != nil {
-					return 0, true, jxrImageError(err)
+					return 0, err
 				}
 				cache.linearReader = reader
 			}
-			if err := source.readLinearRow(cache.linearReader, y, &cache.rows[slot]); err != nil {
-				return 0, true, err
+			if err := source.readRow4(cache.linearReader.ReadRow, y, &cache.rows[slot]); err != nil {
+				return 0, err
 			}
-		} else if err := source.readRow(y, &cache.rows[slot]); err != nil {
-			return 0, false, err
+		case jxrSampleRGB:
+			if cache.rgbReader == nil {
+				reader, err := source.getRGBReader()
+				if err != nil {
+					return 0, err
+				}
+				cache.rgbReader = reader
+			}
+			if err := source.readRow4(cache.rgbReader.ReadRow, y, &cache.rows[slot]); err != nil {
+				return 0, err
+			}
+		default:
+			if err := source.readRow(y, &cache.rows[slot]); err != nil {
+				return 0, err
+			}
 		}
 		cache.ys[slot] = y
 		cache.valid[slot] = true
 	}
 	col := x - source.bounds.Min.X
 	row := &cache.rows[slot]
-	if useLinear {
+	if mode != jxrSampleNative {
 		components[0], components[1], components[2] = row.channels[0][col], row.channels[1][col], row.channels[2][col]
-		return row.alpha[col], true, nil
+		return row.alpha[col], nil
 	}
 	for channel := range source.channels {
 		components[channel] = row.channels[channel][col]
 	}
 	if !source.alpha {
-		return 1, false, nil
+		return 1, nil
 	}
-	return row.alpha[col], false, nil
+	return row.alpha[col], nil
 }
 
 // jxrImageError 将独立编解码器错误映射到文档引擎分类，保留原始原因及取消错误

@@ -78,6 +78,16 @@ const (
 	signatureCoverageGroup
 )
 
+// c14n11URI 保存按RFC3986分解的URI结构组件，不含片段
+type c14n11URI struct {
+	scheme    string
+	hasAuth   bool
+	authority string
+	path      string
+	hasQuery  bool
+	query     string
+}
+
 // SignatureInfo 保存签名XML中的算法、参数、引用及声明时间，不表示摘要、签名值或证书已经验证
 // Certificates保存KeyInfo声明或检索的证书字节，签名XML中的证书优先于独立证书部件
 // PublicKeys保存KeyValue解析出的公钥，PSS保存RSA-PSS参数，InclusiveNamespaces保存Exc-C14N前缀列表
@@ -1217,6 +1227,11 @@ func signatureKnownNamespaces(media string, format Format) map[string]bool {
 		for _, namespace := range []string{printFrameworkNS, printKeywordsNS, printValueNS, xsiNamespace} {
 			known[namespace] = true
 		}
+		if strings.EqualFold(media, printTicket2Type) {
+			for _, namespace := range []string{printFramework2NS, printKeywordsV11NS, printKeywordsV12NS, printKeywords2NS} {
+				known[namespace] = true
+			}
+		}
 		return known
 	}
 	switch strings.ToLower(media) {
@@ -1343,7 +1358,7 @@ func (p *signatureNamespaceScan) walk(node *xmlElement, inherited compatibilityS
 		}
 	}
 	if node.Name.Space == mcNamespace {
-		if _, err := parser.attributes(node, scope, true); err != nil {
+		if err := parser.validateAttributes(node, scope, true); err != nil {
 			return err
 		}
 		switch node.Name.Local {
@@ -2140,7 +2155,7 @@ func parseSignaturePSSParams(node *xmlElement) (*SignaturePSSParams, error) {
 	if !xmlWhitespace(node.Text) || len(node.Children) > 1 {
 		return nil, fmt.Errorf("%w: RSA-PSS SignatureMethod children", ErrInvalid)
 	}
-	params := &SignaturePSSParams{DigestMethod: xmlSignatureNamespace + "sha1", MGFMethod: signatureMethodMGF1, TrailerField: 1}
+	params := &SignaturePSSParams{DigestMethod: "http://www.w3.org/2001/04/xmlenc#sha256", MGFMethod: signatureMethodMGF1, TrailerField: 1}
 	hasMGFDigest, hasSalt := false, false
 	if len(node.Children) == 1 {
 		root := node.Children[0]
@@ -2768,15 +2783,12 @@ func (w *signatureCanonicalWriter) start(token xml.StartElement, node *xmlElemen
 				case "lang", "space":
 					inherited[attr.Name.Local] = attr.Value
 				case "base":
-					if !hasBase {
-						ancestorBase, hasBase = attr.Value, true
-					} else {
-						var err error
-						ancestorBase, err = c14n11JoinURI(ancestorBase, attr.Value)
-						if err != nil {
-							return err
-						}
+					var err error
+					ancestorBase, err = c14n11JoinURI(ancestorBase, attr.Value)
+					if err != nil {
+						return err
 					}
+					hasBase = true
 				}
 			}
 		}
@@ -2796,13 +2808,16 @@ func (w *signatureCanonicalWriter) start(token xml.StartElement, node *xmlElemen
 				return err
 			}
 			hasBase = false
+			if value == "" {
+				continue
+			}
 		}
 		attributes = append(attributes, canonicalAttribute{attr.Name, name, value})
 		if name.Space == xmlNamespace {
 			delete(inherited, name.Local)
 		}
 	}
-	if selected && !exclusive && hasBase {
+	if selected && !exclusive && hasBase && ancestorBase != "" {
 		attributes = append(attributes, canonicalAttribute{xml.Name{Space: "xml", Local: "base"}, xml.Name{Space: xmlNamespace, Local: "base"}, ancestorBase})
 	}
 	for local, value := range inherited {
@@ -2906,93 +2921,117 @@ func (w *signatureCanonicalWriter) write(value string) error {
 	return err
 }
 
+// parseC14N11URI 按RFC3986校验并拆分URI，确保查询串和片段中的分隔符不误判为Scheme或Authority
+// 入参: raw 原始URI文本
+// 返回: c14n11URI 分解组件, error 非法URI语法错误
+func parseC14N11URI(raw string) (c14n11URI, error) {
+	if _, err := url.Parse(raw); err != nil {
+		return c14n11URI{}, fmt.Errorf("%w: invalid C14N1.1 xml:base URI", ErrInvalid)
+	}
+	beforeFrag, _, _ := strings.Cut(raw, "#")
+	head, query, hasQuery := strings.Cut(beforeFrag, "?")
+	result := c14n11URI{hasQuery: hasQuery, query: query}
+	rest := head
+	if colon := strings.IndexByte(head, ':'); colon > 0 {
+		candidate := head[:colon]
+		validScheme := candidate[0] >= 'A' && candidate[0] <= 'Z' || candidate[0] >= 'a' && candidate[0] <= 'z'
+		for i := 1; validScheme && i < len(candidate); i++ {
+			c := candidate[i]
+			validScheme = c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.'
+		}
+		if validScheme {
+			result.scheme = candidate
+			rest = head[colon+1:]
+		}
+	}
+	if strings.HasPrefix(rest, "//") {
+		result.hasAuth = true
+		tail := rest[2:]
+		if slash := strings.IndexByte(tail, '/'); slash >= 0 {
+			result.authority = tail[:slash]
+			result.path = tail[slash:]
+		} else {
+			result.authority = tail
+		}
+	} else {
+		result.path = rest
+	}
+	return result, nil
+}
+
 // c14n11JoinURI 按C14N1.1附录A与RFC3986合并祖先及当前节点的xml:base URI
 // 入参: base 基准URI, ref 待合并的相对或绝对URI
 // 返回: string 合并规范化后的URI, error 非法URI语法错误
 func c14n11JoinURI(base, ref string) (string, error) {
-	if base == "" {
-		return ref, nil
-	}
-	baseURL, err := url.Parse(base)
+	baseURI, err := parseC14N11URI(base)
 	if err != nil {
-		return "", fmt.Errorf("%w: invalid C14N1.1 xml:base URI", ErrInvalid)
+		return "", err
 	}
-	refURL, err := url.Parse(ref)
+	refURI, err := parseC14N11URI(ref)
 	if err != nil {
-		return "", fmt.Errorf("%w: invalid C14N1.1 xml:base URI", ErrInvalid)
+		return "", err
 	}
-	baseHasAuth := baseURL.Host != "" || strings.HasPrefix(base, "//") || strings.Contains(base, "://")
-	refHasAuth := refURL.Host != "" || strings.HasPrefix(ref, "//") || strings.Contains(ref, "://")
-	var scheme, authority, path, query string
-	hasAuth, hasQuery := false, false
-	if refURL.Scheme != "" {
-		scheme = refURL.Scheme
-		hasAuth = refHasAuth
-		authority = c14n11Authority(refURL)
-		path = c14n11RemoveDotSegments(refURL.EscapedPath(), true)
-		query, hasQuery = refURL.RawQuery, refURL.ForceQuery || refURL.RawQuery != ""
-	} else {
-		scheme = baseURL.Scheme
-		if refHasAuth {
-			hasAuth = true
-			authority = c14n11Authority(refURL)
-			path = c14n11RemoveDotSegments(refURL.EscapedPath(), scheme != "")
-			query, hasQuery = refURL.RawQuery, refURL.ForceQuery || refURL.RawQuery != ""
+	var out c14n11URI
+	if refURI.scheme != "" {
+		out.scheme = refURI.scheme
+		out.hasAuth = refURI.hasAuth
+		out.authority = refURI.authority
+		if refURI.hasAuth || strings.HasPrefix(refURI.path, "/") {
+			out.path = c14n11RemoveDotSegments(refURI.path, true)
 		} else {
-			hasAuth = baseHasAuth
-			authority = c14n11Authority(baseURL)
-			refPath := refURL.EscapedPath()
-			if refPath == "" {
-				path = baseURL.EscapedPath()
-				if refURL.ForceQuery || refURL.RawQuery != "" {
-					query, hasQuery = refURL.RawQuery, true
+			out.path = refURI.path
+		}
+		out.hasQuery, out.query = refURI.hasQuery, refURI.query
+	} else {
+		out.scheme = baseURI.scheme
+		if refURI.hasAuth {
+			out.hasAuth = true
+			out.authority = refURI.authority
+			out.path = c14n11RemoveDotSegments(refURI.path, out.scheme != "")
+			out.hasQuery, out.query = refURI.hasQuery, refURI.query
+		} else {
+			out.hasAuth = baseURI.hasAuth
+			out.authority = baseURI.authority
+			if refURI.path == "" {
+				out.path = baseURI.path
+				if refURI.hasQuery {
+					out.hasQuery, out.query = true, refURI.query
 				} else {
-					query, hasQuery = baseURL.RawQuery, baseURL.ForceQuery || baseURL.RawQuery != ""
+					out.hasQuery, out.query = baseURI.hasQuery, baseURI.query
 				}
 			} else {
-				if strings.HasPrefix(refPath, "/") {
-					path = c14n11RemoveDotSegments(refPath, scheme != "" || hasAuth)
+				if strings.HasPrefix(refURI.path, "/") {
+					out.path = c14n11RemoveDotSegments(refURI.path, out.scheme != "" || out.hasAuth)
 				} else {
-					basePath := baseURL.EscapedPath()
 					var merged string
-					if hasAuth && basePath == "" {
-						merged = "/" + refPath
-					} else if slash := strings.LastIndexByte(basePath, '/'); slash >= 0 {
-						merged = basePath[:slash+1] + refPath
+					if out.hasAuth && baseURI.path == "" {
+						merged = "/" + refURI.path
+					} else if slash := strings.LastIndexByte(baseURI.path, '/'); slash >= 0 {
+						merged = baseURI.path[:slash+1] + refURI.path
 					} else {
-						merged = refPath
+						merged = refURI.path
 					}
-					path = c14n11RemoveDotSegments(merged, scheme != "" || hasAuth)
+					out.path = c14n11RemoveDotSegments(merged, out.scheme != "" || out.hasAuth)
 				}
-				query, hasQuery = refURL.RawQuery, refURL.ForceQuery || refURL.RawQuery != ""
+				out.hasQuery, out.query = refURI.hasQuery, refURI.query
 			}
 		}
 	}
-	var out strings.Builder
-	if scheme != "" {
-		out.WriteString(scheme)
-		out.WriteByte(':')
+	var builder strings.Builder
+	if out.scheme != "" {
+		builder.WriteString(out.scheme)
+		builder.WriteByte(':')
 	}
-	if hasAuth {
-		out.WriteString("//")
-		out.WriteString(authority)
+	if out.hasAuth {
+		builder.WriteString("//")
+		builder.WriteString(out.authority)
 	}
-	out.WriteString(path)
-	if hasQuery {
-		out.WriteByte('?')
-		out.WriteString(query)
+	builder.WriteString(out.path)
+	if out.hasQuery {
+		builder.WriteByte('?')
+		builder.WriteString(out.query)
 	}
-	return out.String(), nil
-}
-
-// c14n11Authority 组合URI的用户信息与主机授权段
-// 入参: u 已解析URI
-// 返回: string 授权段字符串
-func c14n11Authority(u *url.URL) string {
-	if u.User == nil {
-		return u.Host
-	}
-	return u.User.String() + "@" + u.Host
+	return builder.String(), nil
 }
 
 // c14n11RemoveDotSegments 按C14N1.1附录A移除路径中的点段并在相对路径中保留必要上级段

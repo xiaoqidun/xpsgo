@@ -54,14 +54,16 @@ var canonicalLineFeeds = strings.NewReplacer("\r\n", "\n", "\r", "\n")
 
 // xmlElement 保存已解析的元素、属性及命名空间作用域
 type xmlElement struct {
-	Name           xml.Name
-	Attr           []xml.Attr
-	Children       []*xmlElement
-	Text           string
-	Namespaces     map[string]string
-	namespaceOwner *xmlElement
-	rawName        xml.Name
-	text           []byte
+	Name                xml.Name
+	Attr                []xml.Attr
+	Children            []*xmlElement
+	Text                string
+	Namespaces          map[string]string
+	PreservedElements   []*xmlElement
+	PreservedAttributes []xml.Attr
+	namespaceOwner      *xmlElement
+	rawName             xml.Name
+	text                []byte
 }
 
 // xmlTokenVisitor 接收已校验的XML词元及所属元素，起始词元保留原始前缀和规范化后的属性值
@@ -147,11 +149,12 @@ type compatibilityProcessor struct {
 	namespaceCopies map[*xmlElement]map[string]string
 }
 
-// compatibilityFragment 保存移除兼容性包装后得到的元素和聚合文本
+// compatibilityFragment 保存移除兼容性包装后得到的元素、保留扩展及聚合文本
 type compatibilityFragment struct {
-	elements []*xmlElement
-	text     string
-	ordered  []xmlContent
+	elements  []*xmlElement
+	preserved []*xmlElement
+	text      string
+	ordered   []xmlContent
 }
 
 // compatibilitySelection 保存候选分支的结构状态及首个可用分支
@@ -1461,13 +1464,20 @@ func (p *compatibilityProcessor) element(node *xmlElement, inherited compatibili
 		if !scope.ignorable[node.Name.Space] {
 			return compatibilityFragment{}, fmt.Errorf("%w: element namespace %q", ErrUnsupported, node.Name.Space)
 		}
-		if !scope.processes(node.Name) {
-			return compatibilityFragment{}, nil
+		if scope.processes(node.Name) {
+			if err := compatibilityNoXMLContext(node); err != nil {
+				return compatibilityFragment{}, err
+			}
+			return p.contents(node, scope)
 		}
-		if err := compatibilityNoXMLContext(node); err != nil {
-			return compatibilityFragment{}, err
+		if scope.preservesElement(node.Name) {
+			preserved, err := cloneXMLElement(node, p.context)
+			if err != nil {
+				return compatibilityFragment{}, err
+			}
+			return compatibilityFragment{preserved: []*xmlElement{preserved}}, nil
 		}
-		return p.contents(node, scope)
+		return compatibilityFragment{}, nil
 	}
 	if node.Name.Space == mcNamespace {
 		if node.Name.Local != "AlternateContent" {
@@ -1475,20 +1485,40 @@ func (p *compatibilityProcessor) element(node *xmlElement, inherited compatibili
 		}
 		return p.alternate(node, scope)
 	}
-	attrs, err := p.attributes(node, scope, false)
+	attrs, preservedAttrs, err := p.attributesWithPreserved(node, scope, false)
 	if err != nil {
 		return compatibilityFragment{}, err
+	}
+	if len(node.PreservedAttributes) != 0 {
+		mergedAttrs := make([]xml.Attr, 0, len(node.PreservedAttributes)+len(preservedAttrs))
+		mergedAttrs = append(mergedAttrs, node.PreservedAttributes...)
+		mergedAttrs = append(mergedAttrs, preservedAttrs...)
+		preservedAttrs = mergedAttrs
 	}
 	content, err := p.contents(node, scope)
 	if err != nil {
 		return compatibilityFragment{}, err
 	}
+	var preservedElements []*xmlElement
+	if len(node.PreservedElements) != 0 || len(content.preserved) != 0 {
+		preservedElements = make([]*xmlElement, 0, len(node.PreservedElements)+len(content.preserved))
+		for _, item := range node.PreservedElements {
+			clonedItem, err := cloneXMLElement(item, p.context)
+			if err != nil {
+				return compatibilityFragment{}, err
+			}
+			preservedElements = append(preservedElements, clonedItem)
+		}
+		preservedElements = append(preservedElements, content.preserved...)
+	}
 	cloned := &xmlElement{
-		Name:       node.Name,
-		Attr:       attrs,
-		Children:   content.elements,
-		Text:       content.text,
-		Namespaces: p.namespaceScope(node),
+		Name:                node.Name,
+		Attr:                attrs,
+		Children:            content.elements,
+		Text:                content.text,
+		Namespaces:          p.namespaceScope(node),
+		PreservedElements:   preservedElements,
+		PreservedAttributes: preservedAttrs,
 	}
 	result := compatibilityFragment{elements: []*xmlElement{cloned}}
 	if p.content != nil {
@@ -1496,6 +1526,46 @@ func (p *compatibilityProcessor) element(node *xmlElement, inherited compatibili
 		result.ordered = []xmlContent{{element: cloned}}
 	}
 	return result, nil
+}
+
+// cloneXMLElement 深拷贝被MCE保留的未知扩展元素子树，避免输出与原始树共享可变状态
+// 入参: node 原始元素, ctx 取消Context
+// 返回: *xmlElement 独立元素副本, error 取消错误
+func cloneXMLElement(node *xmlElement, ctx context.Context) (*xmlElement, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if node == nil {
+		return nil, nil
+	}
+	cloned := &xmlElement{
+		Name:                node.Name,
+		Attr:                slices.Clone(node.Attr),
+		Text:                node.Text,
+		Namespaces:          maps.Clone(node.Namespaces),
+		PreservedAttributes: slices.Clone(node.PreservedAttributes),
+	}
+	if len(node.Children) != 0 {
+		cloned.Children = make([]*xmlElement, len(node.Children))
+		for i, child := range node.Children {
+			copyChild, err := cloneXMLElement(child, ctx)
+			if err != nil {
+				return nil, err
+			}
+			cloned.Children[i] = copyChild
+		}
+	}
+	if len(node.PreservedElements) != 0 {
+		cloned.PreservedElements = make([]*xmlElement, len(node.PreservedElements))
+		for i, item := range node.PreservedElements {
+			copyItem, err := cloneXMLElement(item, ctx)
+			if err != nil {
+				return nil, err
+			}
+			cloned.PreservedElements[i] = copyItem
+		}
+	}
+	return cloned, nil
 }
 
 // namespaceScope 为解析器标识的只读作用域创建独立副本，避免每个节点重复复制全部绑定
@@ -1532,6 +1602,7 @@ func (p *compatibilityProcessor) contents(node *xmlElement, scope compatibilityS
 			return compatibilityFragment{}, err
 		}
 		result.elements = append(result.elements, fragment.elements...)
+		result.preserved = append(result.preserved, fragment.preserved...)
 		text.WriteString(fragment.text)
 	}
 	result.text = text.String()
@@ -1545,53 +1616,43 @@ func (p *compatibilityProcessor) rules(node *xmlElement, inherited compatibility
 	return p.rulesChecked(node, inherited, true)
 }
 
-// rulesChecked 按需校验MustUnderstand并构造不修改祖先的作用域，供候选分支延后检查使用
+// rulesChecked 按需校验MustUnderstand并按写时复制构造不修改祖先的作用域，消除无用克隆分配
 // 入参: node 当前元素, inherited 祖先兼容性作用域, checkMustUnderstand 是否立即校验MustUnderstand
 // 返回: compatibilityScope 当前作用域, error 错误信息
 func (p *compatibilityProcessor) rulesChecked(node *xmlElement, inherited compatibilityScope, checkMustUnderstand bool) (compatibilityScope, error) {
 	scope := inherited
-	local := make(map[string]bool)
+	var local map[string]bool
+	processCloned, preserveElemCloned, preserveAttrCloned := false, false, false
+	resetRule := func(rules map[xml.Name]bool, cloned *bool) map[xml.Name]bool {
+		for name := range rules {
+			if local[name.Space] {
+				if !*cloned {
+					rules = maps.Clone(rules)
+					*cloned = true
+				}
+				delete(rules, name)
+			}
+		}
+		return rules
+	}
 	if value, ok := node.attributeNS(mcNamespace, "Ignorable"); ok {
 		uris, err := compatibilityPrefixes(node, value)
 		if err != nil {
 			return scope, err
 		}
 		if len(uris) > 0 {
+			local = make(map[string]bool, len(uris))
 			scope.ignorable = maps.Clone(inherited.ignorable)
 			if scope.ignorable == nil {
-				scope.ignorable = make(map[string]bool)
-			}
-			scope.process = maps.Clone(inherited.process)
-			if scope.process == nil {
-				scope.process = make(map[xml.Name]bool)
-			}
-			scope.preserveElements = maps.Clone(inherited.preserveElements)
-			if scope.preserveElements == nil {
-				scope.preserveElements = make(map[xml.Name]bool)
-			}
-			scope.preserveAttributes = maps.Clone(inherited.preserveAttributes)
-			if scope.preserveAttributes == nil {
-				scope.preserveAttributes = make(map[xml.Name]bool)
+				scope.ignorable = make(map[string]bool, len(uris))
 			}
 			for _, uri := range uris {
 				local[uri] = true
 				scope.ignorable[uri] = true
 			}
-			for name := range scope.process {
-				if local[name.Space] {
-					delete(scope.process, name)
-				}
-			}
-			for name := range scope.preserveElements {
-				if local[name.Space] {
-					delete(scope.preserveElements, name)
-				}
-			}
-			for name := range scope.preserveAttributes {
-				if local[name.Space] {
-					delete(scope.preserveAttributes, name)
-				}
-			}
+			scope.process = resetRule(scope.process, &processCloned)
+			scope.preserveElements = resetRule(scope.preserveElements, &preserveElemCloned)
+			scope.preserveAttributes = resetRule(scope.preserveAttributes, &preserveAttrCloned)
 		}
 	}
 	for _, attr := range node.Attr {
@@ -1617,10 +1678,31 @@ func (p *compatibilityProcessor) rulesChecked(node *xmlElement, inherited compat
 				}
 				switch attr.Name.Local {
 				case "ProcessContent":
+					if !processCloned {
+						scope.process = maps.Clone(scope.process)
+						if scope.process == nil {
+							scope.process = make(map[xml.Name]bool)
+						}
+						processCloned = true
+					}
 					scope.process[name] = true
 				case "PreserveElements":
+					if !preserveElemCloned {
+						scope.preserveElements = maps.Clone(scope.preserveElements)
+						if scope.preserveElements == nil {
+							scope.preserveElements = make(map[xml.Name]bool)
+						}
+						preserveElemCloned = true
+					}
 					scope.preserveElements[name] = true
 				case "PreserveAttributes":
+					if !preserveAttrCloned {
+						scope.preserveAttributes = maps.Clone(scope.preserveAttributes)
+						if scope.preserveAttributes == nil {
+							scope.preserveAttributes = make(map[xml.Name]bool)
+						}
+						preserveAttrCloned = true
+					}
 					scope.preserveAttributes[name] = true
 				}
 			}
@@ -1654,14 +1736,53 @@ func (s compatibilityScope) processes(name xml.Name) bool {
 	return s.process[name] || s.process[xml.Name{Space: name.Space, Local: "*"}]
 }
 
-// attributes 校验属性命名空间并创建移除MCE指令后的属性副本
+// preservesElement 判断被忽略元素是否命中保留规则
+// 入参: name 元素展开名称
+// 返回: bool 是否保留该扩展元素
+func (s compatibilityScope) preservesElement(name xml.Name) bool {
+	return s.preserveElements[name] || s.preserveElements[xml.Name{Space: name.Space, Local: "*"}]
+}
+
+// preservesAttribute 判断被忽略属性是否命中保留规则
+// 入参: name 属性展开名称
+// 返回: bool 是否保留该扩展属性
+func (s compatibilityScope) preservesAttribute(name xml.Name) bool {
+	return s.preserveAttributes[name] || s.preserveAttributes[xml.Name{Space: name.Space, Local: "*"}]
+}
+
+// validateAttributes 零分配校验属性命名空间与MCE控制元素属性规则
 // 入参: node 当前元素, scope 当前兼容性作用域, control 是否为MCE控制元素
-// 返回: []xml.Attr 保留属性副本, error 错误信息
-func (p *compatibilityProcessor) attributes(node *xmlElement, scope compatibilityScope, control bool) ([]xml.Attr, error) {
-	var result []xml.Attr
+// 返回: error 错误信息
+func (p *compatibilityProcessor) validateAttributes(node *xmlElement, scope compatibilityScope, control bool) error {
 	if control {
 		if err := compatibilityNoXMLContext(node); err != nil {
-			return nil, err
+			return err
+		}
+	}
+	for _, attr := range node.Attr {
+		if attr.Name.Space == xmlnsNamespace || attr.Name.Space == "" && attr.Name.Local == "xmlns" || attr.Name.Space == mcNamespace {
+			continue
+		}
+		if attr.Name.Space == "" {
+			if control && (node.Name.Local != "Choice" || attr.Name.Local != "Requires") {
+				return fmt.Errorf("%w: unqualified attribute %s on MCE %s", ErrInvalid, attr.Name.Local, node.Name.Local)
+			}
+		} else if !p.understood[attr.Name.Space] && !scope.ignorable[attr.Name.Space] {
+			return fmt.Errorf("%w: attribute namespace %q", ErrUnsupported, attr.Name.Space)
+		}
+	}
+	return nil
+}
+
+// attributesWithPreserved 校验属性命名空间并分别返回消费属性副本与命中的保留扩展属性副本
+// 入参: node 当前元素, scope 当前兼容性作用域, control 是否为MCE控制元素
+// 返回: []xml.Attr 消费属性副本, []xml.Attr 保留扩展属性副本, error 错误信息
+func (p *compatibilityProcessor) attributesWithPreserved(node *xmlElement, scope compatibilityScope, control bool) ([]xml.Attr, []xml.Attr, error) {
+	var result []xml.Attr
+	var preserved []xml.Attr
+	if control {
+		if err := compatibilityNoXMLContext(node); err != nil {
+			return nil, nil, err
 		}
 	}
 	for _, attr := range node.Attr {
@@ -1674,24 +1795,27 @@ func (p *compatibilityProcessor) attributes(node *xmlElement, scope compatibilit
 		}
 		if attr.Name.Space == "" {
 			if control && (node.Name.Local != "Choice" || attr.Name.Local != "Requires") {
-				return nil, fmt.Errorf("%w: unqualified attribute %s on MCE %s", ErrInvalid, attr.Name.Local, node.Name.Local)
+				return nil, nil, fmt.Errorf("%w: unqualified attribute %s on MCE %s", ErrInvalid, attr.Name.Local, node.Name.Local)
 			}
 		} else if !p.understood[attr.Name.Space] {
 			if scope.ignorable[attr.Name.Space] {
+				if !control && scope.preservesAttribute(attr.Name) {
+					preserved = append(preserved, attr)
+				}
 				continue
 			}
-			return nil, fmt.Errorf("%w: attribute namespace %q", ErrUnsupported, attr.Name.Space)
+			return nil, nil, fmt.Errorf("%w: attribute namespace %q", ErrUnsupported, attr.Name.Space)
 		}
 		result = append(result, attr)
 	}
-	return result, nil
+	return result, preserved, nil
 }
 
 // alternate 校验候选分支并处理首个可用选择或回退内容
 // 入参: node AlternateContent元素, scope 当前兼容性作用域
 // 返回: compatibilityFragment 被选择的内容，无可用分支时为空, error 错误信息
 func (p *compatibilityProcessor) alternate(node *xmlElement, scope compatibilityScope) (compatibilityFragment, error) {
-	if _, err := p.attributes(node, scope, true); err != nil {
+	if err := p.validateAttributes(node, scope, true); err != nil {
 		return compatibilityFragment{}, err
 	}
 	if len(compatibilityWords(node.Text)) != 0 {
@@ -1747,7 +1871,7 @@ func (p *compatibilityProcessor) alternative(node *xmlElement, inherited compati
 	if !branch {
 		return fmt.Errorf("%w: unexpected AlternateContent child %s", ErrInvalid, node.Name.Local)
 	}
-	if _, err := p.attributes(node, scope, true); err != nil {
+	if err := p.validateAttributes(node, scope, true); err != nil {
 		return err
 	}
 	selectable := true
@@ -1871,6 +1995,7 @@ func (p *compatibilityProcessor) orderedContents(node *xmlElement, scope compati
 			return compatibilityFragment{}, err
 		}
 		result.elements = append(result.elements, fragment.elements...)
+		result.preserved = append(result.preserved, fragment.preserved...)
 		result.ordered = append(result.ordered, fragment.ordered...)
 		text.WriteString(fragment.text)
 	}

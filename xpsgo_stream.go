@@ -102,6 +102,8 @@ type streamPackage struct {
 	pages        int
 	pageWait     map[string]bool
 	pageHold     bool
+	pageTickets  [][]string
+	ticketRefs   map[string]bool
 	documents    []string
 	document     int
 	documentKeys map[string]bool
@@ -869,11 +871,14 @@ func (p *streamPackage) readEntry(offset int64, buffer []byte) (*streamEntry, bo
 	if header.Flags&1 != 0 || header.Method != zip.Store && header.Method != zip.Deflate {
 		return nil, false, fmt.Errorf("%w: streamed ZIP encryption or method", ErrUnsupported)
 	}
-	uncompressed, compressed, _, _, wide, err := packageZIP64Values(header.Extra, uint64(header.UncompressedSize), uint64(header.CompressedSize), 0, 0)
+	descriptor := header.Flags&8 != 0
+	uncompressed, compressed, wide, err := packageZIPLocal64Values(header.Extra, uint64(header.UncompressedSize), uint64(header.CompressedSize), descriptor)
 	if err != nil {
 		return nil, false, err
 	}
-	descriptor := header.Flags&8 != 0
+	if wide && header.ReaderVersion < 45 {
+		return nil, false, fmt.Errorf("%w: streamed ZIP64 local extraction version", ErrInvalid)
+	}
 	if uncompressed > uint64(p.options.Limits.MaxPartBytes) || uncompressed > uint64(p.options.Limits.MaxPackageBytes)-p.bytes {
 		return nil, false, fmt.Errorf("%w: streamed local declared bytes", ErrLimit)
 	}
@@ -928,7 +933,7 @@ func (p *streamPackage) readEntry(offset int64, buffer []byte) (*streamEntry, bo
 		if header.CRC32 != 0 && header.CRC32 != actualCRC || compressed != 0 && compressed != actualCompressed || uncompressed != 0 && uncompressed != count {
 			return nil, false, fmt.Errorf("%w: streamed local descriptor placeholders", ErrInvalid)
 		}
-		if err := p.readDescriptor(actualCRC, actualCompressed, count, wide); err != nil {
+		if err := p.readDescriptor(actualCRC, actualCompressed, count, wide, header.ReaderVersion); err != nil {
 			return nil, false, err
 		}
 	} else if actualCRC != header.CRC32 || actualCompressed != compressed || count != uncompressed {
@@ -938,13 +943,15 @@ func (p *streamPackage) readEntry(offset int64, buffer []byte) (*streamEntry, bo
 	return entry, false, nil
 }
 
-// readDescriptor 根据已经解码的CRC和尺寸识别允许的描述符形式，标记碰撞不依赖猜测
-// 入参: checksum 实际CRC, compressed, uncompressed 实际字节数, wide 本地ZIP64标识
+// readDescriptor 根据已经解码的CRC、尺寸及ZIP64状态识别允许的描述符形式，标记碰撞不依赖猜测
+// 入参: checksum 实际CRC, compressed, uncompressed 实际字节数, wide 本地ZIP64标识, version 本地提取版本
 // 返回: error 描述符、输入、预算或取消错误
-func (p *streamPackage) readDescriptor(checksum uint32, compressed, uncompressed uint64, wide bool) error {
-	width := 4
+func (p *streamPackage) readDescriptor(checksum uint32, compressed, uncompressed uint64, wide bool, version uint16) error {
+	widths := []int{4}
 	if wide || compressed >= 0xffffffff || uncompressed >= 0xffffffff {
-		width = 8
+		widths = []int{8}
+	} else if version >= 45 {
+		widths = []int{8, 4}
 	}
 	var first [4]byte
 	if _, err := io.ReadFull(p.input, first[:]); err != nil {
@@ -952,49 +959,59 @@ func (p *streamPackage) readDescriptor(checksum uint32, compressed, uncompressed
 	}
 	value := binary.LittleEndian.Uint32(first[:])
 	var inputErr error
-	for _, signed := range []bool{false, true} {
-		length := 2 * width
-		if signed {
-			if value != packageZIPDescriptorSignature {
+	for _, width := range widths {
+		for _, signed := range []bool{false, true} {
+			length := 2 * width
+			if signed {
+				if value != packageZIPDescriptorSignature {
+					continue
+				}
+				length += 4
+			} else if value != checksum {
 				continue
 			}
-			length += 4
-		} else if value != checksum {
-			continue
-		}
-		if err := checkContext(p.context); err != nil {
-			return err
-		}
-		peeked, err := p.input.reader.Peek(length)
-		if err != nil {
-			if err == io.EOF && int64(len(peeked)) > p.input.limit-p.input.count {
-				inputErr = fmt.Errorf("%w: stream input bytes", ErrLimit)
+			if err := checkContext(p.context); err != nil {
+				return err
+			}
+			peeked, err := p.input.reader.Peek(length)
+			if err != nil {
+				if err == io.EOF && int64(len(peeked)) > p.input.limit-p.input.count {
+					inputErr = fmt.Errorf("%w: stream input bytes", ErrLimit)
+				} else {
+					inputErr = err
+				}
+				continue
+			}
+			fields := peeked
+			if signed {
+				if binary.LittleEndian.Uint32(fields) != checksum {
+					continue
+				}
+				fields = fields[4:]
+			}
+			left, right := uint64(0), uint64(0)
+			if width == 4 {
+				left, right = uint64(binary.LittleEndian.Uint32(fields)), uint64(binary.LittleEndian.Uint32(fields[4:]))
 			} else {
-				inputErr = err
+				left, right = binary.LittleEndian.Uint64(fields), binary.LittleEndian.Uint64(fields[8:])
 			}
-			continue
-		}
-		fields := peeked
-		if signed {
-			if binary.LittleEndian.Uint32(fields) != checksum {
+			if left != compressed || right != uncompressed {
 				continue
 			}
-			fields = fields[4:]
+			if len(widths) > 1 && width == 8 {
+				if next, nextErr := p.input.reader.Peek(length + 4); nextErr == nil {
+					sig := binary.LittleEndian.Uint32(next[length : length+4])
+					if sig != packageZIPLocalSignature && sig != packageZIPCentralSignature && sig != packageZIPEndSignature && sig != packageZIP64EndSignature && sig != packageZIPDigitalSignature {
+						continue
+					}
+				}
+			}
+			var consumed [20]byte
+			if _, err := io.ReadFull(p.input, consumed[:length]); err != nil {
+				return p.streamInputError("streamed descriptor fields", err)
+			}
+			return nil
 		}
-		left, right := uint64(0), uint64(0)
-		if width == 4 {
-			left, right = uint64(binary.LittleEndian.Uint32(fields)), uint64(binary.LittleEndian.Uint32(fields[4:]))
-		} else {
-			left, right = binary.LittleEndian.Uint64(fields), binary.LittleEndian.Uint64(fields[8:])
-		}
-		if left != compressed || right != uncompressed {
-			continue
-		}
-		var consumed [20]byte
-		if _, err := io.ReadFull(p.input, consumed[:length]); err != nil {
-			return p.streamInputError("streamed descriptor fields", err)
-		}
-		return nil
 	}
 	if inputErr != nil {
 		return p.streamInputError("streamed descriptor input", inputErr)

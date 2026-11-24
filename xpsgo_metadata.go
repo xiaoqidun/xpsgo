@@ -140,6 +140,9 @@ func (p *CoreProperties) MarshalXML(encoder *xml.Encoder, start xml.StartElement
 		if !xmlTextValid(value) {
 			return fmt.Errorf("%w: core property %s XML text", ErrInvalid, name.Local)
 		}
+		if name.Space == dcTermsNS || name == (xml.Name{Space: opcCoreNS, Local: "lastPrinted"}) {
+			value = strings.Trim(value, " \t\r\n")
+		}
 		child := &xmlElement{Name: name, Text: value, Namespaces: root.Namespaces}
 		if name.Space == dcTermsNS {
 			child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Space: xsiNamespace, Local: "type"}, Value: "t:W3CDTF"})
@@ -212,7 +215,7 @@ func corePropertyEncodeLanguages(p *CoreProperties) (map[string]string, error) {
 	if len(p.Languages) == 0 {
 		return nil, nil
 	}
-	allowed := make(map[string]xml.Name, 7)
+	allowed := make(map[string]xml.Name, 9)
 	for _, name := range corePropertyNames {
 		if corePropertyAllowsLanguage(name) {
 			allowed[name.Local] = name
@@ -514,24 +517,27 @@ func parseCoreKeywords(node *xmlElement, content *xmlContentReader) (string, []C
 	return combined.String(), values, nil
 }
 
-// corePropertyAllowsLanguage 判断核心属性元素是否允许携带xml:lang属性
+// corePropertyAllowsLanguage 判断核心属性元素按OPC第二版规范是否允许携带xml:lang属性
 // 入参: name 元素展开名称
 // 返回: bool 是否允许xml:lang
 func corePropertyAllowsLanguage(name xml.Name) bool {
-	return name.Space == dcNamespace || name == (xml.Name{Space: opcCoreNS, Local: "keywords"}) || name == (xml.Name{Space: opcCoreNS, Local: "value"})
+	return name.Space == dcNamespace || name.Space == dcTermsNS && (name.Local == "created" || name.Local == "modified") || name == (xml.Name{Space: opcCoreNS, Local: "keywords"}) || name == (xml.Name{Space: opcCoreNS, Local: "value"})
 }
 
-// corePropertyLanguage 校验核心属性xml:lang标签词法，允许空字符串以清除继承语言
+// corePropertyLanguage 按XML Schema xsd:language空白折叠规则与xml:lang语义校验语言标签
 // 入参: value 语言属性值
-// 返回: string 规范化语言标签, error 非法文本或语言标签错误
+// 返回: string 规范化语言标签, error 非法文本、全空白或语言标签错误
 func corePropertyLanguage(value string) (string, error) {
 	if !xmlTextValid(value) {
 		return "", fmt.Errorf("%w: core property xml:lang XML text", ErrInvalid)
 	}
-	if value == "" {
+	trimmed := strings.Trim(value, " \t\r\n")
+	if trimmed == "" {
+		if value != "" {
+			return "", fmt.Errorf("%w: invalid core property xml:lang %q", ErrInvalid, value)
+		}
 		return "", nil
 	}
-	trimmed := strings.Trim(value, " \t\r\n")
 	if !fixedLanguageTag(trimmed) {
 		return "", fmt.Errorf("%w: invalid core property xml:lang %q", ErrInvalid, value)
 	}

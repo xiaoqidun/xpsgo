@@ -28,6 +28,7 @@ import (
 	"crypto/subtle"
 	"crypto/x509"
 	"encoding/asn1"
+	"encoding/binary"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -614,20 +615,18 @@ func signatureMethodDigest(method string, pss *SignaturePSSParams) (string, erro
 	resolved := pss
 	if resolved == nil {
 		switch method {
-		case signatureMethodPSS256:
+		case signatureMethodRSAPSS, signatureMethodPSS256:
 			resolved = &SignaturePSSParams{DigestMethod: "http://www.w3.org/2001/04/xmlenc#sha256", MGFMethod: signatureMethodMGF1, MGFDigest: "http://www.w3.org/2001/04/xmlenc#sha256", SaltLength: 32, TrailerField: 1}
 		case signatureMethodPSS384:
 			resolved = &SignaturePSSParams{DigestMethod: "http://www.w3.org/2001/04/xmldsig-more#sha384", MGFMethod: signatureMethodMGF1, MGFDigest: "http://www.w3.org/2001/04/xmldsig-more#sha384", SaltLength: 48, TrailerField: 1}
-		case signatureMethodPSS512:
-			resolved = &SignaturePSSParams{DigestMethod: "http://www.w3.org/2001/04/xmlenc#sha512", MGFMethod: signatureMethodMGF1, MGFDigest: "http://www.w3.org/2001/04/xmlenc#sha512", SaltLength: 64, TrailerField: 1}
 		default:
-			return "", fmt.Errorf("%w: missing RSA-PSS parameters", ErrInvalid)
+			resolved = &SignaturePSSParams{DigestMethod: "http://www.w3.org/2001/04/xmlenc#sha512", MGFMethod: signatureMethodMGF1, MGFDigest: "http://www.w3.org/2001/04/xmlenc#sha512", SaltLength: 64, TrailerField: 1}
 		}
 	}
 	if _, _, err := signatureHash(resolved.DigestMethod); err != nil {
 		return "", err
 	}
-	if resolved.MGFMethod != signatureMethodMGF1 || resolved.MGFDigest != resolved.DigestMethod || resolved.TrailerField != 1 || resolved.SaltLength <= 0 {
+	if resolved.MGFMethod != signatureMethodMGF1 || resolved.MGFDigest != resolved.DigestMethod || resolved.TrailerField != 1 || resolved.SaltLength < 0 {
 		return "", fmt.Errorf("%w: unsupported RSA-PSS parameters", ErrUnsupported)
 	}
 	return resolved.DigestMethod, nil
@@ -721,11 +720,20 @@ func verifySignatureValueParams(ctx context.Context, method string, pss *Signatu
 			return fmt.Errorf("%w: ECDSA signature value", ErrSignature)
 		}
 	case signatureMethodPSS(method):
+		public := key.(*rsa.PublicKey)
 		saltLength := identifier.Size()
 		if pss != nil {
 			saltLength = pss.SaltLength
 		}
-		if err := rsa.VerifyPSS(key.(*rsa.PublicKey), identifier, digest, value, &rsa.PSSOptions{SaltLength: saltLength, Hash: identifier}); err != nil {
+		emLen := (public.N.BitLen() - 1 + 7) / 8
+		if emLen < identifier.Size()+2 || saltLength > emLen-identifier.Size()-2 {
+			return fmt.Errorf("%w: RSA-PSS salt length", ErrInvalid)
+		}
+		if saltLength == 0 {
+			if err := verifyRSAPSSZeroSalt(public, identifier, digest, value); err != nil {
+				return err
+			}
+		} else if err := rsa.VerifyPSS(public, identifier, digest, value, &rsa.PSSOptions{SaltLength: saltLength, Hash: identifier}); err != nil {
 			if errors.Is(err, rsa.ErrVerification) {
 				return fmt.Errorf("%w: RSA-PSS signature value", ErrSignature)
 			}
@@ -740,6 +748,74 @@ func verifySignatureValueParams(ctx context.Context, method string, pss *Signatu
 		}
 	}
 	return checkContext(ctx)
+}
+
+// verifyRSAPSSZeroSalt 按RFC8017第9.1.2节严格验证盐长为零的RSASSA-PSS签名，避免Go标准库将0视作自动盐长
+// 入参: public RSA公钥, hashAlg 摘要算法, digest 原始消息摘要, sig 原始签名字节
+// 返回: error 签名或算法错误
+func verifyRSAPSSZeroSalt(public *rsa.PublicKey, hashAlg crypto.Hash, digest, sig []byte) error {
+	k := (public.N.BitLen() + 7) / 8
+	if len(sig) != k {
+		return fmt.Errorf("%w: RSA-PSS signature value", ErrSignature)
+	}
+	s := new(big.Int).SetBytes(sig)
+	if s.Cmp(public.N) >= 0 {
+		return fmt.Errorf("%w: RSA-PSS signature value", ErrSignature)
+	}
+	m := new(big.Int).Exp(s, big.NewInt(int64(public.E)), public.N)
+	emBits := public.N.BitLen() - 1
+	emLen := (emBits + 7) / 8
+	hLen := hashAlg.Size()
+	if m.BitLen() > emBits {
+		return fmt.Errorf("%w: RSA-PSS signature value", ErrSignature)
+	}
+	em := make([]byte, emLen)
+	m.FillBytes(em)
+	if em[emLen-1] != 0xbc {
+		return fmt.Errorf("%w: RSA-PSS signature value", ErrSignature)
+	}
+	dbLen := emLen - hLen - 1
+	maskedDB := em[:dbLen]
+	h := em[dbLen : dbLen+hLen]
+	unusedBits := uint(8*emLen - emBits)
+	if unusedBits > 0 && maskedDB[0]&^(byte(0xff)>>unusedBits) != 0 {
+		return fmt.Errorf("%w: RSA-PSS signature value", ErrSignature)
+	}
+	db := make([]byte, dbLen)
+	copy(db, maskedDB)
+	hasher := hashAlg.New()
+	var counter [4]byte
+	var mask []byte
+	for offset, index := 0, uint32(0); offset < dbLen; index++ {
+		binary.BigEndian.PutUint32(counter[:], index)
+		hasher.Reset()
+		hasher.Write(h)
+		hasher.Write(counter[:])
+		mask = hasher.Sum(mask[:0])
+		for i := 0; i < len(mask) && offset < dbLen; i, offset = i+1, offset+1 {
+			db[offset] ^= mask[i]
+		}
+	}
+	if unusedBits > 0 {
+		db[0] &= byte(0xff) >> unusedBits
+	}
+	for i := range dbLen - 1 {
+		if db[i] != 0 {
+			return fmt.Errorf("%w: RSA-PSS signature value", ErrSignature)
+		}
+	}
+	if db[dbLen-1] != 0x01 {
+		return fmt.Errorf("%w: RSA-PSS signature value", ErrSignature)
+	}
+	hasher.Reset()
+	var prefix [8]byte
+	hasher.Write(prefix[:])
+	hasher.Write(digest)
+	expected := hasher.Sum(nil)
+	if subtle.ConstantTimeCompare(h, expected) != 1 {
+		return fmt.Errorf("%w: RSA-PSS signature value", ErrSignature)
+	}
+	return nil
 }
 
 // signatureHashBytes 分段计算摘要并检查取消，不复制完整输入

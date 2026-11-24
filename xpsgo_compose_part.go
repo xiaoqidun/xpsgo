@@ -1456,7 +1456,7 @@ func (c *compositionNameCollector) name(value string, target bool) (string, erro
 	if err := c.budget.scan(int64(len(value))); err != nil {
 		return "", err
 	}
-	identifier := !target || c.format != FormatOpenXPS
+	identifier := !target || c.format != FormatOpenXPS && (c.source == nil || c.source.sourceFormat != FormatOpenXPS)
 	if identifier {
 		value = strings.Trim(value, " \t\r\n")
 	}
@@ -1492,7 +1492,7 @@ func (c *compositionNameCollector) visual(node *xmlElement, resource, branch boo
 	if err != nil {
 		return err
 	}
-	if _, err := c.mce.attributes(node, scope, branch); err != nil {
+	if err := c.mce.validateAttributes(node, scope, branch); err != nil {
 		return err
 	}
 	if node.Name.Space == mcNamespace {
@@ -1646,8 +1646,9 @@ func newCompositionNavigation(plan *compositionPlan, names []map[string]string) 
 			c.pages[i][original] = target
 		}
 		page := plan.pages[i].reference
-		page.LinkTargets = make([]string, len(page.LinkTargets))
-		for j, name := range plan.pages[i].reference.LinkTargets {
+		mappedTargets := make([]string, 0, len(page.LinkTargets))
+		seenTargets := make(map[string]bool, len(page.LinkTargets))
+		for _, name := range plan.pages[i].reference.LinkTargets {
 			if err := plan.budget.step(1); err != nil {
 				return nil, err
 			}
@@ -1655,8 +1656,12 @@ func newCompositionNavigation(plan *compositionPlan, names []map[string]string) 
 			if !exists {
 				return nil, fmt.Errorf("%w: missing composition advertised name", ErrInvalid)
 			}
-			page.LinkTargets[j] = target
+			if !seenTargets[target] {
+				seenTargets[target] = true
+				mappedTargets = append(mappedTargets, target)
+			}
 		}
+		page.LinkTargets = mappedTargets
 		output.pages[i] = page
 	}
 	for i, document := range plan.documents {

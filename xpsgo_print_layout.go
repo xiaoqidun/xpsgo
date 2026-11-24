@@ -546,7 +546,11 @@ func (r *Reader) readPrintPageHeader(ctx context.Context, index int, options Pri
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	layout, err := settings.Layout(ctx, page, options.Media, &options.Settings)
+	effective := settings
+	if options.IgnoreUnsupportedFeatures {
+		effective = printStripPrivateExtensions(settings)
+	}
+	layout, err := effective.Layout(ctx, page, options.Media, &options.Settings)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -888,6 +892,41 @@ func printOptionProperties(option *PrintSetting, names ...string) error {
 	return nil
 }
 
+// printStripPrivateExtensions 构造已剥离私有命名空间子Feature与私有ScoredProperty的独立设置视图
+// 入参: settings 原有效打印设置
+// 返回: *PrintSettings 独立过滤后的打印设置
+func printStripPrivateExtensions(settings *PrintSettings) *PrintSettings {
+	if settings == nil {
+		return nil
+	}
+	result := &PrintSettings{Version: settings.Version, Elements: make([]PrintSetting, len(settings.Elements))}
+	for index, element := range settings.Elements {
+		result.Elements[index] = printStripPrivateSetting(element)
+	}
+	return result
+}
+
+// printStripPrivateSetting 递归剔除Feature内私有子Feature及Option/ScoredProperty内私有ScoredProperty
+// 入参: setting 原设置节点
+// 返回: PrintSetting 独立过滤后的节点
+func printStripPrivateSetting(setting PrintSetting) PrintSetting {
+	if len(setting.Children) == 0 {
+		return setting
+	}
+	children := make([]PrintSetting, 0, len(setting.Children))
+	for _, child := range setting.Children {
+		if setting.Kind == PrintSettingFeature && child.Kind == PrintSettingFeature && child.Name.Space != printKeywordsNS {
+			continue
+		}
+		if (setting.Kind == PrintSettingOption || setting.Kind == PrintSettingScoredProperty) && child.Kind == PrintSettingScoredProperty && child.Name.Space != printKeywordsNS {
+			continue
+		}
+		children = append(children, printStripPrivateSetting(child))
+	}
+	setting.Children = children
+	return setting
+}
+
 // scale 计算内容坐标空间内的缩放和位置，参数偏移不随缩放再次放大
 // 入参: option 缩放选择, feature 缩放Feature, content 内容区域, bleed 出血区域, page 页面区域, imageable 可打印区域, media 介质区域
 // 返回: Matrix 缩放定位, error 选择、参数或适配冲突错误
@@ -1154,8 +1193,13 @@ func printBindingGutter(finishing PrintFinishing, side PrintSide, duplex PrintDu
 		band.Height = min(finishing.Gutter, side.Height)
 		band.Y = side.Height - band.Height
 	case PrintBindingBooklet:
-		band.Width = min(finishing.Gutter, side.Width)
-		band.X = (side.Width - band.Width) / 2
+		if side.Height > side.Width {
+			band.Height = min(finishing.Gutter, side.Height)
+			band.Y = (side.Height - band.Height) / 2
+		} else {
+			band.Width = min(finishing.Gutter, side.Width)
+			band.X = (side.Width - band.Width) / 2
+		}
 	default:
 		return nil
 	}

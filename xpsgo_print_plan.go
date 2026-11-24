@@ -28,6 +28,7 @@ import (
 	"math/big"
 	"slices"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -384,6 +385,7 @@ func (r *Reader) PrintPlan(ctx context.Context, options *PrintPlanOptions) (*Pri
 	if err != nil {
 		return nil, err
 	}
+	settings.ignoreUnsupported = configuration.IgnoreUnsupportedFeatures || configuration.Print.IgnoreUnsupportedFeatures
 	if len(r.pages) > settings.Limits.MaxPageCount {
 		return nil, fmt.Errorf("%w: print plan input page count", ErrLimit)
 	}
@@ -685,11 +687,10 @@ func clonePrintPlacements(source []PrintPlacement) []PrintPlacement {
 	return result
 }
 
-// printPageRanges 解析严格范围词法，保留列表顺序、重复页和反向区间，先裁至文档范围再展开
+// printPageRanges 解析严格范围词法，遵循Print Schema规范禁止任何空白字符，保留列表顺序、重复页和反向区间，先裁至文档范围再展开
 // 入参: text 原始范围文本，空表示全部, count 文档页数, maximum 输出选择上限, options 数值及取消参数
 // 返回: []int 零基页号, bool 是否含越界页, error 词法、数量、资源或取消错误
 func printPageRanges(text string, count, maximum int, options printSettingsConfig) ([]int, bool, error) {
-	text = strings.Trim(text, " \t\r\n")
 	if text == "" {
 		if count > maximum {
 			return nil, false, fmt.Errorf("%w: print page selection count", ErrLimit)
@@ -699,6 +700,11 @@ func printPageRanges(text string, count, maximum int, options printSettingsConfi
 			result[index] = index
 		}
 		return result, false, checkContext(options.context)
+	}
+	for _, r := range text {
+		if unicode.IsSpace(r) {
+			return nil, false, fmt.Errorf("%w: print page range whitespace", ErrInvalid)
+		}
 	}
 	var result []int
 	outside := false
@@ -715,7 +721,6 @@ func printPageRanges(text string, count, maximum int, options printSettingsConfi
 		}
 		values := [2]*big.Int{}
 		for index, number := range []string{startText, endText} {
-			number = strings.Trim(number, " \t\r\n")
 			if number == "" {
 				return nil, false, fmt.Errorf("%w: empty print page range endpoint", ErrInvalid)
 			}
@@ -993,7 +998,14 @@ func (b *printPlanBuilder) merge(source string, base *PrintSettings) (*PrintSett
 			return nil, &PartError{Part: ticket.Part, Err: err}
 		}
 	}
-	return MergePrintSettings(b.settings.context, base, delta, &b.settings.PrintSettingsOptions)
+	merged, err := MergePrintSettings(b.settings.context, base, delta, &b.settings.PrintSettingsOptions)
+	if err != nil {
+		return nil, err
+	}
+	if b.settings.ignoreUnsupported {
+		merged = printStripPrivateExtensions(merged)
+	}
+	return merged, nil
 }
 
 // count 读取正整数份数并在乘法或循环展开前检查上限，不截断大整数
@@ -1249,16 +1261,48 @@ func (p *printSheetPacker) add(page printPlanPage, document printPlanDocument) e
 	placement := PrintPlacement{Page: page.index, DocumentIndex: page.document, Transform: layout.Transform, PageClip: layout.PageClip, MediaClip: layout.MediaClip, Watermark: page.watermark, Negative: page.negative, Color: clonePrintColorPlan(page.colorPlan)}
 	if p.nup > 1 {
 		cell := printNUpCell(len(side.Pages), p.nup, side.MediaClip, p.direction)
-		factor := min(cell.Width/layout.Width, cell.Height/layout.Height)
-		mapping := Matrix{A: factor, D: factor, E: cell.X + (cell.Width-factor*layout.Width)/2, F: cell.Y + (cell.Height-factor*layout.Height)/2}
+		src := layout.MediaClip
+		if src.Width <= 0 || src.Height <= 0 {
+			src = Rect{Width: layout.Width, Height: layout.Height}
+		}
+		factor := min(cell.Width/src.Width, cell.Height/src.Height)
+		rotated := min(cell.Width/src.Height, cell.Height/src.Width)
+		var mapping Matrix
+		if rotated > factor {
+			factor = rotated
+			mapping = Matrix{
+				B: -factor,
+				C: factor,
+				E: cell.X + (cell.Width-factor*src.Height)/2 - factor*src.Y,
+				F: cell.Y + (cell.Height+factor*src.Width)/2 + factor*src.X,
+			}
+		} else {
+			mapping = Matrix{
+				A: factor,
+				D: factor,
+				E: cell.X + (cell.Width-factor*src.Width)/2 - factor*src.X,
+				F: cell.Y + (cell.Height-factor*src.Height)/2 - factor*src.Y,
+			}
+		}
 		placement.Transform = mapping.Mul(layout.Transform)
-		placement.MediaClip = printTransformBox(layout.MediaClip, mapping)
+		placement.MediaClip = printClampBox(printTransformBox(layout.MediaClip, mapping), cell)
 		if factor <= 0 || !geometryFillMatrixFinite(placement.Transform) || !geometryFinite(placement.MediaClip.X, placement.MediaClip.Y, placement.MediaClip.Width, placement.MediaClip.Height) {
 			return fmt.Errorf("%w: print NUp mapping", ErrLimit)
 		}
 	}
 	side.Pages = append(side.Pages, placement)
 	return nil
+}
+
+// printClampBox 将矩形裁剪在目标容器边界内，消除浮点舍入造成的微小越界
+// 入参: box 待约束矩形, bound 外界容器矩形
+// 返回: Rect 完整位于bound内的矩形
+func printClampBox(box, bound Rect) Rect {
+	left := max(box.X, bound.X)
+	top := max(box.Y, bound.Y)
+	right := min(box.X+box.Width, bound.X+bound.Width)
+	bottom := min(box.Y+box.Height, bound.Y+bound.Height)
+	return Rect{X: left, Y: top, Width: max(0, right-left), Height: max(0, bottom-top)}
 }
 
 // printNUpCell 优先按近方形整除因子对及八向排列选择单元，纸面竖向较长时交换网格行列

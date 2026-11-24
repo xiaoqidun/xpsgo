@@ -43,6 +43,9 @@ var iccPCSFromLinearRGB, _ = iccInverseMatrix(iccPCSDisplayMatrix)
 // iccPCSWhite 保存ICC标准D50连接空间白点XYZ坐标
 var iccPCSWhite = [3]float64{0.9642, 1, 0.8249}
 
+// iccXYZD65ToLinearRGB 保存D65参考白XYZ到线性sRGB的直接显示矩阵
+var iccXYZD65ToLinearRGB = iccDisplayD65Matrix()
+
 // iccPCSDisplayMatrix 保存D50连接空间到线性sRGB显示空间的转换矩阵
 var iccPCSDisplayMatrix = iccDisplayMatrix()
 
@@ -62,7 +65,6 @@ type iccProfile struct {
 	pcs      string
 	intent   uint32
 	channels int
-	chad     [9]float64
 	hasChad  bool
 }
 
@@ -79,8 +81,6 @@ type iccTargetTransform struct {
 	inverse     [3]iccInverseCurve
 	matrix      [9]float64
 	white       [3]float64
-	chad        [9]float64
-	hasChad     bool
 	absolutePCS bool
 	gray        bool
 	intent      uint32
@@ -93,7 +93,6 @@ type iccTransform struct {
 	curves      [3]iccCurve
 	matrix      [9]float64
 	white       [3]float64
-	chadInverse [9]float64
 	hasChad     bool
 	absolutePCS bool
 	gray        bool
@@ -168,9 +167,7 @@ func parseICCProfile(data []byte) (*iccProfile, error) {
 			return nil, fmt.Errorf("%w: overlapping ICC tag data", ErrInvalid)
 		}
 	}
-	if chad, _, ok := iccParseAdaptationMatrix(p.tag("chad")); ok {
-		p.chad, p.hasChad = chad, true
-	}
+	p.hasChad = iccParseAdaptationMatrix(p.tag("chad"))
 	return p, nil
 }
 
@@ -307,35 +304,19 @@ func iccReadDisplayWhite(p *iccProfile, white [3]float64) bool {
 	return iccD50White(p.version, white)
 }
 
-// iccParseAdaptationMatrix 解析sf32色度适应矩阵及其逆矩阵，仅在格式正确且矩阵可逆时返回有效
+// iccParseAdaptationMatrix 校验sf32色度适应矩阵格式及其可逆性
 // 入参: data chad标签字节
-// 返回: [9]float64 适应矩阵, [9]float64 适应逆矩阵, bool 是否存在可逆适应矩阵
-func iccParseAdaptationMatrix(data []byte) ([9]float64, [9]float64, bool) {
+// 返回: bool 是否存在可逆适应矩阵
+func iccParseAdaptationMatrix(data []byte) bool {
 	if len(data) != 44 || string(data[:4]) != "sf32" || binary.BigEndian.Uint32(data[4:]) != 0 {
-		return [9]float64{}, [9]float64{}, false
+		return false
 	}
 	var matrix [9]float64
 	for i := range matrix {
 		matrix[i] = iccFixed(data[8+4*i:])
 	}
-	inverse, err := iccInverseMatrix(matrix)
-	if err != nil {
-		return [9]float64{}, [9]float64{}, false
-	}
-	return matrix, inverse, true
-}
-
-// iccProfileAdaptation 读取配置文件缓存或标签中的可逆色度适应矩阵及其逆矩阵
-// 入参: p 已解析配置文件
-// 返回: [9]float64 适应矩阵, [9]float64 适应逆矩阵, bool 是否可用
-func iccProfileAdaptation(p *iccProfile) ([9]float64, [9]float64, bool) {
-	if p.hasChad {
-		inverse, err := iccInverseMatrix(p.chad)
-		if err == nil {
-			return p.chad, inverse, true
-		}
-	}
-	return iccParseAdaptationMatrix(p.tag("chad"))
+	_, err := iccInverseMatrix(matrix)
+	return err == nil
 }
 
 // iccSelectTransformTag 按ICC.1:2010优先级选择源或目标转换标签，v4优先采用浮点管线
@@ -1228,11 +1209,10 @@ func newICCTarget(profile *iccProfile, intent uint32) (*iccTargetTransform, erro
 	if !iccReadDisplayWhite(profile, white) {
 		return nil, fmt.Errorf("%w: ICC target display white", ErrInvalid)
 	}
-	chad, _, hasChad := iccProfileAdaptation(profile)
-	if profile.version>>24 == 4 && profile.class == "mntr" && (hasChad || iccDisplayWhite(profile, white)) {
+	if profile.version>>24 == 4 && profile.class == "mntr" && (profile.hasChad || iccDisplayWhite(profile, white)) {
 		white = iccPCSWhite
 	}
-	return &iccTargetTransform{profile: profile, white: white, chad: chad, hasChad: hasChad, intent: intent}, nil
+	return &iccTargetTransform{profile: profile, white: white, intent: intent}, nil
 }
 
 // prepareICCTargetDirection 为已校验的目标准备实际使用的反向转换，v4优先采用B2D浮点管线
@@ -1308,37 +1288,16 @@ func prepareICCTargetDirection(t *iccTargetTransform, ctx context.Context) (*icc
 	return t, checkContext(ctx)
 }
 
-// fromXYZ 将物理XYZ编码为最多八通道目标设备分量，供兼容八通道打印原生路径使用
-// 入参: xyz D50连接空间值，绝对意图时为绝对色度
-// 返回: [8]float64 前profile.channels项有效, error 非有限输入、通道超限或转换错误
-func (t *iccTargetTransform) fromXYZ(xyz [3]float64) ([8]float64, error) {
-	if t.profile.channels > 8 {
-		return [8]float64{}, fmt.Errorf("%w: ICC target channel count", ErrUnsupported)
-	}
-	values, err := t.fromXYZChannels(xyz)
-	if err != nil {
-		return [8]float64{}, err
-	}
-	var out [8]float64
-	copy(out[:], values[:8])
-	return out, nil
-}
-
-// fromXYZChannels 将物理XYZ编码为目标设备分量，支持最多十五通道、chad绝对色度及浮点B2D管线
+// fromXYZ 将物理XYZ编码为目标设备分量，支持最多十五通道、绝对色度及浮点B2D管线
 // 入参: xyz D50连接空间值，绝对意图时为绝对色度
 // 返回: [iccMaxChannels]float64 前profile.channels项有效, error 非有限输入或转换错误
-func (t *iccTargetTransform) fromXYZChannels(xyz [3]float64) ([iccMaxChannels]float64, error) {
+func (t *iccTargetTransform) fromXYZ(xyz [3]float64) ([iccMaxChannels]float64, error) {
 	if !geometryFinite(xyz[0], xyz[1], xyz[2]) {
 		return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC target PCS value", ErrInvalid)
 	}
-	if t.intent == 3 && !t.absolutePCS {
-		if t.hasChad {
-			xyz = iccMatrixColor(t.chad, xyz)
-		}
-		if t.white != iccPCSWhite {
-			for axis := range 3 {
-				xyz[axis] *= iccPCSWhite[axis] / t.white[axis]
-			}
+	if t.intent == 3 && !t.absolutePCS && t.white != iccPCSWhite {
+		for axis := range 3 {
+			xyz[axis] *= iccPCSWhite[axis] / t.white[axis]
 		}
 	}
 	if !geometryFinite(xyz[0], xyz[1], xyz[2]) {
@@ -1446,11 +1405,10 @@ func prepareICCTransform(profile *iccProfile, intent uint32) (*iccTransform, err
 	if !iccReadDisplayWhite(profile, white) {
 		return nil, fmt.Errorf("%w: ICC display media white point", ErrInvalid)
 	}
-	_, chadInverse, hasChad := iccProfileAdaptation(profile)
-	if profile.version>>24 == 4 && profile.class == "mntr" && (hasChad || iccDisplayWhite(profile, white)) {
+	if profile.version>>24 == 4 && profile.class == "mntr" && (profile.hasChad || iccDisplayWhite(profile, white)) {
 		white = iccPCSWhite
 	}
-	t := &iccTransform{profile: profile, white: white, chadInverse: chadInverse, hasChad: hasChad, intent: intent}
+	t := &iccTransform{profile: profile, white: white, hasChad: profile.hasChad, intent: intent}
 	if profile.class == "nmcl" {
 		t.named, err = parseICCNamedColor(profile)
 		if err != nil {
@@ -1577,14 +1535,9 @@ func (t *iccTransform) toXYZ(input []float64) ([3]float64, error) {
 		}
 		xyz = iccMatrixColor(t.matrix, linear)
 	}
-	if t.intent == 3 && !t.absolutePCS {
-		if t.white != iccPCSWhite {
-			for i := range 3 {
-				xyz[i] *= t.white[i] / iccPCSWhite[i]
-			}
-		}
-		if t.hasChad {
-			xyz = iccMatrixColor(t.chadInverse, xyz)
+	if t.intent == 3 && !t.absolutePCS && t.white != iccPCSWhite {
+		for i := range 3 {
+			xyz[i] *= t.white[i] / iccPCSWhite[i]
 		}
 	}
 	if !geometryFinite(xyz[0], xyz[1], xyz[2]) {
@@ -1600,6 +1553,9 @@ func (t *iccTransform) linearRGB(input []float64) ([3]float64, error) {
 	xyz, err := t.toXYZ(input)
 	if err != nil {
 		return [3]float64{}, err
+	}
+	if t.intent == 3 && !t.absolutePCS && t.profile.version>>24 == 2 && t.profile.class == "mntr" && !t.hasChad {
+		return iccMatrixColor(iccXYZD65ToLinearRGB, xyz), nil
 	}
 	return iccMatrixColor(iccPCSDisplayMatrix, xyz), nil
 }
@@ -1632,9 +1588,9 @@ func iccMatrixColor(matrix [9]float64, color [3]float64) [3]float64 {
 	}
 }
 
-// iccDisplayMatrix 按Bradford色度适应计算D50连接空间到线性sRGB的显示矩阵
-// 返回: [9]float64 D50条件XYZ至线性sRGB的行优先矩阵
-func iccDisplayMatrix() [9]float64 {
+// iccDisplayD65Matrix 计算D65参考白XYZ到线性sRGB的直接转换矩阵
+// 返回: [9]float64 D65条件XYZ至线性sRGB的行优先矩阵
+func iccDisplayD65Matrix() [9]float64 {
 	white := [3]float64{0.3127 / 0.3290, 1, (1 - 0.3127 - 0.3290) / 0.3290}
 	primaries := [9]float64{0.64 / 0.33, 0.30 / 0.60, 0.15 / 0.06, 1, 1, 1, (1 - 0.64 - 0.33) / 0.33, (1 - 0.30 - 0.60) / 0.60, (1 - 0.15 - 0.06) / 0.06}
 	inversePrimaries, _ := iccInverseMatrix(primaries)
@@ -1645,6 +1601,14 @@ func iccDisplayMatrix() [9]float64 {
 		}
 	}
 	display, _ := iccInverseMatrix(primaries)
+	return display
+}
+
+// iccDisplayMatrix 按Bradford色度适应计算D50连接空间到线性sRGB的显示矩阵
+// 返回: [9]float64 D50条件XYZ至线性sRGB的行优先矩阵
+func iccDisplayMatrix() [9]float64 {
+	white := [3]float64{0.3127 / 0.3290, 1, (1 - 0.3127 - 0.3290) / 0.3290}
+	display := iccDisplayD65Matrix()
 	bradford := [9]float64{0.8951, 0.2664, -0.1614, -0.7502, 1.7135, 0.0367, 0.0389, -0.0685, 1.0296}
 	coneSource, coneTarget := iccMatrixColor(bradford, iccPCSWhite), iccMatrixColor(bradford, white)
 	adapt := bradford

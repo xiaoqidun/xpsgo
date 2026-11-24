@@ -151,6 +151,7 @@ type compositionIndex struct {
 // compositionSource 保存单个源包的独立快照，按小写规范化URI索引部件及原始关系XML
 type compositionSource struct {
 	format            Format
+	sourceFormat      Format
 	sequence          string
 	documents         []Document
 	pages             []PageReference
@@ -896,8 +897,30 @@ func convertCompositionSourceWithReport(source *compositionSource, format Format
 	}
 	result := *source
 	result.indices = nil
+	result.retained = maps.Clone(source.retained)
+	result.sourceFormat = source.format
 	result.format, result.parts = format, make(map[string]packagePart, len(source.parts))
 	result.relationships = make(map[string][]Relationship, len(source.relationships))
+	result.pages = make([]PageReference, len(source.pages))
+	for i, page := range source.pages {
+		page.LinkTargets = slices.Clone(page.LinkTargets)
+		if source.format == FormatOpenXPS && format == FormatXPS {
+			page.LinkTargets = deduplicateStrings(page.LinkTargets)
+		}
+		result.pages[i] = page
+	}
+	result.documents = make([]Document, len(source.documents))
+	for i, doc := range source.documents {
+		doc.Pages = make([]PageReference, len(doc.Pages))
+		for j, page := range source.documents[i].Pages {
+			page.LinkTargets = slices.Clone(page.LinkTargets)
+			if source.format == FormatOpenXPS && format == FormatXPS {
+				page.LinkTargets = deduplicateStrings(page.LinkTargets)
+			}
+			doc.Pages[j] = page
+		}
+		result.documents[i] = doc
+	}
 	if source.rootRelationships.name != "" {
 		part, err := convertCompositionPartMarkup(source.rootRelationships, source.format, format, source.parts, budget)
 		if err != nil {
@@ -1089,6 +1112,12 @@ func convertCompositionPartMarkup(part packagePart, source, target Format, parts
 	if changed {
 		result.items = nil
 	}
+	if source == FormatOpenXPS && target == FormatXPS && strings.EqualFold(result.media, fixedContentType("fixeddocument")) {
+		result, err = deduplicateCompositionLinkTargets(result, target, budget)
+		if err != nil {
+			return packagePart{}, err
+		}
+	}
 	if err := validateCompositionFormatMarkup(result, target, budget); err != nil {
 		if errors.Is(err, ErrInvalid) {
 			return packagePart{}, fmt.Errorf("%w: target document format: %v", ErrUnsupported, err)
@@ -1099,6 +1128,152 @@ func convertCompositionPartMarkup(part packagePart, source, target Format, parts
 		return packagePart{}, err
 	}
 	return result, nil
+}
+
+// deduplicateStrings 按首次出现顺序去除字符串切片中的重复项
+// 入参: values 原始字符串切片
+// 返回: []string 去重后的独立切片
+func deduplicateStrings(values []string) []string {
+	if len(values) < 2 {
+		return values
+	}
+	seen := make(map[string]bool, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
+}
+
+// deduplicateCompositionLinkTargets 将OpenXPS固定文档中合法重复或非NCName的LinkTarget规范化为XPS 1.0唯一标识
+// 入参: part 已切换命名空间的固定文档部件, target 目标方言, budget 共享预算
+// 返回: packagePart 规范化后的文档部件, error 解析、编码、预算或取消错误
+func deduplicateCompositionLinkTargets(part packagePart, target Format, budget *compositionBudget) (packagePart, error) {
+	if err := budget.scan(int64(len(part.data))); err != nil {
+		return packagePart{}, err
+	}
+	root, err := decodeXMLVisit(part.data, budget.limits, func(_ xml.Token, _ *xmlElement) error { return budget.step(1) })
+	if err != nil {
+		return packagePart{}, err
+	}
+	namespace := formatNamespace(target)
+	active, err := preprocessXMLContext(root, []string{namespace, namespace + "/resourcedictionary-key"}, budget.context)
+	if err != nil {
+		return packagePart{}, err
+	}
+	reserved := make(map[string]bool)
+	for _, pageNode := range active.Children {
+		if pageNode.Name != (xml.Name{Space: namespace, Local: "PageContent"}) {
+			continue
+		}
+		for _, child := range pageNode.Children {
+			if child.Name != (xml.Name{Space: namespace, Local: "PageContent.LinkTargets"}) {
+				continue
+			}
+			for _, link := range child.Children {
+				if link.Name == (xml.Name{Space: namespace, Local: "LinkTarget"}) {
+					if val, ok := link.attribute("Name"); ok && xmlNCName(val) {
+						reserved[val] = true
+					}
+				}
+			}
+		}
+	}
+	seen := make(map[string]bool)
+	counter := 0
+	modified := false
+	for _, pageNode := range active.Children {
+		if err := budget.step(1); err != nil {
+			return packagePart{}, err
+		}
+		if pageNode.Name != (xml.Name{Space: namespace, Local: "PageContent"}) {
+			continue
+		}
+		keptPageChildren := make([]*xmlElement, 0, len(pageNode.Children))
+		for _, child := range pageNode.Children {
+			if child.Name != (xml.Name{Space: namespace, Local: "PageContent.LinkTargets"}) {
+				keptPageChildren = append(keptPageChildren, child)
+				continue
+			}
+			keptLinks := make([]*xmlElement, 0, len(child.Children))
+			for _, link := range child.Children {
+				if err := budget.step(1); err != nil {
+					return packagePart{}, err
+				}
+				if link.Name != (xml.Name{Space: namespace, Local: "LinkTarget"}) {
+					keptLinks = append(keptLinks, link)
+					continue
+				}
+				val, ok := link.attribute("Name")
+				if !ok {
+					keptLinks = append(keptLinks, link)
+					continue
+				}
+				if seen[val] {
+					modified = true
+					continue
+				}
+				seen[val] = true
+				if !xmlNCName(val) {
+					for {
+						counter++
+						candidate := "Name_" + strconv.Itoa(counter)
+						if !reserved[candidate] && !seen[candidate] {
+							reserved[candidate], seen[candidate] = true, true
+							for i := range link.Attr {
+								if link.Attr[i].Name.Space == "" && link.Attr[i].Name.Local == "Name" {
+									link.Attr[i].Value = candidate
+									break
+								}
+							}
+							modified = true
+							break
+						}
+					}
+				}
+				keptLinks = append(keptLinks, link)
+			}
+			if len(keptLinks) == 0 {
+				modified = true
+				continue
+			}
+			child.Children = keptLinks
+			keptPageChildren = append(keptPageChildren, child)
+		}
+		pageNode.Children = keptPageChildren
+	}
+	if !modified {
+		return part, nil
+	}
+	var stripNS func(*xmlElement)
+	stripNS = func(node *xmlElement) {
+		var attrs []xml.Attr
+		for _, attr := range node.Attr {
+			if attr.Name.Space != xmlnsNamespace && attr.Name != (xml.Name{Local: "xmlns"}) {
+				attrs = append(attrs, attr)
+			}
+		}
+		node.Attr = attrs
+		for _, child := range node.Children {
+			stripNS(child)
+		}
+	}
+	stripNS(active)
+	limits := budget.limits
+	limits.MaxMetadataBytes = min(limits.MaxMetadataBytes, limits.MaxPackageBytes)
+	data, err := createdMarkup(active, limits, budget.context)
+	if err != nil {
+		return packagePart{}, err
+	}
+	if err := budget.scan(int64(len(data))); err != nil {
+		return packagePart{}, err
+	}
+	part.data, part.items = data, nil
+	return part, nil
 }
 
 // validateCompositionFormatMarkup 校验方言差异及关系、签署请求等结构，不用目标规则替代源规则

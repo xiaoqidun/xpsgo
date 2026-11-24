@@ -47,6 +47,12 @@ const (
 // fontBitmapMaxScaleRecords 限制位图缩放记录的解析数量上限
 const fontBitmapMaxScaleRecords = 65536
 
+// fontBitmapFlagHorizontal 与 fontBitmapFlagVertical 表示EBLC BitmapSizeTable的横竖排标志
+const (
+	fontBitmapFlagHorizontal = 0x01
+	fontBitmapFlagVertical   = 0x02
+)
+
 // cffFontDict 保存字体字典、私有参数及显式矩阵，缺省矩阵由坐标转换层解释
 type cffFontDict struct {
 	dict    cffDict
@@ -819,10 +825,10 @@ func (s *fontSourceBitmapScale) load(face *fontFace, charge func(uint64) error) 
 	return value, err
 }
 
-// selectBitmapStrikeWithWork 在索引和缩放目录初始化时执行预算及取消检查
-// 入参: ppemX 横轴请求尺寸, ppemY 竖轴请求尺寸, charge 可选预算及取消回调
+// selectBitmapStrikeWithWork 按书写方向标志在索引和缩放目录初始化时执行预算及取消检查
+// 入参: ppemX 横轴请求尺寸, ppemY 竖轴请求尺寸, vertical 是否竖排方向, charge 可选预算及取消回调
 // 返回: fontBitmapSelection 原始选择结果, bool 是否匹配, error 请求、目录、预算或取消错误
-func (f *fontSource) selectBitmapStrikeWithWork(ppemX, ppemY uint16, charge func(uint64) error) (fontBitmapSelection, bool, error) {
+func (f *fontSource) selectBitmapStrikeWithWork(ppemX, ppemY uint16, vertical bool, charge func(uint64) error) (fontBitmapSelection, bool, error) {
 	if f == nil || f.metrics == nil || ppemX == 0 || ppemY == 0 {
 		return fontBitmapSelection{}, false, fmt.Errorf("%w: bitmap source or request size", ErrInvalid)
 	}
@@ -839,7 +845,7 @@ func (f *fontSource) selectBitmapStrikeWithWork(ppemX, ppemY uint16, charge func
 	if err := fontBitmapWork(charge, work); err != nil {
 		return fontBitmapSelection{}, false, err
 	}
-	selection, present, err := f.bitmaps.selectStrike(nil, ppemX, ppemY)
+	selection, present, err := f.bitmaps.selectStrike(nil, ppemX, ppemY, vertical)
 	if err != nil || present {
 		return selection, present, err
 	}
@@ -850,7 +856,7 @@ func (f *fontSource) selectBitmapStrikeWithWork(ppemX, ppemY uint16, charge func
 	if err := fontBitmapWork(charge, work*2); err != nil {
 		return fontBitmapSelection{}, false, err
 	}
-	return f.bitmaps.selectStrike(scales, ppemX, ppemY)
+	return f.bitmaps.selectStrike(scales, ppemX, ppemY, vertical)
 }
 
 // parseTrueType 解析TrueType的head、maxp、loca及glyf索引，不执行字体指令
@@ -1762,28 +1768,39 @@ func parseFontBitmapScalesWithWork(face *fontFace, charge func(uint64) error) (*
 	return s, nil
 }
 
-// findStrike 按双轴ppem查找原序EBLC位置，不依据位深或字形覆盖率猜测优先级
-// 入参: x 横轴尺寸, y 竖轴尺寸
+// findStrike 按双轴ppem与方向标志查找原序EBLC位置，无方向匹配时回退至不限标志查找
+// 入参: x 横轴尺寸, y 竖轴尺寸, flag 期望的方向标志
 // 返回: int 首个匹配位置或负一, int 匹配数量
-func (b *fontBitmaps) findStrike(x, y uint8) (int, int) {
-	index, count := -1, 0
-	if b != nil {
-		for i, s := range b.strikes {
-			if s.ppemX == x && s.ppemY == y {
-				if count == 0 {
-					index = i
+func (b *fontBitmaps) findStrike(x, y, flag uint8) (int, int) {
+	if b == nil {
+		return -1, 0
+	}
+	flagIndex, flagCount := -1, 0
+	anyIndex, anyCount := -1, 0
+	for i, s := range b.strikes {
+		if s.ppemX == x && s.ppemY == y {
+			if anyCount == 0 {
+				anyIndex = i
+			}
+			anyCount++
+			if s.flags&flag != 0 {
+				if flagCount == 0 {
+					flagIndex = i
 				}
-				count++
+				flagCount++
 			}
 		}
 	}
-	return index, count
+	if flagCount > 0 {
+		return flagIndex, flagCount
+	}
+	return anyIndex, anyCount
 }
 
-// selectStrike 按精确EBLC优先、精确目标EBSC次之的顺序选择位图strike，冲突时返回ErrUnsupported
-// 入参: scales 已解析的EBSC或nil, ppemX 正横轴请求尺寸, ppemY 正竖轴请求尺寸
+// selectStrike 按方向标志与精确EBLC优先、精确目标EBSC次之的顺序选择位图strike
+// 入参: scales 已解析的EBSC或nil, ppemX 正横轴请求尺寸, ppemY 正竖轴请求尺寸, vertical 是否竖排方向
 // 返回: fontBitmapSelection 选择结果, bool 是否存在匹配, error 请求、引用或选择能力错误
-func (b *fontBitmaps) selectStrike(scales *fontBitmapScales, ppemX, ppemY uint16) (fontBitmapSelection, bool, error) {
+func (b *fontBitmaps) selectStrike(scales *fontBitmapScales, ppemX, ppemY uint16, vertical bool) (fontBitmapSelection, bool, error) {
 	if ppemX == 0 || ppemY == 0 {
 		return fontBitmapSelection{}, false, fmt.Errorf("%w: bitmap request requires positive ppem", ErrInvalid)
 	}
@@ -1791,7 +1808,11 @@ func (b *fontBitmaps) selectStrike(scales *fontBitmapScales, ppemX, ppemY uint16
 		return fontBitmapSelection{}, false, nil
 	}
 	x, y := uint8(ppemX), uint8(ppemY)
-	index, count := b.findStrike(x, y)
+	flag := uint8(fontBitmapFlagHorizontal)
+	if vertical {
+		flag = fontBitmapFlagVertical
+	}
+	index, count := b.findStrike(x, y, flag)
 	if count == 0 {
 		if scales == nil {
 			return fontBitmapSelection{}, false, nil
@@ -1805,7 +1826,7 @@ func (b *fontBitmaps) selectStrike(scales *fontBitmapScales, ppemX, ppemY uint16
 		}
 		record := target.record
 		r := scales.records[record]
-		index, count = b.findStrike(r.substitutePpemX, r.substitutePpemY)
+		index, count = b.findStrike(r.substitutePpemX, r.substitutePpemY, flag)
 		if count == 0 {
 			return fontBitmapSelection{}, false, fmt.Errorf("%w: EBSC record %d source strike %dx%d is missing", ErrInvalid, record, r.substitutePpemX, r.substitutePpemY)
 		}

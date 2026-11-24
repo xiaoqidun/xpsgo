@@ -930,7 +930,7 @@ func (s *gradientSampler) sampleRenderColor(point Point, target renderColorSpace
 	if err != nil {
 		return renderColor{}, err
 	}
-	return imageRGBToRenderColor(values[0], values[1], values[2], values[3]*s.opacity, s.space, target)
+	return imageRGBToRenderColor(values[0], values[1], values[2], values[3]*s.opacity, s.space, target, 0)
 }
 
 // at 根据已排序停靠点求值，重合停靠点采用右连续规则，Pad外部保留首末颜色

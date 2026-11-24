@@ -75,6 +75,9 @@ const (
 // printSurfacePoolMax 定义打印色彩渲染表面复用池的单缓冲区像素上限
 const printSurfacePoolMax = 32 * 8 * 32 * 8
 
+// printColorMaxPlanes 定义按三通道平面拆分十五通道颜色时的最大平面数
+const printColorMaxPlanes = (iccMaxChannels + 2) / 3
+
 // printSurfacePool 复用打印设备原生颜色图块缓冲
 var printSurfacePool sync.Pool
 
@@ -125,7 +128,7 @@ type PrintColorOptions struct {
 	Override       bool
 }
 
-// printSurfaceBuffer 保存可复用的八通道打印表面及其预留存活像素预算
+// printSurfaceBuffer 保存可复用的多通道打印表面及其预留存活像素预算
 type printSurfaceBuffer struct {
 	pixels   []printNativeColor
 	reserved int
@@ -134,8 +137,9 @@ type printSurfaceBuffer struct {
 // printWorkingSpace 保存本次绘制的颜色编码及已准备的双向连接，不跨调用共享
 type printWorkingSpace struct {
 	profile      *iccProfile
-	forward      *iccTransform
-	reverse      *iccTargetTransform
+	forward      atomic.Pointer[iccTransform]
+	reverse      atomic.Pointer[iccTargetTransform]
+	initMu       sync.Mutex
 	space        ColorSpace
 	channels     int
 	intent       RenderingIntent
@@ -144,9 +148,9 @@ type printWorkingSpace struct {
 	hash         [32]byte
 }
 
-// printNativeColor 保存最多八个非预乘颜色分量，alpha与编码身份独立
+// printNativeColor 保存最多十五个非预乘颜色分量，alpha与编码身份独立
 type printNativeColor struct {
-	value  [8]float64
+	value  [iccMaxChannels]float64
 	alpha  float64
 	space  *printWorkingSpace
 	blend  *printWorkingSpace
@@ -168,6 +172,7 @@ type printColorRuntime struct {
 	nativeProfile *iccProfile
 	format        Format
 	renderer      *sceneRenderer
+	mu            sync.RWMutex
 	transforms    map[*iccProfile][4]*iccTransform
 	nativeMatch   map[*iccProfile]bool
 }
@@ -285,7 +290,7 @@ func printColorSettings(settings *PrintSettings, options printSettingsConfig) (*
 // 入参: part 定义部件, value 原始颜色
 // 返回: printNativeColor 页面颜色, error 引用或转换错误
 func (c *printColorRuntime) vector(part string, value Color) (printNativeColor, error) {
-	var components [8]float64
+	var components [iccMaxChannels]float64
 	if len(value.Components) > len(components) {
 		return printNativeColor{}, fmt.Errorf("%w: print color channels", ErrInvalid)
 	}
@@ -423,7 +428,7 @@ func (c *printColorRuntime) gradient(brush *Brush, transform Matrix) (printNativ
 		}
 	}
 	count := (working.channels + 2) / 3
-	var samplers [3]*gradientSampler
+	var samplers [printColorMaxPlanes]*gradientSampler
 	for plane := range count {
 		copyBrush := *brush
 		copyBrush.ColorInterpolationMode = ColorInterpolationScRGB
@@ -536,16 +541,21 @@ func (c *printColorRuntime) image(brush *Brush, transform Matrix) (printNativeSa
 		working = c.device
 	}
 	count := (working.channels + 2) / 3
-	var samplers [3]*imageSampler
+	jxrIntent := c.sourceIntent(profile, true)
+	var samplers [printColorMaxPlanes]*imageSampler
 	for plane := range count {
-		sampler, err := newImageSampler(brush, source, transform, renderScRGB)
+		sampler, err := newImageSampler(brush, source, transform, renderScRGB, false, jxrIntent, c.renderer.options.hdrPeakNits)
 		if err != nil {
 			return nil, err
 		}
-		sampler.charge, sampler.reserve = c.renderer.charge, c.renderer.reservePixels
-		sampler.convert = func(components [8]float64, alpha float64) (renderColor, error) {
+		sampler.charge, sampler.reserve, sampler.release = c.renderer.charge, c.renderer.reservePixels, c.renderer.releaseLive
+		if sampler.filterX || sampler.filterY {
+			c.renderer.hasFiltered = true
+		}
+		c.renderer.registerCleanup(sampler.releaseFilter)
+		sampler.convert = func(components [iccMaxChannels]float64, alpha float64, linear bool) (renderColor, error) {
 			space := ColorSRGB
-			if source.linear {
+			if linear {
 				space = ColorScRGB
 			}
 			value, err := c.color(profile, components, alpha, space, true)
@@ -572,7 +582,13 @@ func (c *printColorRuntime) image(brush *Brush, transform Matrix) (printNativeSa
 	return func(point, center Point) (printNativeColor, error) {
 		value := printNativeColor{space: working, blend: c.working, intent: intent}
 		for plane := range count {
-			color, err := samplers[plane].sampleAt(point, center)
+			var color renderColor
+			var err error
+			if c.renderer.concurrent {
+				color, err = samplers[plane].sampleAtPooled(point, center)
+			} else {
+				color, err = samplers[plane].sampleAt(point, center)
+			}
 			if err != nil {
 				return printNativeColor{}, err
 			}
@@ -946,7 +962,7 @@ func (r *sceneRenderer) renderPrintColorScene(elements []Element, transform Matr
 			space = ColorSRGB
 		}
 		background = printNativeColor{
-			value: [8]float64{r.options.background.r / r.options.background.a, r.options.background.g / r.options.background.a, r.options.background.b / r.options.background.a},
+			value: [iccMaxChannels]float64{r.options.background.r / r.options.background.a, r.options.background.g / r.options.background.a, r.options.background.b / r.options.background.a},
 			alpha: r.options.background.a,
 			space: &printWorkingSpace{space: space, channels: 3},
 		}
@@ -995,7 +1011,6 @@ func (r *sceneRenderer) renderPrintColorScene(elements []Element, transform Matr
 		}
 		return nil, nil
 	}
-	r.initPrintSync()
 	surfaces := make([]*printSurfaceBuffer, workers)
 	states := make([]*sceneWorkerState, workers)
 	defer func() {
@@ -1039,161 +1054,6 @@ func (r *sceneRenderer) renderPrintColorScene(elements []Element, transform Matr
 	return nil, nil
 }
 
-// initPrintSync 在并发图块绘制前登记所有带ICC的工作空间并同步已就绪转换状态
-func (r *sceneRenderer) initPrintSync() {
-	r.printSpaceIndex = make(map[*printWorkingSpace]int, len(r.printContext)*2+1)
-	register := func(space *printWorkingSpace) {
-		if space == nil || space.profile == nil {
-			return
-		}
-		if _, exists := r.printSpaceIndex[space]; exists {
-			return
-		}
-		r.printSpaceIndex[space] = len(r.printSpaceIndex)
-	}
-	register(r.printSideSpace)
-	for _, runtime := range r.printContext {
-		if runtime == nil {
-			continue
-		}
-		register(runtime.working)
-		register(runtime.device)
-	}
-	r.printSpaceFlags = make([]atomic.Uint32, len(r.printSpaceIndex))
-	for space, idx := range r.printSpaceIndex {
-		var bits uint32
-		if space.forward != nil {
-			bits |= 1
-		}
-		if space.reverse != nil {
-			bits |= 2
-		}
-		if bits != 0 {
-			r.printSpaceFlags[idx].Store(bits)
-		}
-	}
-	var targetBits uint32
-	for i, target := range r.options.device.printTarget {
-		if target != nil {
-			targetBits |= 1 << uint(i)
-		}
-	}
-	r.printTargetReady.Store(targetBits)
-}
-
-// printSpaceBit 查询工作空间指定方向的ICC转换是否已并发安全就绪
-// 入参: space 待检工作空间, bit 方向标志位，1表示forward，2表示reverse
-// 返回: bool 是否可无锁调用
-func (r *sceneRenderer) printSpaceBit(space *printWorkingSpace, bit uint32) bool {
-	if space == nil || space.profile == nil {
-		return true
-	}
-	idx, ok := r.printSpaceIndex[space]
-	return ok && r.printSpaceFlags[idx].Load()&bit != 0
-}
-
-// markPrintSpaceBit 发布工作空间已完成初始化的ICC转换方向标志
-// 入参: space 已就绪工作空间, bit 方向标志位
-func (r *sceneRenderer) markPrintSpaceBit(space *printWorkingSpace, bit uint32) {
-	if space == nil || space.profile == nil {
-		return
-	}
-	if idx, ok := r.printSpaceIndex[space]; ok {
-		r.printSpaceFlags[idx].Or(bit)
-	}
-}
-
-// printConvert 在多核阶段保护首次ICC工作空间懒初始化，就绪后无锁执行颜色空间转换
-// 入参: value 源颜色, target 目标工作空间, locked 调用方是否已持有visualMu
-// 返回: printNativeColor 转换后颜色, error 预算或变换错误
-func (r *sceneRenderer) printConvert(value printNativeColor, target *printWorkingSpace, locked bool) (printNativeColor, error) {
-	if value.space == target || value.alpha == 0 || value.space != nil && target != nil && value.space.profile != nil && target.profile != nil && value.space.hash == target.hash {
-		value.space = target
-		return value, nil
-	}
-	if !r.concurrent || locked {
-		return value.convert(target, r)
-	}
-	if r.printSpaceBit(value.space, 1) && r.printSpaceBit(target, 2) {
-		return value.convert(target, r)
-	}
-	r.visualMu.Lock()
-	defer r.visualMu.Unlock()
-	result, err := value.convert(target, r)
-	if err == nil {
-		if value.space != nil && value.space.forward != nil {
-			r.markPrintSpaceBit(value.space, 1)
-		}
-		if target != nil && target.reverse != nil {
-			r.markPrintSpaceBit(target, 2)
-		}
-	}
-	return result, err
-}
-
-// printOver 在多核阶段保护首次ICC混合工作空间懒初始化，就绪后无锁执行source-over合成
-// 入参: fg 前景颜色, bg 背景颜色, locked 调用方是否已持有visualMu
-// 返回: printNativeColor 合成后颜色, error 预算或变换错误
-func (r *sceneRenderer) printOver(fg, bg printNativeColor, locked bool) (printNativeColor, error) {
-	if !r.concurrent || locked || fg.alpha == 0 || fg.alpha == 1 || bg.alpha == 0 {
-		return fg.over(bg, r)
-	}
-	working := fg.blend
-	if r.printSideSpace != nil && bg.blend != nil && working != nil && !printWorkingEquivalent(working, bg.blend) {
-		working = r.printSideSpace
-	}
-	if r.printSpaceBit(fg.space, 1) && r.printSpaceBit(bg.space, 1) && r.printSpaceBit(working, 2) {
-		return fg.over(bg, r)
-	}
-	r.visualMu.Lock()
-	defer r.visualMu.Unlock()
-	result, err := fg.over(bg, r)
-	if err == nil {
-		if fg.space != nil && fg.space.forward != nil {
-			r.markPrintSpaceBit(fg.space, 1)
-		}
-		if bg.space != nil && bg.space.forward != nil {
-			r.markPrintSpaceBit(bg.space, 1)
-		}
-		if working != nil && working.reverse != nil {
-			r.markPrintSpaceBit(working, 2)
-		}
-	}
-	return result, err
-}
-
-// printPixelSafe 在多核阶段保护首次目标意图ICC表懒初始化，就绪后无锁执行设备像素编码
-// 入参: x, y 输出坐标, value 合成结果
-// 返回: error 转换、预算或数值错误
-func (r *sceneRenderer) printPixelSafe(x, y int, value printNativeColor) error {
-	if !r.concurrent {
-		return r.options.device.printPixel(x, y, value, r)
-	}
-	if value.alpha == 0 || value.space != nil && value.space.profile != nil && value.space.hash == r.options.device.printProfileHash {
-		return r.options.device.printPixel(x, y, value, r)
-	}
-	intent := value.intent
-	if intent == IntentDefault {
-		intent = IntentRelativeColorimetric
-	}
-	bit := uint32(1) << (intent - 1)
-	if r.printTargetReady.Load()&bit != 0 && r.printSpaceBit(value.space, 1) {
-		return r.options.device.printPixel(x, y, value, r)
-	}
-	r.visualMu.Lock()
-	defer r.visualMu.Unlock()
-	err := r.options.device.printPixel(x, y, value, r)
-	if err == nil {
-		if r.options.device.printTarget[intent-1] != nil {
-			r.printTargetReady.Or(bit)
-		}
-		if value.space != nil && value.space.forward != nil {
-			r.markPrintSpaceBit(value.space, 1)
-		}
-	}
-	return err
-}
-
 // printColorTile 绘制单个打印颜色图块并降采样编码写入设备输出缓冲
 // 入参: nodes 已准备根节点, storage 复用打印表面, background 背景原生颜色, tileOut 输出像素范围, worker 工作Goroutine独占状态
 // 返回: error 绘制、预算或编码错误
@@ -1223,7 +1083,7 @@ func (r *sceneRenderer) printColorTile(nodes []*sceneNode, storage *printSurface
 				return err
 			}
 			if r.options.outputColor == PrintColorGrayscale || r.options.outputColor == PrintColorMonochrome {
-				value, err = r.printConvert(value, &printWorkingSpace{space: ColorScRGB, channels: 3}, false)
+				value, err = value.convert(&printWorkingSpace{space: ColorScRGB, channels: 3}, r)
 				if err != nil {
 					return err
 				}
@@ -1235,9 +1095,9 @@ func (r *sceneRenderer) printColorTile(nodes []*sceneNode, storage *printSurface
 						level = 0
 					}
 				}
-				value.value = [8]float64{level, level, level}
+				value.value = [iccMaxChannels]float64{level, level, level}
 			}
-			if err := r.printPixelSafe(px, py, value); err != nil {
+			if err := r.options.device.printPixel(px, py, value, r); err != nil {
 				return err
 			}
 		}
@@ -1276,7 +1136,7 @@ func (r *sceneRenderer) preparePrintColorContext(elements []Element) error {
 // 返回: int 像素数量, int 预留存活像素单位, error 容量或取消错误
 func (r *sceneRenderer) reservePrintSurface(bounds image.Rectangle) (int, int, error) {
 	count := uint64(bounds.Dx()) * uint64(bounds.Dy())
-	if count > uint64(^uint(0)>>1)/128 {
+	if count > uint64(^uint(0)>>1)/256 {
 		return 0, 0, fmt.Errorf("%w: print channel surface", ErrLimit)
 	}
 	reserved := int(count) * 4
@@ -1304,7 +1164,7 @@ func allocPrintSurfacePixels(count int) []printNativeColor {
 	return make([]printNativeColor, count)
 }
 
-// acquirePrintSurface 按四个RGB等价单位预留存活预算并从对象池租用八通道打印表面
+// acquirePrintSurface 按四个RGB等价单位预留存活预算并从对象池租用多通道打印表面
 // 入参: bounds 表面范围
 // 返回: *printSurfaceBuffer 可复用打印表面, error 容量或取消错误
 func (r *sceneRenderer) acquirePrintSurface(bounds image.Rectangle) (*printSurfaceBuffer, error) {
@@ -1371,7 +1231,7 @@ func (r *sceneRenderer) samplePrintPaint(node *sceneNode, paint scenePaint, poin
 	if r.options.space == renderSRGB {
 		space = ColorSRGB
 	}
-	return node.color.color(nil, [8]float64{value.r / value.a, value.g / value.a, value.b / value.a}, value.a, space, false)
+	return node.color.color(nil, [iccMaxChannels]float64{value.r / value.a, value.g / value.a, value.b / value.a}, value.a, space, false)
 }
 
 // drawPrintColorPaint 按相交覆盖掩码逐像素采样并合成单条打印画笔，并发遇非无锁画刷时以Defer保障互斥锁释放
@@ -1404,7 +1264,7 @@ func (r *sceneRenderer) drawPrintColorPaint(node *sceneNode, paint scenePaint, m
 				return err
 			}
 			at := rowBase + x - bounds.Min.X
-			surface[at], err = r.printOver(value, surface[at], locked)
+			surface[at], err = value.over(surface[at], r)
 			if err != nil {
 				return err
 			}
@@ -1413,7 +1273,7 @@ func (r *sceneRenderer) drawPrintColorPaint(node *sceneNode, paint scenePaint, m
 	return nil
 }
 
-// drawPrintColor 复用区域覆盖和层级隔离规则，在八通道表面按实际相交子区域完成合成
+// drawPrintColor 复用区域覆盖和层级隔离规则，在多通道表面按实际相交子区域完成合成
 // 入参: node 节点, target 背景表面, bounds 子像素范围, isoDepth 当前隔离嵌套深度, worker 工作Goroutine独占状态
 // 返回: error 采样、资源或颜色错误
 func (r *sceneRenderer) drawPrintColor(node *sceneNode, target []printNativeColor, bounds image.Rectangle, isoDepth int, worker *sceneWorkerState) error {
@@ -1516,7 +1376,7 @@ func (r *sceneRenderer) drawPrintColor(node *sceneNode, target []printNativeColo
 			return err
 		}
 	}
-	needMaskLock := r.concurrent && node.maskVisual
+	needMaskLock := r.concurrent && (node.maskVisual || node.nativeMask == nil)
 	maskLocked := false
 	if needMaskLock {
 		defer func() {
@@ -1564,7 +1424,7 @@ func (r *sceneRenderer) drawPrintColor(node *sceneNode, target []printNativeColo
 			value.alpha *= node.opacity
 			if node.negative {
 				var err error
-				value, err = r.printConvert(value, &printWorkingSpace{space: ColorSRGB, channels: 3}, maskLocked)
+				value, err = value.convert(&printWorkingSpace{space: ColorSRGB, channels: 3}, r)
 				if err != nil {
 					return err
 				}
@@ -1574,7 +1434,7 @@ func (r *sceneRenderer) drawPrintColor(node *sceneNode, target []printNativeColo
 			}
 			dstAt := dstRowBase + x - bounds.Min.X
 			var err error
-			target[dstAt], err = r.printOver(value, target[dstAt], maskLocked)
+			target[dstAt], err = value.over(target[dstAt], r)
 			if err != nil {
 				return err
 			}
@@ -1634,7 +1494,7 @@ func (r *sceneRenderer) averagePrintColor(pixels []printNativeColor, bounds imag
 				continue
 			}
 			var err error
-			value, err = r.printConvert(value, working, false)
+			value, err = value.convert(working, r)
 			if err != nil {
 				return printNativeColor{}, err
 			}
@@ -1738,7 +1598,7 @@ func (c *sceneImageCache) printColorImage(brush *Brush, part string, source *ras
 	if err := checkContext(c.context); err != nil {
 		return nil, err
 	}
-	if brush.ImageProfileURI == "" && len(source.profile) == 0 {
+	if brush.ImageProfileURI == "" && (len(source.profile) == 0 || source.jxr == nil && imageCICPUsable(source.cicp)) {
 		return source, nil
 	}
 	if c.colors == nil {
@@ -1847,13 +1707,26 @@ func renderPrintOutputColor(value color.NRGBA, mode PrintColorMode) (color.NRGBA
 
 // filteredVisual 在所选混合空间复用有界视觉积分，不经过RGB或八位中间图像
 // 入参: source 已准备的视觉过滤器
-// 返回: printNativeSample 保留最多八个分量的积分采样器
+// 返回: printNativeSample 保留最多十五个分量的积分采样器
 func (c *printColorRuntime) filteredVisual(source *visualBrushFilter) printNativeSample {
 	working := c.working
 	count := (working.channels + 2) / 3
-	var filters [3]visualBrushFilter
+	var filters [printColorMaxPlanes]visualBrushFilter
 	for plane := range count {
-		filters[plane] = *source
+		filters[plane] = visualBrushFilter{
+			renderer: source.renderer,
+			node:     source.node,
+			inverse:  source.inverse,
+			viewport: source.viewport,
+			width:    source.width,
+			height:   source.height,
+			filterX:  source.filterX,
+			filterY:  source.filterY,
+			pointX:   source.pointX,
+			pointY:   source.pointY,
+			tile:     source.tile,
+			opacity:  source.opacity,
+		}
 		filters[plane].read = func(point, center Point) (renderColor, error) {
 			value, err := c.renderer.samplePrintColorNode(source.node, point, center)
 			if err != nil {
@@ -1903,8 +1776,9 @@ func (c *printColorRuntime) profileData(ref PrintColorProfile) (*iccProfile, err
 		return nil, fmt.Errorf("%w: ambiguous print profile", ErrInvalid)
 	}
 	if ref.URI != "" {
-		if c.colors.profiles[strings.ToLower(ref.URI)] == nil {
-			size, err := c.colors.pkg.partSize(strings.ToLower(ref.URI))
+		lower := strings.ToLower(ref.URI)
+		if !c.colors.hasCachedProfile(lower) {
+			size, err := c.colors.pkg.partSize(lower)
 			if err != nil {
 				return nil, err
 			}
@@ -1918,16 +1792,7 @@ func (c *printColorRuntime) profileData(ref PrintColorProfile) (*iccProfile, err
 		return nil, nil
 	}
 	key := fmt.Sprintf("#print:%x", sha256.Sum256(ref.Data))
-	if p := c.colors.profiles[key]; p != nil {
-		return p, nil
-	}
-	if err := c.renderer.charge(uint64(len(ref.Data))); err != nil {
-		return nil, err
-	}
-	if len(c.colors.profiles)+len(c.colors.profileErrors) >= c.colors.maxProfiles || int64(len(ref.Data)) > c.colors.bytes {
-		return nil, fmt.Errorf("%w: print ICC budget", ErrLimit)
-	}
-	return c.colors.cacheProfile(key, ref.Data)
+	return c.colors.cachedProfileData(key, ref.Data, c.renderer.charge)
 }
 
 // newPrintWorkingSpace 建立明确意图的ICC编码，使用时才准备所需方向
@@ -1949,28 +1814,37 @@ func newPrintWorkingSpace(profile *iccProfile, space ColorSpace, intent Renderin
 	return result, nil
 }
 
-// xyz 将非预乘分量连接到D50物理XYZ，保留扩展范围
+// xyz 将非预乘分量连接到D50物理XYZ，保留扩展范围并保证多核并发安全初始化
 // 入参: values 编码分量
 // 返回: [3]float64 PCS, error 变换或数据错误
-func (s *printWorkingSpace) xyz(values [8]float64) ([3]float64, error) {
+func (s *printWorkingSpace) xyz(values [iccMaxChannels]float64) ([3]float64, error) {
 	if s == nil {
 		return [3]float64{values[0], values[1], values[2]}, nil
 	}
 	if s.profile != nil {
-		if s.forward == nil {
-			if err := s.renderer.charge(uint64(len(s.profile.data))); err != nil {
-				return [3]float64{}, err
+		forward := s.forward.Load()
+		if forward == nil {
+			s.initMu.Lock()
+			forward = s.forward.Load()
+			if forward == nil {
+				if err := s.renderer.charge(uint64(len(s.profile.data))); err != nil {
+					s.initMu.Unlock()
+					return [3]float64{}, err
+				}
+				prepared, err := prepareICCTransform(s.profile, uint32(s.intent-1))
+				if err != nil {
+					s.initMu.Unlock()
+					return [3]float64{}, err
+				}
+				s.forward.Store(prepared)
+				forward = prepared
 			}
-			var err error
-			s.forward, err = prepareICCTransform(s.profile, uint32(s.intent-1))
-			if err != nil {
-				return [3]float64{}, err
-			}
+			s.initMu.Unlock()
 		}
-		if err := s.renderer.charge(printICCSourceWork(s.forward)); err != nil {
+		if err := s.renderer.charge(printICCSourceWork(forward)); err != nil {
 			return [3]float64{}, err
 		}
-		return s.forward.toXYZ(values[:s.channels])
+		return forward.toXYZ(values[:s.channels])
 	}
 	rgb := [3]float64{values[0], values[1], values[2]}
 	if s.space == ColorSRGB {
@@ -1981,28 +1855,37 @@ func (s *printWorkingSpace) xyz(values [8]float64) ([3]float64, error) {
 	return iccMatrixColor(iccPCSFromLinearRGB, rgb), nil
 }
 
-// encode 将D50物理XYZ连接到工作编码，不量化中间分量
+// encode 将D50物理XYZ连接到工作编码，支持最多十五通道并保证多核并发安全初始化
 // 入参: xyz PCS
-// 返回: [8]float64 工作分量, error 变换错误
-func (s *printWorkingSpace) encode(xyz [3]float64) ([8]float64, error) {
+// 返回: [iccMaxChannels]float64 工作分量, error 变换错误
+func (s *printWorkingSpace) encode(xyz [3]float64) ([iccMaxChannels]float64, error) {
 	if s == nil {
-		return [8]float64{xyz[0], xyz[1], xyz[2]}, nil
+		return [iccMaxChannels]float64{xyz[0], xyz[1], xyz[2]}, nil
 	}
 	if s.profile != nil {
-		if s.reverse == nil {
-			if err := s.renderer.charge(uint64(len(s.profile.data))); err != nil {
-				return [8]float64{}, err
+		reverse := s.reverse.Load()
+		if reverse == nil {
+			s.initMu.Lock()
+			reverse = s.reverse.Load()
+			if reverse == nil {
+				if err := s.renderer.charge(uint64(len(s.profile.data))); err != nil {
+					s.initMu.Unlock()
+					return [iccMaxChannels]float64{}, err
+				}
+				prepared, err := prepareICCTarget(s.profile, uint32(s.intent-1), s.renderer.options.context)
+				if err != nil {
+					s.initMu.Unlock()
+					return [iccMaxChannels]float64{}, err
+				}
+				s.reverse.Store(prepared)
+				reverse = prepared
 			}
-			var err error
-			s.reverse, err = prepareICCTarget(s.profile, uint32(s.intent-1), s.renderer.options.context)
-			if err != nil {
-				return [8]float64{}, err
-			}
+			s.initMu.Unlock()
 		}
-		if err := s.renderer.charge(iccTargetWork(s.reverse)); err != nil {
-			return [8]float64{}, err
+		if err := s.renderer.charge(iccTargetWork(reverse)); err != nil {
+			return [iccMaxChannels]float64{}, err
 		}
-		return s.reverse.fromXYZ(xyz)
+		return reverse.fromXYZ(xyz)
 	}
 	rgb := iccMatrixColor(iccPCSDisplayMatrix, xyz)
 	if s.space == ColorSRGB {
@@ -2010,7 +1893,7 @@ func (s *printWorkingSpace) encode(xyz [3]float64) ([8]float64, error) {
 			rgb[i] = renderLinearToSRGB(colorClamp(rgb[i]))
 		}
 	}
-	return [8]float64{rgb[0], rgb[1], rgb[2]}, nil
+	return [iccMaxChannels]float64{rgb[0], rgb[1], rgb[2]}, nil
 }
 
 // convert 保持相同编码的原始分量，否则通过PCS作一次明确连接
@@ -2117,11 +2000,14 @@ func (r *sceneRenderer) printMixIntent(working *printWorkingSpace, intents ...Re
 	return intent
 }
 
-// native 校验源profile是否匹配当前设备条件与原生ICC清单
+// native 校验源profile是否匹配当前设备条件与原生ICC清单，并发读写受读写锁保护
 // 入参: profile 颜色profile
 // 返回: bool 是否允许保留原生分量, error 身份比较预算或取消错误
 func (c *printColorRuntime) native(profile *iccProfile) (bool, error) {
-	if result, present := c.nativeMatch[profile]; present {
+	c.mu.RLock()
+	result, present := c.nativeMatch[profile]
+	c.mu.RUnlock()
+	if present {
 		return result, nil
 	}
 	if profile != nil {
@@ -2135,8 +2021,14 @@ func (c *printColorRuntime) native(profile *iccProfile) (bool, error) {
 			return false, err
 		}
 	}
-	result := c.matchNative(profile)
+	c.mu.Lock()
+	if cached, ok := c.nativeMatch[profile]; ok {
+		c.mu.Unlock()
+		return cached, nil
+	}
+	result = c.matchNative(profile)
 	c.nativeMatch[profile] = result
+	c.mu.Unlock()
 	return result, nil
 }
 
@@ -2199,7 +2091,7 @@ func (c *printColorRuntime) destinationIntent(profile *iccProfile, raster bool) 
 // color 将源分量连接到PCS，已验证的output-ready颜色直接保留设备编码
 // 入参: profile 源ICC，nil表示内建编码, value 原始分量, alpha 透明度, space 内建源编码, raster 是否为图像
 // 返回: printNativeColor 非预乘颜色, error 变换或预算错误
-func (c *printColorRuntime) color(profile *iccProfile, value [8]float64, alpha float64, space ColorSpace, raster bool) (printNativeColor, error) {
+func (c *printColorRuntime) color(profile *iccProfile, value [iccMaxChannels]float64, alpha float64, space ColorSpace, raster bool) (printNativeColor, error) {
 	result := printNativeColor{value: value, alpha: alpha, blend: c.working, intent: c.destinationIntent(profile, raster)}
 	native, err := c.native(profile)
 	if err != nil {
@@ -2243,7 +2135,7 @@ func (c *printColorRuntime) color(profile *iccProfile, value [8]float64, alpha f
 	if err != nil {
 		return printNativeColor{}, err
 	}
-	result.value = [8]float64{xyz[0], xyz[1], xyz[2]}
+	result.value = [iccMaxChannels]float64{xyz[0], xyz[1], xyz[2]}
 	return result, nil
 }
 
@@ -2252,30 +2144,41 @@ func (c *printColorRuntime) color(profile *iccProfile, value [8]float64, alpha f
 // 返回: *iccTransform 源连接, error 表、预算或取消错误
 func (c *printColorRuntime) sourceTransform(profile *iccProfile, raster bool) (*iccTransform, error) {
 	intent := c.sourceIntent(profile, raster)
+	c.mu.RLock()
 	values := c.transforms[profile]
-	if transform := values[intent-1]; transform != nil {
+	transform := values[intent-1]
+	c.mu.RUnlock()
+	if transform != nil {
 		return transform, nil
 	}
 	if err := c.renderer.charge(uint64(len(profile.data))); err != nil {
 		return nil, err
 	}
-	transform, err := prepareICCTransform(profile, uint32(intent-1))
+	c.mu.Lock()
+	values = c.transforms[profile]
+	if cached := values[intent-1]; cached != nil {
+		c.mu.Unlock()
+		return cached, nil
+	}
+	prepared, err := prepareICCTransform(profile, uint32(intent-1))
 	if err != nil {
+		c.mu.Unlock()
 		return nil, err
 	}
-	values[intent-1] = transform
+	values[intent-1] = prepared
 	c.transforms[profile] = values
-	return transform, nil
+	c.mu.Unlock()
+	return prepared, nil
 }
 
-// printPixel 将完整高精度颜色编码为设备分量，只在最终写入时量化
+// printPixel 将完整高精度颜色编码为设备分量，只在最终写入时量化并支持十五通道并发输出
 // 入参: x, y 输出坐标, value 合成结果, r 场景渲染器
 // 返回: error 转换、预算或数值错误
 func (s *deviceRenderState) printPixel(x, y int, value printNativeColor, r *sceneRenderer) error {
 	if !geometryFinite(value.alpha) || value.alpha < 0 || value.alpha > 1 {
 		return fmt.Errorf("%w: print output alpha", ErrLimit)
 	}
-	var channels [8]float64
+	var channels [iccMaxChannels]float64
 	alpha := uint16(math.Floor(colorClamp(value.alpha)*65535 + .5))
 	if alpha != 0 {
 		if value.space != nil && value.space.profile != nil && value.space.hash == s.printProfileHash {
@@ -2289,16 +2192,24 @@ func (s *deviceRenderState) printPixel(x, y int, value printNativeColor, r *scen
 			if intent == IntentDefault {
 				intent = IntentRelativeColorimetric
 			}
-			target := s.printTarget[intent-1]
+			target := s.printTarget[intent-1].Load()
 			if target == nil {
-				if err := r.charge(uint64(len(s.target.profile.data))); err != nil {
-					return err
+				s.printTargetMu.Lock()
+				target = s.printTarget[intent-1].Load()
+				if target == nil {
+					if err := r.charge(uint64(len(s.target.profile.data))); err != nil {
+						s.printTargetMu.Unlock()
+						return err
+					}
+					prepared, err := prepareICCTarget(s.target.profile, uint32(intent-1), r.options.context)
+					if err != nil {
+						s.printTargetMu.Unlock()
+						return err
+					}
+					s.printTarget[intent-1].Store(prepared)
+					target = prepared
 				}
-				target, err = prepareICCTarget(s.target.profile, uint32(intent-1), r.options.context)
-				if err != nil {
-					return err
-				}
-				s.printTarget[intent-1] = target
+				s.printTargetMu.Unlock()
 			}
 			if err := r.charge(iccTargetWork(target)); err != nil {
 				return err
@@ -2367,7 +2278,7 @@ func newPrintColorRuntime(plan *PrintColorPlan, options *PrintColorOptions, colo
 		return nil, fmt.Errorf("%w: print destination profile selection", ErrInvalid)
 	}
 	if options != nil {
-		if len(options.NativeProfiles) > colors.maxProfiles || len(options.Colorants) > 8 {
+		if len(options.NativeProfiles) > colors.maxProfiles || len(options.Colorants) > iccMaxChannels {
 			return nil, fmt.Errorf("%w: print native profile count", ErrLimit)
 		}
 		remaining := r.options.profileBytes

@@ -23,14 +23,34 @@ import (
 	"fmt"
 	"hash/crc32"
 	"image"
-	"image/color"
 	"image/jpeg"
 	"image/png"
 	"io"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 )
+
+// losslessColorGray 等常量表示独立无损JPEG解析确定的源色彩空间类别
+const (
+	losslessColorGray losslessJPEGColor = iota + 1
+	losslessColorRGB
+	losslessColorYCbCr
+	losslessColorCMYK
+	losslessColorYCCK
+)
+
+// losslessJPEGColor 表示独立无损JPEG解析确定的源色彩空间
+type losslessJPEGColor uint8
+
+// imageCICP 保存图像声明的CICP色彩编码标识，对应ITU-T H.273四元组
+type imageCICP struct {
+	primaries uint8
+	transfer  uint8
+	matrix    uint8
+	fullRange bool
+}
 
 // rasterImage 保存图像原生分量、颜色解释及物理分辨率
 type rasterImage struct {
@@ -41,6 +61,7 @@ type rasterImage struct {
 	channels          int
 	profile           []byte
 	profileCompressed bool
+	cicp              *imageCICP
 	transform         *iccTransform
 	selectedProfile   *iccProfile
 	associatedProfile bool
@@ -89,13 +110,17 @@ type ImageResource struct {
 	source      *rasterImage
 }
 
-// rasterMetadata 保存图像分辨率、原生通道数及内嵌配置文件
+// rasterMetadata 保存图像分辨率、原生通道数、内嵌配置文件及CICP色彩编码
 type rasterMetadata struct {
-	dpi               Point
-	channels          int
-	profile           []byte
-	profileCompressed bool
-	jpegProcess       byte
+	dpi                Point
+	channels           int
+	profile            []byte
+	profileCompressed  bool
+	cicp               *imageCICP
+	jpegProcess        byte
+	jpegJFIF           bool
+	jpegAdobe          bool
+	jpegAdobeTransform byte
 }
 
 // pngCompressionLayout 保存连续IDAT块的物理范围，范围内只包含图像压缩流及块封装
@@ -235,7 +260,7 @@ func decodeRasterImageWithMemory(ctx context.Context, data []byte, media string,
 	if decoded.Bounds() != image.Rect(0, 0, config.Width, config.Height) {
 		return nil, fmt.Errorf("%w: inconsistent decoded image dimensions", ErrInvalid)
 	}
-	return &rasterImage{pixels: decoded, dpi: metadata.dpi, channels: metadata.channels, profile: metadata.profile, profileCompressed: metadata.profileCompressed}, nil
+	return &rasterImage{pixels: decoded, dpi: metadata.dpi, channels: metadata.channels, profile: metadata.profile, profileCompressed: metadata.profileCompressed, cicp: metadata.cicp}, nil
 }
 
 // rasterImageDecodeError 保留资源和能力错误，不将标准解码器的能力缺失误判为无效图像
@@ -306,69 +331,6 @@ func (source *rasterImage) pixelUnits() uint64 {
 		}
 	}
 	return units
-}
-
-// imageSourcePixel 直接读取标准解码图像的非预乘十六位颜色，常见图像不经Interface装箱分配临时对象
-// 入参: pixels 已解码图像, x 有效横坐标, y 有效纵坐标
-// 返回: color.NRGBA64 未应用ICC的解码颜色
-func imageSourcePixel(pixels image.Image, x, y int) color.NRGBA64 {
-	switch pixels := pixels.(type) {
-	case *image.NRGBA64:
-		return pixels.NRGBA64At(x, y)
-	case *image.NRGBA:
-		value := pixels.NRGBAAt(x, y)
-		return color.NRGBA64{R: uint16(value.R) * 257, G: uint16(value.G) * 257, B: uint16(value.B) * 257, A: uint16(value.A) * 257}
-	case *image.Gray16:
-		value := pixels.Gray16At(x, y).Y
-		return color.NRGBA64{R: value, G: value, B: value, A: 65535}
-	case *image.Gray:
-		value := uint16(pixels.GrayAt(x, y).Y) * 257
-		return color.NRGBA64{R: value, G: value, B: value, A: 65535}
-	case *image.YCbCr:
-		value := pixels.YCbCrAt(x, y)
-		r, g, b, _ := value.RGBA()
-		return color.NRGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: 65535}
-	case *image.NYCbCrA:
-		value := pixels.NYCbCrAAt(x, y)
-		r, g, b, _ := value.YCbCr.RGBA()
-		return color.NRGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: uint16(value.A) * 257}
-	case *image.RGBA64:
-		value := pixels.RGBA64At(x, y)
-		return imageUnassociatedPixel(uint32(value.R), uint32(value.G), uint32(value.B), uint32(value.A))
-	case *image.RGBA:
-		value := pixels.RGBAAt(x, y)
-		return imageUnassociatedPixel(uint32(value.R)*257, uint32(value.G)*257, uint32(value.B)*257, uint32(value.A)*257)
-	default:
-		return imageSourceColor(pixels.At(x, y))
-	}
-}
-
-// imageSourceColor 保留已有非预乘颜色的隐藏分量，其他标准颜色按RGBA约定展开
-// 入参: value 已解码颜色
-// 返回: color.NRGBA64 十六位非预乘颜色
-func imageSourceColor(value color.Color) color.NRGBA64 {
-	switch value := value.(type) {
-	case color.NRGBA64:
-		return value
-	case color.NRGBA:
-		return color.NRGBA64{R: uint16(value.R) * 257, G: uint16(value.G) * 257, B: uint16(value.B) * 257, A: uint16(value.A) * 257}
-	default:
-		r, g, b, a := value.RGBA()
-		return imageUnassociatedPixel(r, g, b, a)
-	}
-}
-
-// imageUnassociatedPixel 按标准库颜色约定展开预乘分量，保持十六位整数除法的舍入规则
-// 入参: r 预乘红分量, g 预乘绿分量, b 预乘蓝分量, a 透明度，均不超过65535
-// 返回: color.NRGBA64 非预乘颜色
-func imageUnassociatedPixel(r, g, b, a uint32) color.NRGBA64 {
-	if a == 0 {
-		return color.NRGBA64{}
-	}
-	if a != 65535 {
-		r, g, b = r*65535/a, g*65535/a, b*65535/a
-	}
-	return color.NRGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: uint16(a)}
 }
 
 // DefaultImageOptions 返回图像读取的默认字节上限及解码容量
@@ -525,7 +487,7 @@ func (r *ImageResource) Sample(x, y int, components []float64) (float64, error) 
 		components[0], components[1], components[2], components[3] = float64(value.C)/255, float64(value.M)/255, float64(value.Y)/255, float64(value.K)/255
 		return 1, nil
 	}
-	value := imageSourcePixel(source.pixels, x, y)
+	value := imagePixel(source.pixels, x, y)
 	components[0] = float64(value.R) / 65535
 	if r.Channels() == 3 {
 		components[1], components[2] = float64(value.G)/65535, float64(value.B)/65535
@@ -533,7 +495,7 @@ func (r *ImageResource) Sample(x, y int, components []float64) (float64, error) 
 	return float64(value.A) / 65535, nil
 }
 
-// pngImageMetadata 读取分辨率和内嵌配置文件，不应用XPS要求忽略的颜色提示块
+// pngImageMetadata 读取分辨率、CICP色彩编码和内嵌配置文件，按PNG第三版规则校验块顺序与优先级
 // 入参: data 完整PNG数据
 // 返回: rasterMetadata 图像元数据, error 数据或资源错误
 func pngImageMetadata(data []byte) (rasterMetadata, error) {
@@ -542,7 +504,7 @@ func pngImageMetadata(data []byte) (rasterMetadata, error) {
 		return rasterMetadata{}, fmt.Errorf("%w: PNG signature", ErrInvalid)
 	}
 	seen := false
-	profileSeen, srgbSeen, imageSeen := false, false, false
+	profileSeen, srgbSeen, cicpSeen, paletteSeen, imageSeen := false, false, false, false, false
 	for pos := uint64(8); pos < uint64(len(data)); {
 		if uint64(len(data))-pos < 12 {
 			return rasterMetadata{}, fmt.Errorf("%w: truncated PNG chunk", ErrInvalid)
@@ -564,19 +526,29 @@ func pngImageMetadata(data []byte) (rasterMetadata, error) {
 			if chunk[13] == 0 || chunk[13] == 4 {
 				metadata.channels = 1
 			}
+		case "PLTE":
+			paletteSeen = true
 		case "IDAT":
 			imageSeen = true
+		case "cICP":
+			if cicpSeen || paletteSeen || imageSeen || size != 4 || chunk[7] > 1 {
+				return rasterMetadata{}, fmt.Errorf("%w: PNG cICP chunk", ErrInvalid)
+			}
+			cicpSeen = true
+			metadata.cicp = &imageCICP{primaries: chunk[4], transfer: chunk[5], matrix: chunk[6], fullRange: chunk[7] == 1}
 		case "pHYs":
 			if seen || imageSeen || size != 9 || chunk[12] > 1 {
 				return rasterMetadata{}, fmt.Errorf("%w: PNG physical dimensions", ErrInvalid)
 			}
 			seen = true
+			x, y := binary.BigEndian.Uint32(chunk[4:]), binary.BigEndian.Uint32(chunk[8:])
 			if chunk[12] == 1 {
-				x, y := binary.BigEndian.Uint32(chunk[4:]), binary.BigEndian.Uint32(chunk[8:])
 				if x == 0 || y == 0 {
 					return rasterMetadata{}, fmt.Errorf("%w: zero PNG resolution", ErrInvalid)
 				}
 				metadata.dpi = Point{float64(x) * 0.0254, float64(y) * 0.0254}
+			} else if x != 0 && y != 0 {
+				metadata.dpi = Point{96, 96 * (float64(y) / float64(x))}
 			}
 		case "iCCP":
 			if profileSeen || srgbSeen || imageSeen {
@@ -678,6 +650,7 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 			if len(payload) < 14 {
 				return rasterMetadata{}, fmt.Errorf("%w: truncated JFIF", ErrInvalid)
 			}
+			metadata.jpegJFIF = true
 			unit, x, y := payload[7], binary.BigEndian.Uint16(payload[8:]), binary.BigEndian.Uint16(payload[10:])
 			if unit > 2 || x == 0 || y == 0 {
 				return rasterMetadata{}, fmt.Errorf("%w: JFIF density", ErrInvalid)
@@ -689,6 +662,9 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 				}
 				metadata.dpi = Point{float64(x) * factor, float64(y) * factor}
 			}
+		case marker == 0xee && len(payload) >= 12 && bytes.HasPrefix(payload, []byte("Adobe")):
+			metadata.jpegAdobe = true
+			metadata.jpegAdobeTransform = payload[11]
 		case marker == 0xe1 && bytes.HasPrefix(payload, []byte("Exif\x00\x00")):
 			value, present, err := exifImageResolution(payload[6:])
 			if err != nil {
@@ -992,7 +968,7 @@ func (c *sceneImageCache) colorImage(brush *Brush, part string, source *rasterIm
 	if err := checkContext(c.context); err != nil {
 		return nil, err
 	}
-	if brush.ImageProfileURI == "" && len(source.profile) == 0 {
+	if brush.ImageProfileURI == "" && (source.cicp != nil || len(source.profile) == 0) {
 		return source, nil
 	}
 	if c.colors == nil {
@@ -1038,7 +1014,7 @@ func (c *sceneImageCache) colorImage(brush *Brush, part string, source *rasterIm
 			return nil, e
 		}
 	}
-	if transform == nil && len(source.profile) != 0 {
+	if transform == nil && source.cicp == nil && len(source.profile) != 0 {
 		transform, err = c.colors.embedded(part, source.profile, source.profileCompressed)
 		if e := checkContext(c.context); e != nil {
 			return nil, e
@@ -1083,7 +1059,7 @@ func defaultImageProfile(source *rasterImage) *rasterImage {
 // 入参: source 图像资源
 // 返回: *rasterImage 颜色解释独立的图像视图, error 配置文件或能力错误
 func standaloneImageColor(source *rasterImage) (*rasterImage, error) {
-	if source.transform != nil || source.selectedProfile != nil || len(source.profile) == 0 {
+	if source.transform != nil || source.selectedProfile != nil || source.cicp != nil || len(source.profile) == 0 {
 		return source, nil
 	}
 	data := source.profile
@@ -1425,7 +1401,106 @@ func (r *pngCompressedReader) ReadByte() (byte, error) {
 	return value[0], err
 }
 
-// decodeLosslessJPEGImage 解码灰度或明确标识RGB分量的无损JPEG，逐扫描保留原始精度与颜色配置文件
+// resolveLosslessJPEGColor 按APP14、APP0及帧分量标识确定无损JPEG色彩空间
+// 入参: components 已校验为1、3或4的分量数, ids 帧分量标识, jfif 是否存在APP0 JFIF, adobe 是否存在APP14 Adobe, transform Adobe色彩变换码
+// 返回: losslessJPEGColor 色彩空间类型, error 未支持的色彩解释错误
+func resolveLosslessJPEGColor(components int, ids [4]byte, jfif, adobe bool, transform byte) (losslessJPEGColor, error) {
+	switch components {
+	case 1:
+		return losslessColorGray, nil
+	case 3:
+		three := [3]byte{ids[0], ids[1], ids[2]}
+		if adobe {
+			switch transform {
+			case 0:
+				if three != [3]byte{'R', 'G', 'B'} && three != [3]byte{1, 2, 3} {
+					return 0, fmt.Errorf("%w: unspecified lossless JPEG RGB component mapping", ErrUnsupported)
+				}
+				return losslessColorRGB, nil
+			case 1:
+				if three != [3]byte{1, 2, 3} && three != [3]byte{'Y', 'C', 'c'} {
+					return 0, fmt.Errorf("%w: unspecified lossless JPEG YCbCr component mapping", ErrUnsupported)
+				}
+				return losslessColorYCbCr, nil
+			default:
+				return 0, fmt.Errorf("%w: lossless JPEG Adobe color transform %d", ErrUnsupported, transform)
+			}
+		}
+		if jfif {
+			if three != [3]byte{1, 2, 3} && three != [3]byte{'R', 'G', 'B'} {
+				return 0, fmt.Errorf("%w: unspecified lossless JPEG JFIF component mapping", ErrUnsupported)
+			}
+			return losslessColorYCbCr, nil
+		}
+		if three == [3]byte{'R', 'G', 'B'} || three == [3]byte{1, 2, 3} {
+			return losslessColorRGB, nil
+		}
+		return 0, fmt.Errorf("%w: unspecified lossless JPEG RGB component mapping", ErrUnsupported)
+	default:
+		if !adobe {
+			return 0, fmt.Errorf("%w: lossless JPEG color component interpretation", ErrUnsupported)
+		}
+		switch transform {
+		case 0:
+			return losslessColorCMYK, nil
+		case 2:
+			return losslessColorYCCK, nil
+		default:
+			return 0, fmt.Errorf("%w: lossless JPEG Adobe color transform %d", ErrUnsupported, transform)
+		}
+	}
+}
+
+// losslessYCbCrToRGB16 按ITU-T T.871将十六位归一化YCbCr分量转换为十六位RGB分量
+// 入参: y, cb, cr 归一化十六位分量, mid 对应采样精度的零色度中点
+// 返回: r, g, b 钳位并四舍五入后的十六位RGB分量
+func losslessYCbCrToRGB16(y, cb, cr uint16, mid float64) (uint16, uint16, uint16) {
+	yf := float64(y)
+	cbf := float64(cb) - mid
+	crf := float64(cr) - mid
+	clamp16 := func(v float64) uint16 {
+		if v <= 0 {
+			return 0
+		}
+		if v >= 65535 {
+			return 65535
+		}
+		return uint16(math.Round(v))
+	}
+	return clamp16(yf + 1.402*crf), clamp16(yf - 0.344136*cbf - 0.714136*crf), clamp16(yf + 1.772*cbf)
+}
+
+// convertLosslessJPEGColor 在全部扫描完成后按源色彩空间原地转换像素分量
+// 入参: out 解码目标图像, space 已判定的色彩空间, bits 帧样本精度
+func convertLosslessJPEGColor(out *rasterImage, space losslessJPEGColor, bits uint32) {
+	mid := float64(uint32(1<<(bits-1)) * 65535 / ((1 << bits) - 1))
+	switch space {
+	case losslessColorYCbCr:
+		pixels := out.pixels.(*image.NRGBA64)
+		for at := 0; at < len(pixels.Pix); at += 8 {
+			yVal := binary.BigEndian.Uint16(pixels.Pix[at:])
+			cbVal := binary.BigEndian.Uint16(pixels.Pix[at+2:])
+			crVal := binary.BigEndian.Uint16(pixels.Pix[at+4:])
+			r, g, b := losslessYCbCrToRGB16(yVal, cbVal, crVal, mid)
+			binary.BigEndian.PutUint16(pixels.Pix[at:], r)
+			binary.BigEndian.PutUint16(pixels.Pix[at+2:], g)
+			binary.BigEndian.PutUint16(pixels.Pix[at+4:], b)
+		}
+	case losslessColorCMYK:
+		values := out.native.values
+		for i, v := range values {
+			values[i] = 65535 - v
+		}
+	case losslessColorYCCK:
+		values := out.native.values
+		for at := 0; at < len(values); at += 4 {
+			c, m, y := losslessYCbCrToRGB16(values[at], values[at+1], values[at+2], mid)
+			values[at], values[at+1], values[at+2], values[at+3] = c, m, y, 65535-values[at+3]
+		}
+	}
+}
+
+// decodeLosslessJPEGImage 解码灰度、RGB、YCbCr、CMYK或YCCK无损JPEG，逐扫描保留原始精度与颜色配置文件
 // 入参: data 完整码流, metadata 图像元数据, maxPixels 剩余像素预算
 // 返回: *rasterImage 解码图像, error 数据、能力或资源错误
 func decodeLosslessJPEGImage(data []byte, metadata rasterMetadata, maxPixels uint64) (*rasterImage, error) {
@@ -1439,13 +1514,14 @@ func decodeLosslessJPEGImage(data []byte, metadata rasterMetadata, maxPixels uin
 	if stream.process != 0xc3 {
 		return nil, fmt.Errorf("%w: lossless JPEG frame process", ErrInvalid)
 	}
-	if stream.components != 1 && stream.components != 3 {
+	if stream.components != 1 && stream.components != 3 && stream.components != 4 {
 		return nil, fmt.Errorf("%w: lossless JPEG color component interpretation", ErrUnsupported)
 	}
 	var frame []byte
 	var huffman [4]losslessHuffman
 	var restart uint16
 	var covered uint8
+	var colorSpace losslessJPEGColor
 	var out *rasterImage
 	for pos := 2; pos < len(stream.data); {
 		for pos < len(stream.data) && stream.data[pos] == 0xff {
@@ -1460,6 +1536,7 @@ func decodeLosslessJPEGImage(data []byte, metadata rasterMetadata, maxPixels uin
 			if out == nil || covered != uint8(1<<stream.components)-1 || pos != len(stream.data) {
 				return nil, fmt.Errorf("%w: incomplete lossless JPEG components", ErrInvalid)
 			}
+			convertLosslessJPEGColor(out, colorSpace, uint32(frame[0]))
 			return out, nil
 		}
 		if len(stream.data)-pos < 2 {
@@ -1485,7 +1562,7 @@ func decodeLosslessJPEGImage(data []byte, metadata rasterMetadata, maxPixels uin
 				return nil, fmt.Errorf("%w: lossless JPEG decoded pixels", ErrLimit)
 			}
 			var identities [256]bool
-			var ids [3]byte
+			var ids [4]byte
 			for c := range stream.components {
 				identity := payload[6+c*3]
 				if identities[identity] || payload[8+c*3] != 0 {
@@ -1499,11 +1576,20 @@ func decodeLosslessJPEGImage(data []byte, metadata rasterMetadata, maxPixels uin
 					ids[c] = identity
 				}
 			}
-			if stream.components == 3 && ids != [3]byte{'R', 'G', 'B'} && ids != [3]byte{1, 2, 3} {
-				return nil, fmt.Errorf("%w: unspecified lossless JPEG RGB component mapping", ErrUnsupported)
+			colorSpace, err = resolveLosslessJPEGColor(stream.components, ids, metadata.jpegJFIF, metadata.jpegAdobe, metadata.jpegAdobeTransform)
+			if err != nil {
+				return nil, err
 			}
 			frame = payload
-			out = &rasterImage{pixels: image.NewNRGBA64(image.Rect(0, 0, width, height)), dpi: metadata.dpi, channels: stream.components, profile: metadata.profile}
+			if stream.components == 4 {
+				native, err := newImageComponents(image.Rect(0, 0, width, height), 4, false, maxPixels)
+				if err != nil {
+					return nil, err
+				}
+				out = &rasterImage{native: native, dpi: metadata.dpi, channels: 4, profile: metadata.profile}
+			} else {
+				out = &rasterImage{pixels: image.NewNRGBA64(image.Rect(0, 0, width, height)), dpi: metadata.dpi, channels: stream.components, profile: metadata.profile}
+			}
 		case 0xc4:
 			for len(payload) != 0 {
 				selector := payload[0]

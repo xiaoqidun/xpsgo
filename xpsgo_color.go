@@ -69,10 +69,53 @@ const (
 	iccMaxChannels    = 15
 	iccMaxElements    = 4096
 	iccMaxNamedColors = 1 << 20
+	iccMinFloat32     = 1.1754943508222875e-38
+)
+
+// cicpBT2100Red 等常量定义ITU-R BT.2100亮度权重与PQ、HLG传递特性常数
+const (
+	cicpBT2100Red   = 0.2627
+	cicpBT2100Green = 0.6780
+	cicpBT2100Blue  = 0.0593
+	cicpPQC1        = 107.0 / 128
+	cicpPQC2        = 2413.0 / 128
+	cicpPQC3        = 2392.0 / 128
+	cicpPQM1        = 1305.0 / 8192
+	cicpPQM2        = 2523.0 / 32
+	cicpHLGA        = 0.17883277
+	cicpHLGB        = 1 - 4*cicpHLGA
+	cicpHLGC        = 0.5599107295295620
 )
 
 // colorDecimalPattern 匹配十进制颜色分量词法
 var colorDecimalPattern = regexp.MustCompile(`^-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)$`)
+
+var (
+	// cicpBradford 保存Bradford色度适应变换矩阵
+	cicpBradford = [9]float64{0.8951, 0.2664, -0.1614, -0.7502, 1.7135, 0.0367, 0.0389, -0.0685, 1.0296}
+	// cicpBradfordInverse 保存Bradford色度适应逆矩阵
+	cicpBradfordInverse, _ = iccInverseMatrix(cicpBradford)
+	// cicpBT2020ToSRGB 保存BT.2020线性RGB到D65线性sRGB的转换矩阵
+	cicpBT2020ToSRGB, _, _, _ = cicpPrimariesMatrix(9)
+	// cicpSRGBToBT2020 保存D65线性sRGB到BT.2020线性RGB的转换矩阵
+	cicpSRGBToBT2020, _ = iccInverseMatrix(cicpBT2020ToSRGB)
+	// cicpBT2446SDRRho 保存BT.2446方法A中100 cd/m²输出的ρ减一
+	cicpBT2446SDRRho = 32 * math.Pow(100.0/10000, 1/2.4)
+	// cicpBT2446SDRLog 保存SDR的ρ对数
+	cicpBT2446SDRLog = math.Log1p(cicpBT2446SDRRho)
+)
+
+// imageCICPTransform 保存已校验的H.273 CICP信号范围、线性化及基色转换参数
+type imageCICPTransform struct {
+	linearMatrix [9]float64
+	hlgLuma      [3]float64
+	offset       float64
+	scale        float64
+	primaries    uint8
+	transfer     uint8
+	hdr          bool
+	peakNits     float64
+}
 
 // ColorSpace 表示颜色的源色彩空间
 type ColorSpace uint8
@@ -464,6 +507,25 @@ func renderColorToNRGBA(c renderColor, space renderColorSpace) (color.NRGBA, err
 			value = renderLinearToSRGB(value)
 		}
 		pixels[i] = uint8(math.Floor(colorClamp(value)*255 + 0.5))
+	}
+	return color.NRGBA{R: pixels[0], G: pixels[1], B: pixels[2], A: alpha}, nil
+}
+
+// renderColorToNRGBAToneMapped 按ITU-R BT.2446方法A将线性scRGB预乘颜色色调映射并量化为8位非预乘sRGB像素
+// 入参: c 线性scRGB预乘颜色, peakNits HDR标称峰值亮度（cd/m²）
+// 返回: color.NRGBA 非预乘sRGB像素, error 非法输入错误
+func renderColorToNRGBAToneMapped(c renderColor, peakNits float64) (color.NRGBA, error) {
+	if err := c.validate(); err != nil {
+		return color.NRGBA{}, err
+	}
+	alpha := uint8(math.Floor(c.a*255 + 0.5))
+	if alpha == 0 {
+		return color.NRGBA{}, nil
+	}
+	mapped := renderBT2446MethodA([3]float64{c.r / c.a, c.g / c.a, c.b / c.a}, peakNits)
+	var pixels [3]uint8
+	for i, value := range mapped {
+		pixels[i] = uint8(math.Floor(colorClamp(renderLinearToSRGB(colorClamp(value)))*255 + 0.5))
 	}
 	return color.NRGBA{R: pixels[0], G: pixels[1], B: pixels[2], A: alpha}, nil
 }
@@ -1618,11 +1680,31 @@ func (s iccFloatCurveSegment) evaluateAt(x, lo, hi float64) (float64, error) {
 		p := s.parameters
 		switch s.function {
 		case 0:
-			result = math.Pow(p[1]*x+p[2], p[0]) + p[3]
+			result = iccFloatClamp(iccFloatClamp(iccFloatPow(p[1]*x+p[2], p[0])) + p[3])
 		case 1:
-			result = p[1]*math.Log10(p[2]*math.Pow(x, p[0])+p[3]) + p[4]
+			arg := p[2]*iccFloatClamp(iccFloatPow(x, p[0])) + p[3]
+			if !(arg > iccMinFloat32) {
+				arg = iccMinFloat32
+			} else if math.IsInf(arg, 1) {
+				arg = math.MaxFloat32
+			}
+			result = iccFloatClamp(p[1]*math.Log10(arg) + p[4])
 		case 2:
-			result = p[0]*math.Pow(p[1], p[2]*x+p[3]) + p[4]
+			exp := p[2]*x + p[3]
+			var powered float64
+			switch {
+			case exp == 0:
+				powered = 1
+			case p[1] == 0:
+				if exp < 0 {
+					powered = math.MaxFloat32
+				}
+			case p[1] > 0:
+				powered = math.Pow(p[1], exp)
+			case math.Trunc(exp) == exp:
+				powered = math.Pow(p[1], exp)
+			}
+			result = iccFloatClamp(p[0]*iccFloatClamp(powered) + p[4])
 		default:
 			return 0, fmt.Errorf("%w: ICC formula curve function", ErrUnsupported)
 		}
@@ -1631,4 +1713,359 @@ func (s iccFloatCurveSegment) evaluateAt(x, lo, hi float64) (float64, error) {
 		return 0, fmt.Errorf("%w: non-finite ICC segmented curve value", ErrInvalid)
 	}
 	return result, nil
+}
+
+// iccFloatPow 计算ICC浮点公式曲线的带符号保护幂运算
+// 入参: base 底数, exp 指数
+// 返回: float64 幂运算结果
+func iccFloatPow(base, exp float64) float64 {
+	switch {
+	case exp == 0:
+		return 1
+	case base == 0:
+		if exp < 0 {
+			return math.MaxFloat32
+		}
+		return 0
+	case base > 0 || math.Trunc(exp) == exp:
+		return math.Pow(base, exp)
+	case exp > 0:
+		return -math.Pow(-base, exp)
+	default:
+		return 0
+	}
+}
+
+// iccFloatClamp 将浮点中间结果安全钳位到ICC单精度有限范围，消除NaN与无穷大
+// 入参: value 待保护的浮点值
+// 返回: float64 有限单精度范围内的数值
+func iccFloatClamp(value float64) float64 {
+	if math.IsNaN(value) {
+		return 0
+	}
+	if value > math.MaxFloat32 {
+		return math.MaxFloat32
+	}
+	if value < -math.MaxFloat32 {
+		return -math.MaxFloat32
+	}
+	return value
+}
+
+// imageCICPUsable 判断图像声明的CICP四元组是否包含需解析的色彩标识，全未指定时返回false
+// 入参: cicp 图像CICP四元组
+// 返回: bool 是否应由CICP管线接管
+func imageCICPUsable(cicp *imageCICP) bool {
+	return cicp != nil && !(cicp.primaries == 2 && cicp.transfer == 2 && cicp.matrix == 0)
+}
+
+// prepareImageCICP 校验并构建非JXR图像的H.273 CICP线性转换器，输出相对100 cd/m²归一化的D65线性scRGB
+// 入参: cicp 图像CICP四元组, bits 每通道编码位深（8、16或0表示浮点）, hdrPeakNits 可选HDR峰值亮度
+// 返回: *imageCICPTransform CICP转换器，未指定时为nil, error 不支持的CICP参数错误
+func prepareImageCICP(cicp *imageCICP, bits int, hdrPeakNits float64) (*imageCICPTransform, error) {
+	if !imageCICPUsable(cicp) {
+		return nil, nil
+	}
+	if cicp.matrix != 0 {
+		return nil, fmt.Errorf("%w: unsupported CICP matrix %d for RGB/Gray image", ErrUnsupported, cicp.matrix)
+	}
+	transfer := cicp.transfer
+	switch transfer {
+	case 6, 14, 15:
+		transfer = 1
+	case 1, 4, 5, 7, 8, 9, 10, 11, 12, 13, 16, 17, 18:
+	default:
+		return nil, fmt.Errorf("%w: unsupported CICP transfer %d", ErrUnsupported, cicp.transfer)
+	}
+	if cicp.primaries == 10 && transfer != 8 && transfer != 16 && transfer != 17 || transfer == 17 && cicp.primaries != 10 {
+		return nil, fmt.Errorf("%w: unsupported CICP XYZ transfer combination", ErrUnsupported)
+	}
+	matrix, kr, kb, ok := cicpPrimariesMatrix(cicp.primaries)
+	if !ok {
+		return nil, fmt.Errorf("%w: unsupported CICP primaries %d", ErrUnsupported, cicp.primaries)
+	}
+	offset, scale := 0.0, 1.0
+	if !cicp.fullRange {
+		if bits >= 8 && bits <= 16 {
+			maximum := math.Ldexp(1, bits) - 1
+			step := math.Ldexp(1, bits-8)
+			offset, scale = (16*step)/maximum, maximum/(219*step)
+		} else {
+			offset, scale = 16.0/256.0, 256.0/219.0
+		}
+	}
+	hdr := transfer == 16 || transfer == 18
+	peak := hdrPeakNits
+	if hdr && peak <= 0 {
+		if transfer == 16 {
+			peak = 10000
+		} else {
+			peak = 1000
+		}
+	}
+	var hlgLuma [3]float64
+	if transfer == 18 {
+		if cicp.primaries == 9 {
+			hlgLuma = [3]float64{cicpBT2100Red, cicpBT2100Green, cicpBT2100Blue}
+		} else {
+			kg := 1 - kr - kb
+			if kr < 0 || kg < 0 || kb < 0 {
+				return nil, fmt.Errorf("%w: invalid CICP HLG primaries", ErrUnsupported)
+			}
+			hlgLuma = [3]float64{kr, kg, kb}
+		}
+	}
+	return &imageCICPTransform{
+		linearMatrix: matrix,
+		hlgLuma:      hlgLuma,
+		offset:       offset,
+		scale:        scale,
+		primaries:    cicp.primaries,
+		transfer:     transfer,
+		hdr:          hdr,
+		peakNits:     peak,
+	}, nil
+}
+
+// toLinearSRGB 将归一化源RGB或灰度像素按CICP转换为未裁剪的D65线性scRGB，HDR按100 cd/m²归一化
+// 入参: r, g, b 源像素分量, gray 是否为单通道灰度源
+// 返回: [3]float64 线性scRGB三通道
+func (t *imageCICPTransform) toLinearSRGB(r, g, b float64, gray bool) [3]float64 {
+	if gray {
+		g, b = r, r
+	}
+	rgb := [3]float64{
+		(r - t.offset) * t.scale,
+		(g - t.offset) * t.scale,
+		(b - t.offset) * t.scale,
+	}
+	if t.hdr {
+		for i, v := range rgb {
+			rgb[i] = cicpHDRInverseTransfer(v, t.transfer)
+		}
+		scale := 100.0
+		if t.transfer == 18 {
+			rgb = cicpHLGDisplayLight(rgb, t.hlgLuma, t.peakNits)
+			scale = t.peakNits / 100.0
+		}
+		for i := range rgb {
+			rgb[i] *= scale
+		}
+	} else {
+		for i, v := range rgb {
+			rgb[i] = cicpSDRInverseTransfer(v, t.transfer)
+		}
+	}
+	if gray && !t.hdr && t.primaries != 10 {
+		return [3]float64{rgb[0], rgb[0], rgb[0]}
+	}
+	return iccMatrixColor(t.linearMatrix, rgb)
+}
+
+// cicpPrimariesMatrix 由ITU-T H.273基色代码计算源线性RGB到D65线性sRGB矩阵及红蓝亮度权重
+// 入参: code H.273基色代码
+// 返回: [9]float64 源线性RGB到线性sRGB矩阵, float64 红基色亮度权重, float64 蓝基色亮度权重, bool 是否受支持
+func cicpPrimariesMatrix(code uint8) ([9]float64, float64, float64, bool) {
+	const d65x, d65y = 0.3127, 0.3290
+	wx, wy := d65x, d65y
+	var xy [3][2]float64
+	switch code {
+	case 1:
+		return [9]float64{1, 0, 0, 0, 1, 0, 0, 0, 1}, 87098.0 / 409605, 12673.0 / 175545, true
+	case 4:
+		xy, wx, wy = [3][2]float64{{0.67, 0.33}, {0.21, 0.71}, {0.14, 0.08}}, 0.310, 0.316
+	case 5:
+		xy = [3][2]float64{{0.64, 0.33}, {0.29, 0.60}, {0.15, 0.06}}
+	case 6, 7:
+		xy = [3][2]float64{{0.630, 0.340}, {0.310, 0.595}, {0.155, 0.070}}
+	case 8:
+		xy, wx, wy = [3][2]float64{{0.681, 0.319}, {0.243, 0.692}, {0.145, 0.049}}, 0.310, 0.316
+	case 9:
+		xy = [3][2]float64{{0.708, 0.292}, {0.170, 0.797}, {0.131, 0.046}}
+	case 10:
+		return iccXYZD65ToLinearRGB, 0, 0, true
+	case 11, 12:
+		xy = [3][2]float64{{0.680, 0.320}, {0.265, 0.690}, {0.150, 0.060}}
+		if code == 11 {
+			wx, wy = 0.314, 0.351
+		}
+	case 22:
+		xy = [3][2]float64{{0.630, 0.340}, {0.295, 0.605}, {0.155, 0.077}}
+	default:
+		return [9]float64{}, 0, 0, false
+	}
+	return cicpChromaticityToSRGB(xy, [2]float64{wx, wy})
+}
+
+// cicpChromaticityToSRGB 根据源基色与源白点色度推导经Bradford适配至D65线性sRGB的三阶矩阵
+// 入参: xy 红绿蓝基色色度坐标, whiteXY 源白点色度坐标
+// 返回: [9]float64 行优先线性RGB到线性sRGB矩阵, float64 红基色亮度权重, float64 蓝基色亮度权重, bool 矩阵是否有效
+func cicpChromaticityToSRGB(xy [3][2]float64, whiteXY [2]float64) ([9]float64, float64, float64, bool) {
+	wx, wy := whiteXY[0], whiteXY[1]
+	if wx <= 0 || wy <= 0 || wx+wy >= 1 {
+		return [9]float64{}, 0, 0, false
+	}
+	white := [3]float64{wx / wy, 1, (1 - wx - wy) / wy}
+	var primaries [9]float64
+	for col, p := range xy {
+		primaries[col] = p[0]
+		primaries[3+col] = p[1]
+		primaries[6+col] = 1 - p[0] - p[1]
+	}
+	invPrimaries, err := iccInverseMatrix(primaries)
+	if err != nil {
+		return [9]float64{}, 0, 0, false
+	}
+	scale := iccMatrixColor(invPrimaries, white)
+	for row := range 3 {
+		for col := range 3 {
+			primaries[row*3+col] *= scale[col]
+		}
+	}
+	d65 := [3]float64{0.3127 / 0.3290, 1, (1 - 0.3127 - 0.3290) / 0.3290}
+	coneSrc, coneDst := iccMatrixColor(cicpBradford, white), iccMatrixColor(cicpBradford, d65)
+	adapt := cicpBradford
+	for row := range 3 {
+		for col := range 3 {
+			adapt[row*3+col] *= coneDst[row] / coneSrc[row]
+		}
+	}
+	cat := cicpMulMatrix3(cicpBradfordInverse, adapt)
+	xyzToSRGB := cicpMulMatrix3(iccXYZD65ToLinearRGB, cat)
+	out := cicpMulMatrix3(xyzToSRGB, primaries)
+	for _, v := range out {
+		if !geometryFinite(v) {
+			return [9]float64{}, 0, 0, false
+		}
+	}
+	return out, primaries[3], primaries[5], true
+}
+
+// cicpMulMatrix3 计算两个行优先三阶矩阵的乘积
+// 入参: a 左矩阵, b 右矩阵
+// 返回: [9]float64 乘积矩阵
+func cicpMulMatrix3(a, b [9]float64) [9]float64 {
+	var out [9]float64
+	for row := range 3 {
+		for col := range 3 {
+			for k := range 3 {
+				out[row*3+col] += a[row*3+k] * b[k*3+col]
+			}
+		}
+	}
+	return out
+}
+
+// cicpSDRInverseTransfer 反解ITU-T H.273的SDR及线性传递特性
+// 入参: value 非线性分量, transfer 规范化传递特性编号
+// 返回: float64 线性光分量
+func cicpSDRInverseTransfer(value float64, transfer uint8) float64 {
+	switch transfer {
+	case 4:
+		return math.Pow(max(0, value), 2.2)
+	case 5:
+		return math.Pow(max(0, value), 2.8)
+	case 8:
+		return value
+	case 9, 10:
+		if value <= 0 {
+			return 0
+		}
+		decades := 2.5
+		if transfer == 9 {
+			decades = 2
+		}
+		return math.Pow(10, decades*(value-1))
+	case 17:
+		return (52.37 / 48) * math.Pow(colorClamp(value), 2.6)
+	}
+	alpha, beta, slope, power := 1.099296826809442, 0.018053968510807, 4.5, 1/0.45
+	switch transfer {
+	case 7:
+		alpha, beta, slope, power = 1.1115721959217313, 0.022821585529445028, 4, 1/0.45
+	case 13:
+		alpha, beta, slope, power = 1.055, 0.0031308, 12.92, 2.4
+	}
+	if transfer == 12 && value < -slope*beta/4 {
+		return -math.Pow((alpha-1-4*value)/alpha, power) / 4
+	}
+	magnitude := value
+	if transfer == 11 {
+		magnitude = math.Abs(value)
+	}
+	if magnitude <= beta*slope {
+		return value / slope
+	}
+	return math.Copysign(math.Pow((magnitude+alpha-1)/alpha, power), value)
+}
+
+// cicpHDRInverseTransfer 将PQ转换为相对10000 cd/m²的显示光或将HLG转换为场景光
+// 入参: value 非线性HDR分量, transfer 16(PQ)或18(HLG)
+// 返回: float64 线性光强度
+func cicpHDRInverseTransfer(value float64, transfer uint8) float64 {
+	value = colorClamp(value)
+	if transfer == 16 {
+		root := math.Pow(value, 1/cicpPQM2)
+		return math.Pow(max(root-cicpPQC1, 0)/(cicpPQC2-cicpPQC3*root), 1/cicpPQM1)
+	}
+	if value <= 0.5 {
+		return value * value / 3
+	}
+	return (math.Exp((value-cicpHLGC)/cicpHLGA) + cicpHLGB) / 12
+}
+
+// cicpHLGDisplayLight 按BT.2100参考峰值亮度执行HLG场景光到归一化显示光的OOTF变换
+// 入参: rgb 线性场景RGB, weights 场景亮度权重, peakNits 参考显示峰值亮度
+// 返回: [3]float64 相对peakNits归一化的显示光RGB
+func cicpHLGDisplayLight(rgb, weights [3]float64, peakNits float64) [3]float64 {
+	luma := weights[0]*rgb[0] + weights[1]*rgb[1] + weights[2]*rgb[2]
+	gamma := 1.2
+	if peakNits != 1000 {
+		gamma = 1.2 + 0.42*math.Log10(peakNits/1000)
+	}
+	gain := math.Pow(max(0, luma), gamma-1)
+	return [3]float64{rgb[0] * gain, rgb[1] * gain, rgb[2] * gain}
+}
+
+// renderBT2446MethodA 按ITU-R BT.2446方法A将相对100 cd/m²的线性scRGB映射至100 cd/m²线性sRGB
+// 入参: linearSRGB 相对100 cd/m²归一化的线性scRGB, peakNits HDR标称峰值亮度（cd/m²）
+// 返回: [3]float64 映射后的100 cd/m²线性sRGB
+func renderBT2446MethodA(linearSRGB [3]float64, peakNits float64) [3]float64 {
+	if !(peakNits > 0) {
+		return linearSRGB
+	}
+	bt2020 := iccMatrixColor(cicpSRGBToBT2020, linearSRGB)
+	invPeak := 100.0 / peakNits
+	var rgb [3]float64
+	for i, v := range bt2020 {
+		rgb[i] = math.Pow(colorClamp(v*invPeak), 1/2.4)
+	}
+	luma := cicpBT2100Red*rgb[0] + cicpBT2100Green*rgb[1] + cicpBT2100Blue*rgb[2]
+	if !(luma > 0) {
+		return [3]float64{}
+	}
+	hdrRho := 32 * math.Pow(peakNits/10000, 1/2.4)
+	perceptual := math.Log1p(hdrRho*luma) / math.Log1p(hdrRho)
+	var compressed float64
+	switch {
+	case perceptual <= 0.7399:
+		compressed = 1.0770 * perceptual
+	case perceptual < 0.9909:
+		compressed = (-1.1510*perceptual+2.7811)*perceptual - 0.6302
+	default:
+		compressed = 0.5*perceptual + 0.5
+	}
+	sdr := math.Expm1(cicpBT2446SDRLog*compressed) / cicpBT2446SDRRho
+	gain := sdr / (1.1 * luma)
+	cb, cr := gain*(rgb[2]-luma)/1.8814, gain*(rgb[0]-luma)/1.4746
+	yPrime := sdr - max(0.1*cr, 0)
+	red := yPrime + 2*(1-cicpBT2100Red)*cr
+	blue := yPrime + 2*(1-cicpBT2100Blue)*cb
+	green := (yPrime - cicpBT2100Red*red - cicpBT2100Blue*blue) / cicpBT2100Green
+	sdrBT2020 := [3]float64{
+		math.Pow(max(0, red), 2.4),
+		math.Pow(max(0, green), 2.4),
+		math.Pow(max(0, blue), 2.4),
+	}
+	return iccMatrixColor(cicpBT2020ToSRGB, sdrBT2020)
 }

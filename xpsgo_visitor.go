@@ -44,7 +44,7 @@ const (
 // WalkGroupKind 表示场景遍历器进入或离开的隔离组类别
 type WalkGroupKind uint8
 
-// WalkOptions 设置场景遍历器的画刷展开深度、字形轮廓解析、根变换、水印、回退分辨率及资源上限
+// WalkOptions 设置场景遍历器的画刷展开深度、字形轮廓解析、根变换、水印、签名验证、回退分辨率及资源上限
 // MaxBrushDepth默认8、RenderFallbackDPI默认96（负值返回ErrInvalid），Limits零值字段沿用阅读器上限
 // Transform可左乘PrintSheet.BackFlipTransform()用于背面遍历；Watermark省略时含水印放置标记NeedsRasterFallback
 type WalkOptions struct {
@@ -54,6 +54,7 @@ type WalkOptions struct {
 	RenderFallbackDPI    float64
 	Transform            *Matrix
 	Watermark            *PrintWatermarkOptions
+	Signatures           *PrintSignatureOptions
 	Limits               Limits
 }
 
@@ -65,20 +66,23 @@ type WalkClip struct {
 
 // WalkState 保存当前遍历节点累计的规范化图形与文档状态，Index、DocumentIndex与PageIndex为零基页号（辅助页均为-1）
 // Opacity为扁平累计不透明度，EdgeMode自祖先Canvas向下继承，按EnterGroup/LeaveGroup构建隔离组应使用LocalOpacity避免双重乘算
+// PrintColor与SignaturePolicy在WalkPrintSide中透传自当前纸面，普通单页遍历保持零值
 // Clip内Geometry指针与OpacityMask指针均为只读零拷贝视图，回调期间及返回后不得修改
 type WalkState struct {
-	PagePart      string
-	Index         int
-	DocumentIndex int
-	PageIndex     int
-	Matrix        Matrix
-	Clip          []WalkClip
-	Opacity       float64
-	OpacityMask   *Brush
-	EdgeMode      EdgeMode
-	Language      string
-	NavigateURI   string
-	Name          string
+	PagePart        string
+	Index           int
+	DocumentIndex   int
+	PageIndex       int
+	Matrix          Matrix
+	Clip            []WalkClip
+	Opacity         float64
+	OpacityMask     *Brush
+	EdgeMode        EdgeMode
+	Language        string
+	NavigateURI     string
+	Name            string
+	PrintColor      PrintColor
+	SignaturePolicy PrintSignaturePolicy
 }
 
 // WalkPathEvent 保存规范化后的路径绘制事件及可选光栅化回退建议
@@ -179,6 +183,7 @@ type walkConfiguration struct {
 	fallbackDPI          float64
 	rootTransform        Matrix
 	watermark            *PrintWatermarkOptions
+	signatures           *PrintSignatureOptions
 	limits               Limits
 }
 
@@ -316,11 +321,21 @@ func (r *Reader) WalkPrintSide(ctx context.Context, side *PrintSide, visitor *Sc
 	if !printBoxWithin(side.MediaClip, Rect{Width: side.Width, Height: side.Height}) {
 		return fmt.Errorf("%w: print side media clip", ErrInvalid)
 	}
+	if err := validatePrintColor(side.Color); err != nil {
+		return err
+	}
+	if err := r.checkWalkPrintSideSignatures(ctx, side.SignaturePolicy, config.signatures); err != nil {
+		return err
+	}
 	sideClip, err := printSideGutterClip(side.MediaClip, side.Gutter)
 	if err != nil {
 		return err
 	}
 	walker := newSceneWalker(r, visitor, config)
+	sideFallback := side.Color.Mode == PrintColorGrayscale || side.Color.Mode == PrintColorMonochrome
+	if sideFallback {
+		walker.reportDiagnostic(Diagnostic{Element: "PrintColor", Message: "print side grayscale or monochrome output requires raster fallback"})
+	}
 	pageCache := make(map[string]*Page)
 	for _, placement := range side.Pages {
 		if err := checkContext(ctx); err != nil {
@@ -351,7 +366,7 @@ func (r *Reader) WalkPrintSide(ctx context.Context, side *PrintSide, visitor *Sc
 			pageCache[key] = page
 		}
 		elements := page.Elements
-		placementFallback := false
+		placementFallback := sideFallback
 		if placement.Watermark != nil {
 			if config.watermark != nil && config.watermark.FontURI != "" {
 				materialized, err := r.materializeWalkWatermark(ctx, page.Part, page.Elements, placement.Watermark, config.watermark, config.limits)
@@ -378,14 +393,16 @@ func (r *Reader) WalkPrintSide(ctx context.Context, side *PrintSide, visitor *Sc
 		}
 		clips := walkPrintPlacementClips(sideClip, placement, config.rootTransform, effectiveMatrix)
 		initial := WalkState{
-			PagePart:      page.Part,
-			Index:         globalIndex,
-			DocumentIndex: docIndex,
-			PageIndex:     localIndex,
-			Matrix:        effectiveMatrix,
-			Clip:          clips,
-			Opacity:       1,
-			Language:      page.Language,
+			PagePart:        page.Part,
+			Index:           globalIndex,
+			DocumentIndex:   docIndex,
+			PageIndex:       localIndex,
+			Matrix:          effectiveMatrix,
+			Clip:            clips,
+			Opacity:         1,
+			Language:        page.Language,
+			PrintColor:      side.Color,
+			SignaturePolicy: side.SignaturePolicy,
 		}
 		walker.forceFallback = placementFallback
 		err = walker.walkPageElements(ctx, page.Diagnostics, elements, initial)
@@ -395,6 +412,17 @@ func (r *Reader) WalkPrintSide(ctx context.Context, side *PrintSide, visitor *Sc
 		}
 	}
 	return nil
+}
+
+// checkWalkPrintSideSignatures 在短暂读锁保护下按纸面最低签名策略验证文档签名，回调阶段不持锁
+// 入参: ctx 取消Context, minimum 纸面要求的最低签名策略, options 可选签名验证参数
+// 返回: error 策略非法、签名拒绝、读取或取消错误
+func (r *Reader) checkWalkPrintSideSignatures(ctx context.Context, minimum PrintSignaturePolicy, options *PrintSignatureOptions) error {
+	if err := r.readLock(); err != nil {
+		return err
+	}
+	defer r.mu.RUnlock()
+	return r.printSideSignatures(ctx, minimum, options)
 }
 
 // walkConfig 合并并校验遍历选项与阅读器默认资源上限
@@ -436,6 +464,10 @@ func (r *Reader) walkConfig(options *WalkOptions) (walkConfiguration, error) {
 		if options.Watermark != nil {
 			copied := *options.Watermark
 			config.watermark = &copied
+		}
+		if options.Signatures != nil {
+			copied := *options.Signatures
+			config.signatures = &copied
 		}
 		if options.Limits != (Limits{}) {
 			config.limits = mergeLimits(baseLimits, options.Limits)
@@ -1029,16 +1061,18 @@ func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *
 	}
 	groupClips = append(groupClips, WalkClip{Geometry: renderBoxGeometry(brush.Viewport), Matrix: brushMatrix})
 	groupState := WalkState{
-		PagePart:      state.PagePart,
-		Index:         state.Index,
-		DocumentIndex: state.DocumentIndex,
-		PageIndex:     state.PageIndex,
-		Matrix:        visualMatrix,
-		Clip:          groupClips,
-		Opacity:       colorClamp(state.Opacity * brush.Opacity),
-		EdgeMode:      state.EdgeMode,
-		Language:      state.Language,
-		NavigateURI:   state.NavigateURI,
+		PagePart:        state.PagePart,
+		Index:           state.Index,
+		DocumentIndex:   state.DocumentIndex,
+		PageIndex:       state.PageIndex,
+		Matrix:          visualMatrix,
+		Clip:            groupClips,
+		Opacity:         colorClamp(state.Opacity * brush.Opacity),
+		EdgeMode:        state.EdgeMode,
+		Language:        state.Language,
+		NavigateURI:     state.NavigateURI,
+		PrintColor:      state.PrintColor,
+		SignaturePolicy: state.SignaturePolicy,
 	}
 	groupEvent := WalkGroupEvent{
 		State:               groupState.clone(),
@@ -1290,7 +1324,7 @@ func (w *sceneWalker) bitmapGlyphYMax(ctx context.Context, source *fontSource, g
 	scaleY := 1.0
 	var ppemY uint8
 	if geometryFinite(x, y) && px >= 1 && py >= 1 && px <= 255 && py <= 255 && math.Abs(x-px) <= 1e-9 && math.Abs(y-py) <= 1e-9 {
-		selection, present, err := source.selectBitmapStrikeWithWork(uint16(px), uint16(py), charge)
+		selection, present, err := source.selectBitmapStrikeWithWork(uint16(px), uint16(py), false, charge)
 		if err != nil {
 			return nil, err
 		}

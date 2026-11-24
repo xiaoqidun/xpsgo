@@ -294,7 +294,7 @@ func encodeSubsetFont(ctx context.Context, face *fontFace, replacements map[stri
 			return false
 		}
 		switch tag {
-		case "hdmx", "LTSH", "VDMX", "EBLC", "EBDT", "EBSC":
+		case "hdmx", "LTSH", "VDMX", "EBLC", "EBDT", "EBSC", "CBDT", "CBLC", "sbix":
 			return true
 		}
 		return false
@@ -474,21 +474,9 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 			}
 		}
 		geometry.Figures = slices.DeleteFunc(geometry.Figures, func(figure GeometryFigure) bool { return len(figure.Segments) == 0 })
-		if len(geometry.Figures) != 0 {
-			charGeo := geometry
-			if font.cid {
-				if fdMatrix := font.fontDict[font.fdSelect[gid]].matrix; fdMatrix != nil {
-					charGeo = subsetCFFCloneGeometry(geometry)
-					charMatrix := *fdMatrix
-					if font.top.matrix == nil {
-						charMatrix = (Matrix{A: 1000, D: 1000}).Mul(charMatrix)
-					}
-					if err := fontTransformOutline(&charGeo, charMatrix); err != nil {
-						return nil, err
-					}
-				}
-			}
-			cb, err := charGeo.Bounds()
+		hasOutline := len(geometry.Figures) != 0
+		if hasOutline && !font.cid {
+			cb, err := geometry.Bounds()
 			if err != nil {
 				return nil, err
 			}
@@ -521,8 +509,17 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 		if xMin < -32768 || yMin < -32768 || xMax > 32767 || yMax > 32767 {
 			return nil, fmt.Errorf("%w: subset CFF bounds outside FWORD", ErrInvalid)
 		}
+		if hasOutline && font.cid {
+			box := [4]int64{int64(xMin), int64(yMin), int64(xMax), int64(yMax)}
+			if !hasCFFBounds {
+				cffBounds, hasCFFBounds = box, true
+			} else {
+				cffBounds[0], cffBounds[1] = min(cffBounds[0], box[0]), min(cffBounds[1], box[1])
+				cffBounds[2], cffBounds[3] = max(cffBounds[2], box[2]), max(cffBounds[3], box[3])
+			}
+		}
 		bounds = Rect{X: xMin, Y: yMin, Width: xMax - xMin, Height: yMax - yMin}
-		if err := profile.addBounds(gid, bounds, len(geometry.Figures) != 0, metrics); err != nil {
+		if err := profile.addBounds(gid, bounds, hasOutline, metrics); err != nil {
 			return nil, err
 		}
 	}

@@ -346,7 +346,8 @@ func signatureSigningMethod(public crypto.PublicKey, hash crypto.Hash, pss *rsa.
 			if saltLen == rsa.PSSSaltLengthAuto || saltLen == rsa.PSSSaltLengthEqualsHash {
 				saltLen = hash.Size()
 			}
-			if saltLen <= 0 || saltLen > key.Size()-hash.Size()-2 {
+			emLen := (key.N.BitLen() - 1 + 7) / 8
+			if saltLen <= 0 || emLen < hash.Size()+2 || saltLen > emLen-hash.Size()-2 {
 				return "", "", nil, nil, fmt.Errorf("%w: RSA-PSS salt length", ErrInvalid)
 			}
 			params := &SignaturePSSParams{DigestMethod: digest, MGFMethod: signatureMethodMGF1, MGFDigest: digest, SaltLength: saltLen, TrailerField: 1}

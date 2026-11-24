@@ -277,12 +277,12 @@ func executeCompositionPlan(plan *compositionPlan, names *compositionNames, root
 				return nil, err
 			}
 			original := plan.sources[source].parts[key]
-			data, err := view.pkg.readPart(original.name)
+			data, err := view.pkg.readItemsContext(plan.budget.context, key, view.pkg.limits.MaxPartBytes)
 			if err != nil {
 				return nil, err
 			}
 			media, err := view.pkg.contentType(original.name)
-			if err != nil || media != original.media || view.pkg.names[key] != original.name || !bytes.Equal(data, original.data) {
+			if err != nil || !strings.EqualFold(media, original.media) || view.pkg.names[key] != original.name || !bytes.Equal(data, original.data) {
 				return nil, fmt.Errorf("%w: composition changed protected part %s", ErrRestricted, original.name)
 			}
 			p.protected[key] = true
@@ -441,7 +441,7 @@ func (x *compositionExecution) put(original packagePart, target string, data []b
 	}
 	p, key := x.output, strings.ToLower(target)
 	if prior, exists := p.parts[key]; exists {
-		if prior.name != target || prior.media != original.media || !bytes.Equal(prior.data, data) {
+		if prior.name != target || !strings.EqualFold(prior.media, original.media) || !bytes.Equal(prior.data, data) {
 			return fmt.Errorf("%w: composition shared part differs by context", ErrRestricted)
 		}
 		return nil
@@ -1382,7 +1382,7 @@ func (x *compositionExecution) sameRawTicket(left, right compositionOrigin) (boo
 	}
 	partLeft, okLeft := sourceLeft.parts[keyLeft]
 	partRight, okRight := sourceRight.parts[keyRight]
-	if !okLeft || !okRight || partLeft.media != partRight.media || len(partLeft.data) != len(partRight.data) {
+	if !okLeft || !okRight || !strings.EqualFold(partLeft.media, partRight.media) || len(partLeft.data) != len(partRight.data) {
 		return false, nil
 	}
 	if left.source == right.source && keyLeft == keyRight {
@@ -1397,11 +1397,15 @@ func (x *compositionExecution) sameRawTicket(left, right compositionOrigin) (boo
 	return bytes.Equal(partLeft.data, partRight.data), nil
 }
 
-// validateTickets 在预算内比较迁移后的票据及缺省状态，同级不同内容标准票据按Print Schema语义合并
+// validateTickets 在预算内比较迁移后的票据及缺省状态，同级无冲突标准票据合并并清理孤儿旧票据
 // 返回: error 层级冲突、缺失、保护、预算或取消错误
 func (x *compositionExecution) validateTickets() error {
 	var classes map[string]*compositionTicketClass
+	var orphans map[string]bool
 	for _, scope := range slices.Sorted(maps.Keys(x.tickets)) {
+		if err := checkContext(x.plan.budget.context); err != nil {
+			return err
+		}
 		tickets := x.tickets[scope]
 		if len(tickets) < 2 {
 			continue
@@ -1418,7 +1422,7 @@ func (x *compositionExecution) validateTickets() error {
 			if tickets[0] == "" && ticket == "" {
 				continue
 			}
-			if !exists || !present || first.media != value.media {
+			if !exists || !present || !strings.EqualFold(first.media, value.media) {
 				return fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
 			}
 			if firstKey == key {
@@ -1464,20 +1468,35 @@ func (x *compositionExecution) validateTickets() error {
 			}
 		}
 		if needsMerge {
-			if err := x.mergeScopeTickets(scope, tickets, first.media); err != nil {
+			replaced, err := x.mergeScopeTickets(scope, tickets, first.media)
+			if err != nil {
 				return err
+			}
+			if len(replaced) != 0 {
+				if orphans == nil {
+					orphans = make(map[string]bool, len(replaced))
+				}
+				for _, key := range replaced {
+					orphans[key] = true
+				}
 			}
 		}
 	}
-	return nil
+	if len(orphans) != 0 {
+		return x.cleanupOrphanTickets(orphans)
+	}
+	return checkContext(x.plan.budget.context)
 }
 
-// mergeScopeTickets 对同级不同内容的标准打印票据执行语义合并，写入独立部件并更新作用域关系
+// mergeScopeTickets 对同级无冲突标准打印票据执行语义合并，同级设置值冲突显式报错，返回被替换的旧票据键
 // 入参: scope 小写作用域部件键, tickets 同级全部已迁移票据部件名, media 共享票据媒体类型
-// 返回: error 格式不支持、受限、预算或取消错误
-func (x *compositionExecution) mergeScopeTickets(scope string, tickets []string, media string) error {
+// 返回: []string 被替换的旧票据小写键列表, error 格式不支持、受限、冲突、预算或取消错误
+func (x *compositionExecution) mergeScopeTickets(scope string, tickets []string, media string) ([]string, error) {
+	if err := checkContext(x.plan.budget.context); err != nil {
+		return nil, err
+	}
 	if known, capabilities := printResourceMedia(media); !known || capabilities {
-		return fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
+		return nil, fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
 	}
 	sourceName := ""
 	level := PrintScopeUnknown
@@ -1502,45 +1521,60 @@ func (x *compositionExecution) mergeScopeTickets(scope string, tickets []string,
 	}
 	options := &PrintSettingsOptions{Limits: x.plan.budget.limits, Scope: level}
 	var merged *PrintSettings
-	lastKey := ""
+	seen := make(map[string]bool, len(tickets))
+	var replaced []string
 	for _, ticket := range tickets {
 		if err := x.plan.budget.step(1); err != nil {
-			return err
+			return nil, err
 		}
 		key := strings.ToLower(ticket)
 		part, present := x.output.parts[key]
-		if !present || part.media != media {
-			return fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
+		if !present || !strings.EqualFold(part.media, media) {
+			return nil, fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
 		}
-		if key == lastKey {
+		if seen[key] {
 			continue
 		}
-		lastKey = key
+		seen[key] = true
+		replaced = append(replaced, key)
 		parsed, err := ParsePrintSettings(x.plan.budget.context, part.data, options)
 		if err != nil {
 			if errors.Is(err, ErrLimit) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return err
+				return nil, err
 			}
-			return fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
+			return nil, fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
 		}
 		if merged == nil {
 			merged = parsed
 			continue
 		}
+		conflict, err := printSettingsConflict(merged, parsed, x.plan.budget)
+		if err != nil {
+			return nil, err
+		}
+		if conflict {
+			return nil, fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
+		}
 		merged, err = MergePrintSettings(x.plan.budget.context, merged, parsed, options)
 		if err != nil {
 			if errors.Is(err, ErrLimit) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return err
+				return nil, err
 			}
-			return fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
+			return nil, fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
+		}
+	}
+	if sourceName == "" {
+		return nil, fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
+	}
+	relPartKey := strings.ToLower(createdRelationshipPart(sourceName))
+	for _, parts := range x.protected {
+		if parts[relPartKey] {
+			return nil, fmt.Errorf("%w: protected print ticket relationship", ErrRestricted)
 		}
 	}
 	var buffer bytes.Buffer
 	if _, err := EncodePrintSettings(x.plan.budget.context, &buffer, merged, options); err != nil {
-		return err
-	}
-	if sourceName == "" {
-		return nil
+		return nil, err
 	}
 	first := x.output.parts[strings.ToLower(tickets[0])]
 	dir := first.name[:strings.LastIndexByte(first.name, '/')+1]
@@ -1550,10 +1584,10 @@ func (x *compositionExecution) mergeScopeTickets(scope string, tickets []string,
 	pattern := dir + "PrintTicket_%d.xml"
 	partName, err := x.output.newName(pattern, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := x.output.store(partName, media, buffer.Bytes()); err != nil {
-		return err
+		return nil, err
 	}
 	x.output.commitName(pattern, partName)
 	kind := formatNamespace(x.plan.format) + "/printticket"
@@ -1575,13 +1609,185 @@ func (x *compositionExecution) mergeScopeTickets(scope string, tickets []string,
 	}
 	relData, err := createdRelationshipMarkup(relations, x.plan.budget.limits, x.plan.budget.context)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := x.output.setRelationshipMarkup(sourceName, relData, x.plan.budget.context); err != nil {
-		return err
+		return nil, err
 	}
 	x.output.originalRels[scope] = relations
-	return nil
+	return replaced, nil
+}
+
+// printSettingsConflict 检查两份同级已解析打印设置是否在共享关键字上存在相互矛盾的值
+// 入参: left, right 同级打印设置, budget 共享预算
+// 返回: bool 是否存在同级冲突, error 预算或取消错误
+func printSettingsConflict(left, right *PrintSettings, budget *compositionBudget) (bool, error) {
+	if err := checkContext(budget.context); err != nil {
+		return false, err
+	}
+	if left.Version != right.Version {
+		return true, nil
+	}
+	return printSettingListsConflict(left.Elements, right.Elements, budget)
+}
+
+// printSettingListsConflict 对比同级设置元素切片，仅允许正交互补或完全语义等价的重叠项
+// 入参: left, right 同级元素切片, budget 共享预算
+// 返回: bool 是否存在冲突, error 预算或取消错误
+func printSettingListsConflict(left, right []PrintSetting, budget *compositionBudget) (bool, error) {
+	type key struct {
+		kind PrintSettingKind
+		name xml.Name
+	}
+	byKey := make(map[key][]PrintSetting, len(left))
+	for _, item := range left {
+		if err := budget.step(1); err != nil {
+			return false, err
+		}
+		k := key{item.Kind, item.Name}
+		byKey[k] = append(byKey[k], item)
+	}
+	rightByKey := make(map[key][]PrintSetting, len(right))
+	for _, item := range right {
+		if err := budget.step(1); err != nil {
+			return false, err
+		}
+		k := key{item.Kind, item.Name}
+		rightByKey[k] = append(rightByKey[k], item)
+	}
+	for k, rightItems := range rightByKey {
+		leftItems, overlap := byKey[k]
+		if !overlap {
+			continue
+		}
+		if len(leftItems) != len(rightItems) {
+			return true, nil
+		}
+		for i := range leftItems {
+			equal, err := printSettingEqual(leftItems[i], rightItems[i], budget)
+			if err != nil {
+				return false, err
+			}
+			if !equal {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// printSettingEqual 递归判断两个PrintSetting节点是否语义等价，不依赖子节点顺序或默认xs:string拼写
+// 入参: a, b 待比较节点, budget 共享预算
+// 返回: bool 是否语义等价, error 预算或取消错误
+func printSettingEqual(a, b PrintSetting, budget *compositionBudget) (bool, error) {
+	if err := budget.step(1); err != nil {
+		return false, err
+	}
+	if a.Kind != b.Kind || a.Name != b.Name || a.Constraint != b.Constraint {
+		return false, nil
+	}
+	if (a.Value == nil) != (b.Value == nil) {
+		return false, nil
+	}
+	if a.Value != nil {
+		typeA, typeB := a.Value.Type, b.Value.Type
+		if typeA == (xml.Name{}) {
+			typeA = xml.Name{Space: printValueNS, Local: "string"}
+		}
+		if typeB == (xml.Name{}) {
+			typeB = xml.Name{Space: printValueNS, Local: "string"}
+		}
+		if typeA != typeB || a.Value.Text != b.Value.Text || a.Value.QName != b.Value.QName {
+			return false, nil
+		}
+	}
+	if len(a.Children) != len(b.Children) {
+		return false, nil
+	}
+	used := make([]bool, len(b.Children))
+	for _, childA := range a.Children {
+		matched := false
+		for j, childB := range b.Children {
+			if used[j] {
+				continue
+			}
+			equal, err := printSettingEqual(childA, childB, budget)
+			if err != nil {
+				return false, err
+			}
+			if equal {
+				used[j], matched = true, true
+				break
+			}
+		}
+		if !matched {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// cleanupOrphanTickets 清理票据合并替换后不再被输出包任意关系引用且不受保护的孤儿旧票据及其关系部件
+// 入参: orphans 候选孤儿票据小写键集合
+// 返回: error 取消或预算错误
+func (x *compositionExecution) cleanupOrphanTickets(orphans map[string]bool) error {
+	protected := make(map[string]bool)
+	for _, parts := range x.protected {
+		for key := range parts {
+			protected[key] = true
+		}
+	}
+	referenced := make(map[string]bool)
+	collect := func(sourceKey string, rels []Relationship) error {
+		if orphans[sourceKey] {
+			return nil
+		}
+		sourceName := x.output.sourcePartName(sourceKey)
+		if sourceName == "" {
+			sourceName = "/"
+		}
+		for _, rel := range rels {
+			if err := checkContext(x.plan.budget.context); err != nil {
+				return err
+			}
+			if rel.TargetMode != "" && rel.TargetMode != TargetModeInternal {
+				continue
+			}
+			target, err := resolvePart(sourceName, rel.Target)
+			if err == nil {
+				referenced[strings.ToLower(target)] = true
+			}
+		}
+		return nil
+	}
+	for _, sourceKey := range slices.Sorted(maps.Keys(x.output.originalRels)) {
+		if err := collect(sourceKey, x.output.originalRels[sourceKey]); err != nil {
+			return err
+		}
+	}
+	for _, sourceKey := range slices.Sorted(maps.Keys(x.output.relations)) {
+		if err := collect(sourceKey, x.output.relations[sourceKey]); err != nil {
+			return err
+		}
+	}
+	for _, key := range slices.Sorted(maps.Keys(orphans)) {
+		if err := checkContext(x.plan.budget.context); err != nil {
+			return err
+		}
+		if referenced[key] || protected[key] {
+			continue
+		}
+		part, exists := x.output.parts[key]
+		if !exists {
+			continue
+		}
+		relKey := strings.ToLower(createdRelationshipPart(part.name))
+		x.output.removePart(part.name)
+		delete(x.output.originalRels, key)
+		delete(x.output.original, key)
+		delete(x.output.original, relKey)
+	}
+	return checkContext(x.plan.budget.context)
 }
 
 // structureRelationships 将各原结构的关联迁移到合并结构，共享原结构只登记一次

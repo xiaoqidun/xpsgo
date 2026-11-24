@@ -182,9 +182,9 @@ func (p *Package) deletePage(document, index int) {
 	p.dirty[strings.ToLower(p.documents[document].Part)] = true
 }
 
-// MoveDocument 调整文档序列中的顺序，不改变文档部件和页面内容
+// MoveDocument 调整文档序列中的顺序并同步文档目录引用，不改变文档部件和页面内容
 // 入参: docIndex 来源文档序号, position 移动完成后的文档序号
-// 返回: error 序号错误
+// 返回: error 序号、结构或限制错误
 func (p *Package) MoveDocument(docIndex, position int) error {
 	if err := p.lock(); err != nil {
 		return err
@@ -199,16 +199,25 @@ func (p *Package) MoveDocument(docIndex, position int) error {
 	if err := p.editable(p.sequence); err != nil {
 		return err
 	}
+	if p.hasDocumentStructure() {
+		return p.moveStoryDocument(docIndex, position)
+	}
+	p.moveDocument(docIndex, position)
+	return nil
+}
+
+// moveDocument 调整已校验的文档顺序并标记序列变更，调用方须持有写锁
+// 入参: docIndex 来源文档序号, position 目标文档序号
+func (p *Package) moveDocument(docIndex, position int) {
 	document := p.documents[docIndex]
 	p.documents = slices.Delete(p.documents, docIndex, docIndex+1)
 	p.documents = slices.Insert(p.documents, position, document)
 	p.dirty[strings.ToLower(p.sequence)] = true
-	return nil
 }
 
-// DeleteDocument 删除指定文档及其全部页面和源关系，不隐式删除共享资源
+// DeleteDocument 删除指定文档及其全部页面和源关系并同步保留文档的目录引用，不隐式删除共享资源
 // 入参: docIndex 文档序号
-// 返回: error 序号错误
+// 返回: error 序号、结构或限制错误
 func (p *Package) DeleteDocument(docIndex int) error {
 	if err := p.lock(); err != nil {
 		return err
@@ -225,6 +234,16 @@ func (p *Package) DeleteDocument(docIndex int) error {
 			return err
 		}
 	}
+	if p.hasDocumentStructure() {
+		return p.deleteStoryDocument(docIndex)
+	}
+	p.deleteDocument(docIndex)
+	return nil
+}
+
+// deleteDocument 删除已校验文档及其全部页面和源关系，调用方须持有写锁
+// 入参: docIndex 待删除文档序号
+func (p *Package) deleteDocument(docIndex int) {
 	for _, page := range p.documents[docIndex].Pages {
 		p.removePart(page.Part)
 	}
@@ -232,7 +251,6 @@ func (p *Package) DeleteDocument(docIndex int) error {
 	p.removePart(p.documents[docIndex].Part)
 	p.documents = slices.Delete(p.documents, docIndex, docIndex+1)
 	p.dirty[strings.ToLower(p.sequence)] = true
-	return nil
 }
 
 // DeletePart 删除资源或扩展部件及其源关系，不接受由固定布局模型管理的名称
@@ -512,14 +530,21 @@ func (p *Package) SetThumbnail(ctx context.Context, source, part string) error {
 }
 
 // SetDiscardControl 编码并关联包级释放提示，传入nil时移除包根释放提示关联
-// 提示须引用包内已有部件与固定页面，保留其他包根关系及已有关系ID
-// 入参: hints 释放提示列表，nil移除关联，非nil空切片写入空释放提示
-// 返回: error 提示、部件、关系、许可或资源错误，失败不改变包
-func (p *Package) SetDiscardControl(hints []DiscardHint) error {
+// 提示须引用包内已有部件与固定页面，基于当前待写状态直接校验资源生命周期并保留其他包根关系及已有关系ID
+// 入参: ctx 取消Context，nil采用Background, hints 释放提示列表，nil移除关联，非nil空切片写入空释放提示
+// 返回: error 提示、部件、关系、许可、取消或资源错误，失败不改变包
+func (p *Package) SetDiscardControl(ctx context.Context, hints []DiscardHint) error {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
 	if err := p.lock(); err != nil {
 		return err
 	}
 	defer p.mu.Unlock()
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
 	relations := slices.Clone(p.relations["/"])
 	existing, err := discardControlTarget(relations, p.format)
 	if err != nil {
@@ -540,6 +565,9 @@ func (p *Package) SetDiscardControl(hints []DiscardHint) error {
 		relations = slices.Delete(relations, index, index+1)
 		q := p.signingCopy()
 		if err := q.setRelationships("/", relations); err != nil {
+			return err
+		}
+		if err := checkContext(ctx); err != nil {
 			return err
 		}
 		p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
@@ -565,10 +593,10 @@ func (p *Package) SetDiscardControl(hints []DiscardHint) error {
 		}
 	}
 	var buffer bytes.Buffer
-	if _, err := EncodeDiscardControl(context.Background(), &buffer, hints, &EncodeOptions{Format: p.format, Limits: p.limits, Part: part}); err != nil {
+	if _, err := EncodeDiscardControl(ctx, &buffer, hints, &EncodeOptions{Format: p.format, Limits: p.limits, Part: part}); err != nil {
 		return err
 	}
-	control, err := readDiscardControl(buffer.Bytes(), part, p.format, p.limits, context.Background())
+	control, err := readDiscardControl(buffer.Bytes(), part, p.format, p.limits, ctx)
 	if err != nil {
 		return err
 	}
@@ -582,6 +610,9 @@ func (p *Package) SetDiscardControl(hints []DiscardHint) error {
 		}
 	}
 	for _, hint := range control.Hints {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
 		if !p.names[strings.ToLower(hint.Target)] || !pages[strings.ToLower(hint.SentinelPage)] {
 			return fmt.Errorf("%w: discard resource or sentinel page is absent", ErrInvalid)
 		}
@@ -604,12 +635,19 @@ func (p *Package) SetDiscardControl(hints []DiscardHint) error {
 	if pattern != "" {
 		q.commitName(pattern, part)
 	}
-	if p.pageCount != 0 {
-		view, err := q.reader(context.Background())
+	if len(control.Hints) != 0 && q.pageCount != 0 {
+		view, err := q.editStoryReader(ctx)
 		if err != nil {
 			return err
 		}
+		err = view.validateDiscardLifetime(control, ctx)
 		view.Close()
+		if err != nil {
+			return err
+		}
+	}
+	if err := checkContext(ctx); err != nil {
+		return err
 	}
 	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
 	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
@@ -1522,10 +1560,67 @@ func (p *Package) storyPartUsage(kind string) map[string]int {
 	return usage
 }
 
-// assignStoryPart 为文档结构或故事片段选定目标部件名，优先复用未共享部件并避开受保护或冲突名称
+// sourcePartName 按小写关系来源键反查包内规范源部件名，未匹配时返回空字符串
+// 入参: key 关系映射中的小写来源键
+// 返回: string 规范源部件URI或根路径，未找到为空
+func (p *Package) sourcePartName(key string) string {
+	if key == "/" {
+		return "/"
+	}
+	if part, ok := p.parts[key]; ok {
+		return part.name
+	}
+	if strings.EqualFold(p.sequence, key) {
+		return p.sequence
+	}
+	for _, doc := range p.documents {
+		if strings.EqualFold(doc.Part, key) {
+			return doc.Part
+		}
+		for _, pg := range doc.Pages {
+			if strings.EqualFold(pg.Part, key) {
+				return pg.Part
+			}
+		}
+	}
+	return ""
+}
+
+// storyPartSharedWithOther 判断目标结构部件是否正被包内除当前来源外的任意其他来源引用
+// 入参: source 当前编辑来源部件, target 待检目标部件URI
+// 返回: bool 是否存在其他来源引用该部件
+func (p *Package) storyPartSharedWithOther(source, target string) bool {
+	sourceKey := strings.ToLower(source)
+	targetKey := strings.ToLower(target)
+	for relSourceKey, relations := range p.relations {
+		if relSourceKey == sourceKey {
+			continue
+		}
+		base := p.sourcePartName(relSourceKey)
+		if base == "" {
+			continue
+		}
+		for _, relation := range relations {
+			if relation.TargetMode != "" && relation.TargetMode != TargetModeInternal {
+				continue
+			}
+			resolved, err := resolvePart(base, relation.Target)
+			if err == nil && strings.ToLower(resolved) == targetKey {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// assignStoryPart 为文档结构或故事片段选定目标部件名，强制隔离被其他文档或页面共享的部件路径
 // 入参: source 来源部件, requested 调用方指定部件名, kind 结构关系种类, media 期望媒体类型, pattern 新建命名模板
-// 返回: string 选定部件名, string 新分配时使用的模板, error 部件名、类型或分配错误
+// 返回: string 选定部件名, string 新分配时使用的模板, error 部件名、类型、共享冲突或分配错误
 func (p *Package) assignStoryPart(source, requested, kind, media, pattern string) (string, string, error) {
+	existing, err := p.storyCurrentTarget(source, kind)
+	if err != nil {
+		return "", "", err
+	}
 	if requested != "" {
 		part, err := opcPartName(requested)
 		if err != nil {
@@ -1534,19 +1629,25 @@ func (p *Package) assignStoryPart(source, requested, kind, media, pattern string
 		if opcRelationshipName(part) || p.managed(part) {
 			return "", "", fmt.Errorf("%w: managed %s part", ErrInvalid, kind)
 		}
-		if old, exists := p.parts[strings.ToLower(part)]; exists && !strings.EqualFold(old.media, media) {
+		key := strings.ToLower(part)
+		if old, exists := p.parts[key]; exists && !strings.EqualFold(old.media, media) {
 			return "", "", fmt.Errorf("%w: %s part media mismatch", ErrInvalid, kind)
+		}
+		if p.storyPartSharedWithOther(source, part) {
+			if existing != "" && strings.EqualFold(existing, part) {
+				allocated, err := p.newName(pattern, nil)
+				if err != nil {
+					return "", "", err
+				}
+				return allocated, pattern, nil
+			}
+			return "", "", fmt.Errorf("%w: %s part %s is shared with another source", ErrInvalid, kind, part)
 		}
 		return part, "", nil
 	}
-	existing, err := p.storyCurrentTarget(source, kind)
-	if err != nil {
-		return "", "", err
-	}
 	if existing != "" {
 		key := strings.ToLower(existing)
-		usage := p.storyPartUsage(kind)
-		if usage[key] <= 1 && !p.managed(existing) && !opcRelationshipName(existing) && !p.protected[key] {
+		if !p.storyPartSharedWithOther(source, existing) && !p.managed(existing) && !opcRelationshipName(existing) && !p.protected[key] {
 			if old, exists := p.parts[key]; !exists || strings.EqualFold(old.media, media) {
 				return existing, "", nil
 			}
@@ -1601,8 +1702,9 @@ func (p *Package) editStoryReader(ctx context.Context) (*Reader, error) {
 		return nil, err
 	}
 	pkg := p.partReader()
+	ns := formatNamespace(p.format)
 	if _, present := pkg.parts[strings.ToLower(p.sequence)]; !present {
-		createdPut(pkg, p.sequence, fixedContentType("fixeddocumentsequence"), nil)
+		createdPut(pkg, p.sequence, fixedContentType("fixeddocumentsequence"), []byte(`<FixedDocumentSequence xmlns="`+ns+`"/>`))
 	}
 	r := &Reader{pkg: pkg, format: p.format, limits: p.limits, sequence: p.sequence, documents: p.documents}
 	for _, document := range p.documents {
@@ -1610,7 +1712,7 @@ func (p *Package) editStoryReader(ctx context.Context) (*Reader, error) {
 			return nil, err
 		}
 		if _, present := pkg.parts[strings.ToLower(document.Part)]; !present {
-			createdPut(pkg, document.Part, fixedContentType("fixeddocument"), nil)
+			createdPut(pkg, document.Part, fixedContentType("fixeddocument"), []byte(`<FixedDocument xmlns="`+ns+`"/>`))
 		}
 		r.pages = append(r.pages, document.Pages...)
 	}
@@ -1880,8 +1982,15 @@ func createdDocumentStructure(value *DocumentStructure, format Format, limits Li
 			if err != nil {
 				return nil, err
 			}
+			if entry.Level < 0 {
+				return nil, fmt.Errorf("%w: invalid outline level %d", ErrInvalid, entry.Level)
+			}
+			if entry.Level > 0 {
+				if err := p.attr(child, "OutlineLevel", strconv.FormatInt(int64(entry.Level), 10)); err != nil {
+					return nil, err
+				}
+			}
 			for _, attr := range []struct{ name, value string }{
-				{"OutlineLevel", strconv.FormatInt(int64(entry.Level), 10)},
 				{"OutlineTarget", entry.Target}, {"Description", entry.Description},
 			} {
 				if err := p.attr(child, attr.name, attr.value); err != nil {
@@ -2156,11 +2265,18 @@ func (p *createdStoryEncoder) content(value *ContentStructure, depth int) (*xmlE
 		}
 	}
 	if value.Kind == StructureCell {
-		if err := p.attr(node, "RowSpan", strconv.FormatInt(int64(value.RowSpan), 10)); err != nil {
-			return nil, err
+		if value.RowSpan < 0 || value.ColumnSpan < 0 {
+			return nil, fmt.Errorf("%w: invalid table cell span", ErrInvalid)
 		}
-		if err := p.attr(node, "ColumnSpan", strconv.FormatInt(int64(value.ColumnSpan), 10)); err != nil {
-			return nil, err
+		if value.RowSpan > 0 {
+			if err := p.attr(node, "RowSpan", strconv.FormatInt(int64(value.RowSpan), 10)); err != nil {
+				return nil, err
+			}
+		}
+		if value.ColumnSpan > 0 {
+			if err := p.attr(node, "ColumnSpan", strconv.FormatInt(int64(value.ColumnSpan), 10)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	for index := range value.Children {
@@ -2285,23 +2401,29 @@ func remapOutlineTargets(value *DocumentStructure, sequence string, previous, cu
 				changed = true
 				continue
 			}
-		} else if docTargets, wasDoc := oldDocTargets[targetKey]; wasDoc && uri.Fragment != "" && !linkPageNumber(uri.Fragment) {
-			if firstPageKey, existed := docTargets[uri.Fragment]; existed && !newDocTargets[targetKey][uri.Fragment] {
-				newDocIdx, stillExists := newPageDoc[firstPageKey]
-				if !stillExists {
-					changed = true
-					continue
-				}
-				_, rawFragment, _ := strings.Cut(normalized, "#")
-				newPath := current[newDocIdx].Part
-				if !strings.HasPrefix(normalized, "/") {
-					newPath, err = relativePart(base, current[newDocIdx].Part)
-					if err != nil {
-						return false, err
+		} else if docTargets, wasDoc := oldDocTargets[targetKey]; wasDoc {
+			_, docExists := newDocTargets[targetKey]
+			named := uri.Fragment != "" && !linkPageNumber(uri.Fragment)
+			firstPageKey, existed := docTargets[uri.Fragment]
+			if !docExists || named && existed && !newDocTargets[targetKey][uri.Fragment] {
+				if named && existed {
+					if newDocIdx, stillExists := newPageDoc[firstPageKey]; stillExists {
+						_, rawFragment, _ := strings.Cut(normalized, "#")
+						newPath := current[newDocIdx].Part
+						if !strings.HasPrefix(normalized, "/") {
+							newPath, err = relativePart(base, current[newDocIdx].Part)
+							if err != nil {
+								return false, err
+							}
+						}
+						entry.Target = newPath + "#" + rawFragment
+						changed = true
+						entries = append(entries, entry)
+						continue
 					}
 				}
-				entry.Target = newPath + "#" + rawFragment
 				changed = true
+				continue
 			}
 		}
 		entries = append(entries, entry)
@@ -2366,6 +2488,90 @@ func (p *Package) moveStoryPage(document, index, target, position int) error {
 	for docIdx := range structures {
 		if dirty[docIdx] {
 			if err := q.writeStoryStructure(docIdx, structures[docIdx], owners); err != nil {
+				return err
+			}
+		}
+	}
+	if err := q.validateStoryEdit(nil); err != nil {
+		return err
+	}
+	p.commitStory(q)
+	return nil
+}
+
+// moveStoryDocument 在独立候选中调整文档顺序并同步所有保留文档的目录目标引用
+// 入参: docIndex 来源文档序号, position 移动完成后的文档序号
+// 返回: error 结构、绑定、编辑限制或资源错误
+func (p *Package) moveStoryDocument(docIndex, position int) error {
+	r, err := p.editStoryReader(nil)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	affected := p.structuredDocuments()
+	structures, owners, err := storyStructures(r, affected...)
+	if err != nil {
+		return err
+	}
+	q := p.storyCopy()
+	q.moveDocument(docIndex, position)
+	newIndexByPart := make(map[string]int, len(q.documents))
+	for idx, doc := range q.documents {
+		newIndexByPart[strings.ToLower(doc.Part)] = idx
+	}
+	for oldIdx, structure := range structures {
+		if structure == nil {
+			continue
+		}
+		outlineChanged, err := remapOutlineTargets(structure, p.sequence, p.documents, q.documents)
+		if err != nil {
+			return err
+		}
+		if outlineChanged {
+			newIdx := newIndexByPart[strings.ToLower(p.documents[oldIdx].Part)]
+			if err := q.writeStoryStructure(newIdx, structure, owners); err != nil {
+				return err
+			}
+		}
+	}
+	if err := q.validateStoryEdit(nil); err != nil {
+		return err
+	}
+	p.commitStory(q)
+	return nil
+}
+
+// deleteStoryDocument 在独立候选中删除文档及其页面并同步清理保留文档的目录目标引用
+// 入参: docIndex 待删除文档序号
+// 返回: error 结构、绑定、编辑限制或资源错误
+func (p *Package) deleteStoryDocument(docIndex int) error {
+	r, err := p.editStoryReader(nil)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	affected := p.structuredDocuments()
+	structures, _, err := storyStructures(r, affected...)
+	if err != nil {
+		return err
+	}
+	q := p.storyCopy()
+	q.deleteDocument(docIndex)
+	remainingOwners := q.storyPartUsage("documentstructure")
+	for oldIdx, structure := range structures {
+		if oldIdx == docIndex || structure == nil {
+			continue
+		}
+		outlineChanged, err := remapOutlineTargets(structure, p.sequence, p.documents, q.documents)
+		if err != nil {
+			return err
+		}
+		if outlineChanged {
+			newIdx := oldIdx
+			if oldIdx > docIndex {
+				newIdx--
+			}
+			if err := q.writeStoryStructure(newIdx, structure, remainingOwners); err != nil {
 				return err
 			}
 		}

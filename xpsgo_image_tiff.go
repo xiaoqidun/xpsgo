@@ -78,7 +78,7 @@ type tiffLegacyHeader struct {
 	restart uint16
 }
 
-// tiffPixelFormat 保存已经校验的样本布局及颜色解释
+// tiffPixelFormat 保存已经校验的样本布局、有符号值域及颜色解释
 type tiffPixelFormat struct {
 	order        binary.ByteOrder
 	photo        uint32
@@ -87,6 +87,10 @@ type tiffPixelFormat struct {
 	alpha        uint32
 	sampleFormat uint32
 	palette      []byte
+	hasSMin      bool
+	hasSMax      bool
+	sMin         [5]float64
+	sMax         [5]float64
 }
 
 // readTIFFDirectory 读取经典TIFF头及首个目录，限制目录项数量
@@ -251,7 +255,7 @@ func (d *tiffDirectory) resolution() (Point, error) {
 	return Point{value[0], value[1]}, nil
 }
 
-// decodeTIFFImage 解码首个目录的条带或分块图像，保持16位颜色及独立透明度
+// decodeTIFFImage 解码首个目录的条带或分块图像，保持16位颜色及独立透明度并按Tag 274规范化视觉方向
 // 入参: data 图像字节, maxPixels 剩余像素预算
 // 返回: *rasterImage 图像与分辨率, error 数据、能力或资源错误
 func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
@@ -381,6 +385,40 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 		}
 		if alpha > 2 {
 			return nil, fmt.Errorf("%w: TIFF alpha interpretation", ErrUnsupported)
+		}
+	} else if channels > base {
+		return nil, fmt.Errorf("%w: missing TIFF ExtraSamples", ErrInvalid)
+	}
+	var sMin, sMax [5]float64
+	var hasSMin, hasSMax bool
+	if sampleFormat == 2 {
+		defaultMin, defaultMax := -128.0, 127.0
+		if bits == 16 {
+			defaultMin, defaultMax = -32768.0, 32767.0
+		}
+		for i := range int(channels) {
+			sMin[i], sMax[i] = defaultMin, defaultMax
+		}
+		if d.entry[340] != nil {
+			values, err := d.sampleRange(340, int(channels))
+			if err != nil {
+				return nil, err
+			}
+			copy(sMin[:], values)
+			hasSMin = true
+		}
+		if d.entry[341] != nil {
+			values, err := d.sampleRange(341, int(channels))
+			if err != nil {
+				return nil, err
+			}
+			copy(sMax[:], values)
+			hasSMax = true
+		}
+		for i := range int(channels) {
+			if !geometryFinite(sMin[i], sMax[i]) || sMax[i] <= sMin[i] {
+				return nil, fmt.Errorf("%w: TIFF signed sample range", ErrInvalid)
+			}
 		}
 	}
 	fillOrder, err := d.number(266, 1, false)
@@ -516,7 +554,7 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 		if err != nil {
 			return nil, err
 		}
-		result.linear = true
+		result.linear = photo != 5
 	} else if photo == 5 {
 		result.native, err = newImageComponents(bounds, 4, alpha != 0, maxPixels)
 		if err != nil {
@@ -536,7 +574,7 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 			floatScratch = make([]byte, layout.rowBytes)
 		}
 	}
-	format := tiffPixelFormat{order: d.order, photo: photo, bits: bits, channels: channels, alpha: alpha, sampleFormat: sampleFormat, palette: palette}
+	format := tiffPixelFormat{order: d.order, photo: photo, bits: bits, channels: channels, alpha: alpha, sampleFormat: sampleFormat, palette: palette, hasSMin: hasSMin, hasSMax: hasSMax, sMin: sMin, sMax: sMax}
 	var jpegFrame tiffJPEGTable
 	for i := range layout.blocksPerPlane {
 		region := layout.region(i)
@@ -627,7 +665,171 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 			}
 		}
 	}
+	if orientation > 1 {
+		applyTIFFOrientation(result, orientation)
+	}
 	return result, nil
+}
+
+// sampleRange 解析SMinSampleValue或SMaxSampleValue的逐通道标量范围，允许单值广播到全部通道
+// 入参: tag 字段标识, channels 图像样本通道数
+// 返回: []float64 逐通道范围值, error 字段类型、数量、偏移或数值错误
+func (d *tiffDirectory) sampleRange(tag uint16, channels int) ([]float64, error) {
+	entry := d.entry[tag]
+	typ := d.order.Uint16(entry[2:])
+	count := d.order.Uint32(entry[4:])
+	if count != 1 && int(count) != channels {
+		return nil, fmt.Errorf("%w: TIFF sample range tag %d count", ErrInvalid, tag)
+	}
+	var width uint64
+	switch typ {
+	case 1, 6:
+		width = 1
+	case 3, 8:
+		width = 2
+	case 4, 9, 11:
+		width = 4
+	case 5, 10, 12:
+		width = 8
+	default:
+		return nil, fmt.Errorf("%w: TIFF sample range tag %d type", ErrInvalid, tag)
+	}
+	size := uint64(count) * width
+	var raw []byte
+	if size <= 4 {
+		raw = entry[8 : 8+size]
+	} else {
+		offset := uint64(d.order.Uint32(entry[8:]))
+		if offset > uint64(len(d.data)) || size > uint64(len(d.data))-offset {
+			return nil, fmt.Errorf("%w: TIFF sample range tag %d offset", ErrInvalid, tag)
+		}
+		raw = d.data[offset : offset+size]
+	}
+	result := make([]float64, channels)
+	for i := range int(count) {
+		slice := raw[uint64(i)*width:]
+		var v float64
+		switch typ {
+		case 1:
+			v = float64(slice[0])
+		case 6:
+			v = float64(int8(slice[0]))
+		case 3:
+			v = float64(d.order.Uint16(slice))
+		case 8:
+			v = float64(int16(d.order.Uint16(slice)))
+		case 4:
+			v = float64(d.order.Uint32(slice))
+		case 9:
+			v = float64(int32(d.order.Uint32(slice)))
+		case 5:
+			n, q := d.order.Uint32(slice), d.order.Uint32(slice[4:])
+			if q == 0 {
+				return nil, fmt.Errorf("%w: TIFF sample range rational denominator", ErrInvalid)
+			}
+			v = float64(n) / float64(q)
+		case 10:
+			n, q := int32(d.order.Uint32(slice)), int32(d.order.Uint32(slice[4:]))
+			if q == 0 {
+				return nil, fmt.Errorf("%w: TIFF sample range rational denominator", ErrInvalid)
+			}
+			v = float64(n) / float64(q)
+		case 11:
+			v = float64(math.Float32frombits(d.order.Uint32(slice)))
+		case 12:
+			v = math.Float64frombits(d.order.Uint64(slice))
+		}
+		if !geometryFinite(v) {
+			return nil, fmt.Errorf("%w: TIFF sample range non-finite value", ErrInvalid)
+		}
+		result[i] = v
+	}
+	if count == 1 {
+		for i := 1; i < channels; i++ {
+			result[i] = result[0]
+		}
+	}
+	return result, nil
+}
+
+// tiffOrientedPoint 按TIFF Tag 274定义将存储坐标映射到视觉方向坐标
+// 入参: x, y 存储坐标, w, h 存储宽高, orientation 方向编号2到8
+// 返回: dx, dy 视觉坐标
+func tiffOrientedPoint(x, y, w, h int, orientation uint32) (int, int) {
+	switch orientation {
+	case 2:
+		return w - 1 - x, y
+	case 3:
+		return w - 1 - x, h - 1 - y
+	case 4:
+		return x, h - 1 - y
+	case 5:
+		return y, x
+	case 6:
+		return h - 1 - y, x
+	case 7:
+		return h - 1 - y, w - 1 - x
+	case 8:
+		return y, w - 1 - x
+	default:
+		return x, y
+	}
+}
+
+// applyTIFFOrientation 按TIFF Tag 274对解码后的像素缓冲执行旋转或镜像变换，并在轴交换时同步交换DPI
+// 入参: result 已解码的TIFF图像, orientation 合法方向值2到8
+func applyTIFFOrientation(result *rasterImage, orientation uint32) {
+	bounds := result.bounds()
+	w, h := bounds.Dx(), bounds.Dy()
+	dstW, dstH := w, h
+	if orientation >= 5 {
+		dstW, dstH = h, w
+		result.dpi = Point{result.dpi.Y, result.dpi.X}
+	}
+	dstBounds := image.Rect(0, 0, dstW, dstH)
+	if result.native != nil {
+		src := result.native
+		stride := src.channels
+		if src.alpha {
+			stride++
+		}
+		dst := &imageComponents{bounds: dstBounds, channels: src.channels, alpha: src.alpha}
+		if src.floating != nil {
+			dst.floating = make([]float64, len(src.floating))
+			for y := range h {
+				for x := range w {
+					dx, dy := tiffOrientedPoint(x, y, w, h, orientation)
+					sAt := (y*w + x) * stride
+					dAt := (dy*dstW + dx) * stride
+					copy(dst.floating[dAt:dAt+stride], src.floating[sAt:sAt+stride])
+				}
+			}
+		} else {
+			dst.values = make([]uint16, len(src.values))
+			for y := range h {
+				for x := range w {
+					dx, dy := tiffOrientedPoint(x, y, w, h, orientation)
+					sAt := (y*w + x) * stride
+					dAt := (dy*dstW + dx) * stride
+					copy(dst.values[dAt:dAt+stride], src.values[sAt:sAt+stride])
+				}
+			}
+		}
+		result.native = dst
+		return
+	}
+	if src, ok := result.pixels.(*image.NRGBA64); ok {
+		dst := image.NewNRGBA64(dstBounds)
+		for y := range h {
+			for x := range w {
+				dx, dy := tiffOrientedPoint(x, y, w, h, orientation)
+				sAt := src.PixOffset(x, y)
+				dAt := dst.PixOffset(dx, dy)
+				copy(dst.Pix[dAt:dAt+8], src.Pix[sAt:sAt+8])
+			}
+		}
+		result.pixels = dst
+	}
 }
 
 // restoreTIFFFloatPredictor 按TIFF技术说明3恢复浮点水平差分及大端字节平面重排
@@ -1297,6 +1499,36 @@ func (l *tiffLegacyJPEG) stream(entropy []byte, region image.Rectangle) ([]byte,
 	return data, nil
 }
 
+// signedSample16 将有符号整型样本按SMinSampleValue/SMaxSampleValue线性映射到十六位，绝不对Alpha通道做符号位异或
+// 入参: raw 原始位宽样本值, channel 通道序号, isAlpha 是否为透明度通道, scale 无符号位宽缩放因子
+// 返回: uint16 十六位归一化样本
+func (f *tiffPixelFormat) signedSample16(raw uint16, channel int, isAlpha bool, scale uint16) uint16 {
+	if isAlpha {
+		if (!f.hasSMin && !f.hasSMax) || f.sMin[channel] < 0 {
+			return raw * scale
+		}
+	} else if !f.hasSMin && !f.hasSMax {
+		if f.bits == 16 {
+			return raw ^ 0x8000
+		}
+		return (raw ^ 0x80) * scale
+	}
+	var v float64
+	if f.bits == 16 {
+		v = float64(int16(raw))
+	} else {
+		v = float64(int8(raw))
+	}
+	norm := (v - f.sMin[channel]) / (f.sMax[channel] - f.sMin[channel])
+	if norm <= 0 {
+		return 0
+	}
+	if norm >= 1 {
+		return 65535
+	}
+	return uint16(math.Round(norm * 65535))
+}
+
 // writeRowRange 将压缩块中的可见行区间转换为非预乘16位颜色，不读取边界填充
 // 入参: out 目标图像, x0 目标起始列, y 目标行号, width 可见列数, row 完整存储行
 func (f *tiffPixelFormat) writeRowRange(out *image.NRGBA64, x0, y, width int, row []byte) {
@@ -1305,16 +1537,21 @@ func (f *tiffPixelFormat) writeRowRange(out *image.NRGBA64, x0, y, width int, ro
 		var sample [4]uint16
 		for c := range int(f.channels) {
 			bit := (x*int(f.channels) + c) * int(f.bits)
+			isAlpha := f.alpha != 0 && c == int(f.channels)-1
 			switch f.bits {
 			case 16:
-				sample[c] = f.order.Uint16(row[bit/8:])
+				raw := f.order.Uint16(row[bit/8:])
 				if f.sampleFormat == 2 {
-					sample[c] ^= 0x8000
+					sample[c] = f.signedSample16(raw, c, isAlpha, 1)
+				} else {
+					sample[c] = raw
 				}
 			case 8:
-				sample[c] = uint16(row[bit/8])
+				raw := uint16(row[bit/8])
 				if f.sampleFormat == 2 {
-					sample[c] ^= 0x80
+					sample[c] = f.signedSample16(raw, c, isAlpha, scale)
+				} else {
+					sample[c] = raw
 				}
 			default:
 				sample[c] = uint16(row[bit/8]>>uint(8-int(f.bits)-bit%8)) & uint16((1<<f.bits)-1)
@@ -1326,8 +1563,10 @@ func (f *tiffPixelFormat) writeRowRange(out *image.NRGBA64, x0, y, width int, ro
 			index := int(sample[0]) * 2
 			pixel = color.NRGBA64{f.order.Uint16(f.palette[index:]), f.order.Uint16(f.palette[stride+index:]), f.order.Uint16(f.palette[2*stride+index:]), 65535}
 		} else {
-			for c := range int(f.channels) {
-				sample[c] *= scale
+			if f.sampleFormat != 2 {
+				for c := range int(f.channels) {
+					sample[c] *= scale
+				}
 			}
 			if f.alpha == 1 {
 				for c := range int(f.channels) - 1 {
@@ -1352,14 +1591,14 @@ func (f *tiffPixelFormat) writeRowRange(out *image.NRGBA64, x0, y, width int, ro
 	}
 }
 
-// imageUnassociateSample 还原16位原生预乘分量，舍弃超出单位区间的发光部分
+// imageUnassociateSample 还原16位原生预乘分量并四舍五入，舍弃超出单位区间的发光部分
 // 入参: value 预乘分量, alpha 透明度
 // 返回: uint16 非预乘单位区间分量
 func imageUnassociateSample(value, alpha uint16) uint16 {
 	if alpha == 0 {
 		return 0
 	}
-	return uint16(min(65535, uint32(value)*65535/uint32(alpha)))
+	return uint16(min(65535, (uint32(value)*65535+uint32(alpha)/2)/uint32(alpha)))
 }
 
 // writeComponentRange 将压缩块的可见行区间写入原生分量图像，透明度不参与颜色转换
@@ -1374,18 +1613,21 @@ func (f *tiffPixelFormat) writeComponentRange(out *imageComponents, x0, y, width
 		var sample [5]uint16
 		for channel := range int(f.channels) {
 			at := (x*int(f.channels) + channel) * int(f.bits/8)
+			isAlpha := f.alpha != 0 && channel == int(f.channels)-1
 			if f.bits == 16 {
 				value := f.order.Uint16(row[at:])
 				if f.sampleFormat == 2 {
-					value ^= 0x8000
+					sample[channel] = f.signedSample16(value, channel, isAlpha, 1)
+				} else {
+					sample[channel] = value
 				}
-				sample[channel] = value
 			} else {
 				value := uint16(row[at])
 				if f.sampleFormat == 2 {
-					value ^= 0x80
+					sample[channel] = f.signedSample16(value, channel, isAlpha, scale)
+				} else {
+					sample[channel] = value * scale
 				}
-				sample[channel] = value * scale
 			}
 		}
 		at := (y*out.bounds.Dx() + x0 + x) * stride
@@ -1402,9 +1644,9 @@ func (f *tiffPixelFormat) writeComponentRange(out *imageComponents, x0, y, width
 	}
 }
 
-// writeFloatRange 将32位浮点存储行的可见区间写入扩展范围原生分量，按需展开预乘透明度
+// writeFloatRange 将32位浮点存储行的可见区间写入扩展范围原生分量，校验全部通道有限性并按需展开预乘透明度
 // 入参: out 浮点原生分量图像, x0 目标起始列, y 目标行, width 可见列数, row 完整交织存储行
-// 返回: error 预乘或透明度非有限错误
+// 返回: error 预乘、颜色或透明度非有限错误
 func (f *tiffPixelFormat) writeFloatRange(out *imageComponents, x0, y, width int, row []byte) error {
 	stride := out.channels
 	if out.alpha {
@@ -1427,6 +1669,9 @@ func (f *tiffPixelFormat) writeFloatRange(out *imageComponents, x0, y, width int
 		at := (y*out.bounds.Dx() + x0 + x) * stride
 		for channel := range out.channels {
 			value := sample[channel]
+			if !geometryFinite(value) {
+				return fmt.Errorf("%w: TIFF non-finite color", ErrUnsupported)
+			}
 			if f.alpha == 1 {
 				if alpha == 0 {
 					value = 0

@@ -93,7 +93,7 @@ func resolvePart(source, target string) (string, error) {
 	if strings.ContainsAny(target, "?#") {
 		return "", fmt.Errorf("%w: query or fragment in part reference: %q", ErrUnsupported, target)
 	}
-	escaped, err := opcEscapedPath(target)
+	escaped, err := opcNormalizePath(target, true)
 	if err != nil {
 		return "", err
 	}
@@ -162,7 +162,7 @@ func opcPartName(name string) (string, error) {
 	if !strings.HasPrefix(name, "/") || strings.HasPrefix(name, "//") || strings.ContainsAny(name, "?#") {
 		return "", fmt.Errorf("%w: invalid part name %q", ErrInvalid, name)
 	}
-	canonical, err := opcEscapedPath(name)
+	canonical, err := opcNormalizePath(name, false)
 	if err != nil {
 		return "", err
 	}
@@ -174,10 +174,10 @@ func opcPartName(name string) (string, error) {
 	return canonical, nil
 }
 
-// opcEscapedPath 校验URI路径字符与转义，不解码保留字符或重复解码百分号
-// 入参: value 尚未规范化的URI路径
+// opcNormalizePath 共用OPC路径字符校验与百分号编码规范化，decodeUnreserved控制是否解码未保留字符
+// 入参: value 原始路径, decodeUnreserved 是否按相对URI等价规则解码未保留ASCII字符
 // 返回: string 规范化路径, error 错误信息
-func opcEscapedPath(value string) (string, error) {
+func opcNormalizePath(value string, decodeUnreserved bool) (string, error) {
 	const hex = "0123456789ABCDEF"
 	var b strings.Builder
 	b.Grow(len(value))
@@ -192,12 +192,19 @@ func opcEscapedPath(value string) (string, error) {
 				return "", fmt.Errorf("%w: invalid percent escape in %q", ErrInvalid, value)
 			}
 			decoded := byte(hi*16 + lo)
-			if decoded == '/' || decoded == '\\' || opcUnreserved(decoded) {
+			if decoded == '/' || decoded == '\\' {
 				return "", fmt.Errorf("%w: forbidden percent escape in %q", ErrInvalid, value)
 			}
-			b.WriteByte('%')
-			b.WriteByte(hex[hi])
-			b.WriteByte(hex[lo])
+			if opcUnreserved(decoded) {
+				if !decodeUnreserved {
+					return "", fmt.Errorf("%w: forbidden percent escape in %q", ErrInvalid, value)
+				}
+				b.WriteByte(decoded)
+			} else {
+				b.WriteByte('%')
+				b.WriteByte(hex[hi])
+				b.WriteByte(hex[lo])
+			}
 			i += 2
 		} else if opcUnreserved(c) || strings.ContainsRune("/!$&'()*+,;=:@", rune(c)) {
 			b.WriteByte(c)

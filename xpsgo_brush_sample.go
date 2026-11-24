@@ -15,6 +15,7 @@
 package xpsgo
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	"image/color"
@@ -49,32 +50,36 @@ type imageSampleCache struct {
 	jxr     jxrRowCache
 }
 
-// imageSampler 保存图像画刷的设备逆变换、物理坐标及颜色采样状态
+// imageSampler 保存图像画刷的设备逆变换、物理坐标、色彩编码及颜色采样状态
 type imageSampler struct {
-	image      *rasterImage
-	inverse    Matrix
-	viewbox    Rect
-	viewport   Rect
-	tile       TileMode
-	opacity    float64
-	space      renderColorSpace
-	alphaOnly  bool
-	filterX    bool
-	filterY    bool
-	charge     func(uint64) error
-	reserve    func(int) error
-	release    func(int)
-	reserved   int
-	filter     *imageBrushFilter
-	filterErr  error
-	filterWork uint64
-	lastPoint  Point
-	lastColor  renderColor
-	lastValid  bool
-	jxr        jxrRowCache
-	cachePool  sync.Pool
-	convert    func([8]float64, float64) (renderColor, error)
-	mu         sync.Mutex
+	image       *rasterImage
+	inverse     Matrix
+	viewbox     Rect
+	viewport    Rect
+	tile        TileMode
+	opacity     float64
+	space       renderColorSpace
+	alphaOnly   bool
+	filterX     bool
+	filterY     bool
+	charge      func(uint64) error
+	reserve     func(int) error
+	release     func(int)
+	reserved    int
+	filter      *imageBrushFilter
+	filterErr   error
+	filterWork  uint64
+	lastPoint   Point
+	lastColor   renderColor
+	lastValid   bool
+	jxr         jxrRowCache
+	jxrMode     jxrSampleMode
+	jxrKey      jxrLinearKey
+	cicp        *imageCICPTransform
+	toneMapPeak float64
+	cachePool   sync.Pool
+	convert     func([iccMaxChannels]float64, float64, bool) (renderColor, error)
+	mu          sync.Mutex
 }
 
 // imageBrushFilter 保存已转入合成空间的常量或单轴均值，不持有源像素的可变副本
@@ -123,6 +128,7 @@ type visualBrushFilter struct {
 	reserved   int
 	next       int
 	read       sceneSample
+	mu         sync.Mutex
 }
 
 // visualBrushFilterValue 保存未平均轴的位置及条带颜色，每项按两个预乘像素计入存活预算
@@ -143,17 +149,10 @@ func makeImageByteToUnit() [256]float64 {
 	return table
 }
 
-// newImageSampler 构建图像画刷采样器，关联物理尺寸、画刷变换与小图块平均状态
-// 入参: brush 图像画刷, source 图像资源, transform 所属元素的设备变换, space 合成空间
+// newImageSampler 按渲染意图与HDR峰值亮度构建图像画刷采样器，统一处理JXR三模式、PNG CICP与色调映射
+// 入参: brush 图像画刷, source 图像资源, transform 所属元素的设备变换, space 合成空间, alphaOnly 是否仅读取透明度, jxrIntent 显式源渲染意图, hdrPeakNits 可选HDR参考峰值亮度
 // 返回: *imageSampler 本次绘制独占的采样器, error 属性、能力或数值错误
-func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space renderColorSpace) (*imageSampler, error) {
-	return newImageSamplerMode(brush, source, transform, space, false)
-}
-
-// newImageSamplerMode 按是否仅需透明度掩模构建图像画刷采样器，支持无ICC四通道CMYK及十五通道扩展
-// 入参: brush 图像画刷, source 图像资源, transform 所属元素的设备变换, space 合成空间, alphaOnly 是否作为OpacityMask仅读取透明度
-// 返回: *imageSampler 本次绘制独占的采样器, error 属性、能力或数值错误
-func newImageSamplerMode(brush *Brush, source *rasterImage, transform Matrix, space renderColorSpace, alphaOnly bool) (*imageSampler, error) {
+func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space renderColorSpace, alphaOnly bool, jxrIntent RenderingIntent, hdrPeakNits float64) (*imageSampler, error) {
 	if brush == nil || brush.Kind != BrushImage || source == nil || source.bounds().Empty() || !geometryFinite(source.dpi.X, source.dpi.Y) || source.dpi.X <= 0 || source.dpi.Y <= 0 {
 		return nil, fmt.Errorf("%w: image brush source", ErrInvalid)
 	}
@@ -163,12 +162,97 @@ func newImageSamplerMode(brush *Brush, source *rasterImage, transform Matrix, sp
 	if space != renderSRGB && space != renderScRGB {
 		return nil, fmt.Errorf("%w: image blend space", ErrUnsupported)
 	}
-	source, err := standaloneImageColor(source)
-	if err != nil {
-		return nil, err
+	var cicpTransform *imageCICPTransform
+	var jxrMode jxrSampleMode
+	var jxrKey jxrLinearKey
+	var toneMapPeak float64
+	if source.jxr == nil && brush.ImageProfileURI == "" && !source.associatedProfile && source.selectedProfile == nil && imageCICPUsable(source.cicp) {
+		if source.transform != nil {
+			view := *source
+			view.transform = nil
+			source = &view
+		}
+		var err error
+		cicpTransform, err = prepareImageCICP(source.cicp, imageSourceBitDepth(source), hdrPeakNits)
+		if err != nil {
+			return nil, err
+		}
+		if cicpTransform != nil {
+			if cicpTransform.hdr {
+				toneMapPeak = cicpTransform.peakNits
+			} else if hdrPeakNits > 0 {
+				toneMapPeak = hdrPeakNits
+			}
+		}
+	} else {
+		var err error
+		if source.jxr != nil && source.transform == nil && source.selectedProfile == nil && source.cicp != nil && len(source.profile) > 0 {
+			view := *source
+			view.cicp = nil
+			resolved, resolveErr := standaloneImageColor(&view)
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+			restored := *resolved
+			restored.cicp = source.cicp
+			source = &restored
+		} else {
+			source, err = standaloneImageColor(source)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if source.jxr != nil {
+			effectiveProfile := source.selectedProfile
+			if source.transform != nil {
+				effectiveProfile = source.transform.profile
+			}
+			isExternal := effectiveProfile != nil && (brush.ImageProfileURI != "" || source.associatedProfile || len(source.jxr.info.ICCProfile) == 0 || !bytes.Equal(effectiveProfile.data, source.jxr.info.ICCProfile))
+			if !source.jxr.ycc {
+				if effectiveProfile != nil {
+					jxrMode = jxrSampleNative
+				} else if source.jxr.info.ColorEncoding != nil {
+					jxrMode = jxrSampleLinear
+					jxrKey = jxrLinearKey{applyCICP: true, intent: jxrIntentFromRender(jxrIntent), hdrPeakNits: hdrPeakNits}
+				} else {
+					jxrMode = jxrSampleNative
+				}
+			} else if effectiveProfile != nil && (isExternal || source.selectedProfile != nil || effectiveProfile.class == "nmcl") {
+				if effectiveProfile.space == "YCbr" {
+					jxrMode = jxrSampleNative
+				} else {
+					jxrMode = jxrSampleRGB
+				}
+			} else {
+				jxrMode = jxrSampleLinear
+				intent := jxrIntentFromRender(jxrIntent)
+				if jxrIntent == IntentDefault && source.transform != nil {
+					intent = jxrIntentFromICC(source.transform.intent)
+				}
+				jxrKey = jxrLinearKey{
+					applyCICP:   source.jxr.info.ColorEncoding != nil,
+					applyICC:    len(source.profile) > 0 && len(source.jxr.info.ICCProfile) > 0,
+					intent:      intent,
+					hdrPeakNits: hdrPeakNits,
+				}
+			}
+			if jxrMode == jxrSampleLinear && source.cicp != nil && (source.cicp.transfer == 16 || source.cicp.transfer == 18) {
+				if hdrPeakNits > 0 {
+					toneMapPeak = hdrPeakNits
+				} else if source.cicp.transfer == 16 {
+					toneMapPeak = 10000
+				} else {
+					toneMapPeak = 1000
+				}
+			} else if hdrPeakNits > 0 && (source.linear || jxrMode == jxrSampleLinear) {
+				toneMapPeak = hdrPeakNits
+			}
+		} else if hdrPeakNits > 0 && source.linear {
+			toneMapPeak = hdrPeakNits
+		}
 	}
 	channels := imageColorChannels(source)
-	if !alphaOnly && source.transform == nil && source.selectedProfile == nil && (channels == 2 || channels > 4 || channels == 4 && source.multiChannel) {
+	if !alphaOnly && source.transform == nil && source.selectedProfile == nil && cicpTransform == nil && (channels == 2 || channels > 4 || channels == 4 && source.multiChannel) {
 		return nil, fmt.Errorf("%w: default device image color conversion", ErrUnsupported)
 	}
 	for _, box := range []Rect{brush.Viewbox, brush.Viewport} {
@@ -197,7 +281,22 @@ func newImageSamplerMode(brush *Brush, source *rasterImage, transform Matrix, sp
 	if err != nil {
 		return nil, err
 	}
-	sampler := &imageSampler{image: source, inverse: inverse, viewbox: brush.Viewbox, viewport: brush.Viewport, tile: brush.TileMode, opacity: brush.Opacity, space: space, alphaOnly: alphaOnly, filterX: filterX, filterY: filterY}
+	sampler := &imageSampler{
+		image:       source,
+		inverse:     inverse,
+		viewbox:     brush.Viewbox,
+		viewport:    brush.Viewport,
+		tile:        brush.TileMode,
+		opacity:     brush.Opacity,
+		space:       space,
+		alphaOnly:   alphaOnly,
+		filterX:     filterX,
+		filterY:     filterY,
+		jxrMode:     jxrMode,
+		jxrKey:      jxrKey,
+		cicp:        cicpTransform,
+		toneMapPeak: toneMapPeak,
+	}
 	if collapsed {
 		sampler.filterX, sampler.filterY = true, true
 		if sampler.tile == TileNone {
@@ -205,6 +304,24 @@ func newImageSamplerMode(brush *Brush, source *rasterImage, transform Matrix, sp
 		}
 	}
 	return sampler, nil
+}
+
+// imageSourceBitDepth 返回非JXR图像源编码的单通道位深，浮点图像返回零
+// 入参: source 源图像
+// 返回: int 编码位深（0、8或16）
+func imageSourceBitDepth(source *rasterImage) int {
+	if source.native != nil {
+		if source.native.floating != nil {
+			return 0
+		}
+		return 16
+	}
+	switch source.pixels.(type) {
+	case *image.NRGBA64, *image.RGBA64, *image.Gray16:
+		return 16
+	default:
+		return 8
+	}
 }
 
 // coordinate 将设备位置映射到源图像像素坐标，平铺位置直接计算以避免累计取整误差
@@ -403,11 +520,11 @@ func (s *imageSampler) bilinearWithCache(point Point, jxrCache *jxrRowCache) (re
 	return result, nil
 }
 
-// pixelColorWithCache 在原生通道上执行颜色转换并预乘透明度，支持JPEG XR滑动行缓存与常见格式零分配快路径
+// pixelColorWithCache 在原生通道上执行颜色转换并预乘透明度，支持JPEG XR滑动行缓存、CICP与常见格式零分配快路径
 // 入参: x 源横坐标, y 源纵坐标, jxrCache 可选JPEG XR滑动行缓存
 // 返回: renderColor 合成空间颜色, error 颜色或通道错误
 func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (renderColor, error) {
-	if s.image.jxr == nil && s.image.native == nil && s.image.transform == nil && s.convert == nil && !s.image.linear && s.image.channels != 1 && (s.space == renderSRGB || s.space == renderScRGB) {
+	if s.image.jxr == nil && s.image.native == nil && s.image.transform == nil && s.convert == nil && s.cicp == nil && s.toneMapPeak == 0 && !s.image.linear && s.image.channels != 1 && (s.space == renderSRGB || s.space == renderScRGB) {
 		if nrgba, ok := s.image.pixels.(*image.NRGBA); ok {
 			if !image.Pt(x, y).In(nrgba.Rect) {
 				return renderColor{}, nil
@@ -427,22 +544,28 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 		}
 	}
 	var components [iccMaxChannels]float64
-	alpha, channels, jxrLinear := 1.0, imageColorChannels(s.image), false
+	alpha, channels, jxrLinear, cicpLinear := 1.0, imageColorChannels(s.image), false, false
 	if source := s.image.jxr; source != nil {
-		preferLinear := s.image.transform == nil
 		var err error
 		if jxrCache != nil {
-			alpha, jxrLinear, err = jxrCache.sample(source, x, y, components[:], preferLinear)
-		} else if source.yccOnly || preferLinear && source.useLinear {
-			jxrLinear = true
-			alpha, err = source.sampleLinear(x, y, components[:])
+			alpha, err = jxrCache.sample(source, x, y, components[:], s.jxrMode, s.jxrKey)
 		} else {
-			alpha, err = source.sample(x, y, components[:])
+			switch s.jxrMode {
+			case jxrSampleLinear:
+				alpha, err = source.sampleLinear(x, y, components[:], s.jxrKey)
+			case jxrSampleRGB:
+				alpha, err = source.sampleRGB(x, y, components[:])
+			default:
+				alpha, err = source.sample(x, y, components[:])
+			}
 		}
 		if err != nil {
 			return renderColor{}, err
 		}
-		if jxrLinear {
+		if s.jxrMode == jxrSampleLinear {
+			jxrLinear = true
+			channels = 3
+		} else if s.jxrMode == jxrSampleRGB {
 			channels = 3
 		}
 	} else if source := s.image.native; source != nil {
@@ -495,17 +618,12 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 			}
 		}
 	}
-	if s.image.transform != nil {
-		if s.convert != nil {
-			if channels > 8 {
-				return renderColor{}, fmt.Errorf("%w: image source channels", ErrUnsupported)
-			}
-			var packed [8]float64
-			copy(packed[:], components[:8])
-			return s.convert(packed, alpha)
-		}
+	if s.image.transform != nil && !jxrLinear {
 		if channels < 1 || channels > len(components) {
 			return renderColor{}, fmt.Errorf("%w: image source channels", ErrUnsupported)
+		}
+		if s.convert != nil {
+			return s.convert(components, alpha, s.image.linear)
 		}
 		if !imageProfileCompatible(s.image, s.image.transform) {
 			return renderColor{}, fmt.Errorf("%w: image profile channels", ErrInvalid)
@@ -519,18 +637,22 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 		if err != nil {
 			return renderColor{}, err
 		}
-		return imageRGBToRenderColor(rgb[0], rgb[1], rgb[2], alpha, ColorScRGB, s.space)
+		return imageRGBToRenderColor(rgb[0], rgb[1], rgb[2], alpha, ColorScRGB, s.space, s.toneMapPeak)
+	}
+	if s.cicp != nil && !jxrLinear {
+		rgb := s.cicp.toLinearSRGB(components[0], components[1], components[2], channels == 1)
+		components[0], components[1], components[2] = rgb[0], rgb[1], rgb[2]
+		cicpLinear = true
+		channels = 3
 	}
 	if channels == 1 {
 		components[1], components[2] = components[0], components[0]
 	}
 	if s.convert != nil {
-		if channels > 8 {
+		if channels < 1 || channels > len(components) {
 			return renderColor{}, fmt.Errorf("%w: image source channels", ErrUnsupported)
 		}
-		var packed [8]float64
-		copy(packed[:], components[:8])
-		return s.convert(packed, alpha)
+		return s.convert(components, alpha, s.image.linear || jxrLinear || cicpLinear)
 	}
 	if channels == 4 && !s.image.multiChannel {
 		c, m, yv, k := colorClamp(components[0]), colorClamp(components[1]), colorClamp(components[2]), colorClamp(components[3])
@@ -539,31 +661,35 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 		return renderColor{}, fmt.Errorf("%w: default device image color conversion", ErrUnsupported)
 	}
 	space := ColorSRGB
-	if s.image.linear || jxrLinear {
+	if s.image.linear || jxrLinear || cicpLinear {
 		space = ColorScRGB
 	}
-	return imageRGBToRenderColor(components[0], components[1], components[2], alpha, space, s.space)
+	return imageRGBToRenderColor(components[0], components[1], components[2], alpha, space, s.space, s.toneMapPeak)
 }
 
-// imageExtendedLinearSample 判断图像样本是否包含超单位区间分量或线性非无符号浮点编码
+// imageExtendedLinearSample 判断图像样本是否包含扩展范围线性浮点或定点分量
 // 入参: source 图像资源, input 送入ICC转换的源分量切片
 // 返回: bool 是否需要浮点DToB管线避免裁剪截断
 func imageExtendedLinearSample(source *rasterImage, input []float64) bool {
+	if !source.linear {
+		if source.native != nil && source.native.floating != nil {
+			for _, value := range input {
+				if value < 0 || value > 1 {
+					return true
+				}
+			}
+		}
+		return false
+	}
 	for _, value := range input {
 		if value < 0 || value > 1 {
 			return true
 		}
 	}
-	if !source.linear {
-		return false
-	}
 	if source.native != nil && source.native.floating != nil {
 		return true
 	}
 	if source.jxr != nil {
-		if source.jxr.yccOnly {
-			return true
-		}
 		for i := range source.jxr.channels {
 			if source.jxr.components[i].Info().Format != jxrgo.SampleUnsigned {
 				return true
@@ -573,10 +699,10 @@ func imageExtendedLinearSample(source *rasterImage, input []float64) bool {
 	return false
 }
 
-// imageRGBToRenderColor 零分配将非预乘RGB分量转换为目标合成空间的预乘颜色
-// 入参: r, g, b 源RGB分量, alpha 透明度, srcSpace 源颜色空间, target 目标合成空间
+// imageRGBToRenderColor 将非预乘RGB分量转换至目标合成空间，并在HDR输出至sRGB时执行BT.2446方法A色调映射
+// 入参: r, g, b 源RGB分量, alpha 透明度, srcSpace 源颜色空间, target 目标合成空间, toneMapPeak HDR峰值亮度，零值不启用色调映射
 // 返回: renderColor 预乘颜色, error 非法数值或颜色空间错误
-func imageRGBToRenderColor(r, g, b, alpha float64, srcSpace ColorSpace, target renderColorSpace) (renderColor, error) {
+func imageRGBToRenderColor(r, g, b, alpha float64, srcSpace ColorSpace, target renderColorSpace, toneMapPeak float64) (renderColor, error) {
 	if target != renderSRGB && target != renderScRGB {
 		return renderColor{}, fmt.Errorf("%w: compositor color space", ErrUnsupported)
 	}
@@ -593,6 +719,10 @@ func imageRGBToRenderColor(r, g, b, alpha float64, srcSpace ColorSpace, target r
 			b = renderSRGBToLinear(b)
 		}
 	} else if target == renderSRGB {
+		if toneMapPeak > 0 {
+			mapped := renderBT2446MethodA([3]float64{r, g, b}, toneMapPeak)
+			r, g, b = mapped[0], mapped[1], mapped[2]
+		}
 		r = renderLinearToSRGB(colorClamp(r))
 		g = renderLinearToSRGB(colorClamp(g))
 		b = renderLinearToSRGB(colorClamp(b))
@@ -604,7 +734,7 @@ func imageRGBToRenderColor(r, g, b, alpha float64, srcSpace ColorSpace, target r
 	return renderColor{r * a, g * a, b * a, a}, nil
 }
 
-// imagePixel 读取非预乘16位颜色，常见格式避免经由颜色Interface分配临时对象
+// imagePixel 读取非预乘16位颜色，索引色板与常见非预乘格式直接读取源条目避免预乘往返失真
 // 入参: source 源图像, x 横坐标, y 纵坐标
 // 返回: color.NRGBA64 非预乘颜色
 func imagePixel(source image.Image, x, y int) color.NRGBA64 {
@@ -614,6 +744,15 @@ func imagePixel(source image.Image, x, y int) color.NRGBA64 {
 		return color.NRGBA64{uint16(c.R) * 257, uint16(c.G) * 257, uint16(c.B) * 257, uint16(c.A) * 257}
 	case *image.NRGBA64:
 		return value.NRGBA64At(x, y)
+	case *image.Paletted:
+		if !image.Pt(x, y).In(value.Rect) || len(value.Palette) == 0 {
+			return color.NRGBA64{}
+		}
+		index := int(value.ColorIndexAt(x, y))
+		if index >= len(value.Palette) {
+			return color.NRGBA64{}
+		}
+		return imageStraightColor(value.Palette[index])
 	case *image.RGBA:
 		c := value.RGBA64At(x, y)
 		return imageStraightPixel(c)
@@ -629,8 +768,39 @@ func imagePixel(source image.Image, x, y int) color.NRGBA64 {
 		c := value.YCbCrAt(x, y)
 		r, g, b, a := c.RGBA()
 		return color.NRGBA64{uint16(r), uint16(g), uint16(b), uint16(a)}
+	case *image.NYCbCrA:
+		c := value.NYCbCrAAt(x, y)
+		r, g, b, _ := c.YCbCr.RGBA()
+		return color.NRGBA64{uint16(r), uint16(g), uint16(b), uint16(c.A) * 257}
 	default:
-		return color.NRGBA64Model.Convert(source.At(x, y)).(color.NRGBA64)
+		return imageStraightColor(source.At(x, y))
+	}
+}
+
+// imageStraightColor 直接保留非预乘颜色值，避免调色板等非预乘条目经RGBA预乘量化失真
+// 入参: value 源颜色Interface值
+// 返回: color.NRGBA64 非预乘16位颜色
+func imageStraightColor(value color.Color) color.NRGBA64 {
+	if value == nil {
+		return color.NRGBA64{}
+	}
+	switch c := value.(type) {
+	case color.NRGBA:
+		return color.NRGBA64{uint16(c.R) * 257, uint16(c.G) * 257, uint16(c.B) * 257, uint16(c.A) * 257}
+	case color.NRGBA64:
+		return c
+	case color.RGBA:
+		return imageStraightPixel(color.RGBA64{uint16(c.R) * 257, uint16(c.G) * 257, uint16(c.B) * 257, uint16(c.A) * 257})
+	case color.RGBA64:
+		return imageStraightPixel(c)
+	case color.Gray:
+		gray := uint16(c.Y) * 257
+		return color.NRGBA64{gray, gray, gray, 65535}
+	case color.Gray16:
+		return color.NRGBA64{c.Y, c.Y, c.Y, 65535}
+	default:
+		r, g, b, a := value.RGBA()
+		return imageStraightPixel(color.RGBA64{uint16(r), uint16(g), uint16(b), uint16(a)})
 	}
 }
 
@@ -1127,6 +1297,17 @@ func (r *sceneRenderer) regionContains(region rasterRegion, point, center Point,
 		return false, fmt.Errorf("%w: visual sample coordinates", ErrLimit)
 	}
 	winding := 0
+	var localExact int
+	var exactPtr *int
+	if r.concurrent {
+		r.budgetMu.Lock()
+		localExact = r.exact
+		r.budgetMu.Unlock()
+		exactPtr = &localExact
+	} else {
+		exactPtr = &r.exact
+	}
+	startExact := *exactPtr
 	for _, edge := range region.edges {
 		a, b, direction := edge.start, edge.end, 1
 		if a.Y == b.Y {
@@ -1138,8 +1319,13 @@ func (r *sceneRenderer) regionContains(region rasterRegion, point, center Point,
 		if point.Y < a.Y || point.Y >= b.Y {
 			continue
 		}
-		right, err := rasterAtOrRight(a, b, point, &r.exact)
+		right, err := rasterAtOrRight(a, b, point, exactPtr)
 		if err != nil {
+			if r.concurrent && startExact > localExact {
+				r.budgetMu.Lock()
+				r.exact = max(0, r.exact-(startExact-localExact))
+				r.budgetMu.Unlock()
+			}
 			return false, err
 		}
 		if !right {
@@ -1150,6 +1336,17 @@ func (r *sceneRenderer) regionContains(region rasterRegion, point, center Point,
 		} else {
 			winding += direction
 		}
+	}
+	if r.concurrent && startExact > localExact {
+		used := startExact - localExact
+		r.budgetMu.Lock()
+		if used > r.exact {
+			r.exact = 0
+			r.budgetMu.Unlock()
+			return false, fmt.Errorf("%w: raster exact arithmetic work", ErrLimit)
+		}
+		r.exact -= used
+		r.budgetMu.Unlock()
 	}
 	return winding != 0, nil
 }
@@ -1268,6 +1465,10 @@ func (s *visualBrushFilter) sample(point, center Point) (renderColor, error) {
 // 入参: point 当前覆盖位置, center 设备像素中心, cache 可选工作Goroutine图像缓存
 // 返回: renderColor 平均预乘颜色, error 绘制、预算或取消错误
 func (s *visualBrushFilter) sampleCached(point, center Point, cache *imageSampleCache) (renderColor, error) {
+	if s.renderer.concurrent {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+	}
 	if err := s.renderer.charge(0); err != nil {
 		return renderColor{}, err
 	}

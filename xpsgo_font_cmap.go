@@ -996,7 +996,7 @@ func parseFontCmap(data []byte, numGlyphs uint32) (*fontCmap, error) {
 		return nil, fmt.Errorf("%w: truncated cmap encoding records", ErrInvalid)
 	}
 	seen := make(map[[3]uint32]bool)
-	best := 11
+	best := 12
 	var chosen *fontCmap
 	for i := uint64(4); i < end; i += 8 {
 		platform := binary.BigEndian.Uint16(data[i:])
@@ -1044,7 +1044,7 @@ func parseFontCmap(data []byte, numGlyphs uint32) (*fontCmap, error) {
 
 // fontCmapPriority 返回平台与编码组合的cmap选择优先级
 // 入参: platform 平台编号, encoding 编码编号
-// 返回: int 优先级，11表示不在选择列表中
+// 返回: int 优先级，12表示不在选择列表中
 func fontCmapPriority(platform, encoding uint16) int {
 	if platform == 3 {
 		switch encoding {
@@ -1060,19 +1060,21 @@ func fontCmapPriority(platform, encoding uint16) int {
 	}
 	if platform == 0 {
 		switch encoding {
-		case 4, 6:
+		case 4:
 			return 1
 		case 3:
 			return 3
 		case 0, 1, 2:
 			return 9
+		case 6:
+			return 11
 		}
-		return 11
+		return 12
 	}
 	if platform == 1 && encoding == 0 {
 		return 10
 	}
-	return 11
+	return 12
 }
 
 // fontCmapSubtable 检查已知基线子表的头部和长度，不猜测未知格式的布局
@@ -1321,6 +1323,9 @@ func validateFontCmap14(data []byte, numGlyphs uint32) error {
 		prevSelector = selector
 		defOff := binary.BigEndian.Uint32(data[pos+3:])
 		nonDefOff := binary.BigEndian.Uint32(data[pos+7:])
+		if defOff == 0 && nonDefOff == 0 {
+			return fmt.Errorf("%w: cmap format 14 empty variation selector record", ErrInvalid)
+		}
 		if defOff != 0 {
 			if uint64(defOff) < recordsEnd || uint64(defOff)+4 > uint64(len(data)) {
 				return fmt.Errorf("%w: cmap format 14 default UVS offset", ErrInvalid)
