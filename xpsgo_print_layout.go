@@ -85,8 +85,10 @@ var printMediaSizes = map[string][2]int{
 	"ISOB3":                               {353000, 500000},
 	"ISOB4":                               {250000, 353000},
 	"ISOB4Envelope":                       {250000, 353000},
+	"ISOB5":                               {176000, 250000},
 	"ISOB5Envelope":                       {176000, 250000},
 	"ISOB5Extra":                          {201000, 276000},
+	"ISOB6":                               {125000, 176000},
 	"ISOB7":                               {88000, 125000},
 	"ISOB8":                               {62000, 88000},
 	"ISOB9":                               {44000, 62000},
@@ -130,7 +132,7 @@ var printMediaSizes = map[string][2]int{
 	"JapanYou4Envelope":                   {105000, 235000},
 	"JapanYou4EnvelopeRotated":            {235000, 105000},
 	"JapanYou6Envelope":                   {98000, 190000},
-	"JapanYou6EnvelopeRotated":            {98000, 190000},
+	"JapanYou6EnvelopeRotated":            {190000, 98000},
 	"JISB0":                               {1030000, 1456000},
 	"JISB1":                               {728000, 1030000},
 	"JISB10":                              {32000, 45000},
@@ -249,10 +251,12 @@ type printMediaPlacement struct {
 
 // PrintLayoutOptions 设置页面打印的基础票据、物理介质及解析预算，Settings.Scope须为Unknown
 // Defaults提供消费者基础设置，文档中更具体的票据项优先
+// IgnoreUnsupportedFeatures开启时跳过不影响页面几何与拼版的设备控制Feature
 type PrintLayoutOptions struct {
-	Defaults *PrintSettings
-	Media    PrintMedia
-	Settings PrintSettingsOptions
+	Defaults                  *PrintSettings
+	Media                     PrintMedia
+	Settings                  PrintSettingsOptions
+	IgnoreUnsupportedFeatures bool
 }
 
 // PrintMedia 指定物理介质尺寸与可打印区域，单位为九十六分之一英寸；未指定宽高时回退票据或页面尺寸，ImageableArea为nil时采用整张介质
@@ -821,14 +825,6 @@ func printBoxWithin(inner, outer Rect) bool {
 	return geometryFinite(inner.X, inner.Y, inner.Width, inner.Height, outer.X, outer.Y, outer.Width, outer.Height, inner.X+inner.Width, inner.Y+inner.Height, outer.X+outer.Width, outer.Y+outer.Height) && inner.Width >= 0 && inner.Height >= 0 && outer.Width >= 0 && outer.Height >= 0 && inner.X >= outer.X && inner.Y >= outer.Y && inner.Width <= outer.X+outer.Width-inner.X && inner.Height <= outer.Y+outer.Height-inner.Y
 }
 
-// printFitBoxWithin 校验适配结果区域是否在浮点容差内落入目标范围
-// 入参: inner 适配结果, outer 目标区域
-// 返回: bool 是否落入目标范围
-func printFitBoxWithin(inner, outer Rect) bool {
-	allowance := math.Max(1, max(math.Abs(outer.X), math.Abs(outer.Y), outer.Width, outer.Height)) * 1e-12
-	return printBoxWithin(inner, Rect{X: outer.X - allowance, Y: outer.Y - allowance, Width: outer.Width + allowance*2, Height: outer.Height + allowance*2})
-}
-
 // printCoordinateEqual 在有限坐标范围内允许单位换算的浮点舍入，不忽略实际介质尺寸差异
 // 入参: a, b 待比较尺寸
 // 返回: bool 是否在八倍浮点相对精度内相等
@@ -935,15 +931,11 @@ func (s *printLayoutSettings) scale(option, feature *PrintSetting, content, blee
 	if source.Width <= 0 || source.Height <= 0 {
 		return Matrix{}, fmt.Errorf("%w: empty application region cannot determine print scaling", ErrUnsupported)
 	}
-	factor := min(target.Width/source.Width, target.Height/source.Height)
-	result := Matrix{A: factor, D: factor, E: target.X + (target.Width-source.Width*factor)/2 - source.X*factor, F: target.Y + (target.Height-source.Height*factor)/2 - source.Y*factor}
-	if selected {
-		x, y := content.X+content.Width*anchor.X, content.Y+content.Height*anchor.Y
-		result.E, result.F = x-factor*x, y-factor*y
-		if !printFitBoxWithin(printTransformBox(source, result), target) {
-			return Matrix{}, fmt.Errorf("%w: print alignment conflicts with fit bounds", ErrUnsupported)
-		}
+	if !selected {
+		anchor = Point{X: 0.5, Y: 0.5}
 	}
+	factor := min(target.Width/source.Width, target.Height/source.Height)
+	result := Matrix{A: factor, D: factor, E: target.X + (target.Width-source.Width*factor)*anchor.X - source.X*factor, F: target.Y + (target.Height-source.Height*factor)*anchor.Y - source.Y*factor}
 	return result, nil
 }
 
@@ -999,15 +991,15 @@ func (s *printLayoutSettings) customScale(option *PrintSetting, content Rect, an
 	if err != nil {
 		return Matrix{}, err
 	}
-	offsetX, hasOffsetX, err := s.number(option, "OffsetWidth")
+	offsetX, _, err := s.number(option, "OffsetWidth")
 	if err != nil {
 		return Matrix{}, err
 	}
-	offsetY, hasOffsetY, err := s.number(option, "OffsetHeight")
+	offsetY, _, err := s.number(option, "OffsetHeight")
 	if err != nil {
 		return Matrix{}, err
 	}
-	if !hasX || !hasY || !hasOffsetX || !hasOffsetY {
+	if !hasX || !hasY {
 		return Matrix{}, fmt.Errorf("%w: incomplete custom print scaling", ErrInvalid)
 	}
 	if x < 0 || y < 0 {
@@ -1025,20 +1017,40 @@ func (s *printLayoutSettings) customScale(option *PrintSetting, content Rect, an
 	return result, nil
 }
 
-// validatePrintLayoutFeatures 校验有效票据不含单页布局未支持的Feature
-// 入参: settings 有效票据
+// printLayoutGeometryFeature 判断公共关键字是否影响页面几何、作业拼版或安全策略，开启忽略选项时仍不可跳过
+// 入参: name 展开关键字名称
+// 返回: bool 是否属于不可跳过的布局、拼版或策略Feature
+func printLayoutGeometryFeature(name xml.Name) bool {
+	if name.Space != printKeywordsNS {
+		return false
+	}
+	switch name.Local {
+	case "JobNUpAllDocumentsContiguously", "DocumentNUp", "PresentationDirection", "JobDuplexAllDocumentsContiguously", "DocumentDuplex", "PageForceFrontSide", "JobBindAllDocuments", "DocumentBinding", "JobCollateAllDocuments", "DocumentCollate", "JobPageOrder", "PagePoster", "ScaleOffsetAlignment", "Layering", "JobDigitalSignatureProcessing":
+		return true
+	}
+	return false
+}
+
+// validatePrintLayoutFeatures 校验有效票据不含单页布局未支持的Feature，开启ignoreUnsupported时跳过设备控制Feature
+// 入参: settings 有效票据, ignoreUnsupported 是否忽略不影响几何与拼版的设备控制Feature
 // 返回: error 未支持设置错误
-func validatePrintLayoutFeatures(settings *PrintSettings) error {
+func validatePrintLayoutFeatures(settings *PrintSettings, ignoreUnsupported bool) error {
 	for _, value := range settings.Elements {
 		if value.Kind != PrintSettingFeature {
 			continue
 		}
 		if value.Name.Space != printKeywordsNS {
+			if ignoreUnsupported {
+				continue
+			}
 			return fmt.Errorf("%w: print rendering feature {%s}%s", ErrUnsupported, value.Name.Space, value.Name.Local)
 		}
 		switch value.Name.Local {
 		case "PageMediaSize", "PageOrientation", "PageScaling", "PageMirrorImage", "PageBorderless":
 		default:
+			if ignoreUnsupported && !printLayoutGeometryFeature(value.Name) {
+				continue
+			}
 			return fmt.Errorf("%w: print rendering feature %s", ErrUnsupported, value.Name.Local)
 		}
 		for _, child := range value.Children {
@@ -1090,12 +1102,9 @@ func (s *printLayoutSettings) binding(name string) (PrintFinishing, bool, error)
 	if err := printOptionProperties(option, "BindingGutter"); err != nil {
 		return PrintFinishing{}, true, err
 	}
-	width, present, err := s.number(option, "BindingGutter")
+	width, _, err := s.number(option, "BindingGutter")
 	if err != nil {
 		return PrintFinishing{}, true, err
-	}
-	if !present {
-		return PrintFinishing{}, true, fmt.Errorf("%w: binding requires an explicit gutter", ErrUnsupported)
 	}
 	if width < 0 {
 		return PrintFinishing{}, true, fmt.Errorf("%w: negative binding gutter", ErrInvalid)
@@ -1248,7 +1257,7 @@ func (p *printSheetPacker) posterGrid(count int, area Rect) (int, int, error) {
 	return columns, rows, p.builder.step(1)
 }
 
-// printSinglePosterSettings 移除单张海报的恒等设置，拒绝在单页绘制接口中静默丢弃分幅
+// printSinglePosterSettings 移除单张海报的恒等设置，拒绝在单页绘制方法中静默丢弃分幅
 // 入参: settings 有效设置, options 描述值的资源及取消参数
 // 返回: *PrintSettings 单页设置视图, error 类型、能力或容量错误
 func printSinglePosterSettings(settings *PrintSettings, options printSettingsConfig) (*PrintSettings, error) {

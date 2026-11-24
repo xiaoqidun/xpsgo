@@ -811,7 +811,14 @@ func fontResourceNames(face *fontFace) (string, string) {
 	count := int(binary.BigEndian.Uint16(data[2:]))
 	storage := int(binary.BigEndian.Uint16(data[4:]))
 	end := 6 + 12*count
-	if end > len(data) || storage < end || storage > len(data) {
+	headerEnd := end
+	if format == 1 {
+		if end+2 > len(data) {
+			return "", ""
+		}
+		headerEnd = end + 2 + 4*int(binary.BigEndian.Uint16(data[end:]))
+	}
+	if headerEnd > len(data) || storage < headerEnd || storage > len(data) {
 		return "", ""
 	}
 	var family, typoFamily, postScript string
@@ -1067,29 +1074,52 @@ func validateCreatedFontMetrics(face *fontFace, os2 *fontOS2Metrics) (*fontMetri
 	return metrics, nil
 }
 
-// validateCreatedFontNames 校验格式0名称记录的排序和字符串范围，允许记录共用字符串
+// validateCreatedFontNames 校验格式0或1名称记录的排序、语言标签表及字符串范围，允许记录共用字符串
 // 入参: data 完整name表
 // 返回: error 截断、排序、范围或格式错误
 func validateCreatedFontNames(data []byte) error {
 	if len(data) < 6 {
 		return fmt.Errorf("%w: truncated name header", ErrInvalid)
 	}
-	if binary.BigEndian.Uint16(data) != 0 {
+	format := binary.BigEndian.Uint16(data)
+	if format != 0 && format != 1 {
 		return fmt.Errorf("%w: name table format", ErrUnsupported)
 	}
 	end := 6 + 12*int(binary.BigEndian.Uint16(data[2:]))
 	storage := int(binary.BigEndian.Uint16(data[4:]))
-	if end > len(data) || storage < end || storage > len(data) {
+	headerEnd, langTags := end, 0
+	if format == 1 {
+		if end+2 > len(data) {
+			return fmt.Errorf("%w: truncated name language tag count", ErrInvalid)
+		}
+		langTags = int(binary.BigEndian.Uint16(data[end:]))
+		headerEnd = end + 2 + 4*langTags
+	}
+	if headerEnd > len(data) || storage < headerEnd || storage > len(data) {
 		return fmt.Errorf("%w: name records or string storage", ErrInvalid)
 	}
 	for offset := 6; offset < end; offset += 12 {
 		if offset > 6 && bytes.Compare(data[offset-12:offset-4], data[offset:offset+8]) > 0 {
 			return fmt.Errorf("%w: name record ordering", ErrInvalid)
 		}
+		if format == 1 {
+			if language := binary.BigEndian.Uint16(data[offset+4:]); language >= 0x8000 && int(language-0x8000) >= langTags {
+				return fmt.Errorf("%w: name language tag index", ErrInvalid)
+			}
+		}
 		length := int(binary.BigEndian.Uint16(data[offset+8:]))
 		start := int(binary.BigEndian.Uint16(data[offset+10:]))
 		if start > len(data)-storage || length > len(data)-storage-start {
 			return fmt.Errorf("%w: name string range", ErrInvalid)
+		}
+	}
+	if format == 1 {
+		for offset := end + 2; offset < headerEnd; offset += 4 {
+			length := int(binary.BigEndian.Uint16(data[offset:]))
+			start := int(binary.BigEndian.Uint16(data[offset+2:]))
+			if start > len(data)-storage || length > len(data)-storage-start {
+				return fmt.Errorf("%w: name language tag string range", ErrInvalid)
+			}
 		}
 	}
 	return nil
@@ -1205,9 +1235,6 @@ func parseFontMetricsWithOS2(face *fontFace, os2 *fontOS2Metrics) (*fontMetrics,
 	m.hhea, m.hmtx, err = parseFontMetricAxis(face, "hhea", "hmtx", m.numGlyphs)
 	if err != nil {
 		return nil, err
-	}
-	if face.cff && m.hhea.longMetrics != m.numGlyphs {
-		return nil, fmt.Errorf("%w: CFF hmtx requires one long metric per glyph", ErrInvalid)
 	}
 	_, hasVhea := face.tables["vhea"]
 	_, hasVmtx := face.tables["vmtx"]
@@ -1587,13 +1614,14 @@ func glyphRunCount(glyphs *Glyphs, limit int) (int, error) {
 		}
 		count += len(cluster.Glyphs)
 		for _, entry := range cluster.Glyphs {
-			if !entry.HasIndex && (glyphs.Text == "" || cluster.HasMapping) || entry.HasAdvanceWidth && (!geometryFinite(entry.AdvanceWidth) || entry.AdvanceWidth < 0) || entry.HasUOffset && !geometryFinite(entry.UOffset) || entry.HasVOffset && !geometryFinite(entry.VOffset) {
+			if !entry.HasIndex && (glyphs.Text == "" || len(cluster.Glyphs) != 1) || entry.HasAdvanceWidth && (!geometryFinite(entry.AdvanceWidth) || entry.AdvanceWidth < 0) || entry.HasUOffset && !geometryFinite(entry.UOffset) || entry.HasVOffset && !geometryFinite(entry.VOffset) {
 				return 0, fmt.Errorf("%w: invalid glyph entry", ErrInvalid)
 			}
 		}
 		if glyphs.Text == "" {
 			continue
 		}
+		scalars := 0
 		for units := cluster.CodeUnitCount; units > 0; {
 			if remaining == "" {
 				return 0, fmt.Errorf("%w: glyph cluster exceeds UTF16 text", ErrInvalid)
@@ -1608,6 +1636,10 @@ func glyphRunCount(glyphs *Glyphs, limit int) (int, error) {
 			}
 			units -= width
 			remaining = remaining[size:]
+			scalars++
+		}
+		if len(cluster.Glyphs) == 1 && !cluster.Glyphs[0].HasIndex && scalars != 1 {
+			return 0, fmt.Errorf("%w: cluster glyph index requires a single Unicode scalar", ErrInvalid)
 		}
 	}
 	for _, r := range remaining {

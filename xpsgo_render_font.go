@@ -143,9 +143,9 @@ func (r *sceneRenderer) glyphPaint(glyphs *Glyphs, transform Matrix, aliased boo
 	return []scenePaint{paint}, nil
 }
 
-// glyphBitmapStrike 为纯位图字体按字体轴设备长度选择精确像素尺寸的strike
+// glyphBitmapStrike 为纯位图字体优先选择精确或EBSC代用strike，无匹配时按欧氏距离选取最近strike
 // 入参: source 已加载字体, glyphs 字形元素, transform 元素到设备的有效变换
-// 返回: fontBitmapSelection 精确尺寸选择, bool 是否使用位图, error 尺寸、字体、预算或取消错误
+// 返回: fontBitmapSelection 选中的strike与比例, bool 是否使用位图, error 尺寸、字体、预算或取消错误
 func (r *sceneRenderer) glyphBitmapStrike(source *fontSource, glyphs *Glyphs, transform Matrix) (fontBitmapSelection, bool, error) {
 	if !fontIsBitmapOnly(source.face) {
 		return fontBitmapSelection{}, false, nil
@@ -158,18 +158,43 @@ func (r *sceneRenderer) glyphBitmapStrike(source *fontSource, glyphs *Glyphs, tr
 		x, y = y, x
 	}
 	x, y = x*glyphs.FontRenderingEmSize, y*glyphs.FontRenderingEmSize
-	px, py := math.Round(x), math.Round(y)
-	if !geometryFinite(x, y) || px < 1 || py < 1 || px > 255 || py > 255 || math.Abs(x-px) > 1e-9 || math.Abs(y-py) > 1e-9 {
-		return fontBitmapSelection{}, false, fmt.Errorf("%w: bitmap glyph requires integral device ppem in 1..255", ErrUnsupported)
+	if !geometryFinite(x, y) || x <= 0 || y <= 0 {
+		return fontBitmapSelection{}, false, fmt.Errorf("%w: bitmap glyph requires positive finite device ppem", ErrUnsupported)
 	}
 	if err := r.charge(uint64(source.face.tables["EBLC"].length) + uint64(source.face.tables["EBSC"].length) + 1); err != nil {
 		return fontBitmapSelection{}, false, err
 	}
-	selection, present, err := source.selectBitmapStrikeWithWork(uint16(px), uint16(py), r.charge)
-	if err == nil && !present {
-		err = fmt.Errorf("%w: no matching page bitmap strike", ErrUnsupported)
+	px, py := math.Round(x), math.Round(y)
+	if px >= 1 && py >= 1 && px <= 255 && py <= 255 && math.Abs(x-px) <= 1e-9 && math.Abs(y-py) <= 1e-9 {
+		selection, present, err := source.selectBitmapStrikeWithWork(uint16(px), uint16(py), r.charge)
+		if err != nil || present {
+			return selection, present, err
+		}
 	}
-	return selection, present, err
+	if err := source.loadBitmaps(r.charge); err != nil {
+		return fontBitmapSelection{}, false, err
+	}
+	if source.bitmaps == nil || len(source.bitmaps.strikes) == 0 {
+		return fontBitmapSelection{}, false, fmt.Errorf("%w: no matching page bitmap strike", ErrUnsupported)
+	}
+	if err := r.charge(uint64(len(source.bitmaps.strikes))); err != nil {
+		return fontBitmapSelection{}, false, err
+	}
+	best, bestDist := -1, math.Inf(1)
+	for i, candidate := range source.bitmaps.strikes {
+		if candidate.ppemX == 0 || candidate.ppemY == 0 {
+			continue
+		}
+		dist := math.Hypot(float64(candidate.ppemX)-x, float64(candidate.ppemY)-y)
+		if best < 0 || dist < bestDist {
+			best, bestDist = i, dist
+		}
+	}
+	if best < 0 {
+		return fontBitmapSelection{}, false, fmt.Errorf("%w: no matching page bitmap strike", ErrUnsupported)
+	}
+	strike := source.bitmaps.strikes[best]
+	return fontBitmapSelection{strike: best, ppemX: strike.ppemX, ppemY: strike.ppemY, scaleX: 1, scaleY: 1}, true, nil
 }
 
 // glyphBitmapPaint 解码位图字形并合并覆盖索引，按单次覆盖结果采样画刷
@@ -243,7 +268,8 @@ func (r *sceneRenderer) glyphBitmapPaint(source *fontSource, glyphs *Glyphs, sel
 		metrics := decoded.metrics
 		axis := metrics.horizontal
 		local := glyph.matrix
-		if run.sideways && metrics.hasVertical {
+		vertical := run.sideways && metrics.hasVertical
+		if vertical {
 			axis = metrics.vertical
 			local.E, local.F = glyph.origin.X, glyph.origin.Y
 		} else if !metrics.hasHorizontal {
@@ -260,7 +286,11 @@ func (r *sceneRenderer) glyphBitmapPaint(source *fontSource, glyphs *Glyphs, sel
 		}
 		unitsX := float64(source.metrics.unitsPerEm) / float64(selection.ppemX)
 		unitsY := float64(source.metrics.unitsPerEm) / float64(selection.ppemY)
-		pixels := Matrix{A: unitsX, D: -unitsY, E: math.Round(float64(axis.bearingX)*selection.scaleX) * unitsX, F: math.Round(float64(axis.bearingY)*selection.scaleY) * unitsY}
+		bearingY := math.Round(float64(axis.bearingY) * selection.scaleY)
+		if vertical {
+			bearingY = -bearingY
+		}
+		pixels := Matrix{A: unitsX, D: -unitsY, E: math.Round(float64(axis.bearingX)*selection.scaleX) * unitsX, F: bearingY * unitsY}
 		matrix := strokePathCompose(transform, strokePathCompose(local, pixels))
 		if !geometryFillMatrixFinite(matrix) {
 			return nil, fmt.Errorf("%w: page bitmap transform range", ErrLimit)

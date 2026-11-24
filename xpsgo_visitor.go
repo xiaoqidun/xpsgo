@@ -182,6 +182,13 @@ type walkConfiguration struct {
 	limits               Limits
 }
 
+// walkImageExtent 缓存源图像在96DPI物理坐标系下的完整宽高，用于识别局部Viewbox裁剪
+type walkImageExtent struct {
+	width  float64
+	height float64
+	ok     bool
+}
+
 // sceneWalker 保存单次场景遍历的私有缓存、递归保护状态及资源预算
 type sceneWalker struct {
 	reader             *Reader
@@ -200,6 +207,7 @@ type sceneWalker struct {
 	activeBrushes      map[*Brush]bool
 	fontData           map[string][]byte
 	fontFaces          map[fontCacheKey]*fontSource
+	imageExtents       map[string]walkImageExtent
 }
 
 // String 返回隔离组类别的可读名称
@@ -607,6 +615,7 @@ func newSceneWalker(r *Reader, visitor *SceneVisitor, config walkConfiguration) 
 		activeBrushes:      make(map[*Brush]bool),
 		fontData:           make(map[string][]byte),
 		fontFaces:          make(map[fontCacheKey]*fontSource),
+		imageExtents:       make(map[string]walkImageExtent),
 	}
 }
 
@@ -809,15 +818,16 @@ func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state Walk
 		brushOpacity = brush.Opacity
 	}
 	imageTransform := state.Matrix
+	brushMatrix := state.Matrix
+	viewportClip := false
 	if brush.TileMode > TileFlipXY {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "ImageBrush", Message: "invalid image brush tile mode"})
 		brushFallback = true
-	} else if !geometryFinite(brush.Viewbox.X, brush.Viewbox.Y, brush.Viewbox.Width, brush.Viewbox.Height, brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height) || brush.Viewbox.Width <= 0 || brush.Viewbox.Height <= 0 || brush.Viewport.Width <= 0 || brush.Viewport.Height <= 0 {
-		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "ImageBrush", Attribute: "Viewbox", Message: "degenerate image brush viewbox or viewport"})
-		brushFallback = true
 	} else {
+		if brush.TileMode != TileNone {
+			brushFallback = true
+		}
 		transformOK := true
-		brushMatrix := state.Matrix
 		if brush.Transform != nil {
 			if !geometryFillMatrixFinite(*brush.Transform) {
 				w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "ImageBrush", Attribute: "Transform", Message: "non-finite image brush transform"})
@@ -825,22 +835,55 @@ func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state Walk
 				transformOK = false
 			} else {
 				brushMatrix = strokePathCompose(brushMatrix, *brush.Transform)
+				if !geometryFillMatrixFinite(brushMatrix) {
+					w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "ImageBrush", Attribute: "Transform", Message: "image brush transform overflow"})
+					brushFallback = true
+					transformOK = false
+				}
 			}
 		}
-		if transformOK {
+		if transformOK && geometryMatrixSingular(brushMatrix) {
+			if brush.TileMode == TileNone {
+				return nil
+			}
+			w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "ImageBrush", Attribute: "Transform", Message: "singular image brush transform"})
+			brushFallback = true
+			transformOK = false
+		}
+		if !geometryFinite(brush.Viewbox.X, brush.Viewbox.Y, brush.Viewbox.Width, brush.Viewbox.Height, brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height) || brush.Viewbox.Width <= 0 || brush.Viewbox.Height <= 0 || brush.Viewport.Width <= 0 || brush.Viewport.Height <= 0 {
+			w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "ImageBrush", Attribute: "Viewbox", Message: "degenerate image brush viewbox or viewport"})
+			brushFallback = true
+		} else if transformOK {
 			sx := brush.Viewport.Width / brush.Viewbox.Width
 			sy := brush.Viewport.Height / brush.Viewbox.Height
 			mapping := Matrix{A: sx, D: sy, E: brush.Viewport.X - brush.Viewbox.X*sx, F: brush.Viewport.Y - brush.Viewbox.Y*sy}
 			composed := strokePathCompose(brushMatrix, mapping)
-			if !geometryFillMatrixFinite(composed) {
+			if !geometryFillMatrixFinite(composed) || geometryMatrixSingular(composed) {
 				w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "ImageBrush", Attribute: "Transform", Message: "image brush transform overflow"})
 				brushFallback = true
 			} else {
 				imageTransform = composed
+				viewportClip = brush.TileMode == TileNone
+			}
+			if !brushFallback {
+				if brush.Viewbox.X != 0 || brush.Viewbox.Y != 0 {
+					brushFallback = true
+				} else {
+					extent, extErr := w.imagePhysicalExtent(ctx, imagePart)
+					if extErr != nil {
+						return extErr
+					}
+					if !extent.ok || math.Abs(brush.Viewbox.Width-extent.width) > 1e-6*max(1, extent.width) || math.Abs(brush.Viewbox.Height-extent.height) > 1e-6*max(1, extent.height) {
+						brushFallback = true
+					}
+				}
 			}
 		}
 	}
 	imgState := state.clone()
+	if viewportClip {
+		imgState.Clip = append(imgState.Clip, WalkClip{Geometry: renderBoxGeometry(brush.Viewport), Matrix: brushMatrix})
+	}
 	imgState.Opacity = colorClamp(state.Opacity * brushOpacity)
 	event := WalkImageEvent{
 		State:               imgState,
@@ -856,6 +899,39 @@ func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state Walk
 		FallbackDPI:         w.config.fallbackDPI,
 	}
 	return w.visitor.Image(ctx, event)
+}
+
+// imagePhysicalExtent 查询并缓存图像部件在96DPI物理单位下的完整尺寸，非致命读取失败标记不可用
+// 入参: ctx 取消Context, imagePart 规范化图像部件URI
+// 返回: walkImageExtent 图像物理宽高及可用标志, error 取消或阅读器已关闭错误
+func (w *sceneWalker) imagePhysicalExtent(ctx context.Context, imagePart string) (walkImageExtent, error) {
+	if w.reader == nil || imagePart == "" {
+		return walkImageExtent{}, nil
+	}
+	key := strings.ToLower(imagePart)
+	if cached, ok := w.imageExtents[key]; ok {
+		return cached, nil
+	}
+	res, err := w.reader.Image(ctx, imagePart, &ImageOptions{MaxBytes: w.config.limits.MaxPartBytes})
+	if err != nil {
+		if cerr := walkContextError(ctx, err); cerr != nil {
+			return walkImageExtent{}, cerr
+		}
+		if errors.Is(err, ErrClosed) {
+			return walkImageExtent{}, err
+		}
+		w.imageExtents[key] = walkImageExtent{}
+		return walkImageExtent{}, nil
+	}
+	bounds := res.Bounds()
+	dpi := res.Resolution
+	if bounds.Empty() || !geometryFinite(dpi.X, dpi.Y) || dpi.X <= 0 || dpi.Y <= 0 {
+		w.imageExtents[key] = walkImageExtent{}
+		return walkImageExtent{}, nil
+	}
+	extent := walkImageExtent{width: float64(bounds.Dx()) * 96 / dpi.X, height: float64(bounds.Dy()) * 96 / dpi.Y, ok: true}
+	w.imageExtents[key] = extent
+	return extent, nil
 }
 
 // emitPathEvent 构造WalkPathEvent并调用Path回调，Data、Fill与Stroke作为只读零拷贝视图透传
@@ -932,6 +1008,9 @@ func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Transform", Message: "visual brush transform overflow"})
 		return false, nil
 	}
+	if geometryMatrixSingular(brushMatrix) {
+		return true, nil
+	}
 	if !geometryFinite(brush.Viewbox.X, brush.Viewbox.Y, brush.Viewbox.Width, brush.Viewbox.Height, brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height) || brush.Viewbox.Width <= 0 || brush.Viewbox.Height <= 0 || brush.Viewport.Width <= 0 || brush.Viewport.Height <= 0 {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Viewbox", Message: "degenerate visual brush viewbox or viewport"})
 		return false, nil
@@ -940,7 +1019,7 @@ func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *
 	sy := brush.Viewport.Height / brush.Viewbox.Height
 	mapping := Matrix{A: sx, D: sy, E: brush.Viewport.X - brush.Viewbox.X*sx, F: brush.Viewport.Y - brush.Viewbox.Y*sy}
 	visualMatrix := strokePathCompose(brushMatrix, mapping)
-	if !geometryFillMatrixFinite(visualMatrix) || !geometryFinite(brush.Opacity) || brush.Opacity < 0 || brush.Opacity > 1 {
+	if !geometryFillMatrixFinite(visualMatrix) || geometryMatrixSingular(visualMatrix) || !geometryFinite(brush.Opacity) || brush.Opacity < 0 || brush.Opacity > 1 {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: "visual brush mapping or opacity out of range"})
 		return false, nil
 	}
@@ -993,7 +1072,7 @@ func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *
 // 入参: ctx 取消Context, glyphs 字形元素, state 当前有效状态
 // 返回: error 资源上限、取消或回调错误
 func (w *sceneWalker) walkGlyphs(ctx context.Context, glyphs *Glyphs, state WalkState) error {
-	if w.visitor.Glyphs == nil {
+	if w.visitor.Glyphs == nil || glyphs.Fill == nil || glyphs.FontRenderingEmSize == 0 {
 		return nil
 	}
 	fontPart := glyphs.FontPart
@@ -1444,7 +1523,7 @@ func walkEdgesToGeometry(edges []geometryEdge) Geometry {
 		used[i] = true
 		start := edge.start
 		current := edge.end
-		segments := []GeometrySegment{{Kind: GeometryLine, Point: current}}
+		segments := []GeometrySegment{{Kind: GeometryLine, Point: current, IsStroked: true}}
 		for current != start {
 			list := outgoing[current]
 			nextIdx := -1
@@ -1463,7 +1542,7 @@ func walkEdgesToGeometry(edges []geometryEdge) Geometry {
 			used[nextIdx] = true
 			current = edges[nextIdx].end
 			if current != start {
-				segments = append(segments, GeometrySegment{Kind: GeometryLine, Point: current})
+				segments = append(segments, GeometrySegment{Kind: GeometryLine, Point: current, IsStroked: true})
 			}
 		}
 		if len(segments) >= 2 {

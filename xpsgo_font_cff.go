@@ -975,8 +975,8 @@ func (p *type2Interpreter) hint(op byte, data []byte) (int, error) {
 	if op == 1 || op == 3 {
 		p.plainStems = true
 	}
-	if op == 19 && p.plainStems {
-		return 0, fmt.Errorf("%w: Type2 hintmask requires hm stem declarations", ErrInvalid)
+	if (op == 19 || op == 20) && p.plainStems {
+		return 0, fmt.Errorf("%w: Type2 mask requires hm stem declarations", ErrInvalid)
 	}
 	p.stems += p.n / 2
 	p.n = 0

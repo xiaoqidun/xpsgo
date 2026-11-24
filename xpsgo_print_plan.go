@@ -114,15 +114,16 @@ type PrintPlan struct {
 	Signatures        *PrintSignatureReport
 }
 
-// PrintPlanOptions 设置有效票据、介质及作业编排预算，零值预算采用默认上限
-// MaxSheets和MaxPlacements分别限制纸张数与页面放置数，MaxWork限制票据处理与编排步骤
+// PrintPlanOptions 设置有效票据、介质、作业编排预算及忽略策略，零值预算采用默认上限
+// MaxSheets和MaxPlacements限制纸张与页面放置数，MaxWork限制票据与编排步骤，IgnoreUnsupportedFeatures跳过设备控制Feature
 // Signatures设置整包签名检查，需要错误报告时须提供包内报告页并在末尾追加独立单面纸
 type PrintPlanOptions struct {
-	Print         PrintLayoutOptions
-	MaxSheets     int
-	MaxPlacements int
-	MaxWork       uint64
-	Signatures    *PrintSignatureOptions
+	Print                     PrintLayoutOptions
+	MaxSheets                 int
+	MaxPlacements             int
+	MaxWork                   uint64
+	Signatures                *PrintSignatureOptions
+	IgnoreUnsupportedFeatures bool
 }
 
 // printPlanPage 保存可重复编排的轻量页面描述，不保留已解析场景或票据树
@@ -344,7 +345,7 @@ func (s PrintSheet) BackFlipTransform() Matrix {
 }
 
 // PrintPlan 按有效票据生成选页、份数、逐份、拼版、双面及装订留白的输出计划
-// 缺省为全部页面、1份、Collated、1页拼版、OneSided与None装订；仅校验页面头与布局标记，内容错误由绘制接口报告
+// 缺省为全部页面、1份、Collated、1页拼版、OneSided与None装订；仅校验页面头与布局标记，内容错误由绘制方法报告
 // 入参: ctx 取消Context，nil采用Background, options 作业、介质及预算参数，nil采用默认值
 // 返回: *PrintPlan 独立纸张计划，失败为nil, error 票据、组合、资源、取消或关闭错误
 func (r *Reader) PrintPlan(ctx context.Context, options *PrintPlanOptions) (*PrintPlan, error) {
@@ -688,6 +689,7 @@ func clonePrintPlacements(source []PrintPlacement) []PrintPlacement {
 // 入参: text 原始范围文本，空表示全部, count 文档页数, maximum 输出选择上限, options 数值及取消参数
 // 返回: []int 零基页号, bool 是否含越界页, error 词法、数量、资源或取消错误
 func printPageRanges(text string, count, maximum int, options printSettingsConfig) ([]int, bool, error) {
+	text = strings.Trim(text, " \t\r\n")
 	if text == "" {
 		if count > maximum {
 			return nil, false, fmt.Errorf("%w: print page selection count", ErrLimit)
@@ -713,6 +715,7 @@ func printPageRanges(text string, count, maximum int, options printSettingsConfi
 		}
 		values := [2]*big.Int{}
 		for index, number := range []string{startText, endText} {
+			number = strings.Trim(number, " \t\r\n")
 			if number == "" {
 				return nil, false, fmt.Errorf("%w: empty print page range endpoint", ErrInvalid)
 			}
@@ -895,7 +898,7 @@ func (b *printPlanBuilder) page(index int, source string, document *PrintSetting
 	if err != nil {
 		return result, err
 	}
-	layoutSettings, err := printPlanLayoutSettings(model, b.signatures != nil)
+	layoutSettings, err := printPlanLayoutSettings(model, b.signatures != nil, b.options.IgnoreUnsupportedFeatures || b.options.Print.IgnoreUnsupportedFeatures)
 	if err != nil {
 		return result, err
 	}
@@ -922,10 +925,10 @@ func (b *printPlanBuilder) page(index int, source string, document *PrintSetting
 	return result, nil
 }
 
-// printPlanLayoutSettings 分离已由作业编排执行的Feature，未实现的设置仍由布局输出严格拒绝
-// 入参: settings 已校验有效设置, signatures 是否已执行整包签名策略
+// printPlanLayoutSettings 分离已由作业编排执行的Feature，未实现的设置按忽略策略校验
+// 入参: settings 已校验有效设置, signatures 是否已执行整包签名策略, ignoreUnsupported 是否跳过不影响几何与拼版的设备控制Feature
 // 返回: *PrintSettings 仅供内部布局使用的视图, error 未支持Feature错误
-func printPlanLayoutSettings(settings *PrintSettings, signatures bool) (*PrintSettings, error) {
+func printPlanLayoutSettings(settings *PrintSettings, signatures, ignoreUnsupported bool) (*PrintSettings, error) {
 	if signatures {
 		settings = printSignatureLayoutSettings(settings)
 	}
@@ -947,7 +950,7 @@ func printPlanLayoutSettings(settings *PrintSettings, signatures bool) (*PrintSe
 		}
 		result.Elements = append(result.Elements, setting)
 	}
-	return result, validatePrintLayoutFeatures(result)
+	return result, validatePrintLayoutFeatures(result, ignoreUnsupported)
 }
 
 // merge 复用票据链校验与根设置合并，同一票据载荷仅从封装读取一次
@@ -1258,12 +1261,24 @@ func (p *printSheetPacker) add(page printPlanPage, document printPlanDocument) e
 	return nil
 }
 
-// printNUpCell 按确定性近方形网格及八向排列选择单元，纸面竖向较长时交换网格行列
+// printNUpCell 优先按近方形整除因子对及八向排列选择单元，纸面竖向较长时交换网格行列
 // 入参: index 面内顺序, count 每面页数, area 可打印区域, direction 排列方向
 // 返回: Rect 纸面坐标中的单元
 func printNUpCell(index, count int, area Rect, direction string) Rect {
-	columns := int(math.Ceil(math.Sqrt(float64(count))))
-	rows := 1 + (count-1)/columns
+	columns := 0
+	for rows := int(math.Sqrt(float64(count))); rows > 1 && count/rows <= rows*2; rows-- {
+		if count%rows == 0 {
+			columns = count / rows
+			break
+		}
+	}
+	var rows int
+	if columns != 0 {
+		rows = count / columns
+	} else {
+		columns = int(math.Ceil(math.Sqrt(float64(count))))
+		rows = 1 + (count-1)/columns
+	}
 	if area.Height > area.Width {
 		columns, rows = rows, columns
 	}
@@ -1695,12 +1710,23 @@ func (b *printSideGeometryBudget) resource(node *xmlElement) error {
 	return nil
 }
 
-// watermark 读取标准Text水印参数与叠放层级
-// 返回: *PrintWatermark 独立描述，未声明为nil, error 名称、描述、类型、范围或能力错误
+// watermark 读取标准None禁用选项或Text水印参数与叠放层级
+// 返回: *PrintWatermark 独立描述，未声明或None时为nil, error 名称、描述、类型、范围或能力错误
 func (s *printLayoutSettings) watermark() (*PrintWatermark, error) {
 	option, feature, err := s.option(s.model.Elements, "PageWatermark")
 	if err != nil || option == nil {
 		return nil, err
+	}
+	if option.Name == (xml.Name{Space: printKeywordsNS, Local: "None"}) {
+		for _, child := range feature.Children {
+			if child.Kind == PrintSettingFeature {
+				return nil, fmt.Errorf("%w: print watermark subfeature", ErrUnsupported)
+			}
+		}
+		if err := printOptionProperties(option); err != nil {
+			return nil, err
+		}
+		return nil, checkContext(s.options.context)
 	}
 	if option.Name != (xml.Name{Space: printKeywordsNS, Local: "Text"}) {
 		return nil, fmt.Errorf("%w: print watermark option", ErrUnsupported)
@@ -1713,46 +1739,49 @@ func (s *printLayoutSettings) watermark() (*PrintWatermark, error) {
 	if err := printOptionProperties(option, "OriginWidth", "OriginHeight", "Transparency", "Angle", "FontColor", "FontSize", "Text"); err != nil {
 		return nil, err
 	}
+	result := &PrintWatermark{Layer: PrintWatermarkOverlay}
 	layer, layering, err := s.option(feature.Children, "Layering")
 	if err != nil {
 		return nil, err
 	}
-	if layer == nil {
-		return nil, fmt.Errorf("%w: watermark layering requires an explicit selection", ErrUnsupported)
-	}
-	for _, child := range layering.Children {
-		if child.Kind == PrintSettingFeature {
-			return nil, fmt.Errorf("%w: nested watermark layering", ErrUnsupported)
+	if layer != nil {
+		for _, child := range layering.Children {
+			if child.Kind == PrintSettingFeature {
+				return nil, fmt.Errorf("%w: nested watermark layering", ErrUnsupported)
+			}
+		}
+		name, err := s.keyword(layer, "")
+		if err != nil {
+			return nil, err
+		}
+		switch name {
+		case "Overlay":
+			result.Layer = PrintWatermarkOverlay
+		case "Underlay":
+			result.Layer = PrintWatermarkUnderlay
+		default:
+			return nil, fmt.Errorf("%w: watermark layering option %s", ErrUnsupported, name)
 		}
 	}
-	name, err := s.keyword(layer, "")
-	if err != nil {
-		return nil, err
-	}
-	result := &PrintWatermark{}
-	switch name {
-	case "Overlay":
-		result.Layer = PrintWatermarkOverlay
-	case "Underlay":
-		result.Layer = PrintWatermarkUnderlay
-	default:
-		return nil, fmt.Errorf("%w: watermark layering option %s", ErrUnsupported, name)
-	}
 	for _, field := range []struct {
-		name  string
-		value *float64
+		name     string
+		value    *float64
+		required bool
 	}{
-		{"OriginWidth", &result.Origin.X},
-		{"OriginHeight", &result.Origin.Y},
-		{"Angle", &result.Angle},
-		{"FontSize", &result.FontSize},
+		{"OriginWidth", &result.Origin.X, false},
+		{"OriginHeight", &result.Origin.Y, false},
+		{"Angle", &result.Angle, false},
+		{"FontSize", &result.FontSize, true},
 	} {
 		value, present, err := s.number(option, field.name)
 		if err != nil {
 			return nil, err
 		}
 		if !present {
-			return nil, fmt.Errorf("%w: watermark requires %s", ErrUnsupported, field.name)
+			if field.required {
+				return nil, fmt.Errorf("%w: watermark requires %s", ErrUnsupported, field.name)
+			}
+			continue
 		}
 		*field.value = value
 	}
@@ -1831,8 +1860,8 @@ func printWatermarkSettings(settings *PrintSettings, options printSettingsConfig
 		return nil, nil, err
 	}
 	mark, err := newPrintLayoutSettings(settings, configuration).watermark()
-	if err != nil || mark == nil {
-		return settings, mark, err
+	if err != nil {
+		return settings, nil, err
 	}
 	result := &PrintSettings{Version: settings.Version}
 	for _, setting := range settings.Elements {
@@ -1930,7 +1959,7 @@ func (r *Reader) printSignatureJobSettings(ctx context.Context, defaults *PrintS
 	return MergePrintSettings(ctx, base, delta, &configuration)
 }
 
-// printSignaturePolicy 读取标准作业Feature，公共Option不允许包含任何子元素
+// printSignaturePolicy 读取标准作业Feature，放行说明性Property并拒绝配置描述
 // 入参: settings 已校验的有效设置, ctx 取消Context
 // 返回: PrintSignaturePolicy 策略, error 结构、私有选项、能力或取消错误
 func printSignaturePolicy(settings *PrintSettings, ctx context.Context) (PrintSignaturePolicy, error) {
@@ -1945,8 +1974,8 @@ func printSignaturePolicy(settings *PrintSettings, ctx context.Context) (PrintSi
 	if option.Name.Space != printKeywordsNS {
 		return PrintSignatureFromTicket, fmt.Errorf("%w: private digital signature processing option", ErrUnsupported)
 	}
-	if len(option.Children) != 0 {
-		return PrintSignatureFromTicket, fmt.Errorf("%w: digital signature processing option content", ErrInvalid)
+	if err := printOptionProperties(option); err != nil {
+		return PrintSignatureFromTicket, err
 	}
 	switch option.Name.Local {
 	case "PrintInvalidSignatures":

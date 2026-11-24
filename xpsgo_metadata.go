@@ -46,7 +46,15 @@ var corePropertyNames = []xml.Name{
 	{Space: opcCoreNS, Local: "revision"}, {Space: dcNamespace, Local: "subject"}, {Space: dcNamespace, Local: "title"}, {Space: opcCoreNS, Local: "version"},
 }
 
+// CoreKeyword 表示核心属性keywords中的词条，IsText为true表示直接混合文本，否则表示cp:value子元素
+type CoreKeyword struct {
+	Value    string
+	Language *string
+	IsText   bool
+}
+
 // CoreProperties 保存OPC核心属性，nil字段表示省略，非nil空字符串表示显式空值
+// Languages映射允许xml:lang的元素本地名到语言标签，KeywordValues保存cp:keywords中的混合cp:value结构
 // 日期保留已校验的声明精度与时区，不补入当前用户、软件名称或时间
 type CoreProperties struct {
 	Part           string
@@ -58,7 +66,9 @@ type CoreProperties struct {
 	Description    *string
 	Identifier     *string
 	Keywords       *string
+	KeywordValues  []CoreKeyword
 	Language       *string
+	Languages      map[string]string
 	LastModifiedBy *string
 	LastPrinted    *string
 	Modified       *string
@@ -81,8 +91,8 @@ type DiscardControl struct {
 	Ignored int
 }
 
-// MarshalXML 按OPC核心属性模式编码非nil字段，不写入Part位置或自动补造身份、时间及软件信息
-// 所有字段在输出前校验，XML编码器及底层写入错误原样返回
+// MarshalXML 按OPC核心属性模式编码非nil字段，支持允许元素的xml:lang及cp:keywords混合cp:value结构
+// 所有字段在输出前校验，不写入Part位置或自动补造身份、时间及软件信息，底层写入错误原样返回
 // 入参: encoder XML编码器, start 标准库提供的起始标记，根名称按OPC规范固定
 // 返回: error 属性、编码或写入错误
 func (p *CoreProperties) MarshalXML(encoder *xml.Encoder, start xml.StartElement) error {
@@ -92,8 +102,36 @@ func (p *CoreProperties) MarshalXML(encoder *xml.Encoder, start xml.StartElement
 	if encoder == nil {
 		return fmt.Errorf("%w: nil XML encoder", ErrInvalid)
 	}
+	languages, err := corePropertyEncodeLanguages(p)
+	if err != nil {
+		return err
+	}
+	keywordValues, err := corePropertyEncodeKeywords(p)
+	if err != nil {
+		return err
+	}
 	root := &xmlElement{Name: xml.Name{Space: opcCoreNS, Local: "coreProperties"}, Namespaces: map[string]string{"t": dcTermsNS}}
 	for _, name := range corePropertyNames {
+		isKeywords := name == (xml.Name{Space: opcCoreNS, Local: "keywords"})
+		if isKeywords && len(keywordValues) != 0 {
+			child := &xmlElement{Name: name, Namespaces: root.Namespaces}
+			if lang, ok := languages[name.Local]; ok {
+				child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Space: xmlNamespace, Local: "lang"}, Value: lang})
+			}
+			for _, item := range keywordValues {
+				if item.IsText {
+					child.Text += item.Value
+					continue
+				}
+				sub := &xmlElement{Name: xml.Name{Space: opcCoreNS, Local: "value"}, Text: item.Value, Namespaces: root.Namespaces}
+				if item.Language != nil {
+					sub.Attr = []xml.Attr{{Name: xml.Name{Space: xmlNamespace, Local: "lang"}, Value: *item.Language}}
+				}
+				child.Children = append(child.Children, sub)
+			}
+			root.Children = append(root.Children, child)
+			continue
+		}
 		field := corePropertyField(p, name)
 		if field == nil || *field == nil {
 			continue
@@ -104,11 +142,14 @@ func (p *CoreProperties) MarshalXML(encoder *xml.Encoder, start xml.StartElement
 		}
 		child := &xmlElement{Name: name, Text: value, Namespaces: root.Namespaces}
 		if name.Space == dcTermsNS {
-			child.Attr = []xml.Attr{{Name: xml.Name{Space: xsiNamespace, Local: "type"}, Value: "t:W3CDTF"}}
+			child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Space: xsiNamespace, Local: "type"}, Value: "t:W3CDTF"})
+		}
+		if lang, ok := languages[name.Local]; ok {
+			child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Space: xmlNamespace, Local: "lang"}, Value: lang})
 		}
 		root.Children = append(root.Children, child)
 	}
-	if _, err := parseCoreProperties(root); err != nil {
+	if _, err := parseCorePropertiesContent(root, nil); err != nil {
 		return err
 	}
 	start = xml.StartElement{Name: xml.Name{Local: "coreProperties"}, Attr: []xml.Attr{
@@ -127,14 +168,115 @@ func (p *CoreProperties) MarshalXML(encoder *xml.Encoder, start xml.StartElement
 			name = "dc:" + name
 		} else if node.Name.Space == dcTermsNS {
 			name = "t:" + name
-			attributes = []xml.Attr{{Name: xml.Name{Local: "xsi:type"}, Value: "t:W3CDTF"}}
+			attributes = append(attributes, xml.Attr{Name: xml.Name{Local: "xsi:type"}, Value: "t:W3CDTF"})
+		}
+		if lang, ok := node.attributeNS(xmlNamespace, "lang"); ok {
+			attributes = append(attributes, xml.Attr{Name: xml.Name{Local: "xml:lang"}, Value: lang})
 		}
 		child := xml.StartElement{Name: xml.Name{Local: name}, Attr: attributes}
+		if node.Name == (xml.Name{Space: opcCoreNS, Local: "keywords"}) && len(keywordValues) != 0 {
+			if err := encoder.EncodeToken(child); err != nil {
+				return err
+			}
+			for _, item := range keywordValues {
+				if item.IsText {
+					if err := encoder.EncodeToken(xml.CharData(item.Value)); err != nil {
+						return err
+					}
+					continue
+				}
+				var subAttrs []xml.Attr
+				if item.Language != nil {
+					subAttrs = []xml.Attr{{Name: xml.Name{Local: "xml:lang"}, Value: *item.Language}}
+				}
+				if err := encoder.EncodeElement(item.Value, xml.StartElement{Name: xml.Name{Local: "value"}, Attr: subAttrs}); err != nil {
+					return err
+				}
+			}
+			if err := encoder.EncodeToken(child.End()); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := encoder.EncodeElement(node.Text, child); err != nil {
 			return err
 		}
 	}
 	return encoder.EncodeToken(start.End())
+}
+
+// corePropertyEncodeLanguages 校验核心属性语言映射的允许元素与语言标签词法
+// 入参: p 核心属性
+// 返回: map[string]string 规范化后的语言映射, error 元素不支持、属性省略或标签错误
+func corePropertyEncodeLanguages(p *CoreProperties) (map[string]string, error) {
+	if len(p.Languages) == 0 {
+		return nil, nil
+	}
+	allowed := make(map[string]xml.Name, 7)
+	for _, name := range corePropertyNames {
+		if corePropertyAllowsLanguage(name) {
+			allowed[name.Local] = name
+		}
+	}
+	result := make(map[string]string, len(p.Languages))
+	for local, raw := range p.Languages {
+		name, ok := allowed[local]
+		if !ok {
+			return nil, fmt.Errorf("%w: xml:lang not allowed on core property %q", ErrInvalid, local)
+		}
+		present := false
+		if local == "keywords" {
+			present = p.Keywords != nil || len(p.KeywordValues) != 0
+		} else if field := corePropertyField(p, name); field != nil && *field != nil {
+			present = true
+		}
+		if !present {
+			return nil, fmt.Errorf("%w: xml:lang specified for omitted core property %q", ErrInvalid, local)
+		}
+		lang, err := corePropertyLanguage(raw)
+		if err != nil {
+			return nil, err
+		}
+		result[local] = lang
+	}
+	return result, nil
+}
+
+// corePropertyEncodeKeywords 校验cp:keywords混合词条并核对与Keywords聚合文本的一致性
+// 入参: p 核心属性
+// 返回: []CoreKeyword 规范化词条副本, error 文本、语言或聚合冲突错误
+func corePropertyEncodeKeywords(p *CoreProperties) ([]CoreKeyword, error) {
+	if len(p.KeywordValues) == 0 {
+		return nil, nil
+	}
+	result := make([]CoreKeyword, len(p.KeywordValues))
+	var combined strings.Builder
+	for index, item := range p.KeywordValues {
+		if !xmlTextValid(item.Value) {
+			return nil, fmt.Errorf("%w: core property keywords XML text", ErrInvalid)
+		}
+		if item.IsText {
+			if item.Language != nil {
+				return nil, fmt.Errorf("%w: core property keywords text fragment cannot carry xml:lang", ErrInvalid)
+			}
+			result[index] = CoreKeyword{Value: item.Value, IsText: true}
+		} else {
+			entry := CoreKeyword{Value: item.Value}
+			if item.Language != nil {
+				lang, err := corePropertyLanguage(*item.Language)
+				if err != nil {
+					return nil, err
+				}
+				entry.Language = &lang
+			}
+			result[index] = entry
+		}
+		combined.WriteString(item.Value)
+	}
+	if p.Keywords != nil && *p.Keywords != combined.String() {
+		return nil, fmt.Errorf("%w: core property keywords text conflicts with KeywordValues", ErrInvalid)
+	}
+	return result, nil
 }
 
 // SetCoreProperties 编码并写入包级OPC核心属性，复用已有或分配/docProps/core.xml并保留其他根关系
@@ -256,10 +398,10 @@ func (r *Reader) CoreProperties(ctx context.Context) (*CoreProperties, error) {
 	if err != nil {
 		return nil, &PartError{Part: part, Err: err}
 	}
-	root, err := decodeXMLVisit(data, r.limits, func(_ xml.Token, _ *xmlElement) error { return checkContext(ctx) })
+	root, content, err := decodeXMLContent(data, r.limits, ctx)
 	if err == nil {
 		var result *CoreProperties
-		result, err = parseCoreProperties(root)
+		result, err = parseCorePropertiesContent(root, content)
 		if err == nil {
 			if err := checkContext(ctx); err != nil {
 				return nil, err
@@ -271,25 +413,42 @@ func (r *Reader) CoreProperties(ctx context.Context) (*CoreProperties, error) {
 	return nil, &PartError{Part: part, Err: err}
 }
 
-// parseCoreProperties 按原始OPC模式及正文约束解析属性，不对禁止的MCE执行容错预处理
-// 入参: root 部件根节点
-// 返回: *CoreProperties 独立核心属性, error 根节点、重复属性或内容错误
-func parseCoreProperties(root *xmlElement) (*CoreProperties, error) {
+// parseCorePropertiesContent 按OPC模式解析核心属性及cp:keywords混合内容顺序，保留允许元素的xml:lang
+// 入参: root 部件根节点, content 可选有序内容索引
+// 返回: *CoreProperties 独立核心属性, error 根节点、属性、语言、重复或日期错误
+func parseCorePropertiesContent(root *xmlElement, content *xmlContentReader) (*CoreProperties, error) {
 	if root == nil || root.Name != (xml.Name{Space: opcCoreNS, Local: "coreProperties"}) || !xmlWhitespace(root.Text) {
 		return nil, fmt.Errorf("%w: core properties root or text", ErrInvalid)
 	}
-	if err := corePropertyAttributes(root, false); err != nil {
+	if _, err := corePropertyAttributes(root, false, false); err != nil {
 		return nil, err
 	}
 	result := &CoreProperties{}
 	for _, child := range root.Children {
 		field := corePropertyField(result, child.Name)
-		if field == nil || *field != nil || len(child.Children) != 0 {
+		isKeywords := child.Name == (xml.Name{Space: opcCoreNS, Local: "keywords"})
+		if field == nil || *field != nil || !isKeywords && len(child.Children) != 0 {
 			return nil, fmt.Errorf("%w: unknown, repeated or nested core property {%s}%s", ErrInvalid, child.Name.Space, child.Name.Local)
 		}
 		date := child.Name.Space == dcTermsNS && (child.Name.Local == "created" || child.Name.Local == "modified")
-		if err := corePropertyAttributes(child, date); err != nil {
+		lang, err := corePropertyAttributes(child, date, corePropertyAllowsLanguage(child.Name))
+		if err != nil {
 			return nil, err
+		}
+		if lang != nil {
+			if result.Languages == nil {
+				result.Languages = make(map[string]string)
+			}
+			result.Languages[child.Name.Local] = *lang
+		}
+		if isKeywords && len(child.Children) != 0 {
+			combined, values, err := parseCoreKeywords(child, content)
+			if err != nil {
+				return nil, err
+			}
+			*field = &combined
+			result.KeywordValues = values
+			continue
 		}
 		value := child.Text
 		printed := child.Name == (xml.Name{Space: opcCoreNS, Local: "lastPrinted"})
@@ -302,6 +461,81 @@ func parseCoreProperties(root *xmlElement) (*CoreProperties, error) {
 		*field = &value
 	}
 	return result, nil
+}
+
+// parseCoreKeywords 解析cp:keywords内的混合文本及cp:value子元素，并保持文档顺序
+// 入参: node keywords元素, content 可选有序内容索引
+// 返回: string 聚合关键词文本, []CoreKeyword 有序混合条目, error 非法子元素或属性错误
+func parseCoreKeywords(node *xmlElement, content *xmlContentReader) (string, []CoreKeyword, error) {
+	byNode := make(map[*xmlElement]CoreKeyword, len(node.Children))
+	for _, child := range node.Children {
+		if child.Name != (xml.Name{Space: opcCoreNS, Local: "value"}) || len(child.Children) != 0 {
+			return "", nil, fmt.Errorf("%w: invalid cp:keywords child {%s}%s", ErrInvalid, child.Name.Space, child.Name.Local)
+		}
+		lang, err := corePropertyAttributes(child, false, true)
+		if err != nil {
+			return "", nil, err
+		}
+		byNode[child] = CoreKeyword{Value: child.Text, Language: lang}
+	}
+	var combined strings.Builder
+	var values []CoreKeyword
+	appendText := func(text string) {
+		if text == "" {
+			return
+		}
+		combined.WriteString(text)
+		if len(values) != 0 && values[len(values)-1].IsText {
+			values[len(values)-1].Value += text
+			return
+		}
+		values = append(values, CoreKeyword{Value: text, IsText: true})
+	}
+	if content != nil {
+		if items, ok := content.nodes[node]; ok {
+			for _, item := range items {
+				if item.element != nil {
+					entry := byNode[item.element]
+					combined.WriteString(entry.Value)
+					values = append(values, entry)
+				} else if data, ok := item.token.(xml.CharData); ok {
+					appendText(string(data))
+				}
+			}
+			return combined.String(), values, nil
+		}
+	}
+	appendText(node.Text)
+	for _, child := range node.Children {
+		entry := byNode[child]
+		combined.WriteString(entry.Value)
+		values = append(values, entry)
+	}
+	return combined.String(), values, nil
+}
+
+// corePropertyAllowsLanguage 判断核心属性元素是否允许携带xml:lang属性
+// 入参: name 元素展开名称
+// 返回: bool 是否允许xml:lang
+func corePropertyAllowsLanguage(name xml.Name) bool {
+	return name.Space == dcNamespace || name == (xml.Name{Space: opcCoreNS, Local: "keywords"}) || name == (xml.Name{Space: opcCoreNS, Local: "value"})
+}
+
+// corePropertyLanguage 校验核心属性xml:lang标签词法，允许空字符串以清除继承语言
+// 入参: value 语言属性值
+// 返回: string 规范化语言标签, error 非法文本或语言标签错误
+func corePropertyLanguage(value string) (string, error) {
+	if !xmlTextValid(value) {
+		return "", fmt.Errorf("%w: core property xml:lang XML text", ErrInvalid)
+	}
+	if value == "" {
+		return "", nil
+	}
+	trimmed := strings.Trim(value, " \t\r\n")
+	if !fixedLanguageTag(trimmed) {
+		return "", fmt.Errorf("%w: invalid core property xml:lang %q", ErrInvalid, value)
+	}
+	return trimmed, nil
 }
 
 // corePropertyField 将扩展名称映射到对应字段，不合并不同命名空间中的同名属性
@@ -354,35 +588,47 @@ func corePropertyField(properties *CoreProperties, name xml.Name) **string {
 	return nil
 }
 
-// corePropertyAttributes 校验OPC核心属性禁用属性及日期字段必需的QName类型
-// 入参: node 属性节点, date 是否为创建或修改日期
-// 返回: error 属性或类型声明错误
-func corePropertyAttributes(node *xmlElement, date bool) error {
+// corePropertyAttributes 校验OPC核心属性允许的属性集合、可选xml:lang及日期字段必需的QName类型
+// 入参: node 属性节点, date 是否为创建或修改日期, allowLanguage 是否允许xml:lang
+// 返回: *string 可选语言标签, error 属性、语言或类型声明错误
+func corePropertyAttributes(node *xmlElement, date, allowLanguage bool) (*string, error) {
 	typed := false
+	var language *string
 	for _, attribute := range node.Attr {
 		if attribute.Name.Space == xmlnsNamespace || attribute.Name == (xml.Name{Local: "xmlns"}) {
 			continue
 		}
+		if attribute.Name == (xml.Name{Space: xmlNamespace, Local: "lang"}) {
+			if !allowLanguage {
+				return nil, fmt.Errorf("%w: xml:lang not allowed on core property %s", ErrInvalid, node.Name.Local)
+			}
+			lang, err := corePropertyLanguage(attribute.Value)
+			if err != nil {
+				return nil, err
+			}
+			language = &lang
+			continue
+		}
 		if attribute.Name.Space != xsiNamespace {
-			return fmt.Errorf("%w: core property attribute {%s}%s", ErrInvalid, attribute.Name.Space, attribute.Name.Local)
+			return nil, fmt.Errorf("%w: core property attribute {%s}%s", ErrInvalid, attribute.Name.Space, attribute.Name.Local)
 		}
 		switch attribute.Name.Local {
 		case "type":
 			if !date || !coreDateType(node, attribute.Value) {
-				return fmt.Errorf("%w: core property date type", ErrInvalid)
+				return nil, fmt.Errorf("%w: core property date type", ErrInvalid)
 			}
 			typed = true
 		case "nil":
-			return fmt.Errorf("%w: xsi:nil on a non-nillable core property", ErrInvalid)
+			return nil, fmt.Errorf("%w: xsi:nil on a non-nillable core property", ErrInvalid)
 		case "schemaLocation", "noNamespaceSchemaLocation":
 		default:
-			return fmt.Errorf("%w: core property schema attribute %s", ErrInvalid, attribute.Name.Local)
+			return nil, fmt.Errorf("%w: core property schema attribute %s", ErrInvalid, attribute.Name.Local)
 		}
 	}
 	if date && !typed {
-		return fmt.Errorf("%w: missing core property date type", ErrInvalid)
+		return nil, fmt.Errorf("%w: missing core property date type", ErrInvalid)
 	}
-	return nil
+	return language, nil
 }
 
 // coreDateType 按节点的命名空间作用域解析日期类型，不固定dcterms前缀名称

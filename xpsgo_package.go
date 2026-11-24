@@ -181,8 +181,11 @@ func newPackageReaderWithLimits(ctx context.Context, r io.ReaderAt, size int64, 
 			if file.UncompressedSize64 != 0 {
 				return nil, fmt.Errorf("%w: nonempty ZIP directory %q", ErrInvalid, file.Name)
 			}
-			if _, err := opcPartName("/" + strings.TrimSuffix(file.Name, "/")); err != nil {
-				return nil, fmt.Errorf("directory: %w", err)
+			dir := strings.TrimSuffix(file.Name, "/")
+			if !strings.EqualFold(dir, strings.TrimPrefix(opcTypesName, "/")) {
+				if _, err := opcPartName("/" + dir); err != nil {
+					return nil, fmt.Errorf("directory: %w", err)
+				}
 			}
 			continue
 		}
@@ -477,19 +480,19 @@ func (p *packageReader) contentType(name string) (string, error) {
 		return "", fmt.Errorf("%w: part %q: %w", ErrNotFound, key, fs.ErrNotExist)
 	}
 	value := p.declaredContentType(canonical)
+	if value == "" {
+		return "", fmt.Errorf("%w: no content type for %q", ErrInvalid, name)
+	}
 	if opcRelationshipName(key) {
-		if value != "" && !strings.EqualFold(value, opcRelsType) {
+		if !strings.EqualFold(value, opcRelsType) {
 			return "", fmt.Errorf("%w: incorrect relationship content type for %q", ErrInvalid, name)
 		}
 		return opcRelsType, nil
 	}
-	if value == "" {
-		return "", fmt.Errorf("%w: no content type for %q", ErrInvalid, name)
-	}
 	return value, nil
 }
 
-// declaredContentType 查询规范部件名的类型声明，关系部件缺省采用关系内容类型
+// declaredContentType 查询规范部件名的类型声明，未命中Override或Default时返回空字符串
 // 入参: name 规范部件URI
 // 返回: string 声明媒体类型，无声明时为空
 func (p *packageReader) declaredContentType(name string) string {
@@ -500,9 +503,6 @@ func (p *packageReader) declaredContentType(name string) string {
 		if dot := strings.LastIndexByte(base, '.'); dot >= 0 {
 			value = p.defaults[base[dot+1:]]
 		}
-	}
-	if value == "" && opcRelationshipName(key) {
-		return opcRelsType
 	}
 	return value
 }
@@ -730,7 +730,7 @@ func parseRelationship(source string, element xml.StartElement, attrs map[string
 	return rel, nil
 }
 
-// opcMetadataContext 在取消检查下校验两层OPC元数据，仅关系部件执行兼容性预处理
+// opcMetadataContext 在取消检查下校验两层OPC元数据，对内容类型流与关系部件均执行兼容性预处理
 // 入参: ctx 取消Context, data XML数据, limits 资源上限, namespace 预期命名空间, root 根元素名, visit 子元素处理函数
 // 返回: error 错误信息
 func opcMetadataContext(ctx context.Context, data []byte, limits Limits, namespace, root string, visit func(xml.StartElement, map[string]string) error) error {
@@ -741,7 +741,7 @@ func opcMetadataContext(ctx context.Context, data []byte, limits Limits, namespa
 	if err != nil {
 		return err
 	}
-	if namespace == opcRelsNS {
+	if namespace == opcRelsNS || namespace == opcTypesNS {
 		document, err = preprocessXMLContext(document, []string{namespace}, ctx)
 		if err != nil {
 			return err
@@ -1044,7 +1044,8 @@ func readPackageZIPLocal(input io.ReaderAt, boundary, offset int64, file *zip.Fi
 		return packageZIPLocal{}, fmt.Errorf("%w: ZIP local record signature", ErrInvalid)
 	}
 	version := binary.LittleEndian.Uint16(fixed[4:])
-	versionMatch := version == file.ReaderVersion || extendedOffset && file.ReaderVersion == 45 && (version == 10 && file.Method == zip.Store || version == 20)
+	extendedSize := file.Flags&8 != 0 && (file.CompressedSize64 >= 0xffffffff || file.UncompressedSize64 >= 0xffffffff)
+	versionMatch := version == file.ReaderVersion || (extendedOffset || extendedSize) && file.ReaderVersion == 45 && (version == 10 && file.Method == zip.Store || version == 20)
 	if !versionMatch || binary.LittleEndian.Uint16(fixed[6:]) != file.Flags || binary.LittleEndian.Uint16(fixed[8:]) != file.Method || binary.LittleEndian.Uint16(fixed[10:]) != file.ModifiedTime || binary.LittleEndian.Uint16(fixed[12:]) != file.ModifiedDate {
 		return packageZIPLocal{}, fmt.Errorf("%w: ZIP local/central common fields", ErrInvalid)
 	}
@@ -1198,34 +1199,45 @@ func readPackageZIPEnd(input io.ReaderAt, size int64, limits Limits) (packageZIP
 	directorySize := uint64(binary.LittleEndian.Uint32(end[12:]))
 	directoryOffset := uint64(binary.LittleEndian.Uint32(end[16:]))
 	boundary := layout.footer
-	if layout.count == 65535 || directorySize == 0xffffffff || directoryOffset == 0xffffffff {
-		var locator [20]byte
-		present := layout.footer >= 20
-		if present {
-			if err := readPackageZIPAt(input, size, layout.footer-20, locator[:]); err != nil {
+	saturated := layout.count == 65535 || directorySize == 0xffffffff || directoryOffset == 0xffffffff
+	var locator [20]byte
+	present := layout.footer >= 20
+	if present {
+		if err := readPackageZIPAt(input, size, layout.footer-20, locator[:]); err != nil {
+			return packageZIPLayout{}, err
+		}
+		present = binary.LittleEndian.Uint32(locator[:]) == packageZIP64LocatorSignature
+	}
+	if present && !saturated {
+		offset := binary.LittleEndian.Uint64(locator[8:])
+		if offset > uint64(layout.footer-20) || layout.footer-20-int64(offset) < 4 {
+			present = false
+		} else {
+			var signature [4]byte
+			if err := readPackageZIPAt(input, layout.footer-20, int64(offset), signature[:]); err != nil {
 				return packageZIPLayout{}, err
 			}
-			present = binary.LittleEndian.Uint32(locator[:]) == packageZIP64LocatorSignature
+			present = binary.LittleEndian.Uint32(signature[:]) == packageZIP64EndSignature
 		}
-		if present {
-			if binary.LittleEndian.Uint32(locator[4:]) != 0 || binary.LittleEndian.Uint32(locator[16:]) != 1 {
-				return packageZIPLayout{}, fmt.Errorf("%w: multiple ZIP64 disks", ErrUnsupported)
-			}
-			offset := binary.LittleEndian.Uint64(locator[8:])
-			if offset > uint64(layout.footer-20) {
-				return packageZIPLayout{}, fmt.Errorf("%w: ZIP64 end offset", ErrInvalid)
-			}
-			count, bytes, start, err := readPackageZIP64End(input, layout.footer-20, int64(offset), limits)
-			if err != nil {
-				return packageZIPLayout{}, err
-			}
-			if layout.count != 65535 && layout.count != count || directorySize != 0xffffffff && directorySize != bytes || directoryOffset != 0xffffffff && directoryOffset != start {
-				return packageZIPLayout{}, fmt.Errorf("%w: ZIP32/ZIP64 end fields", ErrInvalid)
-			}
-			layout.count, directorySize, directoryOffset, boundary = count, bytes, start, int64(offset)
-		} else if directorySize == 0xffffffff || directoryOffset == 0xffffffff {
-			return packageZIPLayout{}, fmt.Errorf("%w: missing ZIP64 end locator", ErrInvalid)
+	}
+	if present {
+		if binary.LittleEndian.Uint32(locator[4:]) != 0 || binary.LittleEndian.Uint32(locator[16:]) != 1 {
+			return packageZIPLayout{}, fmt.Errorf("%w: multiple ZIP64 disks", ErrUnsupported)
 		}
+		offset := binary.LittleEndian.Uint64(locator[8:])
+		if offset > uint64(layout.footer-20) {
+			return packageZIPLayout{}, fmt.Errorf("%w: ZIP64 end offset", ErrInvalid)
+		}
+		count, bytes, start, err := readPackageZIP64End(input, layout.footer-20, int64(offset), limits)
+		if err != nil {
+			return packageZIPLayout{}, err
+		}
+		if layout.count != 65535 && layout.count != count || directorySize != 0xffffffff && directorySize != bytes || directoryOffset != 0xffffffff && directoryOffset != start {
+			return packageZIPLayout{}, fmt.Errorf("%w: ZIP32/ZIP64 end fields", ErrInvalid)
+		}
+		layout.count, directorySize, directoryOffset, boundary = count, bytes, start, int64(offset)
+	} else if directorySize == 0xffffffff || directoryOffset == 0xffffffff {
+		return packageZIPLayout{}, fmt.Errorf("%w: missing ZIP64 end locator", ErrInvalid)
 	}
 	if layout.count > uint64(limits.MaxPartCount) || directorySize > uint64(limits.MaxPackageBytes) {
 		return packageZIPLayout{}, fmt.Errorf("%w: ZIP central metadata budget", ErrLimit)

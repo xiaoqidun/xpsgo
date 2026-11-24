@@ -223,7 +223,7 @@ func (r *Reader) renderPrint(ctx context.Context, pageIndex int, options *PrintR
 	if device == nil && (colorPlan != nil || configuration.Color != nil) {
 		return nil, fmt.Errorf("%w: print color requires explicit device output", ErrUnsupported)
 	}
-	if err := validatePrintLayoutFeatures(ticket); err != nil {
+	if err := validatePrintLayoutFeatures(ticket, configuration.Print.IgnoreUnsupportedFeatures); err != nil {
 		return nil, err
 	}
 	var bounds image.Rectangle
@@ -1202,13 +1202,6 @@ func (c *printResourceCollector) value(path []int, kind printResourceKind) error
 	}
 	if value.Text == "" {
 		return nil
-	}
-	if c.document.capabilities && len(path) == 3 {
-		parameter := &c.document.model.Elements[path[0]]
-		property := &parameter.Children[path[1]]
-		if parameter.Kind == PrintSettingParameterDef && property.Kind == PrintSettingProperty && property.Name == (xml.Name{Space: printFrameworkNS, Local: "DefaultValue"}) {
-			return fmt.Errorf("%w: nonempty print resource default", ErrInvalid)
-		}
 	}
 	uri, err := opcPartName(value.Text)
 	if err != nil {

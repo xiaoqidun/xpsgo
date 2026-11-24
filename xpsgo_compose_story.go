@@ -159,7 +159,7 @@ func (g *compositionStoryProjector) root(source int, owner, kind, local string) 
 			return "", nil, false, err
 		}
 		if part != "" && !strings.EqualFold(part, target) {
-			return "", nil, false, fmt.Errorf("%w: multiple composition story targets", ErrUnsupported)
+			return "", nil, false, fmt.Errorf("%w: multiple composition story targets", ErrInvalid)
 		}
 		part = target
 	}

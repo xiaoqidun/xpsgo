@@ -567,7 +567,7 @@ func pngImageMetadata(data []byte) (rasterMetadata, error) {
 		case "IDAT":
 			imageSeen = true
 		case "pHYs":
-			if seen || size != 9 || chunk[12] > 1 {
+			if seen || imageSeen || size != 9 || chunk[12] > 1 {
 				return rasterMetadata{}, fmt.Errorf("%w: PNG physical dimensions", ErrInvalid)
 			}
 			seen = true
@@ -1321,7 +1321,7 @@ func pngCompressionChunks(data []byte, budget *resourceMergeBudget) (pngCompress
 				}
 				palette = true
 			default:
-				if kind[0]&32 == 0 || kind[3]&32 == 0 && !slices.Contains([]string{"tRNS", "cHRM", "gAMA", "iCCP", "sBIT", "sRGB", "bKGD", "hIST", "pHYs", "sPLT", "tIME"}, string(kind)) {
+				if kind[0]&32 == 0 || kind[3]&32 == 0 && !slices.Contains([]string{"tRNS", "cHRM", "gAMA", "iCCP", "sBIT", "sRGB", "cICP", "mDCv", "cLLi", "mDCV", "cLLI", "bKGD", "hIST", "pHYs", "sPLT", "tIME"}, string(kind)) {
 					return pngCompressionLayout{}, fmt.Errorf("%w: PNG preserved chunk %s", ErrUnsupported, kind)
 				}
 			}
@@ -1485,6 +1485,7 @@ func decodeLosslessJPEGImage(data []byte, metadata rasterMetadata, maxPixels uin
 				return nil, fmt.Errorf("%w: lossless JPEG decoded pixels", ErrLimit)
 			}
 			var identities [256]bool
+			var ids [3]byte
 			for c := range stream.components {
 				identity := payload[6+c*3]
 				if identities[identity] || payload[8+c*3] != 0 {
@@ -1494,9 +1495,12 @@ func decodeLosslessJPEGImage(data []byte, metadata rasterMetadata, maxPixels uin
 				if payload[7+c*3] != 0x11 {
 					return nil, fmt.Errorf("%w: subsampled lossless JPEG components", ErrUnsupported)
 				}
-				if stream.components == 3 && identity != "RGB"[c] {
-					return nil, fmt.Errorf("%w: unspecified lossless JPEG RGB component mapping", ErrUnsupported)
+				if c < len(ids) {
+					ids[c] = identity
 				}
+			}
+			if stream.components == 3 && ids != [3]byte{'R', 'G', 'B'} && ids != [3]byte{1, 2, 3} {
+				return nil, fmt.Errorf("%w: unspecified lossless JPEG RGB component mapping", ErrUnsupported)
 			}
 			frame = payload
 			out = &rasterImage{pixels: image.NewNRGBA64(image.Rect(0, 0, width, height)), dpi: metadata.dpi, channels: stream.components, profile: metadata.profile}

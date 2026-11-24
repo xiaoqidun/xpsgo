@@ -872,6 +872,9 @@ func parseDocumentOutline(root *xmlElement, namespace string) (*DocumentOutline,
 			return nil, fmt.Errorf("%w: missing outline target or description", ErrInvalid)
 		}
 		target = structureURI(target)
+		if target == "" || !uriReference(target) {
+			return nil, fmt.Errorf("%w: invalid outline target %q", ErrInvalid, target)
+		}
 		language, err := structureLanguage(attrs, false)
 		if err != nil {
 			return nil, err
@@ -1078,7 +1081,7 @@ func (r *Reader) readStructurePartContext(ctx context.Context, source, kind, roo
 			return "", nil, &PartError{Part: source, Err: err}
 		}
 		if part != "" && !strings.EqualFold(part, target) {
-			return "", nil, &PartError{Part: source, Err: fmt.Errorf("%w: multiple distinct %s parts", ErrUnsupported, rootName)}
+			return "", nil, &PartError{Part: source, Err: fmt.Errorf("%w: multiple distinct %s parts", ErrInvalid, rootName)}
 		}
 		part = target
 	}
@@ -1751,7 +1754,7 @@ func validateFixedNamesSeen(root *xmlElement, format Format, seen map[string]boo
 			}
 		}
 		for _, child := range node.Children {
-			if err := visit(child, node.Name.Local == "ResourceDictionary"); err != nil {
+			if err := visit(child, resource || node.Name.Local == "ResourceDictionary"); err != nil {
 				return err
 			}
 		}

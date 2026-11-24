@@ -353,19 +353,36 @@ func (p *Package) AddFont(data []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	os2, err := parseFontOS2Metrics(face)
-	if err != nil {
-		return "", err
+	count := uint32(1)
+	if face.collection {
+		count = binary.BigEndian.Uint32(data[8:12])
 	}
-	if os2 == nil {
-		return "", fmt.Errorf("%w: producer font needs OS/2", ErrInvalid)
-	}
-	rights, err := fontEmbeddingRights(os2)
-	if err != nil {
-		return "", err
-	}
-	if rights&2 != 0 {
-		return "", fmt.Errorf("%w: font prohibits embedding", ErrRestricted)
+	checked := make(map[uint32]bool)
+	for index := uint32(0); index < count; index++ {
+		if index != 0 {
+			face, err = parseFontFace(data, index)
+			if err != nil {
+				return "", err
+			}
+		}
+		if checked[face.offset] {
+			continue
+		}
+		os2, err := parseFontOS2Metrics(face)
+		if err != nil {
+			return "", err
+		}
+		if os2 == nil {
+			return "", fmt.Errorf("%w: producer font needs OS/2", ErrInvalid)
+		}
+		rights, err := fontEmbeddingRights(os2)
+		if err != nil {
+			return "", err
+		}
+		if rights&2 != 0 {
+			return "", fmt.Errorf("%w: font prohibits embedding", ErrRestricted)
+		}
+		checked[face.offset] = true
 	}
 	part, err := p.newFontPart()
 	if err != nil {
@@ -426,6 +443,38 @@ func (p *Package) AddImage(data []byte) (string, error) {
 		return "", err
 	}
 	if err := p.storePart(part, media, data, false); err != nil {
+		return "", err
+	}
+	p.commitName(pattern, part)
+	return part, nil
+}
+
+// AddColorProfile 校验ICC颜色配置文件并分配唯一路径存入包中
+// 入参: data 原始ICC颜色配置文件字节
+// 返回: string 配置文件部件的包根URI, error 格式、预算或名称冲突错误
+func (p *Package) AddColorProfile(data []byte) (string, error) {
+	if err := p.lock(); err != nil {
+		return "", err
+	}
+	defer p.mu.Unlock()
+	if len(data) == 0 {
+		return "", fmt.Errorf("%w: empty color profile data", ErrInvalid)
+	}
+	if int64(len(data)) > p.limits.MaxPartBytes {
+		return "", fmt.Errorf("%w: color profile byte budget", ErrLimit)
+	}
+	if _, err := validateCreatedICCProfile(data, nil); err != nil {
+		return "", err
+	}
+	pattern := "/Resources/Profiles/%d.icc"
+	part, err := p.newName(pattern, nil)
+	if err != nil {
+		return "", err
+	}
+	if err := p.editable(part); err != nil {
+		return "", err
+	}
+	if err := p.storePart(part, "application/vnd.ms-color.iccprofile", data, false); err != nil {
 		return "", err
 	}
 	p.commitName(pattern, part)
@@ -1574,7 +1623,7 @@ func (g *createdStoryGraph) target(source, kind string) (string, error) {
 			return "", &PartError{Part: source, Err: err}
 		}
 		if part != "" && !strings.EqualFold(part, target) {
-			return "", &PartError{Part: source, Err: fmt.Errorf("%w: multiple distinct %s parts", ErrUnsupported, kind)}
+			return "", &PartError{Part: source, Err: fmt.Errorf("%w: multiple distinct %s parts", ErrInvalid, kind)}
 		}
 		part = target
 	}

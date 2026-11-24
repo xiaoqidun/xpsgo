@@ -899,7 +899,7 @@ func convertCompositionSourceWithReport(source *compositionSource, format Format
 	result.format, result.parts = format, make(map[string]packagePart, len(source.parts))
 	result.relationships = make(map[string][]Relationship, len(source.relationships))
 	if source.rootRelationships.name != "" {
-		part, err := convertCompositionMarkup(source.rootRelationships, source.format, format, budget)
+		part, err := convertCompositionPartMarkup(source.rootRelationships, source.format, format, source.parts, budget)
 		if err != nil {
 			return nil, nil, &PartError{Part: source.rootRelationships.name, Err: err}
 		}
@@ -917,7 +917,7 @@ func convertCompositionSourceWithReport(source *compositionSource, format Format
 				return nil, nil, &PartError{Part: source.parts[key].name, Err: err}
 			}
 		}
-		part, err := convertCompositionMarkup(part, source.format, format, budget)
+		part, err := convertCompositionPartMarkup(part, source.format, format, source.parts, budget)
 		if err != nil {
 			return nil, nil, &PartError{Part: source.parts[key].name, Err: err}
 		}
@@ -925,8 +925,15 @@ func convertCompositionSourceWithReport(source *compositionSource, format Format
 	}
 	for _, key := range slices.Sorted(maps.Keys(source.relationships)) {
 		relations := slices.Clone(source.relationships[key])
+		relSource := key
+		if owner, exists := source.parts[key]; exists {
+			relSource = owner.name
+		}
 		for index := range relations {
 			if err := budget.step(1); err != nil {
+				return nil, nil, err
+			}
+			if err := validateCompositionFormatTicket(relSource, relations[index], source.format, format, source.parts); err != nil {
 				return nil, nil, err
 			}
 			kind, err := compositionFormatRelationship(relations[index].Type, source.format, format)
@@ -943,10 +950,27 @@ func convertCompositionSourceWithReport(source *compositionSource, format Format
 	return &result, report, nil
 }
 
-// convertCompositionMarkup 转换方言绑定及关系类型，布局资源采用部件相对路径，保留原编码和其他内容
-// 入参: part 原部件, source 原格式, target 目标格式, budget 共享预算
+// validateCompositionFormatTicket 在OpenXPS转换到XPS时提前拦截非标准Microsoft打印票据内容类型
+// 入参: source 关系源部件, relation 源关系, from 原格式, to 目标格式, parts 原快照部件表
+// 返回: error 不支持的非标准票据媒体类型错误
+func validateCompositionFormatTicket(source string, relation Relationship, from, to Format, parts map[string]packagePart) error {
+	if from != FormatOpenXPS || to != FormatXPS || relation.Type != openXPSNamespace+"/printticket" || relation.TargetMode != TargetModeInternal || parts == nil {
+		return nil
+	}
+	target, err := resolvePart(source, relation.Target)
+	if err != nil {
+		return nil
+	}
+	if part, present := parts[strings.ToLower(target)]; present && !strings.EqualFold(part.media, printTicketType) {
+		return &PartError{Part: part.name, Err: fmt.Errorf("%w: OpenXPS custom print ticket content type %s cannot convert to XPS 1.0", ErrUnsupported, part.media)}
+	}
+	return nil
+}
+
+// convertCompositionPartMarkup 转换方言绑定及关系类型，结合部件表在跨方言转换阶段提前校验打印票据媒体类型
+// 入参: part 原部件, source 原格式, target 目标格式, parts 可选原快照部件表, budget 共享预算
 // 返回: packagePart 目标部件，失败为空值, error 结构、表达能力、预算或取消错误
-func convertCompositionMarkup(part packagePart, source, target Format, budget *compositionBudget) (packagePart, error) {
+func convertCompositionPartMarkup(part packagePart, source, target Format, parts map[string]packagePart, budget *compositionBudget) (packagePart, error) {
 	if err := budget.step(1); err != nil {
 		return packagePart{}, err
 	}
@@ -956,13 +980,17 @@ func convertCompositionMarkup(part packagePart, source, target Format, budget *c
 	definition := strings.EqualFold(part.media, fixedContentType("signaturedefinitions"))
 	discard := strings.EqualFold(part.media, fixedContentType("discard-control"))
 	if relations {
-		records, err := compositionRelationshipRecords(relationshipSource(part.name), part, budget)
+		relSource := relationshipSource(part.name)
+		records, err := compositionRelationshipRecords(relSource, part, budget)
 		if err != nil {
 			return packagePart{}, err
 		}
 		edited := false
 		for index := range records {
 			if err := budget.step(1); err != nil {
+				return packagePart{}, err
+			}
+			if err := validateCompositionFormatTicket(relSource, records[index], source, target, parts); err != nil {
 				return packagePart{}, err
 			}
 			kind, err := compositionFormatRelationship(records[index].Type, source, target)

@@ -21,6 +21,8 @@ import (
 	"math"
 	"math/bits"
 	"sync"
+
+	"github.com/xiaoqidun/jxrgo"
 )
 
 // imageBrushFilterMaxWork 与同组常量限制图像画刷滤波采样工作量及颜色缓存上限
@@ -56,6 +58,7 @@ type imageSampler struct {
 	tile       TileMode
 	opacity    float64
 	space      renderColorSpace
+	alphaOnly  bool
 	filterX    bool
 	filterY    bool
 	charge     func(uint64) error
@@ -144,6 +147,13 @@ func makeImageByteToUnit() [256]float64 {
 // 入参: brush 图像画刷, source 图像资源, transform 所属元素的设备变换, space 合成空间
 // 返回: *imageSampler 本次绘制独占的采样器, error 属性、能力或数值错误
 func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space renderColorSpace) (*imageSampler, error) {
+	return newImageSamplerMode(brush, source, transform, space, false)
+}
+
+// newImageSamplerMode 按是否仅需透明度掩模构建图像画刷采样器，支持无ICC四通道CMYK及十五通道扩展
+// 入参: brush 图像画刷, source 图像资源, transform 所属元素的设备变换, space 合成空间, alphaOnly 是否作为OpacityMask仅读取透明度
+// 返回: *imageSampler 本次绘制独占的采样器, error 属性、能力或数值错误
+func newImageSamplerMode(brush *Brush, source *rasterImage, transform Matrix, space renderColorSpace, alphaOnly bool) (*imageSampler, error) {
 	if brush == nil || brush.Kind != BrushImage || source == nil || source.bounds().Empty() || !geometryFinite(source.dpi.X, source.dpi.Y) || source.dpi.X <= 0 || source.dpi.Y <= 0 {
 		return nil, fmt.Errorf("%w: image brush source", ErrInvalid)
 	}
@@ -157,7 +167,8 @@ func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space 
 	if err != nil {
 		return nil, err
 	}
-	if source.transform == nil && source.selectedProfile == nil && (imageColorChannels(source) == 2 || imageColorChannels(source) >= 4) {
+	channels := imageColorChannels(source)
+	if !alphaOnly && source.transform == nil && source.selectedProfile == nil && (channels == 2 || channels > 4 || channels == 4 && source.multiChannel) {
 		return nil, fmt.Errorf("%w: default device image color conversion", ErrUnsupported)
 	}
 	for _, box := range []Rect{brush.Viewbox, brush.Viewport} {
@@ -186,7 +197,7 @@ func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space 
 	if err != nil {
 		return nil, err
 	}
-	sampler := &imageSampler{image: source, inverse: inverse, viewbox: brush.Viewbox, viewport: brush.Viewport, tile: brush.TileMode, opacity: brush.Opacity, space: space, filterX: filterX, filterY: filterY}
+	sampler := &imageSampler{image: source, inverse: inverse, viewbox: brush.Viewbox, viewport: brush.Viewport, tile: brush.TileMode, opacity: brush.Opacity, space: space, alphaOnly: alphaOnly, filterX: filterX, filterY: filterY}
 	if collapsed {
 		sampler.filterX, sampler.filterY = true, true
 		if sampler.tile == TileNone {
@@ -415,19 +426,29 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 			return renderColor{r * av, g * av, b * av, av}, nil
 		}
 	}
-	var components [8]float64
-	alpha, channels := 1.0, imageColorChannels(s.image)
+	var components [iccMaxChannels]float64
+	alpha, channels, jxrLinear := 1.0, imageColorChannels(s.image), false
 	if source := s.image.jxr; source != nil {
+		preferLinear := s.image.transform == nil
 		var err error
 		if jxrCache != nil {
-			alpha, err = jxrCache.sample(source, x, y, components[:])
+			alpha, jxrLinear, err = jxrCache.sample(source, x, y, components[:], preferLinear)
+		} else if source.yccOnly || preferLinear && source.useLinear {
+			jxrLinear = true
+			alpha, err = source.sampleLinear(x, y, components[:])
 		} else {
 			alpha, err = source.sample(x, y, components[:])
 		}
 		if err != nil {
 			return renderColor{}, err
 		}
+		if jxrLinear {
+			channels = 3
+		}
 	} else if source := s.image.native; source != nil {
+		if source.channels < 1 || source.channels > len(components) {
+			return renderColor{}, fmt.Errorf("%w: image source channels", ErrUnsupported)
+		}
 		stride := source.channels
 		if source.alpha {
 			stride++
@@ -448,14 +469,24 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 		}
 	} else if source, ok := s.image.pixels.(*image.CMYK); ok {
 		value := source.CMYKAt(x, y)
-		components = [8]float64{float64(value.C) / 255, float64(value.M) / 255, float64(value.Y) / 255, float64(value.K) / 255}
+		components[0], components[1], components[2], components[3] = float64(value.C)/255, float64(value.M)/255, float64(value.Y)/255, float64(value.K)/255
 	} else {
 		value := imagePixel(s.image.pixels, x, y)
-		components = [8]float64{float64(value.R) / 65535, float64(value.G) / 65535, float64(value.B) / 65535}
+		components[0], components[1], components[2] = float64(value.R)/65535, float64(value.G)/65535, float64(value.B)/65535
 		alpha = float64(value.A) / 65535
+	}
+	if !geometryFinite(alpha) {
+		return renderColor{}, fmt.Errorf("%w: non-finite raster alpha interpretation", ErrUnsupported)
 	}
 	if alpha == 0 {
 		return renderColor{}, nil
+	}
+	if s.alphaOnly && s.convert == nil {
+		a := colorClamp(alpha)
+		if a == 0 {
+			return renderColor{}, nil
+		}
+		return renderColor{a: a}, nil
 	}
 	if s.image.native != nil && s.image.native.floating != nil || s.image.jxr != nil && s.image.linear {
 		for i := range channels {
@@ -466,7 +497,12 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 	}
 	if s.image.transform != nil {
 		if s.convert != nil {
-			return s.convert(components, alpha)
+			if channels > 8 {
+				return renderColor{}, fmt.Errorf("%w: image source channels", ErrUnsupported)
+			}
+			var packed [8]float64
+			copy(packed[:], components[:8])
+			return s.convert(packed, alpha)
 		}
 		if channels < 1 || channels > len(components) {
 			return renderColor{}, fmt.Errorf("%w: image source channels", ErrUnsupported)
@@ -474,7 +510,12 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 		if !imageProfileCompatible(s.image, s.image.transform) {
 			return renderColor{}, fmt.Errorf("%w: image profile channels", ErrInvalid)
 		}
-		rgb, err := s.image.transform.linearRGB(components[:s.image.transform.inputChannels()])
+		input := components[:s.image.transform.inputChannels()]
+		floating := s.image.transform.pipeline != nil && s.image.transform.pipeline.floating
+		if !floating && imageExtendedLinearSample(s.image, input) {
+			return renderColor{}, fmt.Errorf("%w: extended-range linear image requires floating-point ICC DToB transform", ErrUnsupported)
+		}
+		rgb, err := s.image.transform.linearRGB(input)
 		if err != nil {
 			return renderColor{}, err
 		}
@@ -484,13 +525,52 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 		components[1], components[2] = components[0], components[0]
 	}
 	if s.convert != nil {
-		return s.convert(components, alpha)
+		if channels > 8 {
+			return renderColor{}, fmt.Errorf("%w: image source channels", ErrUnsupported)
+		}
+		var packed [8]float64
+		copy(packed[:], components[:8])
+		return s.convert(packed, alpha)
+	}
+	if channels == 4 && !s.image.multiChannel {
+		c, m, yv, k := colorClamp(components[0]), colorClamp(components[1]), colorClamp(components[2]), colorClamp(components[3])
+		components[0], components[1], components[2] = (1-c)*(1-k), (1-m)*(1-k), (1-yv)*(1-k)
+	} else if channels != 1 && channels != 3 {
+		return renderColor{}, fmt.Errorf("%w: default device image color conversion", ErrUnsupported)
 	}
 	space := ColorSRGB
-	if s.image.linear {
+	if s.image.linear || jxrLinear {
 		space = ColorScRGB
 	}
 	return imageRGBToRenderColor(components[0], components[1], components[2], alpha, space, s.space)
+}
+
+// imageExtendedLinearSample 判断图像样本是否包含超单位区间分量或线性非无符号浮点编码
+// 入参: source 图像资源, input 送入ICC转换的源分量切片
+// 返回: bool 是否需要浮点DToB管线避免裁剪截断
+func imageExtendedLinearSample(source *rasterImage, input []float64) bool {
+	for _, value := range input {
+		if value < 0 || value > 1 {
+			return true
+		}
+	}
+	if !source.linear {
+		return false
+	}
+	if source.native != nil && source.native.floating != nil {
+		return true
+	}
+	if source.jxr != nil {
+		if source.jxr.yccOnly {
+			return true
+		}
+		for i := range source.jxr.channels {
+			if source.jxr.components[i].Info().Format != jxrgo.SampleUnsigned {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // imageRGBToRenderColor 零分配将非预乘RGB分量转换为目标合成空间的预乘颜色

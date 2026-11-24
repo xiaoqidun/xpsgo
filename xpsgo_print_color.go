@@ -85,7 +85,7 @@ var renderPrintColorLinearTable = newRenderPrintColorLinearTable()
 type PrintColorMode uint8
 
 // PrintColor 保存目标纸面的输出色彩模式及设备、驱动色深意图
-// DeviceBitsPerPixel为零表示未声明；显式选择模式时DriverBitsPerPixel须为正
+// DeviceBitsPerPixel与DriverBitsPerPixel为零表示未声明，均不得为负
 type PrintColor struct {
 	Mode               PrintColorMode
 	DeviceBitsPerPixel int
@@ -223,21 +223,17 @@ func (s *printLayoutSettings) printColors() (bool, PrintColor, error) {
 		return false, result, fmt.Errorf("%w: print output color option %s", ErrUnsupported, option.Name.Local)
 	}
 	for _, field := range []struct {
-		name     string
-		value    *int
-		required bool
+		name  string
+		value *int
 	}{
-		{"DeviceBitsPerPixel", &result.DeviceBitsPerPixel, false},
-		{"DriverBitsPerPixel", &result.DriverBitsPerPixel, true},
+		{"DeviceBitsPerPixel", &result.DeviceBitsPerPixel},
+		{"DriverBitsPerPixel", &result.DriverBitsPerPixel},
 	} {
 		value, err := s.scored(option, field.name)
 		if err != nil {
 			return false, PrintColor{}, err
 		}
 		if value == nil {
-			if field.required {
-				return false, PrintColor{}, fmt.Errorf("%w: print output color requires %s", ErrUnsupported, field.name)
-			}
 			continue
 		}
 		*field.value, err = s.integer(value, field.name, int(^uint(0)>>1))
@@ -1817,7 +1813,7 @@ func validatePrintColor(value PrintColor) error {
 			return fmt.Errorf("%w: unspecified print output color has bit depth", ErrInvalid)
 		}
 	case PrintColorPreserve, PrintColorGrayscale, PrintColorMonochrome:
-		if value.DeviceBitsPerPixel < 0 || value.DriverBitsPerPixel <= 0 {
+		if value.DeviceBitsPerPixel < 0 || value.DriverBitsPerPixel < 0 {
 			return fmt.Errorf("%w: print output color bit depth", ErrInvalid)
 		}
 	default:

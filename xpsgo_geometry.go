@@ -1151,7 +1151,8 @@ func (b *geometryFillBuilder) arc(start Point, s GeometrySegment, m Matrix, firs
 	if err != nil {
 		return err
 	}
-	if math.Hypot(computed.X-last.X, computed.Y-last.Y) > b.tolerance/2 {
+	maxCoord := max(math.Abs(first.X), math.Abs(first.Y), math.Abs(last.X), math.Abs(last.Y), scale)
+	if math.Hypot(computed.X-last.X, computed.Y-last.Y) > max(b.tolerance/2, 1e-9*max(1, maxCoord)) {
 		return fmt.Errorf("%w: fill arc endpoint precision exceeds tolerance", ErrLimit)
 	}
 	previous := first
@@ -1567,10 +1568,11 @@ func geometryXMLPointsLimited(text string, single, nonnegative bool, charge func
 // 入参: text 变换属性文本, resolve 资源解析回调
 // 返回: Matrix 有限系数矩阵, error 错误信息
 func geometryXMLTransform(text string, resolve func(string) (Matrix, error)) (Matrix, error) {
-	if !strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), "{") {
+	trimmed := strings.TrimLeft(text, " \t\r\n")
+	if !strings.HasPrefix(trimmed, "{") {
 		return ParseMatrix(text)
 	}
-	p := geometryScanner{text: strings.TrimRight(text, " \t\r\n")}
+	p := geometryScanner{text: strings.TrimRight(trimmed, " \t\r\n")}
 	const prefix = "{StaticResource"
 	if !strings.HasPrefix(p.text, prefix) || !strings.HasSuffix(p.text, "}") {
 		return Matrix{}, fmt.Errorf("%w: invalid matrix resource reference", ErrInvalid)

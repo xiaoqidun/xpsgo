@@ -562,7 +562,8 @@ func brushViewbox(text string) (Rect, error) {
 // 入参: text ImageSource属性原文
 // 返回: string 图片引用, string 可选ICC引用, error 引用词法错误
 func parseBrushImageSource(text string) (string, string, error) {
-	if !strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), "{") {
+	trimmed := strings.TrimLeft(text, " \t\r\n")
+	if !strings.HasPrefix(trimmed, "{") {
 		value := strings.Join(strings.FieldsFunc(text, func(r rune) bool { return r == ' ' || r == '\t' || r == '\r' || r == '\n' }), " ")
 		if err := brushPartReference(value); err != nil {
 			return "", "", err
@@ -570,10 +571,10 @@ func parseBrushImageSource(text string) (string, string, error) {
 		return value, "", nil
 	}
 	const prefix = "{ColorConvertedBitmap"
-	if !strings.HasPrefix(text, prefix) || len(text) == len(prefix) || !xmlSpace(text[len(prefix)]) {
+	if !strings.HasPrefix(trimmed, prefix) || len(trimmed) == len(prefix) || !xmlSpace(trimmed[len(prefix)]) {
 		return "", "", fmt.Errorf("%w: invalid ColorConvertedBitmap expression", ErrInvalid)
 	}
-	body, suffix, ok := strings.Cut(text[len(prefix):], "}")
+	body, suffix, ok := strings.Cut(trimmed[len(prefix):], "}")
 	if !ok || !xmlWhitespace(suffix) || body == "" || xmlSpace(body[len(body)-1]) {
 		return "", "", fmt.Errorf("%w: invalid ColorConvertedBitmap terminator", ErrInvalid)
 	}

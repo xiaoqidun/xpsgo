@@ -115,6 +115,7 @@ type trueTypeGlyph struct {
 	bounds               Rect
 	metricsGlyph         uint16
 	metricsBounds        Rect
+	metricsTransform     Matrix
 	metricsPositionKnown bool
 	points               []trueTypePoint
 	endPoints            []int
@@ -648,7 +649,14 @@ func (f *fontSource) glyphOutline(gid uint16) (Geometry, error) {
 		if err != nil {
 			return Geometry{}, err
 		}
-		x := float64(bearing) - glyph.metricsBounds.X
+		origin := Point{X: glyph.metricsBounds.X - float64(bearing)}
+		if !glyph.metricsPositionKnown {
+			origin = glyph.metricsTransform.Transform(origin)
+		}
+		if !geometryFinite(origin.X) {
+			return Geometry{}, fmt.Errorf("%w: non-finite composite metrics origin", ErrLimit)
+		}
+		x := -origin.X
 		if x != 0 {
 			if err := fontTransformOutline(&glyph.geometry, Matrix{A: 1, D: 1, E: x}); err != nil {
 				return Geometry{}, err
@@ -938,7 +946,7 @@ func (f *trueTypeFont) load(gid uint16, budget *trueTypeBudget) (*trueTypeGlyph,
 	budget.path = append(budget.path, gid)
 	defer func() { budget.path = budget.path[:len(budget.path)-1] }()
 	start, end := f.locations[int(gid)], f.locations[int(gid)+1]
-	g := &trueTypeGlyph{metricsGlyph: gid, metricsPositionKnown: true}
+	g := &trueTypeGlyph{metricsGlyph: gid, metricsTransform: IdentityMatrix(), metricsPositionKnown: true}
 	if start == end {
 		return g, nil
 	}
@@ -1133,6 +1141,10 @@ func (f *trueTypeFont) readComposite(g *trueTypeGlyph, r *trueTypeCursor, budget
 		if flags&0x200 != 0 {
 			g.metricsGlyph = child.metricsGlyph
 			g.metricsBounds = child.metricsBounds
+			g.metricsTransform = m.Mul(child.metricsTransform)
+			if !geometryFinite(g.metricsTransform.A, g.metricsTransform.B, g.metricsTransform.C, g.metricsTransform.D, g.metricsTransform.E, g.metricsTransform.F) {
+				return fmt.Errorf("%w: non-finite composite metrics transform", ErrLimit)
+			}
 			g.metricsPositionKnown = child.metricsPositionKnown && *m == IdentityMatrix()
 		}
 		g.components = append(g.components, component)

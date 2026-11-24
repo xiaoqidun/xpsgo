@@ -24,7 +24,7 @@ import (
 	"slices"
 )
 
-// rasterMaxDimension 等常量限制光栅化资源上限
+// rasterMaxDimension 等常量定义光栅化默认资源上限与几何容差
 const (
 	rasterMaxDimension = 1 << 20
 	rasterMaxPixels    = 1 << 24
@@ -120,11 +120,11 @@ func rasterFillOnes(dst []byte) {
 	}
 }
 
-// rasterRegionsCoverageScratch 共享区域准备、扫描及资源预算，支持调用方复用掩模和扫描线工作区
-// 入参: regions 非空独立区域列表, bounds 输出像素范围, aliased 是否禁用抗锯齿, required 所需命中区域数, dst 可选复用输出掩模, scratch 可选复用工作区
+// rasterRegionsCoverageBudget 按调用方预算与整数溢出防线执行区域扫描，允许显式提高像素和边数上限
+// 入参: regions 非空独立区域列表, bounds 输出像素范围, aliased 是否禁用抗锯齿, required 所需命中区域数, maxPixels 最大像素预算, maxEdges 最大边数预算, maxWork 最大扫描工作量, dst 可选复用输出掩模, scratch 可选复用工作区
 // 返回: *image.Alpha 覆盖率图像, error 参数、闭合性或资源限制错误，失败时不返回部分图像
-func rasterRegionsCoverageScratch(regions []rasterRegion, bounds image.Rectangle, aliased bool, required int, dst *image.Alpha, scratch *rasterScratch) (*image.Alpha, error) {
-	if len(regions) == 0 || bounds.Min.X > bounds.Max.X || bounds.Min.Y > bounds.Max.Y {
+func rasterRegionsCoverageBudget(regions []rasterRegion, bounds image.Rectangle, aliased bool, required int, maxPixels uint64, maxEdges int, maxWork uint64, dst *image.Alpha, scratch *rasterScratch) (*image.Alpha, error) {
+	if len(regions) == 0 || bounds.Min.X > bounds.Max.X || bounds.Min.Y > bounds.Max.Y || maxEdges < 0 {
 		return nil, fmt.Errorf("%w: raster regions or bounds", ErrInvalid)
 	}
 	if len(regions) > rasterMaxRegions {
@@ -135,7 +135,7 @@ func rasterRegionsCoverageScratch(regions []rasterRegion, bounds image.Rectangle
 		if region.rule != GeometryEvenOdd && region.rule != GeometryNonZero {
 			return nil, fmt.Errorf("%w: raster fill rule", ErrInvalid)
 		}
-		if len(region.edges) > rasterMaxEdges-edgeCount {
+		if len(region.edges) > maxEdges-edgeCount {
 			return nil, fmt.Errorf("%w: raster edge count", ErrLimit)
 		}
 		edgeCount += len(region.edges)
@@ -144,7 +144,7 @@ func rasterRegionsCoverageScratch(regions []rasterRegion, bounds image.Rectangle
 		return nil, fmt.Errorf("%w: raster coordinate range", ErrLimit)
 	}
 	width64, height64 := int64(bounds.Max.X)-int64(bounds.Min.X), int64(bounds.Max.Y)-int64(bounds.Min.Y)
-	if width64 > rasterMaxDimension || height64 > rasterMaxDimension || uint64(width64)*uint64(height64) > rasterMaxPixels {
+	if width64 > rasterMaxDimension || height64 > rasterMaxDimension || width64 > 0 && (uint64(height64) > maxPixels/uint64(width64) || uint64(height64) > uint64(^uint(0)>>1)/uint64(width64)) {
 		return nil, fmt.Errorf("%w: raster dimensions", ErrLimit)
 	}
 	width, height := int(width64), int(height64)
@@ -266,7 +266,7 @@ func rasterRegionsCoverageScratch(regions []rasterRegion, bounds image.Rectangle
 				}
 				skip := uint64(jump - row)
 				work += skip * uint64(len(regions)) * 2
-				if work > rasterMaxWork {
+				if work > maxWork {
 					return nil, fmt.Errorf("%w: raster scan work", ErrLimit)
 				}
 				row = jump - 1
@@ -274,7 +274,7 @@ func rasterRegionsCoverageScratch(regions []rasterRegion, bounds image.Rectangle
 			}
 			cost := 3 + bits.Len(uint(len(active))) + widthBits
 			work += (uint64(len(active))*uint64(cost) + uint64(len(regions))) * 2
-			if work > rasterMaxWork {
+			if work > maxWork {
 				return nil, fmt.Errorf("%w: raster scan work", ErrLimit)
 			}
 			y := float64(bounds.Min.Y+row) + 0.5

@@ -62,6 +62,8 @@ type iccProfile struct {
 	pcs      string
 	intent   uint32
 	channels int
+	chad     [9]float64
+	hasChad  bool
 }
 
 // iccMetadataValidator 限制元数据检查的累计工作量，不复制配置文件或改写私有标签
@@ -72,25 +74,31 @@ type iccMetadataValidator struct {
 
 // iccTargetTransform 将D50连接空间转换为目标设备分量，不承担源颜色解释或页面合成
 type iccTargetTransform struct {
-	profile  *iccProfile
-	pipeline *iccPipeline
-	inverse  [3]iccInverseCurve
-	matrix   [9]float64
-	white    [3]float64
-	gray     bool
-	intent   uint32
+	profile     *iccProfile
+	pipeline    *iccPipeline
+	inverse     [3]iccInverseCurve
+	matrix      [9]float64
+	white       [3]float64
+	chad        [9]float64
+	hasChad     bool
+	absolutePCS bool
+	gray        bool
+	intent      uint32
 }
 
 // iccTransform 保存已选渲染意图的源配置文件转换，输出D50参考条件的XYZ
 type iccTransform struct {
-	profile  *iccProfile
-	pipeline *iccPipeline
-	curves   [3]iccCurve
-	matrix   [9]float64
-	white    [3]float64
-	gray     bool
-	intent   uint32
-	named    []iccNamedColor
+	profile     *iccProfile
+	pipeline    *iccPipeline
+	curves      [3]iccCurve
+	matrix      [9]float64
+	white       [3]float64
+	chadInverse [9]float64
+	hasChad     bool
+	absolutePCS bool
+	gray        bool
+	intent      uint32
+	named       []iccNamedColor
 }
 
 // parseICCProfile 校验ICC封装和标签范围，输入在配置文件使用期间不得修改
@@ -159,6 +167,9 @@ func parseICCProfile(data []byte) (*iccProfile, error) {
 		if uint64(current.offset) < uint64(previous.offset)+uint64(previous.size) && current != previous {
 			return nil, fmt.Errorf("%w: overlapping ICC tag data", ErrInvalid)
 		}
+	}
+	if chad, _, ok := iccParseAdaptationMatrix(p.tag("chad")); ok {
+		p.chad, p.hasChad = chad, true
 	}
 	return p, nil
 }
@@ -284,6 +295,81 @@ func iccDisplayWhite(p *iccProfile, white [3]float64) bool {
 		return true
 	}
 	return iccD50White(p.version, white)
+}
+
+// iccReadDisplayWhite 校验读取路径的显示类白点，放宽ICCv4.0至v4.2非D50白点而对v4.3及以上保持D50约束
+// 入参: p 已解析的配置文件, white 从XYZType解码的白点
+// 返回: bool 是否满足读取路径显示类白点约束
+func iccReadDisplayWhite(p *iccProfile, white [3]float64) bool {
+	if p.version>>24 != 4 || p.class != "mntr" || p.version>>20&15 < 3 {
+		return true
+	}
+	return iccD50White(p.version, white)
+}
+
+// iccParseAdaptationMatrix 解析sf32色度适应矩阵及其逆矩阵，仅在格式正确且矩阵可逆时返回有效
+// 入参: data chad标签字节
+// 返回: [9]float64 适应矩阵, [9]float64 适应逆矩阵, bool 是否存在可逆适应矩阵
+func iccParseAdaptationMatrix(data []byte) ([9]float64, [9]float64, bool) {
+	if len(data) != 44 || string(data[:4]) != "sf32" || binary.BigEndian.Uint32(data[4:]) != 0 {
+		return [9]float64{}, [9]float64{}, false
+	}
+	var matrix [9]float64
+	for i := range matrix {
+		matrix[i] = iccFixed(data[8+4*i:])
+	}
+	inverse, err := iccInverseMatrix(matrix)
+	if err != nil {
+		return [9]float64{}, [9]float64{}, false
+	}
+	return matrix, inverse, true
+}
+
+// iccProfileAdaptation 读取配置文件缓存或标签中的可逆色度适应矩阵及其逆矩阵
+// 入参: p 已解析配置文件
+// 返回: [9]float64 适应矩阵, [9]float64 适应逆矩阵, bool 是否可用
+func iccProfileAdaptation(p *iccProfile) ([9]float64, [9]float64, bool) {
+	if p.hasChad {
+		inverse, err := iccInverseMatrix(p.chad)
+		if err == nil {
+			return p.chad, inverse, true
+		}
+	}
+	return iccParseAdaptationMatrix(p.tag("chad"))
+}
+
+// iccSelectTransformTag 按ICC.1:2010优先级选择源或目标转换标签，v4优先采用浮点管线
+// 入参: profile 已解析配置文件, intent ICC渲染意图, forward 是否为设备到PCS方向
+// 返回: string 选中标签名, []byte 标签字节，未找到为空
+func iccSelectTransformTag(profile *iccProfile, intent uint32, forward bool) (string, []byte) {
+	var candidates []string
+	if profile.version>>24 == 4 {
+		if forward {
+			candidates = [4][]string{
+				{"D2B0", "A2B0"},
+				{"D2B1", "A2B1", "D2B0", "A2B0"},
+				{"D2B2", "A2B2", "D2B0", "A2B0"},
+				{"D2B3", "D2B1", "A2B1", "D2B0", "A2B0"},
+			}[intent]
+		} else {
+			candidates = [4][]string{
+				{"B2D0", "B2A0"},
+				{"B2D1", "B2A1", "B2D0", "B2A0"},
+				{"B2D2", "B2A2", "B2D0", "B2A0"},
+				{"B2D3", "B2D1", "B2A1", "B2D0", "B2A0"},
+			}[intent]
+		}
+	} else if forward {
+		candidates = [4][]string{{"A2B0"}, {"A2B1", "A2B0"}, {"A2B2", "A2B0"}, {"A2B1", "A2B0"}}[intent]
+	} else {
+		candidates = [4][]string{{"B2A0"}, {"B2A1", "B2A0"}, {"B2A2", "B2A0"}, {"B2A1", "B2A0"}}[intent]
+	}
+	for _, name := range candidates {
+		if data := profile.tag(name); data != nil {
+			return name, data
+		}
+	}
+	return "", nil
 }
 
 // iccD50White 按ICC版本校验s15Fixed16编码的D50标准白点
@@ -973,12 +1059,12 @@ func validateCreatedICCTransforms(p *iccProfile, ctx context.Context) error {
 					}
 				}
 			}
-		case "A2B0", "A2B1", "A2B2", "B2A0", "B2A1", "B2A2", "gamt":
+		case "A2B0", "A2B1", "A2B2", "B2A0", "B2A1", "B2A2", "gamt", "D2B0", "D2B1", "D2B2", "D2B3", "B2D0", "B2D1", "B2D2", "B2D3":
 			inputs, outputs, inputXYZ := p.channels, 3, p.space == "XYZ "
 			if p.class == "link" {
 				outputs = iccColorChannels(p.pcs)
 			}
-			forward := name[0] == 'A'
+			forward := name[0] == 'A' || name[0] == 'D'
 			if !forward {
 				inputs, outputs, inputXYZ = 3, p.channels, p.pcs == "XYZ "
 				if name == "gamt" {
@@ -1003,7 +1089,12 @@ func validateCreatedICCTransforms(p *iccProfile, ctx context.Context) error {
 func validateCreatedICCLUT(p *iccProfile, name string, forward bool, inputs, outputs int, inputXYZ bool, cache map[iccTag]*iccPipeline) error {
 	data := p.tag(name)
 	kind := string(data[:4])
-	if kind == "mAB " && !forward || kind == "mBA " && forward || p.version>>24 == 2 && (kind == "mAB " || kind == "mBA ") {
+	floatingTag := name[0] == 'D' || len(name) >= 3 && name[2] == 'D'
+	if floatingTag {
+		if p.version>>24 != 4 || kind != "mpet" {
+			return fmt.Errorf("%w: ICC %s transform type %q", ErrInvalid, name, kind)
+		}
+	} else if kind == "mAB " && !forward || kind == "mBA " && forward || p.version>>24 == 2 && (kind == "mAB " || kind == "mBA ") {
 		return fmt.Errorf("%w: ICC %s transform type %q", ErrInvalid, name, kind)
 	}
 	tag := p.tags[name]
@@ -1015,6 +1106,11 @@ func validateCreatedICCLUT(p *iccProfile, name string, forward bool, inputs, out
 			pipeline, err = parseICCLUT(data, inputXYZ)
 		case "mAB ", "mBA ":
 			pipeline, err = parseICCMultiLUT(data)
+		case "mpet":
+			if !floatingTag {
+				return fmt.Errorf("%w: ICC %s transform type %q", ErrInvalid, name, kind)
+			}
+			pipeline, err = parseICCMultiProcess(data)
 		default:
 			return fmt.Errorf("%w: ICC %s transform type %q", ErrUnsupported, name, kind)
 		}
@@ -1117,7 +1213,7 @@ func newICCTarget(profile *iccProfile, intent uint32) (*iccTargetTransform, erro
 	default:
 		return nil, fmt.Errorf("%w: ICC target class %q", ErrUnsupported, profile.class)
 	}
-	if profile.channels < 1 || profile.channels > 8 {
+	if profile.channels < 1 || profile.channels > iccMaxChannels {
 		return nil, fmt.Errorf("%w: ICC target channels", ErrUnsupported)
 	}
 	white, err := iccXYZ(profile.tag("wtpt"))
@@ -1129,36 +1225,42 @@ func newICCTarget(profile *iccProfile, intent uint32) (*iccTargetTransform, erro
 			return nil, fmt.Errorf("%w: ICC target white point", ErrInvalid)
 		}
 	}
-	if !iccDisplayWhite(profile, white) {
+	if !iccReadDisplayWhite(profile, white) {
 		return nil, fmt.Errorf("%w: ICC target display white", ErrInvalid)
 	}
-	if profile.version>>24 == 4 && profile.class == "mntr" {
+	chad, _, hasChad := iccProfileAdaptation(profile)
+	if profile.version>>24 == 4 && profile.class == "mntr" && (hasChad || iccDisplayWhite(profile, white)) {
 		white = iccPCSWhite
 	}
-	return &iccTargetTransform{profile: profile, white: white, intent: intent}, nil
+	return &iccTargetTransform{profile: profile, white: white, chad: chad, hasChad: hasChad, intent: intent}, nil
 }
 
-// prepareICCTargetDirection 为已校验的目标准备实际使用的反向转换
+// prepareICCTargetDirection 为已校验的目标准备实际使用的反向转换，v4优先采用B2D浮点管线
 // 入参: t 已校验目标, ctx 取消Context
 // 返回: *iccTargetTransform 可用转换, error 表、曲线或预算错误
 func prepareICCTargetDirection(t *iccTargetTransform, ctx context.Context) (*iccTargetTransform, error) {
 	profile, intent := t.profile, t.intent
 	var err error
-	data := profile.tag([4]string{"B2A0", "B2A1", "B2A2", "B2A1"}[intent])
-	if data == nil {
-		data = profile.tag("B2A0")
-	}
+	name, data := iccSelectTransformTag(profile, intent, false)
 	if data != nil {
-		switch string(data[:4]) {
-		case "mft1", "mft2":
-			t.pipeline, err = parseICCLUT(data, profile.pcs == "XYZ ")
-		case "mBA ":
-			if profile.version>>24 != 4 {
-				return nil, fmt.Errorf("%w: ICC v2 target LUT type", ErrInvalid)
+		if len(name) >= 3 && name[2] == 'D' {
+			if string(data[:4]) != "mpet" {
+				return nil, fmt.Errorf("%w: ICC target float LUT type %q", ErrInvalid, string(data[:4]))
 			}
-			t.pipeline, err = parseICCMultiLUT(data)
-		default:
-			return nil, fmt.Errorf("%w: ICC target LUT type %q", ErrUnsupported, string(data[:4]))
+			t.pipeline, err = parseICCMultiProcess(data)
+			t.absolutePCS = name == "B2D3"
+		} else {
+			switch string(data[:4]) {
+			case "mft1", "mft2":
+				t.pipeline, err = parseICCLUT(data, profile.pcs == "XYZ ")
+			case "mBA ":
+				if profile.version>>24 != 4 {
+					return nil, fmt.Errorf("%w: ICC v2 target LUT type", ErrInvalid)
+				}
+				t.pipeline, err = parseICCMultiLUT(data)
+			default:
+				return nil, fmt.Errorf("%w: ICC target LUT type %q", ErrUnsupported, string(data[:4]))
+			}
 		}
 		if err != nil {
 			return nil, err
@@ -1206,24 +1308,49 @@ func prepareICCTargetDirection(t *iccTargetTransform, ctx context.Context) (*icc
 	return t, checkContext(ctx)
 }
 
-// fromXYZ 将物理XYZ编码为目标设备的归一化分量，PCS连接不执行整数舍入
+// fromXYZ 将物理XYZ编码为最多八通道目标设备分量，供兼容八通道打印原生路径使用
 // 入参: xyz D50连接空间值，绝对意图时为绝对色度
-// 返回: [8]float64 前profile.channels项有效, error 非有限输入或转换错误
+// 返回: [8]float64 前profile.channels项有效, error 非有限输入、通道超限或转换错误
 func (t *iccTargetTransform) fromXYZ(xyz [3]float64) ([8]float64, error) {
-	if !geometryFinite(xyz[0], xyz[1], xyz[2]) {
-		return [8]float64{}, fmt.Errorf("%w: ICC target PCS value", ErrInvalid)
+	if t.profile.channels > 8 {
+		return [8]float64{}, fmt.Errorf("%w: ICC target channel count", ErrUnsupported)
 	}
-	if t.intent == 3 {
-		for axis := range 3 {
-			xyz[axis] *= iccPCSWhite[axis] / t.white[axis]
+	values, err := t.fromXYZChannels(xyz)
+	if err != nil {
+		return [8]float64{}, err
+	}
+	var out [8]float64
+	copy(out[:], values[:8])
+	return out, nil
+}
+
+// fromXYZChannels 将物理XYZ编码为目标设备分量，支持最多十五通道、chad绝对色度及浮点B2D管线
+// 入参: xyz D50连接空间值，绝对意图时为绝对色度
+// 返回: [iccMaxChannels]float64 前profile.channels项有效, error 非有限输入或转换错误
+func (t *iccTargetTransform) fromXYZChannels(xyz [3]float64) ([iccMaxChannels]float64, error) {
+	if !geometryFinite(xyz[0], xyz[1], xyz[2]) {
+		return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC target PCS value", ErrInvalid)
+	}
+	if t.intent == 3 && !t.absolutePCS {
+		if t.hasChad {
+			xyz = iccMatrixColor(t.chad, xyz)
+		}
+		if t.white != iccPCSWhite {
+			for axis := range 3 {
+				xyz[axis] *= iccPCSWhite[axis] / t.white[axis]
+			}
 		}
 	}
 	if !geometryFinite(xyz[0], xyz[1], xyz[2]) {
-		return [8]float64{}, fmt.Errorf("%w: ICC target white adaptation", ErrLimit)
+		return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC target white adaptation", ErrLimit)
 	}
 	if t.pipeline != nil {
 		input := xyz
-		if t.profile.pcs == "XYZ " {
+		if t.pipeline.floating {
+			if t.profile.pcs == "Lab " {
+				input = iccXYZToLab(xyz)
+			}
+		} else if t.profile.pcs == "XYZ " {
 			for axis := range 3 {
 				input[axis] *= 32768.0 / 65535
 			}
@@ -1235,11 +1362,11 @@ func (t *iccTargetTransform) fromXYZ(xyz [3]float64) ([8]float64, error) {
 			}
 		}
 		if !geometryFinite(input[0], input[1], input[2]) {
-			return [8]float64{}, fmt.Errorf("%w: ICC target PCS encoding range", ErrLimit)
+			return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC target PCS encoding range", ErrLimit)
 		}
 		return t.pipeline.evaluate(input[:])
 	}
-	var result [8]float64
+	var result [iccMaxChannels]float64
 	if t.gray {
 		value := xyz[1] / iccPCSWhite[1]
 		if t.profile.pcs == "Lab " {
@@ -1292,7 +1419,7 @@ func iccInverseMatrix(m [9]float64) ([9]float64, error) {
 	return r, nil
 }
 
-// prepareICCTransform 选择源设备至PCS的查找表，缺省时使用规定的RGB或灰阶模型
+// prepareICCTransform 选择源设备至PCS的查找表，v4优先采用D2B浮点管线，缺省时使用规定的RGB或灰阶模型
 // 入参: profile 已解析配置文件, intent ICC渲染意图
 // 返回: *iccTransform 只读转换, error 配置文件、能力或结构错误
 func prepareICCTransform(profile *iccProfile, intent uint32) (*iccTransform, error) {
@@ -1304,7 +1431,7 @@ func prepareICCTransform(profile *iccProfile, intent uint32) (*iccTransform, err
 	default:
 		return nil, fmt.Errorf("%w: ICC source profile class %q", ErrUnsupported, profile.class)
 	}
-	if profile.class != "nmcl" && profile.channels > 8 {
+	if profile.class != "nmcl" && profile.channels > iccMaxChannels {
 		return nil, fmt.Errorf("%w: ICC transform channel count", ErrUnsupported)
 	}
 	white, err := iccXYZ(profile.tag("wtpt"))
@@ -1316,13 +1443,14 @@ func prepareICCTransform(profile *iccProfile, intent uint32) (*iccTransform, err
 			return nil, fmt.Errorf("%w: ICC media white point", ErrInvalid)
 		}
 	}
-	if !iccDisplayWhite(profile, white) {
+	if !iccReadDisplayWhite(profile, white) {
 		return nil, fmt.Errorf("%w: ICC display media white point", ErrInvalid)
 	}
-	if profile.version>>24 == 4 && profile.class == "mntr" {
+	_, chadInverse, hasChad := iccProfileAdaptation(profile)
+	if profile.version>>24 == 4 && profile.class == "mntr" && (hasChad || iccDisplayWhite(profile, white)) {
 		white = iccPCSWhite
 	}
-	t := &iccTransform{profile: profile, white: white, intent: intent}
+	t := &iccTransform{profile: profile, white: white, chadInverse: chadInverse, hasChad: hasChad, intent: intent}
 	if profile.class == "nmcl" {
 		t.named, err = parseICCNamedColor(profile)
 		if err != nil {
@@ -1330,22 +1458,26 @@ func prepareICCTransform(profile *iccProfile, intent uint32) (*iccTransform, err
 		}
 		return t, nil
 	}
-	name := [4]string{"A2B0", "A2B1", "A2B2", "A2B1"}[intent]
-	data := profile.tag(name)
-	if data == nil {
-		data = profile.tag("A2B0")
-	}
+	name, data := iccSelectTransformTag(profile, intent, true)
 	if data != nil {
-		switch string(data[:4]) {
-		case "mft1", "mft2":
-			t.pipeline, err = parseICCLUT(data, profile.space == "XYZ ")
-		case "mAB ":
-			if profile.version>>24 != 4 {
-				return nil, fmt.Errorf("%w: ICC v2 source LUT type", ErrInvalid)
+		if name[0] == 'D' {
+			if string(data[:4]) != "mpet" {
+				return nil, fmt.Errorf("%w: ICC source float transform type %q", ErrInvalid, string(data[:4]))
 			}
-			t.pipeline, err = parseICCMultiLUT(data)
-		default:
-			return nil, fmt.Errorf("%w: ICC source transform type %q", ErrUnsupported, string(data[:4]))
+			t.pipeline, err = parseICCMultiProcess(data)
+			t.absolutePCS = name == "D2B3"
+		} else {
+			switch string(data[:4]) {
+			case "mft1", "mft2":
+				t.pipeline, err = parseICCLUT(data, profile.space == "XYZ ")
+			case "mAB ":
+				if profile.version>>24 != 4 {
+					return nil, fmt.Errorf("%w: ICC v2 source LUT type", ErrInvalid)
+				}
+				t.pipeline, err = parseICCMultiLUT(data)
+			default:
+				return nil, fmt.Errorf("%w: ICC source transform type %q", ErrUnsupported, string(data[:4]))
+			}
 		}
 		if err != nil {
 			return nil, err
@@ -1405,7 +1537,13 @@ func (t *iccTransform) toXYZ(input []float64) ([3]float64, error) {
 		if err != nil {
 			return [3]float64{}, err
 		}
-		if t.profile.pcs == "XYZ " {
+		if t.pipeline.floating {
+			if t.profile.pcs == "XYZ " {
+				xyz = [3]float64{output[0], output[1], output[2]}
+			} else {
+				xyz = iccLabToXYZ([3]float64{output[0], output[1], output[2]})
+			}
+		} else if t.profile.pcs == "XYZ " {
 			for i := range 3 {
 				xyz[i] = output[i] * (65535.0 / 32768)
 			}
@@ -1439,9 +1577,14 @@ func (t *iccTransform) toXYZ(input []float64) ([3]float64, error) {
 		}
 		xyz = iccMatrixColor(t.matrix, linear)
 	}
-	if t.intent == 3 {
-		for i := range 3 {
-			xyz[i] *= t.white[i] / iccPCSWhite[i]
+	if t.intent == 3 && !t.absolutePCS {
+		if t.white != iccPCSWhite {
+			for i := range 3 {
+				xyz[i] *= t.white[i] / iccPCSWhite[i]
+			}
+		}
+		if t.hasChad {
+			xyz = iccMatrixColor(t.chadInverse, xyz)
 		}
 	}
 	if !geometryFinite(xyz[0], xyz[1], xyz[2]) {

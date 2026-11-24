@@ -411,8 +411,11 @@ func (p *streamPackage) accept(entry *streamEntry) error {
 		if entry.header.UncompressedSize64 != 0 {
 			return fmt.Errorf("%w: nonempty streamed directory", ErrInvalid)
 		}
-		if _, err := opcPartName("/" + strings.TrimSuffix(name, "/")); err != nil {
-			return fmt.Errorf("directory: %w", err)
+		dir := strings.TrimSuffix(name, "/")
+		if !strings.EqualFold(dir, strings.TrimPrefix(opcTypesName, "/")) {
+			if _, err := opcPartName("/" + dir); err != nil {
+				return fmt.Errorf("directory: %w", err)
+			}
 		}
 		return nil
 	}

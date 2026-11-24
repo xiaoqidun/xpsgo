@@ -35,18 +35,15 @@ type EncodeOptions struct {
 
 // pageEncoder 构造独立的固定页面标记，限制展开工作量并检测模型引用循环
 type pageEncoder struct {
-	format            Format
-	ns                string
-	part              string
-	limits            Limits
-	ctx               context.Context
-	active            map[any]bool
-	work              int
-	bytes             int64
-	scope             map[string]string
-	visualKeys        map[Element]string
-	visualDefinitions []*xmlElement
-	nextVisual        int
+	format Format
+	ns     string
+	part   string
+	limits Limits
+	ctx    context.Context
+	active map[any]bool
+	work   int
+	bytes  int64
+	scope  map[string]string
 }
 
 // DefaultEncodeOptions 返回默认编码选项
@@ -80,8 +77,8 @@ func EncodePage(ctx context.Context, output io.Writer, page *Page, options *Enco
 	if formatNamespace(configuration.Format) == "" {
 		return 0, fmt.Errorf("%w: invalid page format", ErrInvalid)
 	}
-	p := pageEncoder{format: configuration.Format, ns: formatNamespace(configuration.Format), part: page.Part, limits: configuration.Limits, ctx: ctx, active: make(map[any]bool), visualKeys: make(map[Element]string)}
-	p.scope = map[string]string{"": p.ns, "xml": xmlNamespace, "r": p.ns + "/resourcedictionary-key"}
+	p := pageEncoder{format: configuration.Format, ns: formatNamespace(configuration.Format), part: page.Part, limits: configuration.Limits, ctx: ctx, active: make(map[any]bool)}
+	p.scope = map[string]string{"": p.ns, "xml": xmlNamespace}
 	var err error
 	if p.part == "" {
 		p.part = "/"
@@ -262,22 +259,6 @@ func (p *pageEncoder) page(value *Page) (*xmlElement, error) {
 		}
 		root.Children = append(root.Children, child)
 	}
-	if len(p.visualDefinitions) != 0 {
-		container, err := p.node("FixedPage.Resources", 2)
-		if err != nil {
-			return nil, err
-		}
-		dictionary, err := p.node("ResourceDictionary", 3)
-		if err != nil {
-			return nil, err
-		}
-		dictionary.Children = p.visualDefinitions
-		container.Children = []*xmlElement{dictionary}
-		root.Children = append([]*xmlElement{container}, root.Children...)
-		if err := p.attribute(root, xml.Name{Space: xmlnsNamespace, Local: "r"}, p.ns+"/resourcedictionary-key"); err != nil {
-			return nil, err
-		}
-	}
 	return root, nil
 }
 
@@ -450,7 +431,7 @@ func encodeDecimal(value float64) string {
 	return strconv.FormatFloat(value, 'f', -1, 64)
 }
 
-// brush 编码五类画刷的实际参数，视觉内容通过页面字典共享，不生成重复的命名元素
+// brush 编码五类画刷的实际参数，视觉内容直接输出内联VisualBrush.Visual属性元素
 // 入参: value 画刷模型, depth 画刷节点深度
 // 返回: *xmlElement 画刷节点, error 属性、资源、循环或预算错误
 func (p *pageEncoder) brush(value *Brush, depth int) (*xmlElement, error) {
@@ -512,11 +493,14 @@ func (p *pageEncoder) brush(value *Brush, depth int) (*xmlElement, error) {
 		}
 		return node, p.attr(node, "ImageSource", image)
 	}
-	key, err := p.visualResource(value.Visual)
+	if contentProperties(value.Visual) == nil {
+		return nil, fmt.Errorf("%w: missing or unknown brush visual", ErrInvalid)
+	}
+	visual, err := p.element(value.Visual, depth+2)
 	if err != nil {
 		return nil, err
 	}
-	return node, p.attr(node, "Visual", "{StaticResource "+key+"}")
+	return node, p.property(node, "Visual", visual, depth+1)
 }
 
 // gradient 编码全部渐变参数与停靠点，保留停靠点顺序和重复、范围外偏移
@@ -574,38 +558,6 @@ func (p *pageEncoder) gradient(node *xmlElement, value *Brush, depth int) error 
 	}
 	node.Children = append(node.Children, container)
 	return nil
-}
-
-// visualResource 按依赖顺序生成视觉资源，以无名画布包装保留视觉模型本身的Name及语言属性
-// 入参: value 已解析或新建的视觉模型
-// 返回: string 页面字典资源键, error 类型、循环或预算错误
-func (p *pageEncoder) visualResource(value Element) (string, error) {
-	if contentProperties(value) == nil {
-		return "", fmt.Errorf("%w: missing or unknown brush visual", ErrInvalid)
-	}
-	if p.active[value] {
-		return "", fmt.Errorf("%w: cyclic visual resource", ErrInvalid)
-	}
-	if key := p.visualKeys[value]; key != "" {
-		return key, nil
-	}
-	p.nextVisual++
-	key := fmt.Sprintf("_V%d", p.nextVisual)
-	wrapper, err := p.node("Canvas", 4)
-	if err != nil {
-		return "", err
-	}
-	if err := p.attribute(wrapper, xml.Name{Space: p.ns + "/resourcedictionary-key", Local: "Key"}, key); err != nil {
-		return "", err
-	}
-	child, err := p.element(value, 5)
-	if err != nil {
-		return "", err
-	}
-	wrapper.Children = []*xmlElement{child}
-	p.visualKeys[value] = key
-	p.visualDefinitions = append(p.visualDefinitions, wrapper)
-	return key, nil
 }
 
 // element 编码三类绘制元素，保持局部属性和子元素顺序，不把共享模型视为可重复声明的XML标识
@@ -742,11 +694,26 @@ func (p *pageEncoder) property(node *xmlElement, name string, value *xmlElement,
 	return nil
 }
 
-// path 编码完整路径描边及绘制属性，缺省枚举采用标准值，数值零仍按模型含义处理
+// path 编码完整路径描边及绘制属性，无描边时省略零值描边数值参数
 // 入参: node 路径节点, value 路径模型, depth 节点深度
 // 返回: error 属性、几何或预算错误
 func (p *pageEncoder) path(node *xmlElement, value *Path, depth int) error {
-	for _, attr := range []struct{ name, value string }{{"StrokeThickness", encodeNumber(value.StrokeThickness)}, {"StrokeMiterLimit", encodeNumber(value.StrokeMiterLimit)}, {"StrokeDashOffset", encodeNumber(value.StrokeDashOffset)}, {"StrokeDashCap", string(value.StrokeDashCap)}, {"StrokeStartLineCap", string(value.StrokeStartLineCap)}, {"StrokeEndLineCap", string(value.StrokeEndLineCap)}, {"StrokeLineJoin", string(value.StrokeLineJoin)}, {"AutomationProperties.Name", value.AutomationName}, {"AutomationProperties.HelpText", value.AutomationHelpText}} {
+	if value.Stroke != nil || value.StrokeThickness != 0 {
+		if err := p.attr(node, "StrokeThickness", encodeNumber(value.StrokeThickness)); err != nil {
+			return err
+		}
+	}
+	if value.Stroke != nil || value.StrokeMiterLimit != 0 {
+		if err := p.attr(node, "StrokeMiterLimit", encodeNumber(value.StrokeMiterLimit)); err != nil {
+			return err
+		}
+	}
+	if value.Stroke != nil || value.StrokeDashOffset != 0 {
+		if err := p.attr(node, "StrokeDashOffset", encodeNumber(value.StrokeDashOffset)); err != nil {
+			return err
+		}
+	}
+	for _, attr := range []struct{ name, value string }{{"StrokeDashCap", string(value.StrokeDashCap)}, {"StrokeStartLineCap", string(value.StrokeStartLineCap)}, {"StrokeEndLineCap", string(value.StrokeEndLineCap)}, {"StrokeLineJoin", string(value.StrokeLineJoin)}, {"AutomationProperties.Name", value.AutomationName}, {"AutomationProperties.HelpText", value.AutomationHelpText}} {
 		if attr.value != "" {
 			if err := p.attr(node, attr.name, attr.value); err != nil {
 				return err

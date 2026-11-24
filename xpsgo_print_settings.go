@@ -1098,8 +1098,8 @@ func (t *PrintTicket) Settings(ctx context.Context, options *PrintSettingsOption
 	return ParsePrintSettings(ctx, t.Data, &configuration)
 }
 
-// MergePrintSettings 合并根设置，同名项由delta整项覆盖，同族不同作用域前缀按高优先级作用域覆盖低层级项
-// 作用域过滤分别应用于两个输入，不执行设备默认值或约束求解
+// MergePrintSettings 合并根设置，同名Feature递归合并子Feature、Option与Property，其他同名项由delta覆盖
+// 同族不同作用域前缀按高优先级作用域覆盖低层级项，作用域过滤分别应用于两个输入，不执行设备默认值或约束求解
 // 入参: ctx 取消Context，nil采用Background, baseline 基础设置, delta 优先设置, options 合并结果的关联层级及资源参数
 // 返回: *PrintSettings 独立合并结构, error 结构、资源或取消错误
 func MergePrintSettings(ctx context.Context, baseline, delta *PrintSettings, options *PrintSettingsOptions) (*PrintSettings, error) {
@@ -1152,12 +1152,20 @@ func MergePrintSettings(ctx context.Context, baseline, delta *PrintSettings, opt
 			}
 		}
 		if index, exists := indices[value.Name]; exists {
-			if oldKey, _, ok := printPrefixFamily(elements[index]); ok && families[oldKey] == index {
-				delete(families, oldKey)
-			}
-			elements[index] = value
-			if hasFamily {
-				families[familyKey] = index
+			if elements[index].Kind == PrintSettingFeature && value.Kind == PrintSettingFeature {
+				mergedFeature, err := mergePrintFeature(elements[index], value, configuration.context)
+				if err != nil {
+					return nil, err
+				}
+				elements[index] = mergedFeature
+			} else {
+				if oldKey, _, ok := printPrefixFamily(elements[index]); ok && families[oldKey] == index {
+					delete(families, oldKey)
+				}
+				elements[index] = value
+				if hasFamily {
+					families[familyKey] = index
+				}
 			}
 		} else if replacedIndex >= 0 {
 			removed[replacedIndex] = false
@@ -1192,6 +1200,102 @@ func MergePrintSettings(ctx context.Context, baseline, delta *PrintSettings, opt
 	if _, err := writePrintSettingsMarkup(io.Discard, root, configuration); err != nil {
 		return nil, err
 	}
+	return result, nil
+}
+
+// mergePrintFeature 递归合并同名Feature的直接子Feature、Option与Property，delta未提供直接Option时保留baseline的Option
+// 入参: baseline 基础Feature, delta 优先Feature, ctx 取消Context
+// 返回: PrintSetting 合并后的Feature, error 取消错误
+func mergePrintFeature(baseline, delta PrintSetting, ctx context.Context) (PrintSetting, error) {
+	if err := checkContext(ctx); err != nil {
+		return PrintSetting{}, err
+	}
+	deltaHasOption := false
+	for _, child := range delta.Children {
+		if child.Kind == PrintSettingOption {
+			deltaHasOption = true
+			break
+		}
+	}
+	elements := make([]PrintSetting, 0, len(baseline.Children)+len(delta.Children))
+	removed := make([]bool, 0, len(baseline.Children)+len(delta.Children))
+	indices := make(map[xml.Name]int, len(baseline.Children))
+	families := make(map[printPrefixKey]int, len(baseline.Children))
+	for _, child := range baseline.Children {
+		if child.Kind == PrintSettingOption && deltaHasOption {
+			continue
+		}
+		index := len(elements)
+		elements = append(elements, child)
+		removed = append(removed, false)
+		if child.Kind != PrintSettingOption && child.Name != (xml.Name{}) {
+			indices[child.Name] = index
+			if key, _, ok := printPrefixFamily(child); ok {
+				families[key] = index
+			}
+		}
+	}
+	for _, child := range delta.Children {
+		if err := checkContext(ctx); err != nil {
+			return PrintSetting{}, err
+		}
+		if child.Kind == PrintSettingOption {
+			elements = append(elements, child)
+			removed = append(removed, false)
+			continue
+		}
+		familyKey, scope, hasFamily := printPrefixFamily(child)
+		replacedIndex := -1
+		if hasFamily {
+			if existing, exists := families[familyKey]; exists && elements[existing].Name != child.Name {
+				if scope < printKeywordScope(elements[existing].Name) {
+					continue
+				}
+				delete(indices, elements[existing].Name)
+				delete(families, familyKey)
+				removed[existing] = true
+				replacedIndex = existing
+			}
+		}
+		if index, exists := indices[child.Name]; exists {
+			if elements[index].Kind == PrintSettingFeature && child.Kind == PrintSettingFeature {
+				mergedChild, err := mergePrintFeature(elements[index], child, ctx)
+				if err != nil {
+					return PrintSetting{}, err
+				}
+				elements[index] = mergedChild
+			} else {
+				if oldKey, _, ok := printPrefixFamily(elements[index]); ok && families[oldKey] == index {
+					delete(families, oldKey)
+				}
+				elements[index] = child
+				if hasFamily {
+					families[familyKey] = index
+				}
+			}
+		} else if replacedIndex >= 0 {
+			removed[replacedIndex] = false
+			elements[replacedIndex] = child
+			indices[child.Name] = replacedIndex
+			families[familyKey] = replacedIndex
+		} else {
+			index := len(elements)
+			elements = append(elements, child)
+			removed = append(removed, false)
+			indices[child.Name] = index
+			if hasFamily {
+				families[familyKey] = index
+			}
+		}
+	}
+	merged := make([]PrintSetting, 0, len(elements))
+	for index, value := range elements {
+		if !removed[index] {
+			merged = append(merged, value)
+		}
+	}
+	result := baseline
+	result.Children = merged
 	return result, nil
 }
 
@@ -1669,20 +1773,16 @@ func EncodePrintCapabilities(ctx context.Context, output io.Writer, capabilities
 	return counted.count, err
 }
 
-// printConstraint 解析约束枚举属性及其关键字QName
+// printConstraint 解析约束枚举属性及其关键字QName并要求属于Print Schema公共关键字命名空间
 // 入参: node Option命名空间作用域, text 约束属性文本
 // 返回: PrintConstraint 约束类别, error 非法值错误
 func printConstraint(node *xmlElement, text string) (PrintConstraint, error) {
-	text = strings.Trim(text, " \t\r\n")
-	if strings.Contains(text, ":") {
-		name, err := printSettingsQName(node, text)
-		if err != nil || name.Space != printKeywordsNS {
-			return PrintConstraintUnknown, fmt.Errorf("%w: print Option constraint QName", ErrInvalid)
-		}
-		text = name.Local
+	name, err := printSettingsQName(node, text)
+	if err != nil || name.Space != printKeywordsNS {
+		return PrintConstraintUnknown, fmt.Errorf("%w: print Option constraint QName", ErrInvalid)
 	}
-	for value, name := range printConstraintNames {
-		if value != 0 && name == text {
+	for value, local := range printConstraintNames {
+		if value != 0 && local == name.Local {
 			return PrintConstraint(value), nil
 		}
 	}
@@ -1791,12 +1891,12 @@ func printParameterDefinition(parameter PrintSetting, options printSettingsConfi
 		return nil, fmt.Errorf("%w: print parameter Mandatory", ErrInvalid)
 	}
 	if parameter.Name.Space == printKeywordsNS {
-		units := []string{"characters", "numeric", "sRGB"}
+		units := []string{"characters", "numeric", "sRGB", "base64"}
 		switch domain.kind.Local {
 		case "QName":
 			units = []string{"characters"}
 		case "integer":
-			units = []string{"copies", "microns", "percent", "points", "degrees"}
+			units = []string{"copies", "microns", "percent", "points", "degrees", "dpi", "pixels", "sheets"}
 		case "decimal":
 			units = []string{"microns", "percent", "points", "degrees"}
 		}
@@ -1825,8 +1925,12 @@ func printParameterDefinition(parameter PrintSetting, options printSettingsConfi
 		if minimum == nil || maximum == nil || multiple == nil || minimum.Type != domain.kind || maximum.Type != domain.kind || multiple.Type != domain.kind || defaultValue.Type != domain.kind {
 			return nil, fmt.Errorf("%w: print numeric parameter property type", ErrInvalid)
 		}
-		if _, err := printParameterNumber(multiple.Text, options); err != nil {
+		step, err := printParameterNumber(multiple.Text, options)
+		if err != nil {
 			return nil, err
+		}
+		if step.Sign() <= 0 {
+			return nil, fmt.Errorf("%w: print parameter multiple must be positive", ErrInvalid)
 		}
 	default:
 		return nil, fmt.Errorf("%w: print parameter data type", ErrInvalid)
@@ -1843,7 +1947,7 @@ func printParameterDefinition(parameter PrintSetting, options printSettingsConfi
 	if domain.minimum.Cmp(domain.maximum) > 0 || (domain.kind.Local == "string" && domain.minimum.Sign() < 0) || (domain.kind.Local == "QName" && domain.minimum.Sign() <= 0) {
 		return nil, fmt.Errorf("%w: print parameter range", ErrInvalid)
 	}
-	if parameter.Name.Space == printKeywordsNS && (domain.kind.Local == "string" || domain.kind.Local == "QName") && domain.maximum.Cmp(big.NewRat(65535, 1)) > 0 {
+	if parameter.Name.Space == printKeywordsNS && (domain.kind.Local == "string" && domain.unit != "base64" || domain.kind.Local == "QName") && domain.maximum.Cmp(big.NewRat(65535, 1)) > 0 {
 		return nil, fmt.Errorf("%w: public print parameter string length", ErrInvalid)
 	}
 	if domain.kind.Local == "string" && domain.defaultValue.Text == "" {

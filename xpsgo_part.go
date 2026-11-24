@@ -250,7 +250,14 @@ func opcHex(c byte) int {
 // 返回: bool 是否为关系部件
 func opcRelationshipName(name string) bool {
 	segments := strings.Split(strings.ToLower(name), "/")
-	return len(segments) >= 3 && segments[len(segments)-2] == "_rels" && strings.HasSuffix(segments[len(segments)-1], ".rels")
+	if len(segments) < 3 || segments[len(segments)-2] != "_rels" {
+		return false
+	}
+	last := segments[len(segments)-1]
+	if !strings.HasSuffix(last, ".rels") {
+		return false
+	}
+	return len(last) > len(".rels") || len(segments) == 3 && segments[0] == ""
 }
 
 // opcMetadataPart 判断部件是否属于受MaxMetadataBytes约束的OPC元数据部件

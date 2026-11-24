@@ -329,9 +329,6 @@ func (limits RenderLimits) apply(options *sceneRenderOptions) error {
 			*field.to = field.value
 		}
 	}
-	if limits.MaxEdges > rasterMaxEdges {
-		return fmt.Errorf("%w: render max edges", ErrLimit)
-	}
 	for _, field := range []struct {
 		value int64
 		to    *int64
@@ -506,8 +503,12 @@ func iccTargetWork(target *iccTargetTransform) uint64 {
 				work += uint64((1 << len(stage.grid)) * stage.outputs * 2)
 			case iccStageMatrix:
 				work += 24
+			case iccStageFloatMatrix:
+				work += uint64(stage.inputs*stage.outputs+stage.outputs) * 2
 			case iccStageCurves:
 				work += uint64(len(stage.curves) * 4)
+			case iccStageSegmentedCurves:
+				work += uint64(len(stage.segCurves) * 8)
 			}
 		}
 	} else {
@@ -585,7 +586,7 @@ func (s *deviceRenderState) pixel(x, y int, c renderColor, space renderColorSpac
 	linear := [3]float64{c.r / c.a, c.g / c.a, c.b / c.a}
 	if space == renderSRGB {
 		for axis := range 3 {
-			linear[axis] = renderSRGBToLinear(linear[axis])
+			linear[axis] = renderSRGBToLinear(colorClamp(linear[axis]))
 		}
 	}
 	if mode == PrintColorGrayscale || mode == PrintColorMonochrome {
@@ -599,7 +600,7 @@ func (s *deviceRenderState) pixel(x, y int, c renderColor, space renderColorSpac
 		}
 		linear = [3]float64{luminance, luminance, luminance}
 	}
-	value, err := s.target.fromXYZ(iccMatrixColor(iccPCSFromLinearRGB, linear))
+	value, err := s.target.fromXYZChannels(iccMatrixColor(iccPCSFromLinearRGB, linear))
 	if err != nil {
 		return err
 	}
@@ -1118,7 +1119,7 @@ func (c *sceneColorCache) vector(part string, value Color) (Color, error) {
 		return Color{}, err
 	}
 	input := value.Components
-	var scaled [8]float64
+	var scaled [iccMaxChannels]float64
 	if transform.pipeline != nil && transform.pipeline.inputPrecision != 0 {
 		if len(input) != transform.profile.channels || len(input) > len(scaled) {
 			return Color{}, fmt.Errorf("%w: context color channel count", ErrInvalid)

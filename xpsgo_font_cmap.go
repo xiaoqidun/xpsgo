@@ -1018,6 +1018,14 @@ func parseFontCmap(data []byte, numGlyphs uint32) (*fontCmap, error) {
 				return nil, fmt.Errorf("%w: cmap language %d for platform %d encoding %d", ErrInvalid, language, platform, encoding)
 			}
 			seen[key] = true
+			if binary.BigEndian.Uint16(sub) == 14 {
+				if platform != 0 || encoding != 5 {
+					return nil, fmt.Errorf("%w: cmap format 14 requires platform 0 encoding 5", ErrInvalid)
+				}
+				if err := validateFontCmap14(sub, numGlyphs); err != nil {
+					return nil, err
+				}
+			}
 		}
 		rank := fontCmapPriority(platform, encoding)
 		if rank < best {
@@ -1043,20 +1051,19 @@ func fontCmapPriority(platform, encoding uint16) int {
 		case 10:
 			return 0
 		case 1:
-			return 1
-		case 5, 4, 3, 2, 0:
-			if encoding == 0 {
-				return 6
-			}
-			return 7 - int(encoding)
+			return 2
+		case 5, 4, 3, 2:
+			return 9 - int(encoding)
+		case 0:
+			return 8
 		}
 	}
 	if platform == 0 {
 		switch encoding {
 		case 4, 6:
-			return 7
+			return 1
 		case 3:
-			return 8
+			return 3
 		case 0, 1, 2:
 			return 9
 		}
@@ -1083,13 +1090,21 @@ func fontCmapSubtable(data []byte) ([]byte, uint32, bool, error) {
 		if length < 6 {
 			return nil, 0, true, fmt.Errorf("%w: short cmap subtable length", ErrInvalid)
 		}
-	case 8, 10, 12:
+	case 8, 10, 12, 13:
 		if len(data) < 12 || binary.BigEndian.Uint16(data[2:]) != 0 {
 			return nil, 0, true, fmt.Errorf("%w: invalid extended cmap header", ErrInvalid)
 		}
 		length, language = binary.BigEndian.Uint32(data[4:]), binary.BigEndian.Uint32(data[8:])
 		if length < 12 {
 			return nil, 0, true, fmt.Errorf("%w: short extended cmap length", ErrInvalid)
+		}
+	case 14:
+		if len(data) < 10 {
+			return nil, 0, true, fmt.Errorf("%w: truncated cmap format 14 header", ErrInvalid)
+		}
+		length = binary.BigEndian.Uint32(data[2:])
+		if length < 10 {
+			return nil, 0, true, fmt.Errorf("%w: short cmap format 14 length", ErrInvalid)
 		}
 	default:
 		return data[:2], 0, false, nil
@@ -1147,7 +1162,7 @@ func (c *fontCmap) validate() error {
 				return fmt.Errorf("%w: cmap glyph outside maxp", ErrInvalid)
 			}
 		}
-	case 8, 12:
+	case 8, 12, 13:
 		return c.validateGroups()
 	default:
 		return fmt.Errorf("%w: cmap format %d", ErrUnsupported, c.format)
@@ -1233,7 +1248,7 @@ func (c *fontCmap) validate4() error {
 	return nil
 }
 
-// validateGroups 校验格式8和12的有序非重叠分组及字形编号范围
+// validateGroups 校验格式8、12和13的有序非重叠分组及字形编号范围
 // 返回: error 分组结构或格式8编码宽度错误
 func (c *fontCmap) validateGroups() error {
 	d := c.data
@@ -1253,7 +1268,11 @@ func (c *fontCmap) validateGroups() error {
 		pos := uint64(c.arrayOffset) + 12*uint64(i)
 		start, end := binary.BigEndian.Uint32(d[pos:]), binary.BigEndian.Uint32(d[pos+4:])
 		glyph := binary.BigEndian.Uint32(d[pos+8:])
-		if start > end || i != 0 && start <= previous || uint64(glyph)+uint64(end)-uint64(start) >= uint64(c.numGlyphs) {
+		maxGlyph := uint64(glyph)
+		if c.format != 13 {
+			maxGlyph += uint64(end) - uint64(start)
+		}
+		if start > end || i != 0 && start <= previous || maxGlyph >= uint64(c.numGlyphs) {
 			return fmt.Errorf("%w: cmap group order or glyph range", ErrInvalid)
 		}
 		if c.format == 8 {
@@ -1273,6 +1292,130 @@ func (c *fontCmap) validateGroups() error {
 			}
 		}
 		previous = end
+	}
+	return nil
+}
+
+// validateFontCmap14 校验Format 14变体序列子表的记录排序、偏移范围、有效标量及字形范围
+// 入参: data 完整Format 14子表, numGlyphs 字体字形数量
+// 返回: error 结构、排序、范围或字形越界错误
+func validateFontCmap14(data []byte, numGlyphs uint32) error {
+	if len(data) < 10 {
+		return fmt.Errorf("%w: truncated cmap format 14 header", ErrInvalid)
+	}
+	count := uint64(binary.BigEndian.Uint32(data[6:]))
+	recordsEnd := 10 + 11*count
+	if recordsEnd > uint64(len(data)) {
+		return fmt.Errorf("%w: truncated cmap format 14 records", ErrInvalid)
+	}
+	defaultDone := make(map[uint32]bool)
+	nonDefaultDone := make(map[uint32]bool)
+	pairDone := make(map[[2]uint32]bool)
+	var prevSelector uint32
+	for i := uint64(0); i < count; i++ {
+		pos := 10 + 11*i
+		selector := uint32(data[pos])<<16 | uint32(data[pos+1])<<8 | uint32(data[pos+2])
+		if !utf8.ValidRune(rune(selector)) || i != 0 && selector <= prevSelector {
+			return fmt.Errorf("%w: invalid cmap format 14 variation selector", ErrInvalid)
+		}
+		prevSelector = selector
+		defOff := binary.BigEndian.Uint32(data[pos+3:])
+		nonDefOff := binary.BigEndian.Uint32(data[pos+7:])
+		if defOff != 0 {
+			if uint64(defOff) < recordsEnd || uint64(defOff)+4 > uint64(len(data)) {
+				return fmt.Errorf("%w: cmap format 14 default UVS offset", ErrInvalid)
+			}
+			if !defaultDone[defOff] {
+				if err := validateFontCmap14Default(data[defOff:]); err != nil {
+					return err
+				}
+				defaultDone[defOff] = true
+			}
+		}
+		if nonDefOff != 0 {
+			if uint64(nonDefOff) < recordsEnd || uint64(nonDefOff)+4 > uint64(len(data)) {
+				return fmt.Errorf("%w: cmap format 14 non-default UVS offset", ErrInvalid)
+			}
+			if !nonDefaultDone[nonDefOff] {
+				if err := validateFontCmap14NonDefault(data[nonDefOff:], numGlyphs); err != nil {
+					return err
+				}
+				nonDefaultDone[nonDefOff] = true
+			}
+		}
+		if defOff != 0 && nonDefOff != 0 {
+			pair := [2]uint32{defOff, nonDefOff}
+			if !pairDone[pair] {
+				if err := validateFontCmap14Disjoint(data[defOff:], data[nonDefOff:]); err != nil {
+					return err
+				}
+				pairDone[pair] = true
+			}
+		}
+	}
+	return nil
+}
+
+// validateFontCmap14Default 校验Format 14默认变体表的区间边界、代理区回避与严格递增顺序
+// 入参: data 从defaultUVSOffset开始的子表数据
+// 返回: error 截断、越界或排序错误
+func validateFontCmap14Default(data []byte) error {
+	count := uint64(binary.BigEndian.Uint32(data))
+	if 4+4*count > uint64(len(data)) {
+		return fmt.Errorf("%w: truncated cmap format 14 default UVS ranges", ErrInvalid)
+	}
+	var prevEnd uint32
+	for i := uint64(0); i < count; i++ {
+		pos := 4 + 4*i
+		start := uint32(data[pos])<<16 | uint32(data[pos+1])<<8 | uint32(data[pos+2])
+		end := start + uint32(data[pos+3])
+		if end > 0x10ffff || start <= 0xdfff && end >= 0xd800 || i != 0 && start <= prevEnd {
+			return fmt.Errorf("%w: invalid cmap format 14 default UVS range", ErrInvalid)
+		}
+		prevEnd = end
+	}
+	return nil
+}
+
+// validateFontCmap14NonDefault 校验Format 14非默认变体表的标量排序与目标字形范围
+// 入参: data 从nonDefaultUVSOffset开始的子表数据, numGlyphs 字体字形数量
+// 返回: error 截断、排序或字形越界错误
+func validateFontCmap14NonDefault(data []byte, numGlyphs uint32) error {
+	count := uint64(binary.BigEndian.Uint32(data))
+	if 4+5*count > uint64(len(data)) {
+		return fmt.Errorf("%w: truncated cmap format 14 non-default UVS mappings", ErrInvalid)
+	}
+	var prev uint32
+	for i := uint64(0); i < count; i++ {
+		pos := 4 + 5*i
+		scalar := uint32(data[pos])<<16 | uint32(data[pos+1])<<8 | uint32(data[pos+2])
+		gid := binary.BigEndian.Uint16(data[pos+3:])
+		if !utf8.ValidRune(rune(scalar)) || i != 0 && scalar <= prev || uint32(gid) >= numGlyphs {
+			return fmt.Errorf("%w: invalid cmap format 14 non-default UVS mapping", ErrInvalid)
+		}
+		prev = scalar
+	}
+	return nil
+}
+
+// validateFontCmap14Disjoint 校验同一变体选择符的默认与非默认映射表不包含重叠标量
+// 入参: defData 已校验的默认UVS表数据, nonDefData 已校验的非默认UVS表数据
+// 返回: error 重叠标量错误
+func validateFontCmap14Disjoint(defData, nonDefData []byte) error {
+	defCount := uint64(binary.BigEndian.Uint32(defData))
+	nonCount := uint64(binary.BigEndian.Uint32(nonDefData))
+	for i, j := uint64(0), uint64(0); i < defCount && j < nonCount; {
+		dPos, nPos := 4+4*i, 4+5*j
+		start := uint32(defData[dPos])<<16 | uint32(defData[dPos+1])<<8 | uint32(defData[dPos+2])
+		end := start + uint32(defData[dPos+3])
+		scalar := uint32(nonDefData[nPos])<<16 | uint32(nonDefData[nPos+1])<<8 | uint32(nonDefData[nPos+2])
+		if scalar < start {
+			j++
+		} else if scalar > end {
+			i++
+		} else {
+			return fmt.Errorf("%w: overlapping cmap format 14 default and non-default UVS scalar", ErrInvalid)
+		}
 	}
 	return nil
 }
@@ -1422,7 +1565,7 @@ func (c *fontCmap) lookup(code uint32) uint16 {
 		if code >= start && code-start < c.count {
 			return binary.BigEndian.Uint16(d[uint64(c.arrayOffset)+2*uint64(code-start):])
 		}
-	case 8, 12:
+	case 8, 12, 13:
 		if c.format == 8 && (code > 0xffff && !c.is32(code>>16) || code <= 0xffff && !c.is32(0) && c.is32(code)) {
 			return 0
 		}
@@ -1440,6 +1583,9 @@ func (c *fontCmap) lookup(code uint32) uint16 {
 			pos := uint64(c.arrayOffset) + 12*uint64(lo)
 			start := binary.BigEndian.Uint32(d[pos:])
 			if code >= start {
+				if c.format == 13 {
+					return uint16(binary.BigEndian.Uint32(d[pos+8:]))
+				}
 				return uint16(binary.BigEndian.Uint32(d[pos+8:]) + code - start)
 			}
 		}

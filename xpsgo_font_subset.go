@@ -278,15 +278,27 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, config
 	if !short {
 		binary.BigEndian.PutUint16(tables["head"][50:], 1)
 	}
-	return encodeSubsetFont(ctx, face, tables, configuration)
+	return encodeSubsetFont(ctx, face, tables, slices.Contains(needed, false), configuration)
 }
 
-// encodeSubsetFont 重建独立SFNT目录及四字节表填充，保留未替换表并重新计算head校验调整值
-// 入参: ctx 取消Context, face 原字体面, replacements 替换的字体表, options 字节上限
+// encodeSubsetFont 重建独立SFNT目录及四字节表填充，剔除失效签名及与被置空字形不一致的衍生表
+// 入参: ctx 取消Context, face 原字体面, replacements 替换的字体表, pruned 是否置空了未用轮廓字形, options 字节上限
 // 返回: []byte 独立字体数据, error 表、字节、目录或取消错误
-func encodeSubsetFont(ctx context.Context, face *fontFace, replacements map[string][]byte, options FontSubsetOptions) ([]byte, error) {
+func encodeSubsetFont(ctx context.Context, face *fontFace, replacements map[string][]byte, pruned bool, options FontSubsetOptions) ([]byte, error) {
 	tags := slices.Sorted(maps.Keys(face.tables))
-	tags = slices.DeleteFunc(tags, func(tag string) bool { return tag == "DSIG" })
+	tags = slices.DeleteFunc(tags, func(tag string) bool {
+		if tag == "DSIG" {
+			return true
+		}
+		if !pruned {
+			return false
+		}
+		switch tag {
+		case "hdmx", "LTSH", "VDMX", "EBLC", "EBDT", "EBSC":
+			return true
+		}
+		return false
+	})
 	count := len(tags)
 	if count == 0 || count > 4095 {
 		return nil, fmt.Errorf("%w: subset table directory range", ErrLimit)
@@ -441,6 +453,8 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 		remaining -= len(programs[index])
 	}
 	profile := subsetFontProfile{}
+	var cffBounds [4]int64
+	hasCFFBounds := false
 	for _, gid := range queue {
 		geometry := subsetCFFCloneGeometry(selected[gid].geometry)
 		if seac := selected[gid].seac; seac != nil {
@@ -459,6 +473,38 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 				geometry.Figures = append(geometry.Figures, part.Figures...)
 			}
 		}
+		geometry.Figures = slices.DeleteFunc(geometry.Figures, func(figure GeometryFigure) bool { return len(figure.Segments) == 0 })
+		if len(geometry.Figures) != 0 {
+			charGeo := geometry
+			if font.cid {
+				if fdMatrix := font.fontDict[font.fdSelect[gid]].matrix; fdMatrix != nil {
+					charGeo = subsetCFFCloneGeometry(geometry)
+					charMatrix := *fdMatrix
+					if font.top.matrix == nil {
+						charMatrix = (Matrix{A: 1000, D: 1000}).Mul(charMatrix)
+					}
+					if err := fontTransformOutline(&charGeo, charMatrix); err != nil {
+						return nil, err
+					}
+				}
+			}
+			cb, err := charGeo.Bounds()
+			if err != nil {
+				return nil, err
+			}
+			cxMin, cyMin := math.Floor(cb.X), math.Floor(cb.Y)
+			cxMax, cyMax := math.Ceil(cb.X+cb.Width), math.Ceil(cb.Y+cb.Height)
+			if cxMin < math.MinInt32 || cyMin < math.MinInt32 || cxMax > math.MaxInt32 || cyMax > math.MaxInt32 {
+				return nil, fmt.Errorf("%w: subset CFF FontBBox range", ErrLimit)
+			}
+			box := [4]int64{int64(cxMin), int64(cyMin), int64(cxMax), int64(cyMax)}
+			if !hasCFFBounds {
+				cffBounds, hasCFFBounds = box, true
+			} else {
+				cffBounds[0], cffBounds[1] = min(cffBounds[0], box[0]), min(cffBounds[1], box[1])
+				cffBounds[2], cffBounds[3] = max(cffBounds[2], box[2]), max(cffBounds[3], box[3])
+			}
+		}
 		matrix, err := font.designMatrix(gid, metrics.unitsPerEm)
 		if err != nil {
 			return nil, err
@@ -466,7 +512,6 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 		if err := fontTransformOutline(&geometry, matrix); err != nil {
 			return nil, err
 		}
-		geometry.Figures = slices.DeleteFunc(geometry.Figures, func(figure GeometryFigure) bool { return len(figure.Segments) == 0 })
 		bounds, err := geometry.Bounds()
 		if err != nil {
 			return nil, err
@@ -481,7 +526,7 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 			return nil, err
 		}
 	}
-	encoded, err := encodeSubsetCFF(ctx, font, programs, options)
+	encoded, err := encodeSubsetCFFWithBBox(ctx, font, programs, cffBounds[:], options)
 	if err != nil {
 		return nil, err
 	}
@@ -489,7 +534,7 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 	if err := profile.apply(face, metrics, tables, ctx); err != nil {
 		return nil, err
 	}
-	return encodeSubsetFont(ctx, face, tables, options)
+	return encodeSubsetFont(ctx, face, tables, slices.Contains(needed, false), options)
 }
 
 // subsetCFFGlyph 按原字体字典执行单个字形，共用累计操作预算和取消Context
@@ -704,10 +749,10 @@ func subsetCFFEntry(operator uint16, values []int64) ([]byte, error) {
 	return append(data, byte(operator)), nil
 }
 
-// encodeSubsetCFF 重建CFF1核心索引、字符集和CID选择及字典，保留名称、字符串和子程序编号
-// 入参: ctx 取消Context, font 原CFF字体, programs 按原GID排列的新字形程序, options 字节上限
+// encodeSubsetCFFWithBBox 重建CFF1表并在提供字符空间包围盒时同步更新Top DICT的FontBBox
+// 入参: ctx 取消Context, font 原CFF字体, programs 按原GID排列的新字形程序, fontBBox 可选四元组FontBBox, options 字节上限
 // 返回: []byte 独立CFF表, error 字典、布局、范围或取消错误
-func encodeSubsetCFF(ctx context.Context, font *cffFont, programs [][]byte, options FontSubsetOptions) ([]byte, error) {
+func encodeSubsetCFFWithBBox(ctx context.Context, font *cffFont, programs [][]byte, fontBBox []int64, options FontSubsetOptions) ([]byte, error) {
 	maximum := min(options.MaxBytes, int64(math.MaxInt32))
 	set := font.set
 	_, afterName, err := parseCFFIndex(set.data, uint32(set.data[2]))
@@ -763,6 +808,9 @@ func encodeSubsetCFF(ctx context.Context, font *cffFont, programs [][]byte, opti
 		return nil, err
 	}
 	values := map[uint16][]int64{15: {0}, 17: {0}}
+	if len(fontBBox) == 4 {
+		values[5] = fontBBox
+	}
 	if font.cid {
 		values[0x0c24], values[0x0c25] = []int64{0}, []int64{0}
 	} else {
@@ -803,9 +851,14 @@ func encodeSubsetCFF(ctx context.Context, font *cffFont, programs [][]byte, opti
 			topPosition, topLength = int(position), len(data)
 		}
 	}
-	charset := make([]byte, 1, 1+2*(len(font.charset.values)-1))
-	for _, value := range font.charset.values[1:] {
-		charset = binary.BigEndian.AppendUint16(charset, value)
+	var charset []byte
+	if font.cid {
+		charset = encodeSubsetCFFCharsetFormat2(font.charset.values)
+	} else {
+		charset = make([]byte, 1, 1+2*(len(font.charset.values)-1))
+		for _, value := range font.charset.values[1:] {
+			charset = binary.BigEndian.AppendUint16(charset, value)
+		}
 	}
 	position, err := put(charset)
 	if err != nil {
@@ -830,7 +883,7 @@ func encodeSubsetCFF(ctx context.Context, font *cffFont, programs [][]byte, opti
 	values[17][0] = position
 	var fdPosition, fdLength int
 	if font.cid {
-		position, err := put(append([]byte{0}, font.fdSelect...))
+		position, err := put(encodeSubsetCFFFDSelectFormat3(font.fdSelect))
 		if err != nil {
 			return nil, err
 		}
@@ -895,6 +948,44 @@ func encodeSubsetCFF(ctx context.Context, font *cffFont, programs [][]byte, opti
 	}
 	copy(output[topPosition:topPosition+topLength], data)
 	return output, checkContext(ctx)
+}
+
+// encodeSubsetCFFCharsetFormat2 按连续区间编码紧凑的CFF Format 2字符集表
+// 入参: values 包含隐式.notdef在内的GID到CID或SID映射
+// 返回: []byte Format 2字符集字节
+func encodeSubsetCFFCharsetFormat2(values []uint16) []byte {
+	out := []byte{2}
+	for i := 1; i < len(values); {
+		first := values[i]
+		nLeft := 0
+		for i+1+nLeft < len(values) && nLeft < 65535 && uint32(values[i+1+nLeft]) == uint32(first)+uint32(nLeft)+1 {
+			nLeft++
+		}
+		out = binary.BigEndian.AppendUint16(out, first)
+		out = binary.BigEndian.AppendUint16(out, uint16(nLeft))
+		i += nLeft + 1
+	}
+	return out
+}
+
+// encodeSubsetCFFFDSelectFormat3 按连续相同字典索引编码紧凑的CFF Format 3选择表
+// 入参: fdSelect 按GID排列的字体字典索引
+// 返回: []byte Format 3选择表字节
+func encodeSubsetCFFFDSelectFormat3(fdSelect []uint8) []byte {
+	out := []byte{3, 0, 0}
+	ranges := 0
+	for gid := 0; gid < len(fdSelect); {
+		fd := fdSelect[gid]
+		start := gid
+		for gid < len(fdSelect) && fdSelect[gid] == fd {
+			gid++
+		}
+		out = binary.BigEndian.AppendUint16(out, uint16(start))
+		out = append(out, fd)
+		ranges++
+	}
+	binary.BigEndian.PutUint16(out[1:], uint16(ranges))
+	return binary.BigEndian.AppendUint16(out, uint16(len(fdSelect)))
 }
 
 // buildSubsetCFFPrivate 重建局部Subrs相对偏移，子程序内容与编号不变，不复制原布局中的无关间隔
@@ -1437,7 +1528,7 @@ func (p *Package) SubsetFonts(ctx context.Context, options *OptimizationOptions)
 	}
 	for key, value := range pending {
 		p.total -= int64(len(p.parts[key].data)) - int64(len(value.data))
-		p.parts[key] = value
+		p.parts[key], p.dirty[key] = value, true
 	}
 	return result, nil
 }

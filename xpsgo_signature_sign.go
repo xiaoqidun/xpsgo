@@ -19,9 +19,12 @@ import (
 	"context"
 	"crypto"
 	"crypto/dsa"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/xml"
 	"errors"
@@ -29,6 +32,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"math/big"
 	"mime"
 	"net/url"
 	"regexp"
@@ -41,16 +45,20 @@ import (
 // signatureDefinitionNumber 匹配xs:double的有限数值词法，不套用固定页面实数的额外限制
 var signatureDefinitionNumber = regexp.MustCompile(`^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$`)
 
-// SignatureSignOptions 设置签署标识、声明时间、算法与可选覆盖，Hash缺省时RSA用SHA256、DSA用SHA1
+// SignatureSignOptions 设置签署标识、声明时间、算法、规范化与可选覆盖，Hash缺省时按密钥类型自动选择
+// PSS非nil且签名器为RSA时采用RSASSA-PSS；SeparateCertificate为true时证书写入独立部件并建立证书关系
 // ProtectSignatures按类型组覆盖已有及本次签名关系；存在MCE或签署票据时须提供Validate校验原始内容
-// 调用期间不得修改参数，Signer与Validate不得重入当前Package
 type SignatureSignOptions struct {
-	ID                string
-	Time              time.Time
-	Hash              crypto.Hash
-	Parts             []string
-	ProtectSignatures bool
-	Validate          func(context.Context, PartInfo, []byte) error
+	ID                  string
+	Time                time.Time
+	Hash                crypto.Hash
+	PSS                 *rsa.PSSOptions
+	Canonicalization    string
+	InclusiveNamespaces []string
+	SeparateCertificate bool
+	Parts               []string
+	ProtectSignatures   bool
+	Validate            func(context.Context, PartInfo, []byte) error
 }
 
 // SignatureDefinitionPart 保存签署请求及引用它的固定文档，不表示已经存在真实签名
@@ -80,8 +88,8 @@ type SignatureSpot struct {
 }
 
 // Sign 按当前方言创建完整文档数字签名并保留已有签名，失败时不修改包状态；certificates须包含与signer匹配的证书
-// DSA签名器须返回XML签名约定的四十字节r||s拼接值；options为nil时采用默认签署参数
-// 入参: ctx 取消Context，nil采用Background, signer 可用且调用期间不变的RSA或DSA签名器, certificates 与签名器匹配的X509证书列表, options 可选签署参数，nil采用默认值
+// 支持RSA、RSA-PSS、ECDSA及DSA签名器，DSA签名器须返回四十字节r||s值，ECDSA签名器遵循crypto.Signer返回ASN.1签名
+// 入参: ctx 取消Context，nil采用Background, signer 可用且调用期间不变的签名器, certificates 与签名器匹配的X509证书列表, options 可选签署参数，nil采用默认值
 // 返回: PartInfo 新签名部件，失败为零值, error 结构、策略、算法、证书、签名器、预算或取消错误
 func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates []*x509.Certificate, options *SignatureSignOptions) (PartInfo, error) {
 	if err := p.lock(); err != nil {
@@ -98,9 +106,30 @@ func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates [
 	configuration := SignatureSignOptions{}
 	if options != nil {
 		configuration = *options
+		configuration.InclusiveNamespaces = slices.Clone(options.InclusiveNamespaces)
+		if options.PSS != nil {
+			pssCopy := *options.PSS
+			configuration.PSS = &pssCopy
+		}
+	}
+	if configuration.Canonicalization == "" {
+		configuration.Canonicalization = signatureCanonical
+	}
+	if !signatureCanonicalMethod(configuration.Canonicalization) {
+		return PartInfo{}, fmt.Errorf("%w: signing canonicalization method", ErrUnsupported)
+	}
+	if len(configuration.InclusiveNamespaces) != 0 {
+		if !signatureCanonicalExclusive(configuration.Canonicalization) {
+			return PartInfo{}, fmt.Errorf("%w: InclusiveNamespaces requires exclusive canonicalization", ErrInvalid)
+		}
+		for _, prefix := range configuration.InclusiveNamespaces {
+			if prefix != "#default" && (!xmlNCName(prefix) || prefix == "xmlns") {
+				return PartInfo{}, fmt.Errorf("%w: InclusiveNamespaces prefix %q", ErrInvalid, prefix)
+			}
+		}
 	}
 	public := signer.Public()
-	method, digest, hash, err := signatureSigningMethod(public, configuration.Hash)
+	method, digest, pssParams, signerOpts, err := signatureSigningMethod(public, configuration.Hash, configuration.PSS)
 	if err != nil {
 		return PartInfo{}, err
 	}
@@ -171,14 +200,34 @@ func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates [
 		return PartInfo{}, err
 	}
 	q.dirtyRels[strings.ToLower(origin)] = replaced
-	if err := q.signingParts(reader, origin, part, ctx); err != nil {
+	var certParts []string
+	if configuration.SeparateCertificate {
+		certRels := make([]Relationship, 0, len(derCertificates))
+		certNextID := createdRelationshipIDs(nil)
+		for _, der := range derCertificates {
+			certPart, err := q.newName("/Signatures/%d.cer", ctx)
+			if err != nil {
+				return PartInfo{}, err
+			}
+			if err := q.store(certPart, opcCertificateType, der); err != nil {
+				return PartInfo{}, err
+			}
+			q.commitName("/Signatures/%d.cer", certPart)
+			certParts = append(certParts, certPart)
+			certRels = append(certRels, Relationship{ID: certNextID(), Type: opcCertificateRel, Target: certPart, TargetMode: TargetModeInternal})
+		}
+		if err := q.setRelationships(part, certRels); err != nil {
+			return PartInfo{}, err
+		}
+	}
+	if err := q.signingParts(reader, origin, part, certParts, ctx); err != nil {
 		return PartInfo{}, err
 	}
-	references, graph, err := signatureSigningReferences(reader, configuration, ctx)
+	references, graph, err := signatureSigningReferences(reader, part, configuration, ctx)
 	if err != nil {
 		return PartInfo{}, err
 	}
-	data, err := encodeDocumentSignature(configuration, derCertificates, references, graph, method, digest, hash, signer)
+	data, err := encodeDocumentSignature(configuration, derCertificates, references, graph, method, digest, pssParams, signerOpts, signer)
 	if err != nil {
 		return PartInfo{}, err
 	}
@@ -219,14 +268,15 @@ func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates [
 	return info.Part, nil
 }
 
-// signingParts 向私有快照补入待签署部件与签名源关系供覆盖清单及摘要计算使用
-// 入参: reader 签署前的私有快照, origin 签名源部件, part 待签名部件, ctx 取消Context
+// signingParts 向私有快照补入待签署部件、独立证书部件与签名源关系供覆盖清单及摘要计算使用
+// 入参: reader 签署前的私有快照, origin 签名源部件, part 待签名部件, certificates 独立证书部件列表, ctx 取消Context
 // 返回: error 部件、关系或取消错误
-func (p *Package) signingParts(reader *Reader, origin, part string, ctx context.Context) error {
+func (p *Package) signingParts(reader *Reader, origin, part string, certificates []string, ctx context.Context) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
-	for _, name := range []string{origin, part} {
+	candidates := append([]string{origin, part}, certificates...)
+	for _, name := range candidates {
 		value, present := p.parts[strings.ToLower(name)]
 		if !present {
 			return fmt.Errorf("%w: missing signing candidate part", ErrInvalid)
@@ -239,6 +289,11 @@ func (p *Package) signingParts(reader *Reader, origin, part string, ctx context.
 	}
 	if err := p.composeRelationships(reader.pkg, origin, nil, ctx); err != nil {
 		return err
+	}
+	if len(certificates) != 0 {
+		if err := p.composeRelationships(reader.pkg, part, nil, ctx); err != nil {
+			return err
+		}
 	}
 	return checkContext(ctx)
 }
@@ -254,13 +309,49 @@ func (p *Package) signingCopy() *Package {
 	}
 }
 
-// signatureSigningMethod 确定XML签名方法及摘要，不以未知算法替换标准选择
-// 入参: public 签名器公钥, hash 摘要选择，零值按密钥类型选择
-// 返回: string 签名方法URI, string 摘要方法URI, crypto.Hash 摘要算法, error 算法能力错误
-func signatureSigningMethod(public crypto.PublicKey, hash crypto.Hash) (string, string, crypto.Hash, error) {
+// signatureSigningMethod 确定XML签名方法、摘要及RSA-PSS签名参数，不以未知算法替换标准选择
+// 入参: public 签名器公钥, hash 摘要选择，零值按密钥类型选择, pss 可选RSA-PSS参数
+// 返回: string 签名方法URI, string 摘要方法URI, *SignaturePSSParams PSS参数, crypto.SignerOpts 签名器选项, error 算法或参数错误
+func signatureSigningMethod(public crypto.PublicKey, hash crypto.Hash, pss *rsa.PSSOptions) (string, string, *SignaturePSSParams, crypto.SignerOpts, error) {
 	method := ""
-	switch public.(type) {
+	switch key := public.(type) {
 	case *rsa.PublicKey:
+		if pss != nil {
+			if err := signatureKey(signatureMethodRSAPSS, key); err != nil {
+				return "", "", nil, nil, err
+			}
+			if pss.Hash != 0 {
+				if hash != 0 && hash != pss.Hash {
+					return "", "", nil, nil, fmt.Errorf("%w: RSA-PSS hash conflict", ErrInvalid)
+				}
+				hash = pss.Hash
+			}
+			if hash == 0 {
+				hash = crypto.SHA256
+			}
+			digest := ""
+			switch hash {
+			case crypto.SHA1:
+				digest = xmlSignatureNamespace + "sha1"
+			case crypto.SHA256:
+				digest = "http://www.w3.org/2001/04/xmlenc#sha256"
+			case crypto.SHA384:
+				digest = "http://www.w3.org/2001/04/xmldsig-more#sha384"
+			case crypto.SHA512:
+				digest = "http://www.w3.org/2001/04/xmlenc#sha512"
+			default:
+				return "", "", nil, nil, fmt.Errorf("%w: RSA-PSS hash algorithm", ErrUnsupported)
+			}
+			saltLen := pss.SaltLength
+			if saltLen == rsa.PSSSaltLengthAuto || saltLen == rsa.PSSSaltLengthEqualsHash {
+				saltLen = hash.Size()
+			}
+			if saltLen <= 0 || saltLen > key.Size()-hash.Size()-2 {
+				return "", "", nil, nil, fmt.Errorf("%w: RSA-PSS salt length", ErrInvalid)
+			}
+			params := &SignaturePSSParams{DigestMethod: digest, MGFMethod: signatureMethodMGF1, MGFDigest: digest, SaltLength: saltLen, TrailerField: 1}
+			return signatureMethodRSAPSS, digest, params, &rsa.PSSOptions{SaltLength: saltLen, Hash: hash}, nil
+		}
 		if hash == 0 {
 			hash = crypto.SHA256
 		}
@@ -274,7 +365,37 @@ func signatureSigningMethod(public crypto.PublicKey, hash crypto.Hash) (string, 
 		case crypto.SHA512:
 			method = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512"
 		}
+	case *ecdsa.PublicKey:
+		if pss != nil {
+			return "", "", nil, nil, fmt.Errorf("%w: RSA-PSS options require RSA key", ErrInvalid)
+		}
+		if key == nil || key.Curve == nil {
+			return "", "", nil, nil, fmt.Errorf("%w: ECDSA signing key", ErrInvalid)
+		}
+		if hash == 0 {
+			switch key.Curve {
+			case elliptic.P256():
+				hash = crypto.SHA256
+			case elliptic.P384():
+				hash = crypto.SHA384
+			case elliptic.P521():
+				hash = crypto.SHA512
+			default:
+				return "", "", nil, nil, fmt.Errorf("%w: ECDSA signing curve", ErrUnsupported)
+			}
+		}
+		switch hash {
+		case crypto.SHA256:
+			method = signatureMethodECDSA256
+		case crypto.SHA384:
+			method = signatureMethodECDSA384
+		case crypto.SHA512:
+			method = signatureMethodECDSA512
+		}
 	case *dsa.PublicKey:
+		if pss != nil {
+			return "", "", nil, nil, fmt.Errorf("%w: RSA-PSS options require RSA key", ErrInvalid)
+		}
 		if hash == 0 {
 			hash = crypto.SHA1
 		}
@@ -283,10 +404,10 @@ func signatureSigningMethod(public crypto.PublicKey, hash crypto.Hash) (string, 
 		}
 	}
 	if method == "" {
-		return "", "", 0, fmt.Errorf("%w: document signing key or hash", ErrUnsupported)
+		return "", "", nil, nil, fmt.Errorf("%w: document signing key or hash", ErrUnsupported)
 	}
 	digest, err := signatureMethodHash(method)
-	return method, digest, hash, err
+	return method, digest, nil, hash, err
 }
 
 // signatureSigningCertificates 复制并校验调用方证书，确认存在与签名器匹配且可用于签署的证书
@@ -366,28 +487,19 @@ func signatureSigningOrigin(reader *Reader, ctx context.Context) (string, error)
 }
 
 // encodeDocumentSignature 编码标准包专用对象，计算原始部件、关系筛选及对象摘要后调用签名器
-// 入参: options 签署选项, certificates 独立DER, references 包部件引用, graph 私有读取预算, method 签名URI, digest 摘要URI, hash 摘要算法, signer 外部签名器
+// 入参: options 签署选项, certificates 独立DER, references 包部件引用, graph 私有读取预算, method 签名URI, digest 摘要URI, pss 可选RSA-PSS参数, signerOpts 签名器选项, signer 外部签名器
 // 返回: []byte 完整UTF-8签名XML, error 结构、摘要、签名器、资源或取消错误
-func encodeDocumentSignature(options SignatureSignOptions, certificates [][]byte, references []SignatureReference, graph *signaturePartGraph, method, digest string, hash crypto.Hash, signer crypto.Signer) ([]byte, error) {
+func encodeDocumentSignature(options SignatureSignOptions, certificates [][]byte, references []SignatureReference, graph *signaturePartGraph, method, digest string, pss *SignaturePSSParams, signerOpts crypto.SignerOpts, signer crypto.Signer) ([]byte, error) {
 	ctx, limits := graph.context, graph.pkg.limits
 	root := createdNode(xmlSignatureNamespace, "Signature")
 	root.Attr = []xml.Attr{{Name: xml.Name{Local: "Id"}, Value: options.ID}}
 	info := createdNode(xmlSignatureNamespace, "SignedInfo")
-	canonicalization := signatureSigningNode("CanonicalizationMethod", "Algorithm", signatureCanonical)
-	signatureMethod := signatureSigningNode("SignatureMethod", "Algorithm", method)
+	canonicalization := signatureSigningCanonicalNode("CanonicalizationMethod", options.Canonicalization, options.InclusiveNamespaces)
+	signatureMethod := signatureSigningMethodNode(method, pss)
 	objectReference := signatureSigningNode("Reference", "URI", "#"+url.PathEscape("idPackageObject"))
-	objectReference.Children = []*xmlElement{signatureSigningTransforms([]SignatureTransform{{Algorithm: signatureCanonical}}), signatureSigningNode("DigestMethod", "Algorithm", digest), signatureSigningText("DigestValue", "AA==")}
+	objectReference.Children = []*xmlElement{signatureSigningTransforms([]SignatureTransform{{Algorithm: options.Canonicalization, InclusiveNamespaces: options.InclusiveNamespaces}}), signatureSigningNode("DigestMethod", "Algorithm", digest), signatureSigningText("DigestValue", "AA==")}
 	info.Children = []*xmlElement{canonicalization, signatureMethod, objectReference}
 	value := signatureSigningText("SignatureValue", "AA==")
-	keyInfo := createdNode(xmlSignatureNamespace, "KeyInfo")
-	x509Data := createdNode(xmlSignatureNamespace, "X509Data")
-	for _, certificate := range certificates {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		x509Data.Children = append(x509Data.Children, signatureSigningText("X509Certificate", base64.StdEncoding.EncodeToString(certificate)))
-	}
-	keyInfo.Children = []*xmlElement{x509Data}
 	object := signatureSigningNode("Object", "Id", "idPackageObject")
 	manifest := createdNode(xmlSignatureNamespace, "Manifest")
 	v := signatureVerifier{graph: graph, limits: limits, work: limits.MaxPackageBytes}
@@ -421,12 +533,25 @@ func encodeDocumentSignature(options SignatureSignOptions, certificates [][]byte
 	property.Children = []*xmlElement{stamp}
 	properties.Children = []*xmlElement{property}
 	object.Children = []*xmlElement{manifest, properties}
-	root.Children = []*xmlElement{info, value, keyInfo, object}
+	if options.SeparateCertificate {
+		root.Children = []*xmlElement{info, value, object}
+	} else {
+		keyInfo := createdNode(xmlSignatureNamespace, "KeyInfo")
+		x509Data := createdNode(xmlSignatureNamespace, "X509Data")
+		for _, certificate := range certificates {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			x509Data.Children = append(x509Data.Children, signatureSigningText("X509Certificate", base64.StdEncoding.EncodeToString(certificate)))
+		}
+		keyInfo.Children = []*xmlElement{x509Data}
+		root.Children = []*xmlElement{info, value, keyInfo, object}
+	}
 	data, err := signatureSigningMarkup(root, limits, ctx)
 	if err != nil {
 		return nil, err
 	}
-	canonical, err := v.canonical(data, signatureCanonical, false, func(node *xmlElement, _ []xml.Name) bool {
+	canonical, err := v.canonicalExclusive(data, options.Canonicalization, options.InclusiveNamespaces, false, limits.MaxMetadataBytes, func(node *xmlElement, _ []xml.Name) bool {
 		for _, attribute := range node.Attr {
 			if signatureIDAttribute(node, attribute) && attribute.Value == "idPackageObject" {
 				return true
@@ -452,7 +577,7 @@ func encodeDocumentSignature(options SignatureSignOptions, certificates [][]byte
 	if err != nil {
 		return nil, err
 	}
-	canonical, err = v.canonical(data, signatureCanonical, false, func(node *xmlElement, path []xml.Name) bool {
+	canonical, err = v.canonicalExclusive(data, options.Canonicalization, options.InclusiveNamespaces, signatureCanonicalComments(options.Canonicalization), limits.MaxMetadataBytes, func(node *xmlElement, path []xml.Name) bool {
 		return len(path) == 2 && node.Name == (xml.Name{Space: xmlSignatureNamespace, Local: "SignedInfo"})
 	})
 	if err != nil {
@@ -468,12 +593,26 @@ func encodeDocumentSignature(options SignatureSignOptions, certificates [][]byte
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	signed, err := signer.Sign(rand.Reader, hasher.Sum(nil), hash)
+	signed, err := signer.Sign(rand.Reader, hasher.Sum(nil), signerOpts)
 	if err != nil {
 		return nil, fmt.Errorf("signing provider: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if public, ok := signer.Public().(*ecdsa.PublicKey); ok {
+		var pair struct {
+			R, S *big.Int
+		}
+		rest, err := asn1.Unmarshal(signed, &pair)
+		if err != nil || len(rest) != 0 || pair.R == nil || pair.S == nil || pair.R.Sign() <= 0 || pair.S.Sign() <= 0 || pair.R.Cmp(public.Curve.Params().N) >= 0 || pair.S.Cmp(public.Curve.Params().N) >= 0 {
+			return nil, fmt.Errorf("%w: signing provider ECDSA value", ErrSignature)
+		}
+		nBytes := (public.Curve.Params().BitSize + 7) / 8
+		encoded := make([]byte, 2*nBytes)
+		pair.R.FillBytes(encoded[:nBytes])
+		pair.S.FillBytes(encoded[nBytes:])
+		signed = encoded
 	}
 	if len(signed) > signatureMaxKeyBits/8 || int64(len(signed)) > limits.MaxMetadataBytes {
 		return nil, fmt.Errorf("%w: signing provider value size", ErrLimit)
@@ -487,6 +626,45 @@ func encodeDocumentSignature(options SignatureSignOptions, certificates [][]byte
 		return nil, err
 	}
 	return data, nil
+}
+
+// signatureSigningCanonicalNode 创建规范化元素并在Exclusive C14N存在前缀列表时附加InclusiveNamespaces子元素
+// 入参: name 元素名称, algorithm 规范化算法URI, inclusive 可选前缀列表
+// 返回: *xmlElement 独立规范化元素节点
+func signatureSigningCanonicalNode(name, algorithm string, inclusive []string) *xmlElement {
+	node := signatureSigningNode(name, "Algorithm", algorithm)
+	if signatureCanonicalExclusive(algorithm) && len(inclusive) != 0 {
+		child := createdNode(signatureExcNamespace, "InclusiveNamespaces")
+		child.Attr = []xml.Attr{{Name: xml.Name{Local: "xmlns"}, Value: signatureExcNamespace}, {Name: xml.Name{Local: "PrefixList"}, Value: strings.Join(inclusive, " ")}}
+		node.Children = append(node.Children, child)
+	}
+	return node
+}
+
+// signatureSigningMethodNode 创建SignatureMethod元素并在RSA-PSS时编码标准RSAPSSParams参数结构
+// 入参: method 签名方法URI, pss 可选RSA-PSS参数
+// 返回: *xmlElement 独立签名方法节点
+func signatureSigningMethodNode(method string, pss *SignaturePSSParams) *xmlElement {
+	node := signatureSigningNode("SignatureMethod", "Algorithm", method)
+	if method != signatureMethodRSAPSS || pss == nil {
+		return node
+	}
+	params := createdNode(signaturePSSNamespace, "RSAPSSParams")
+	params.Attr = []xml.Attr{{Name: xml.Name{Local: "xmlns"}, Value: signaturePSSNamespace}}
+	digestNode := createdNode(xmlSignatureNamespace, "DigestMethod")
+	digestNode.Attr = []xml.Attr{{Name: xml.Name{Local: "xmlns"}, Value: xmlSignatureNamespace}, {Name: xml.Name{Local: "Algorithm"}, Value: pss.DigestMethod}}
+	mgfNode := createdNode(signaturePSSNamespace, "MaskGenerationFunction")
+	mgfNode.Attr = []xml.Attr{{Name: xml.Name{Local: "Algorithm"}, Value: pss.MGFMethod}}
+	mgfDigest := createdNode(xmlSignatureNamespace, "DigestMethod")
+	mgfDigest.Attr = []xml.Attr{{Name: xml.Name{Local: "xmlns"}, Value: xmlSignatureNamespace}, {Name: xml.Name{Local: "Algorithm"}, Value: pss.MGFDigest}}
+	mgfNode.Children = []*xmlElement{mgfDigest}
+	saltNode := createdNode(signaturePSSNamespace, "SaltLength")
+	saltNode.Text = strconv.Itoa(pss.SaltLength)
+	trailerNode := createdNode(signaturePSSNamespace, "TrailerField")
+	trailerNode.Text = strconv.Itoa(pss.TrailerField)
+	params.Children = []*xmlElement{digestNode, mgfNode, saltNode, trailerNode}
+	node.Children = []*xmlElement{params}
+	return node
 }
 
 // signatureSigningMarkup 紧凑编码自生成签名的空元素，按XML词元处理而非替换标记字符串
@@ -556,7 +734,7 @@ func signatureSigningText(name, text string) *xmlElement {
 func signatureSigningTransforms(transforms []SignatureTransform) *xmlElement {
 	root := createdNode(xmlSignatureNamespace, "Transforms")
 	for _, transform := range transforms {
-		node := signatureSigningNode("Transform", "Algorithm", transform.Algorithm)
+		node := signatureSigningCanonicalNode("Transform", transform.Algorithm, transform.InclusiveNamespaces)
 		for _, kind := range transform.RelationshipTypes {
 			filter := createdNode(opcSignatureNamespace, "RelationshipsGroupReference")
 			filter.Attr = []xml.Attr{{Name: xml.Name{Local: "xmlns"}, Value: opcSignatureNamespace}, {Name: xml.Name{Local: "SourceType"}, Value: kind}}
@@ -572,10 +750,10 @@ func signatureSigningTransforms(transforms []SignatureTransform) *xmlElement {
 	return root
 }
 
-// signatureSigningReferences 生成单次签署的完整覆盖引用清单并校验可选额外部件
-// 入参: reader 候选快照, options 签署选项, ctx 取消Context
+// signatureSigningReferences 生成单次签署的完整覆盖引用清单并校验可选额外部件及会签目标
+// 入参: reader 候选快照, selfPart 当前待签署部件URI, options 签署选项, ctx 取消Context
 // 返回: []SignatureReference 有序引用, *signaturePartGraph 私有累计读取预算, error 策略、目标、资源或取消错误
-func signatureSigningReferences(reader *Reader, options SignatureSignOptions, ctx context.Context) ([]SignatureReference, *signaturePartGraph, error) {
+func signatureSigningReferences(reader *Reader, selfPart string, options SignatureSignOptions, ctx context.Context) ([]SignatureReference, *signaturePartGraph, error) {
 	g := &signaturePartGraph{context: ctx, remaining: reader.limits.MaxPackageBytes}
 	pkg := *reader.pkg
 	pkg.beforeRead, g.pkg = g.readAllowance, &pkg
@@ -583,7 +761,7 @@ func signatureSigningReferences(reader *Reader, options SignatureSignOptions, ct
 		graph: g, format: reader.format, owners: make(map[string]string), parts: make(map[string]bool), required: make(map[string]bool),
 		relations: make(map[signatureCoverageKey]SignatureRelationship), modes: make(map[signatureCoverageKey]int), targets: make(map[signatureCoverageKey]string), bySource: make(map[string][]Relationship),
 	}
-	if err := c.collect(reader); err != nil {
+	if err := c.collect(reader, selfPart); err != nil {
 		return nil, nil, err
 	}
 	if len(options.Parts) > reader.limits.MaxPartCount {
@@ -670,7 +848,7 @@ func signatureSigningReferences(reader *Reader, options SignatureSignOptions, ct
 		if err := signatureSigningXML(g, name, opcRelsType, false, options.Validate); err != nil {
 			return nil, nil, err
 		}
-		result = append(result, SignatureReference{URI: signatureSigningURI(name, opcRelsType), Part: name, ContentType: opcRelsType, Transforms: []SignatureTransform{transform, {Algorithm: signatureCanonical}}})
+		result = append(result, SignatureReference{URI: signatureSigningURI(name, opcRelsType), Part: name, ContentType: opcRelsType, Transforms: []SignatureTransform{transform, {Algorithm: options.Canonicalization, InclusiveNamespaces: slices.Clone(options.InclusiveNamespaces)}}})
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
@@ -695,7 +873,8 @@ func signatureSigningTicket(graph signatureCoverageGraph, part string) bool {
 		}
 	}
 	media, _ := graph.graph.pkg.contentType(part)
-	return strings.EqualFold(media, printTicketType)
+	known, capabilities := printResourceMedia(media)
+	return known && !capabilities
 }
 
 // signatureSigningXML 检查XML编码及MCE存在性，需要扩展或票据理解时将独立字节交由校验器确认
@@ -942,8 +1121,9 @@ func parseSignatureDefinition(node *xmlElement, namespace string) (SignatureDefi
 				return result, err
 			}
 			page, present := attrs["PageURI"]
-			if !present {
-				return result, fmt.Errorf("%w: missing signature spot page URI", ErrInvalid)
+			pageURI := structureURI(page)
+			if !present || pageURI == "" || !uriReference(pageURI) {
+				return result, fmt.Errorf("%w: invalid or missing signature spot page URI", ErrInvalid)
 			}
 			x, err := signatureDefinitionDouble(attrs["StartX"])
 			if err != nil {
@@ -953,7 +1133,7 @@ func parseSignatureDefinition(node *xmlElement, namespace string) (SignatureDefi
 			if err != nil {
 				return result, err
 			}
-			result.Spot = &SignatureSpot{PageURI: structureURI(page), Start: Point{x, y}}
+			result.Spot = &SignatureSpot{PageURI: pageURI, Start: Point{x, y}}
 			continue
 		}
 		copy := *child
@@ -967,9 +1147,9 @@ func parseSignatureDefinition(node *xmlElement, namespace string) (SignatureDefi
 			result.Intent = &value
 		case 3:
 			value = strings.Trim(value, " \t\r\n")
-			utc := len(value) == 20 && strings.HasSuffix(value, "Z")
-			if !utc || !xmlDateValue(value, true) || value[0] == '-' || value[11:13] == "24" {
-				return result, fmt.Errorf("%w: signature deadline requires complete UTC seconds", ErrInvalid)
+			tIndex := strings.IndexByte(value, 'T')
+			if !strings.HasSuffix(value, "Z") || !xmlDateValue(value, true) || value[0] == '-' || tIndex < 10 || value[tIndex+1:tIndex+3] == "24" {
+				return result, fmt.Errorf("%w: signature deadline requires UTC dateTime", ErrInvalid)
 			}
 			result.SignBy = &value
 		case 4:

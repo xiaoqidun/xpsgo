@@ -19,6 +19,8 @@ import (
 	"context"
 	"crypto"
 	"crypto/dsa"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -147,7 +149,7 @@ func (v *signatureVerifier) prepare(info *SignatureInfo, data []byte) ([]byte, e
 			return nil, &PartError{Part: reference.Part, Element: "Reference", Err: err}
 		}
 	}
-	canonical, err := v.canonical(data, info.Canonicalization, info.Canonicalization == signatureComments, func(node *xmlElement, path []xml.Name) bool {
+	canonical, err := v.canonicalExclusive(data, info.Canonicalization, info.InclusiveNamespaces, signatureCanonicalComments(info.Canonicalization), v.limits.MaxMetadataBytes, func(node *xmlElement, path []xml.Name) bool {
 		return len(path) == 2 && path[0] == (xml.Name{Space: xmlSignatureNamespace, Local: "Signature"}) && node.Name == (xml.Name{Space: xmlSignatureNamespace, Local: "SignedInfo"})
 	})
 	if err != nil {
@@ -177,20 +179,20 @@ func (v *signatureVerifier) charge(size int64) error {
 // 入参: data XML字节, algorithm 规范化算法, comments 是否保留当前输入中的注释, selectElement 可选子树选择
 // 返回: []byte 独立规范化输出, error 规范化、预算或取消错误
 func (v *signatureVerifier) canonical(data []byte, algorithm string, comments bool, selectElement func(*xmlElement, []xml.Name) bool) ([]byte, error) {
-	return v.canonicalLimited(data, algorithm, comments, v.limits.MaxMetadataBytes, selectElement)
+	return v.canonicalExclusive(data, algorithm, nil, comments, v.limits.MaxMetadataBytes, selectElement)
 }
 
-// canonicalLimited 按指定字节上限对XML字节执行C14N规范化
-// 入参: data XML字节, algorithm 规范化算法, comments 是否保留当前输入中的注释, maxBytes 允许输出字节上限, selectElement 可选子树选择
+// canonicalExclusive 按指定字节上限与可选InclusiveNamespaces前缀列表对XML执行规范化
+// 入参: data XML字节, algorithm 规范化算法, inclusive Exc-C14N前缀列表, comments 是否保留注释, maxBytes 允许输出字节上限, selectElement 可选子树选择
 // 返回: []byte 独立规范化输出, error 规范化、预算或取消错误
-func (v *signatureVerifier) canonicalLimited(data []byte, algorithm string, comments bool, maxBytes int64, selectElement func(*xmlElement, []xml.Name) bool) ([]byte, error) {
+func (v *signatureVerifier) canonicalExclusive(data []byte, algorithm string, inclusive []string, comments bool, maxBytes int64, selectElement func(*xmlElement, []xml.Name) bool) ([]byte, error) {
 	if !signatureCanonicalMethod(algorithm) {
 		return nil, fmt.Errorf("%w: signature canonicalization algorithm", ErrUnsupported)
 	}
 	if err := v.charge(int64(len(data))); err != nil {
 		return nil, err
 	}
-	return canonicalXML(data, canonicalXMLOptions{limits: v.limits, maxBytes: maxBytes, comments: comments, context: v.graph.context, selectElement: selectElement})
+	return signatureCanonicalXML(data, signatureCanonicalOptions{limits: v.limits, maxBytes: maxBytes, algorithm: algorithm, comments: comments, inclusive: signatureInclusiveSet(inclusive), context: v.graph.context, selectElement: selectElement})
 }
 
 // elementDigest 验证同文档引用，首次节点集转换遵守裸ID移除注释及完整XPointer保留注释的区别
@@ -202,10 +204,12 @@ func (v *signatureVerifier) elementDigest(data []byte, reference SignatureRefere
 		return err
 	}
 	algorithm := signatureCanonical
+	var inclusive []string
 	if len(reference.Transforms) != 0 {
 		algorithm = reference.Transforms[0].Algorithm
+		inclusive = reference.Transforms[0].InclusiveNamespaces
 	}
-	converted, err := v.canonical(data, algorithm, retain && algorithm == signatureComments, func(node *xmlElement, _ []xml.Name) bool {
+	converted, err := v.canonicalExclusive(data, algorithm, inclusive, retain && signatureCanonicalComments(algorithm), v.limits.MaxMetadataBytes, func(node *xmlElement, _ []xml.Name) bool {
 		for _, attr := range node.Attr {
 			if signatureIDAttribute(node, attr) && strings.Trim(attr.Value, " \t\r\n") == id {
 				return true
@@ -217,7 +221,7 @@ func (v *signatureVerifier) elementDigest(data []byte, reference SignatureRefere
 		return err
 	}
 	for _, transform := range reference.Transforms[min(1, len(reference.Transforms)):] {
-		converted, err = v.canonical(converted, transform.Algorithm, transform.Algorithm == signatureComments, nil)
+		converted, err = v.canonicalExclusive(converted, transform.Algorithm, transform.InclusiveNamespaces, signatureCanonicalComments(transform.Algorithm), v.limits.MaxMetadataBytes, nil)
 		if err != nil {
 			return err
 		}
@@ -268,7 +272,7 @@ func (v *signatureVerifier) computePartDigest(reference SignatureReference) ([]b
 			}
 			data, err = signatureRelationshipXML(data, transform, v.limits, v.graph.context)
 		} else {
-			data, err = v.canonicalLimited(data, transform.Algorithm, transform.Algorithm == signatureComments, limit, nil)
+			data, err = v.canonicalExclusive(data, transform.Algorithm, transform.InclusiveNamespaces, signatureCanonicalComments(transform.Algorithm), limit, nil)
 		}
 		if err != nil {
 			return nil, err
@@ -374,6 +378,37 @@ func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePar
 		return nil, false, err
 	}
 	if len(certificates) == 0 {
+		var keyCapErr error
+		triedKey := false
+		for _, key := range info.PublicKeys {
+			if err := ctx.Err(); err != nil {
+				return nil, false, err
+			}
+			if err := signatureKey(info.Method, key); err != nil {
+				if !errors.Is(err, ErrInvalid) {
+					keyCapErr = err
+				}
+				continue
+			}
+			triedKey = true
+			if err := verifySignatureValueParams(ctx, info.Method, info.PSS, key, canonical, info.Value); err != nil {
+				if errors.Is(err, ErrSignature) {
+					continue
+				}
+				if errors.Is(err, ErrUnsupported) || errors.Is(err, ErrLimit) {
+					keyCapErr = err
+					continue
+				}
+				return nil, false, err
+			}
+			return nil, true, fmt.Errorf("%w: no document signer certificates", ErrTrust)
+		}
+		if keyCapErr != nil {
+			return nil, false, keyCapErr
+		}
+		if triedKey {
+			return nil, false, fmt.Errorf("%w: no key value matches the signature value", ErrSignature)
+		}
 		return nil, false, fmt.Errorf("%w: no document signer certificates", ErrTrust)
 	}
 	for _, certificate := range certificates {
@@ -393,7 +428,7 @@ func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePar
 			capabilityError = err
 			continue
 		}
-		if err := verifySignatureValue(ctx, info.Method, certificate.PublicKey, canonical, info.Value); err != nil {
+		if err := verifySignatureValueParams(ctx, info.Method, info.PSS, certificate.PublicKey, canonical, info.Value); err != nil {
 			if errors.Is(err, ErrSignature) {
 				continue
 			}
@@ -537,22 +572,65 @@ func signatureHash(algorithm string) (hash.Hash, crypto.Hash, error) {
 	}
 }
 
-// signatureMethodHash 确定RSA或DSA签名方法的摘要，不以密钥类型推测签名声明
+// signatureMethodHash 确定RSA、DSA、ECDSA或RSA-PSS签名方法的摘要URI，不以密钥类型推测签名声明
 // 入参: method 签名方法URI
 // 返回: string 摘要算法URI, error 算法能力错误
 func signatureMethodHash(method string) (string, error) {
 	switch method {
 	case xmlSignatureNamespace + "rsa-sha1", xmlSignatureNamespace + "dsa-sha1":
 		return xmlSignatureNamespace + "sha1", nil
-	case "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256":
+	case "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256", signatureMethodECDSA256, signatureMethodPSS256, signatureMethodRSAPSS:
 		return "http://www.w3.org/2001/04/xmlenc#sha256", nil
-	case "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384":
+	case "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384", signatureMethodECDSA384, signatureMethodPSS384:
 		return "http://www.w3.org/2001/04/xmldsig-more#sha384", nil
-	case "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512":
+	case "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512", signatureMethodECDSA512, signatureMethodPSS512:
 		return "http://www.w3.org/2001/04/xmlenc#sha512", nil
 	default:
 		return "", fmt.Errorf("%w: signature method", ErrUnsupported)
 	}
+}
+
+// signatureMethodPSS 判断签名方法URI是否采用RSASSA-PSS填充方案
+// 入参: method 签名方法URI
+// 返回: bool 是否为RSA-PSS方法
+func signatureMethodPSS(method string) bool {
+	return method == signatureMethodRSAPSS || method == signatureMethodPSS256 || method == signatureMethodPSS384 || method == signatureMethodPSS512
+}
+
+// signatureMethodECDSA 判断签名方法URI是否采用ECDSA算法
+// 入参: method 签名方法URI
+// 返回: bool 是否为ECDSA方法
+func signatureMethodECDSA(method string) bool {
+	return method == signatureMethodECDSA256 || method == signatureMethodECDSA384 || method == signatureMethodECDSA512
+}
+
+// signatureMethodDigest 校验RSA-PSS参数或普通签名方法并返回实际摘要算法URI
+// 入参: method 签名方法URI, pss 可选RSA-PSS参数
+// 返回: string 摘要算法URI, error 参数或算法能力错误
+func signatureMethodDigest(method string, pss *SignaturePSSParams) (string, error) {
+	if !signatureMethodPSS(method) {
+		return signatureMethodHash(method)
+	}
+	resolved := pss
+	if resolved == nil {
+		switch method {
+		case signatureMethodPSS256:
+			resolved = &SignaturePSSParams{DigestMethod: "http://www.w3.org/2001/04/xmlenc#sha256", MGFMethod: signatureMethodMGF1, MGFDigest: "http://www.w3.org/2001/04/xmlenc#sha256", SaltLength: 32, TrailerField: 1}
+		case signatureMethodPSS384:
+			resolved = &SignaturePSSParams{DigestMethod: "http://www.w3.org/2001/04/xmldsig-more#sha384", MGFMethod: signatureMethodMGF1, MGFDigest: "http://www.w3.org/2001/04/xmldsig-more#sha384", SaltLength: 48, TrailerField: 1}
+		case signatureMethodPSS512:
+			resolved = &SignaturePSSParams{DigestMethod: "http://www.w3.org/2001/04/xmlenc#sha512", MGFMethod: signatureMethodMGF1, MGFDigest: "http://www.w3.org/2001/04/xmlenc#sha512", SaltLength: 64, TrailerField: 1}
+		default:
+			return "", fmt.Errorf("%w: missing RSA-PSS parameters", ErrInvalid)
+		}
+	}
+	if _, _, err := signatureHash(resolved.DigestMethod); err != nil {
+		return "", err
+	}
+	if resolved.MGFMethod != signatureMethodMGF1 || resolved.MGFDigest != resolved.DigestMethod || resolved.TrailerField != 1 || resolved.SaltLength <= 0 {
+		return "", fmt.Errorf("%w: unsupported RSA-PSS parameters", ErrUnsupported)
+	}
+	return resolved.DigestMethod, nil
 }
 
 // signatureKey 检查调用方公钥的必要字段及运算上限，不建立证书信任或替代密钥来源认证
@@ -578,6 +656,19 @@ func signatureKey(method string, key crypto.PublicKey) error {
 		}
 		return nil
 	}
+	if signatureMethodECDSA(method) {
+		public, ok := key.(*ecdsa.PublicKey)
+		if !ok || public == nil || public.Curve == nil || public.X == nil || public.Y == nil {
+			return fmt.Errorf("%w: ECDSA verification key", ErrInvalid)
+		}
+		if public.Curve != elliptic.P256() && public.Curve != elliptic.P384() && public.Curve != elliptic.P521() {
+			return fmt.Errorf("%w: ECDSA verification curve", ErrUnsupported)
+		}
+		if public.X.Sign() < 0 || public.Y.Sign() < 0 || public.X.Cmp(public.Curve.Params().P) >= 0 || public.Y.Cmp(public.Curve.Params().P) >= 0 || !public.Curve.IsOnCurve(public.X, public.Y) {
+			return fmt.Errorf("%w: ECDSA verification key point", ErrInvalid)
+		}
+		return nil
+	}
 	public, ok := key.(*rsa.PublicKey)
 	if !ok || public == nil || public.N == nil || public.N.Sign() <= 0 || public.N.Bit(0) == 0 || public.E < 3 || public.E&1 == 0 || uint64(public.E) > 1<<31-1 || public.N.Cmp(big.NewInt(int64(public.E))) <= 0 {
 		return fmt.Errorf("%w: RSA verification key", ErrInvalid)
@@ -588,17 +679,20 @@ func signatureKey(method string, key crypto.PublicKey) error {
 	return nil
 }
 
-// verifySignatureValue 使用标准库验证签名值，DSA采用XML签名规定的两个二十字节整数而非ASN.1
-// 入参: ctx 取消Context, method 签名方法URI, key 调用方公钥, data 规范化SignedInfo, value 解码后的签名值
+// verifySignatureValueParams 按指定算法与可选RSA-PSS参数验证签名值，DSA与ECDSA采用定长r||s编码
+// 入参: ctx 取消Context, method 签名方法URI, pss 可选RSA-PSS参数, key 调用方公钥, data 规范化SignedInfo, value 解码后的签名值
 // 返回: error 摘要、签名、算法、密钥、资源或取消错误
-func verifySignatureValue(ctx context.Context, method string, key crypto.PublicKey, data, value []byte) error {
+func verifySignatureValueParams(ctx context.Context, method string, pss *SignaturePSSParams, key crypto.PublicKey, data, value []byte) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
 	if err := signatureKey(method, key); err != nil {
 		return err
 	}
-	algorithm, _ := signatureMethodHash(method)
+	algorithm, err := signatureMethodDigest(method, pss)
+	if err != nil {
+		return err
+	}
 	h, identifier, err := signatureHash(algorithm)
 	if err != nil {
 		return err
@@ -607,7 +701,8 @@ func verifySignatureValue(ctx context.Context, method string, key crypto.PublicK
 		return err
 	}
 	digest := h.Sum(nil)
-	if method == xmlSignatureNamespace+"dsa-sha1" {
+	switch {
+	case method == xmlSignatureNamespace+"dsa-sha1":
 		if len(value) != 40 {
 			return fmt.Errorf("%w: DSA signature size", ErrSignature)
 		}
@@ -615,11 +710,34 @@ func verifySignatureValue(ctx context.Context, method string, key crypto.PublicK
 		if !dsa.Verify(key.(*dsa.PublicKey), digest, r, s) {
 			return fmt.Errorf("%w: DSA signature value", ErrSignature)
 		}
-	} else if err := rsa.VerifyPKCS1v15(key.(*rsa.PublicKey), identifier, digest, value); err != nil {
-		if errors.Is(err, rsa.ErrVerification) {
-			return fmt.Errorf("%w: RSA signature value", ErrSignature)
+	case signatureMethodECDSA(method):
+		public := key.(*ecdsa.PublicKey)
+		nBytes := (public.Curve.Params().BitSize + 7) / 8
+		if len(value) != 2*nBytes {
+			return fmt.Errorf("%w: ECDSA signature size", ErrSignature)
 		}
-		return fmt.Errorf("%w: RSA verification unavailable: %w", ErrUnsupported, err)
+		r, s := new(big.Int).SetBytes(value[:nBytes]), new(big.Int).SetBytes(value[nBytes:])
+		if !ecdsa.Verify(public, digest, r, s) {
+			return fmt.Errorf("%w: ECDSA signature value", ErrSignature)
+		}
+	case signatureMethodPSS(method):
+		saltLength := identifier.Size()
+		if pss != nil {
+			saltLength = pss.SaltLength
+		}
+		if err := rsa.VerifyPSS(key.(*rsa.PublicKey), identifier, digest, value, &rsa.PSSOptions{SaltLength: saltLength, Hash: identifier}); err != nil {
+			if errors.Is(err, rsa.ErrVerification) {
+				return fmt.Errorf("%w: RSA-PSS signature value", ErrSignature)
+			}
+			return fmt.Errorf("%w: RSA-PSS verification unavailable: %w", ErrUnsupported, err)
+		}
+	default:
+		if err := rsa.VerifyPKCS1v15(key.(*rsa.PublicKey), identifier, digest, value); err != nil {
+			if errors.Is(err, rsa.ErrVerification) {
+				return fmt.Errorf("%w: RSA signature value", ErrSignature)
+			}
+			return fmt.Errorf("%w: RSA verification unavailable: %w", ErrUnsupported, err)
+		}
 	}
 	return checkContext(ctx)
 }
@@ -667,17 +785,17 @@ func (p *signatureXML) retrievalCertificates(node *xmlElement) ([][]byte, bool, 
 	if typ != "" && typ != xmlSignatureNamespace+"X509Data" && typ != xmlSignatureNamespace+"rawX509Certificate" {
 		return nil, false, nil
 	}
-	var algorithms []string
+	var transforms []SignatureTransform
 	if len(node.Children) != 0 {
 		for _, transform := range node.Children[0].Children {
-			algorithm, err := signatureAlgorithm(transform)
+			algorithm, inclusive, err := signatureCanonicalNode(transform)
 			if err != nil {
 				return nil, false, err
 			}
 			if !signatureCanonicalMethod(algorithm) {
 				return nil, false, fmt.Errorf("%w: OPC M6.19 forbids KeyInfo retrieval transform %s", ErrInvalid, algorithm)
 			}
-			algorithms = append(algorithms, algorithm)
+			transforms = append(transforms, SignatureTransform{Algorithm: algorithm, InclusiveNamespaces: inclusive})
 		}
 	}
 	uri := strings.Trim(attrs["URI"], " \t\r\n")
@@ -686,7 +804,7 @@ func (p *signatureXML) retrievalCertificates(node *xmlElement) ([][]byte, bool, 
 		return nil, false, err
 	}
 	data := part.data
-	for _, algorithm := range algorithms {
+	for _, transform := range transforms {
 		if err := p.retrievalCharge(int64(len(data))); err != nil {
 			return nil, false, err
 		}
@@ -698,7 +816,7 @@ func (p *signatureXML) retrievalCertificates(node *xmlElement) ([][]byte, bool, 
 				return remaining == 0
 			}
 		}
-		data, err = canonicalXML(data, canonicalXMLOptions{limits: p.limits, maxBytes: min(p.limits.MaxMetadataBytes, p.limits.MaxPartBytes), comments: (target == nil || retain) && algorithm == signatureComments, context: p.context, selectElement: selectElement})
+		data, err = signatureCanonicalXML(data, signatureCanonicalOptions{limits: p.limits, maxBytes: min(p.limits.MaxMetadataBytes, p.limits.MaxPartBytes), algorithm: transform.Algorithm, comments: (target == nil || retain) && signatureCanonicalComments(transform.Algorithm), inclusive: signatureInclusiveSet(transform.InclusiveNamespaces), context: p.context, selectElement: selectElement})
 		if err != nil {
 			return nil, false, err
 		}
@@ -737,7 +855,7 @@ func (p *signatureXML) retrievalCertificates(node *xmlElement) ([][]byte, bool, 
 		}
 		return nil, false, fmt.Errorf("%w: certificate retrieval output differs from Type", ErrInvalid)
 	}
-	certificates, err := p.certificates(&xmlElement{Children: []*xmlElement{target}})
+	certificates, _, err := p.certificates(&xmlElement{Children: []*xmlElement{target}})
 	return certificates, part.root == p.root, err
 }
 
@@ -967,6 +1085,9 @@ func (r *Reader) verifyLoadedDocumentSignature(info *SignatureInfo, data []byte,
 		if err := signatureKey(info.Method, configuration.PublicKey); err != nil {
 			return nil, err
 		}
+		if _, err := signatureMethodDigest(info.Method, info.PSS); err != nil {
+			return nil, err
+		}
 	}
 	coverage, err := r.signatureCoverage(info, graph)
 	if err != nil {
@@ -977,7 +1098,7 @@ func (r *Reader) verifyLoadedDocumentSignature(info *SignatureInfo, data []byte,
 		v := signatureVerifier{graph: graph, limits: r.limits, work: r.limits.MaxPackageBytes}
 		canonical, err := v.prepare(info, data)
 		if err == nil {
-			err = verifySignatureValue(ctx, info.Method, configuration.PublicKey, canonical, info.Value)
+			err = verifySignatureValueParams(ctx, info.Method, info.PSS, configuration.PublicKey, canonical, info.Value)
 		}
 		if err != nil {
 			var failure *packageReadError
@@ -1047,7 +1168,7 @@ func (r *Reader) verifyLoadedDocumentSignature(info *SignatureInfo, data []byte,
 		}
 		return result, nil
 	}
-	if _, err := signatureMethodHash(info.Method); err != nil {
+	if _, err := signatureMethodDigest(info.Method, info.PSS); err != nil {
 		return nil, err
 	}
 	signer, verified, err := verifySignatureSigner(info, data, graph, r.limits, signatureTrustOptions(configuration.Trust))

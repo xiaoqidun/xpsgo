@@ -21,6 +21,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"math"
 	"math/bits"
 )
 
@@ -33,17 +34,20 @@ type tiffDirectory struct {
 
 // tiffLayout 保存条带或图块的存储尺寸、位置索引及经过校验的字节范围
 type tiffLayout struct {
-	height      int
-	blockWidth  int
-	blockHeight int
-	across      int
-	count       int
-	rowBytes    int
-	tiled       bool
-	offsets     []byte
-	counts      []byte
-	offsetWidth int
-	countWidth  int
+	height         int
+	blockWidth     int
+	blockHeight    int
+	across         int
+	blocksPerPlane int
+	planes         int
+	count          int
+	rowBytes       int
+	rowChannels    int
+	tiled          bool
+	offsets        []byte
+	counts         []byte
+	offsetWidth    int
+	countWidth     int
 }
 
 // tiffLegacyJPEG 保存旧式TIFF/JPEG的分量码表、抽样及重启参数
@@ -76,12 +80,13 @@ type tiffLegacyHeader struct {
 
 // tiffPixelFormat 保存已经校验的样本布局及颜色解释
 type tiffPixelFormat struct {
-	order    binary.ByteOrder
-	photo    uint32
-	bits     uint32
-	channels uint32
-	alpha    uint32
-	palette  []byte
+	order        binary.ByteOrder
+	photo        uint32
+	bits         uint32
+	channels     uint32
+	alpha        uint32
+	sampleFormat uint32
+	palette      []byte
 }
 
 // readTIFFDirectory 读取经典TIFF头及首个目录，限制目录项数量
@@ -203,7 +208,7 @@ func (d *tiffDirectory) integer(data []byte, width int) uint32 {
 	return d.order.Uint32(data)
 }
 
-// resolution 读取横纵分辨率，按XPS规则将无单位的TIFF分辨率解释为每英寸像素数
+// resolution 读取横纵分辨率，无物理单位时按九十六像素基准保持像素纵横比
 // 返回: Point 横纵分辨率, error 字段错误
 func (d *tiffDirectory) resolution() (Point, error) {
 	unit, err := d.number(296, 2, false)
@@ -214,6 +219,7 @@ func (d *tiffDirectory) resolution() (Point, error) {
 		return Point{}, fmt.Errorf("%w: TIFF resolution unit", ErrInvalid)
 	}
 	value := [2]float64{96, 96}
+	var present [2]bool
 	for i, tag := range [2]uint16{282, 283} {
 		entry := d.entry[tag]
 		if entry == nil {
@@ -231,9 +237,16 @@ func (d *tiffDirectory) resolution() (Point, error) {
 			return Point{}, fmt.Errorf("%w: TIFF resolution value", ErrInvalid)
 		}
 		value[i] = float64(n) / float64(q)
+		present[i] = true
 		if unit == 3 {
 			value[i] *= 2.54
 		}
+	}
+	if unit == 1 {
+		if !present[0] || !present[1] || value[0] == value[1] {
+			return Point{96, 96}, nil
+		}
+		return Point{96, 96 * (value[1] / value[0])}, nil
 	}
 	return Point{value[0], value[1]}, nil
 }
@@ -265,8 +278,15 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 	if err != nil {
 		return nil, err
 	}
-	if compression != 1 && compression != 2 && compression != 3 && compression != 4 && compression != 5 && compression != 6 && compression != 7 && compression != 32773 {
+	if compression != 1 && compression != 2 && compression != 3 && compression != 4 && compression != 5 && compression != 6 && compression != 7 && compression != 8 && compression != 32773 && compression != 32946 {
 		return nil, fmt.Errorf("%w: TIFF compression %d", ErrUnsupported, compression)
+	}
+	orientation, err := d.number(274, 1, false)
+	if err != nil {
+		return nil, err
+	}
+	if orientation < 1 || orientation > 8 {
+		return nil, fmt.Errorf("%w: TIFF orientation", ErrInvalid)
 	}
 	if d.entry[262] == nil {
 		return nil, fmt.Errorf("%w: missing TIFF photometric interpretation", ErrInvalid)
@@ -307,6 +327,22 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 	if channels < base || channels > base+1 || photo == 3 && channels != 1 {
 		return nil, fmt.Errorf("%w: TIFF sample count", ErrUnsupported)
 	}
+	sampleFormat := uint32(1)
+	if d.entry[339] != nil {
+		field, _, e := d.field(339, int(channels), false)
+		if e != nil {
+			return nil, e
+		}
+		sampleFormat = uint32(d.order.Uint16(field))
+		if sampleFormat < 1 || sampleFormat > 3 {
+			return nil, fmt.Errorf("%w: TIFF sample format", ErrUnsupported)
+		}
+		for i := 1; i < int(channels); i++ {
+			if uint32(d.order.Uint16(field[2*i:])) != sampleFormat {
+				return nil, fmt.Errorf("%w: mixed TIFF sample formats", ErrUnsupported)
+			}
+		}
+	}
 	bits := uint32(1)
 	if d.entry[258] != nil {
 		field, _, e := d.field(258, int(channels), false)
@@ -320,8 +356,19 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 			}
 		}
 	}
-	if bits != 1 && bits != 4 && bits != 8 && bits != 16 || (photo == 2 || photo == 5 || photo == 6) && bits < 8 || photo == 3 && bits == 16 || channels > base && bits < 8 {
-		return nil, fmt.Errorf("%w: TIFF sample depth", ErrUnsupported)
+	switch sampleFormat {
+	case 1:
+		if bits != 1 && bits != 4 && bits != 8 && bits != 16 || (photo == 2 || photo == 5 || photo == 6) && bits < 8 || photo == 3 && bits == 16 || channels > base && bits < 8 {
+			return nil, fmt.Errorf("%w: TIFF sample depth", ErrUnsupported)
+		}
+	case 2:
+		if bits != 8 && bits != 16 || photo == 3 || photo == 6 {
+			return nil, fmt.Errorf("%w: TIFF signed sample depth", ErrUnsupported)
+		}
+	case 3:
+		if bits != 32 || photo == 3 || photo == 6 {
+			return nil, fmt.Errorf("%w: TIFF floating sample depth", ErrUnsupported)
+		}
 	}
 	alpha := uint32(0)
 	if d.entry[338] != nil {
@@ -350,19 +397,8 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 	if err != nil {
 		return nil, err
 	}
-	if planar != 1 {
-		return nil, fmt.Errorf("%w: TIFF planar sample layout", ErrUnsupported)
-	}
-	if d.entry[339] != nil {
-		field, _, e := d.field(339, int(channels), false)
-		if e != nil {
-			return nil, e
-		}
-		for i := range int(channels) {
-			if d.order.Uint16(field[2*i:]) != 1 {
-				return nil, fmt.Errorf("%w: TIFF sample format", ErrUnsupported)
-			}
-		}
+	if planar != 1 && planar != 2 {
+		return nil, fmt.Errorf("%w: TIFF planar configuration", ErrInvalid)
 	}
 	profile, err := d.byteField(34675, 64<<20)
 	if err != nil {
@@ -388,13 +424,13 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 	if err != nil {
 		return nil, err
 	}
-	if predictor != 1 && predictor != 2 || predictor == 2 && bits < 8 {
+	if predictor < 1 || predictor > 3 || predictor == 2 && (sampleFormat == 3 || bits < 8) || predictor == 3 && (sampleFormat != 3 || bits != 32) {
 		return nil, fmt.Errorf("%w: TIFF predictor", ErrUnsupported)
 	}
 	fax := compression >= 2 && compression <= 4
 	faxOptions := uint32(0)
 	if fax {
-		if bits != 1 || channels != 1 || photo > 1 || predictor != 1 {
+		if bits != 1 || channels != 1 || photo > 1 || predictor != 1 || sampleFormat != 1 {
 			return nil, fmt.Errorf("%w: TIFF fax sample layout", ErrInvalid)
 		}
 		if compression == 3 || compression == 4 {
@@ -409,7 +445,7 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 		}
 	}
 	if jpegCompression {
-		if photo == 3 || predictor != 1 || channels != base && photo != 2 && photo != 5 {
+		if photo == 3 || predictor != 1 || sampleFormat != 1 || planar == 2 && channels > 1 || channels != base && photo != 2 && photo != 5 {
 			return nil, fmt.Errorf("%w: TIFF JPEG sample layout", ErrUnsupported)
 		}
 		if photo == 6 {
@@ -440,7 +476,7 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 			return nil, err
 		}
 	}
-	layout, err := d.imageLayout(width, height, channels, bits, compression)
+	layout, err := d.imageLayout(width, height, channels, bits, compression, planar)
 	if err != nil {
 		return nil, err
 	}
@@ -475,7 +511,13 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 	result := &rasterImage{dpi: dpi, channels: colorChannels, profile: profile}
 	bounds := image.Rect(0, 0, int(width), int(height))
 	var out *image.NRGBA64
-	if photo == 5 {
+	if sampleFormat == 3 {
+		result.native, err = newTIFFFloatComponents(bounds, colorChannels, alpha != 0, maxPixels)
+		if err != nil {
+			return nil, err
+		}
+		result.linear = true
+	} else if photo == 5 {
 		result.native, err = newImageComponents(bounds, 4, alpha != 0, maxPixels)
 		if err != nil {
 			return nil, err
@@ -484,17 +526,23 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 		out = image.NewNRGBA64(bounds)
 		result.pixels = out
 	}
-	var buffer []byte
+	var buffer, combined, floatScratch []byte
 	if !jpegCompression {
-		buffer = make([]byte, layout.rowBytes*layout.blockHeight)
+		buffer = make([]byte, layout.rowBytes*layout.blockHeight*layout.planes)
+		if layout.planes > 1 {
+			combined = make([]byte, layout.rowBytes*layout.planes)
+		}
+		if predictor == 3 {
+			floatScratch = make([]byte, layout.rowBytes)
+		}
 	}
-	format := tiffPixelFormat{order: d.order, photo: photo, bits: bits, channels: channels, alpha: alpha, palette: palette}
+	format := tiffPixelFormat{order: d.order, photo: photo, bits: bits, channels: channels, alpha: alpha, sampleFormat: sampleFormat, palette: palette}
 	var jpegFrame tiffJPEGTable
-	for i := range layout.count {
-		offset, size := layout.block(d, i)
+	for i := range layout.blocksPerPlane {
 		region := layout.region(i)
 		visible := region.Intersect(bounds)
 		if jpegCompression {
+			offset, size := layout.block(d, i)
 			block := data[offset : offset+size]
 			if compression == 6 {
 				if legacyExtra.stream.data != nil {
@@ -539,25 +587,40 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 			}
 			continue
 		}
-		strip := buffer[:layout.rowBytes*region.Dy()]
-		if fax {
-			if err := faxStrip(strip, data[offset:offset+size], region.Dx(), compression, fillOrder, faxOptions); err != nil {
-				return nil, err
-			}
-		} else {
-			if err := decodeTIFFStrip(strip, data[offset:offset+size], compression, layout.rowBytes); err != nil {
+		planeSize := layout.rowBytes * region.Dy()
+		for plane := range layout.planes {
+			offset, size := layout.block(d, plane*layout.blocksPerPlane+i)
+			strip := buffer[plane*planeSize : (plane+1)*planeSize]
+			if fax {
+				if err := faxStrip(strip, data[offset:offset+size], region.Dx(), compression, fillOrder, faxOptions); err != nil {
+					return nil, err
+				}
+			} else if err := decodeTIFFStrip(strip, data[offset:offset+size], compression, layout.rowBytes); err != nil {
 				return nil, err
 			}
 		}
 		for y := range visible.Dy() {
-			row := strip[y*layout.rowBytes : (y+1)*layout.rowBytes]
-			if fillOrder == 2 && !fax {
-				reverseTIFFBits(row)
+			for plane := range layout.planes {
+				row := buffer[plane*planeSize+y*layout.rowBytes : plane*planeSize+(y+1)*layout.rowBytes]
+				if fillOrder == 2 && !fax {
+					reverseTIFFBits(row)
+				}
+				if predictor == 2 {
+					restoreTIFFPredictor(row, layout.rowChannels, int(bits), d.order)
+				} else if predictor == 3 {
+					restoreTIFFFloatPredictor(row, floatScratch, layout.rowChannels, d.order)
+				}
 			}
-			if predictor == 2 {
-				restoreTIFFPredictor(row, int(channels), int(bits), d.order)
+			row := buffer[y*layout.rowBytes : (y+1)*layout.rowBytes]
+			if layout.planes > 1 {
+				interleaveTIFFPlaneRows(combined, buffer, planeSize, layout.rowBytes, y, visible.Dx(), layout.planes, int(bits/8))
+				row = combined
 			}
-			if result.native != nil {
+			if sampleFormat == 3 {
+				if err := format.writeFloatRange(result.native, visible.Min.X, visible.Min.Y+y, visible.Dx(), row); err != nil {
+					return nil, err
+				}
+			} else if result.native != nil {
 				format.writeComponentRange(result.native, visible.Min.X, visible.Min.Y+y, visible.Dx(), row)
 			} else {
 				format.writeRowRange(out, visible.Min.X, visible.Min.Y+y, visible.Dx(), row)
@@ -565,6 +628,51 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 		}
 	}
 	return result, nil
+}
+
+// restoreTIFFFloatPredictor 按TIFF技术说明3恢复浮点水平差分及大端字节平面重排
+// 入参: row 当前行字节, scratch 同长临时缓冲, channels 行内通道数, order 文件字节序
+func restoreTIFFFloatPredictor(row, scratch []byte, channels int, order binary.ByteOrder) {
+	for i := channels; i < len(row); i++ {
+		row[i] += row[i-channels]
+	}
+	copy(scratch, row)
+	samples := len(row) / 4
+	for i := range samples {
+		value := uint32(scratch[i])<<24 | uint32(scratch[samples+i])<<16 | uint32(scratch[2*samples+i])<<8 | uint32(scratch[3*samples+i])
+		order.PutUint32(row[i*4:], value)
+	}
+}
+
+// interleaveTIFFPlaneRows 将分离平面块中的当前可见行重组为交织样本行
+// 入参: dst 交织行缓冲, planes 全部平面解压缓冲, planeSize 单平面块字节数, rowBytes 单平面行字节数, y 块内行号, width 可见列数, count 平面数, sampleBytes 单样本字节数
+func interleaveTIFFPlaneRows(dst, planes []byte, planeSize, rowBytes, y, width, count, sampleBytes int) {
+	pixelBytes := count * sampleBytes
+	for plane := range count {
+		src := planes[plane*planeSize+y*rowBytes:]
+		for x := range width {
+			copy(dst[x*pixelBytes+plane*sampleBytes:x*pixelBytes+(plane+1)*sampleBytes], src[x*sampleBytes:(x+1)*sampleBytes])
+		}
+	}
+}
+
+// newTIFFFloatComponents 按浮点样本容量检查预算并分配连续扩展范围分量
+// 入参: bounds 图像范围, channels 颜色通道数, alpha 是否包含透明度, maxPixels 剩余RGBA64像素容量
+// 返回: *imageComponents 浮点原生分量图像, error 结构或资源错误
+func newTIFFFloatComponents(bounds image.Rectangle, channels int, alpha bool, maxPixels uint64) (*imageComponents, error) {
+	if bounds.Empty() || bounds.Min.X != 0 || bounds.Min.Y != 0 || channels < 1 || channels > 8 {
+		return nil, fmt.Errorf("%w: image component layout", ErrInvalid)
+	}
+	stride := channels
+	if alpha {
+		stride++
+	}
+	count := uint64(bounds.Dx()) * uint64(bounds.Dy())
+	units := uint64(stride)
+	if bounds.Dx() > rasterMaxDimension || bounds.Dy() > rasterMaxDimension || count > maxPixels/units || count > uint64(^uint(0)>>1)/uint64(8*stride) {
+		return nil, fmt.Errorf("%w: image component storage", ErrLimit)
+	}
+	return &imageComponents{bounds: bounds, channels: channels, alpha: alpha, floating: make([]float64, int(count)*stride)}, nil
 }
 
 // restoreTIFFPredictor 逐行恢复同一颜色通道的水平差分，16位样本遵循文件字节序
@@ -603,6 +711,8 @@ func decodeTIFFStrip(dst, src []byte, compression uint32, rowBytes int) error {
 		return nil
 	case 5:
 		return decodeTIFFLZW(dst, src)
+	case 8, 32946:
+		return decodeTIFFDeflate(dst, src)
 	case 32773:
 		return decodeTIFFPackBits(dst, src, rowBytes)
 	default:
@@ -732,10 +842,10 @@ func decodeTIFFLZW(dst, src []byte) error {
 	}
 }
 
-// imageLayout 校验条带与图块组织，计入边界填充的解码工作量和临时内存
-// 入参: width 图像宽度, height 图像高度, channels 样本数, bits 样本位数, compression 压缩标识
+// imageLayout 校验条带与图块组织，计入分离平面及边界填充的解码工作量和临时内存
+// 入参: width 图像宽度, height 图像高度, channels 样本数, bits 样本位数, compression 压缩标识, planar 平面布局
 // 返回: tiffLayout 存储布局, error 字段或资源错误
-func (d *tiffDirectory) imageLayout(width, height, channels, bits, compression uint32) (tiffLayout, error) {
+func (d *tiffDirectory) imageLayout(width, height, channels, bits, compression, planar uint32) (tiffLayout, error) {
 	l := tiffLayout{height: int(height), blockWidth: int(width), across: 1}
 	for _, tag := range []uint16{322, 323, 324, 325} {
 		l.tiled = l.tiled || d.entry[tag] != nil
@@ -786,18 +896,23 @@ func (d *tiffDirectory) imageLayout(width, height, channels, bits, compression u
 		}
 		l.blockHeight = int(min(rows, height))
 	}
+	planes, rowChannels := uint64(1), uint64(channels)
+	if planar == 2 && channels > 1 {
+		planes, rowChannels = uint64(channels), 1
+	}
 	down := (uint64(height) + uint64(l.blockHeight) - 1) / uint64(l.blockHeight)
-	count := uint64(l.across) * down
-	rowBytes := (uint64(l.blockWidth)*uint64(channels)*uint64(bits) + 7) / 8
+	blocksPerPlane := uint64(l.across) * down
+	count := blocksPerPlane * planes
+	rowBytes := (uint64(l.blockWidth)*rowChannels*uint64(bits) + 7) / 8
 	blockBytes := rowBytes * uint64(l.blockHeight)
-	decodedBytes := rowBytes * uint64(height)
+	decodedBytes := rowBytes * uint64(height) * planes
 	if l.tiled {
 		decodedBytes = blockBytes * count
 	}
-	if count > rasterMaxWork || blockBytes > 64<<20 || decodedBytes > rasterMaxWork || rowBytes > uint64(^uint(0)>>1) {
+	if blocksPerPlane > rasterMaxWork/planes || blockBytes > (64<<20)/planes || decodedBytes > rasterMaxWork || rowBytes > uint64(^uint(0)>>1)/planes {
 		return l, fmt.Errorf("%w: TIFF block decoding budget", ErrLimit)
 	}
-	l.count, l.rowBytes = int(count), int(rowBytes)
+	l.blocksPerPlane, l.planes, l.count, l.rowBytes, l.rowChannels = int(blocksPerPlane), int(planes), int(count), int(rowBytes), int(rowChannels)
 	var err error
 	l.offsets, l.offsetWidth, err = d.field(offsetTag, l.count, true)
 	if err != nil {
@@ -1193,8 +1308,14 @@ func (f *tiffPixelFormat) writeRowRange(out *image.NRGBA64, x0, y, width int, ro
 			switch f.bits {
 			case 16:
 				sample[c] = f.order.Uint16(row[bit/8:])
+				if f.sampleFormat == 2 {
+					sample[c] ^= 0x8000
+				}
 			case 8:
 				sample[c] = uint16(row[bit/8])
+				if f.sampleFormat == 2 {
+					sample[c] ^= 0x80
+				}
 			default:
 				sample[c] = uint16(row[bit/8]>>uint(8-int(f.bits)-bit%8)) & uint16((1<<f.bits)-1)
 			}
@@ -1254,9 +1375,17 @@ func (f *tiffPixelFormat) writeComponentRange(out *imageComponents, x0, y, width
 		for channel := range int(f.channels) {
 			at := (x*int(f.channels) + channel) * int(f.bits/8)
 			if f.bits == 16 {
-				sample[channel] = f.order.Uint16(row[at:])
+				value := f.order.Uint16(row[at:])
+				if f.sampleFormat == 2 {
+					value ^= 0x8000
+				}
+				sample[channel] = value
 			} else {
-				sample[channel] = uint16(row[at]) * scale
+				value := uint16(row[at])
+				if f.sampleFormat == 2 {
+					value ^= 0x80
+				}
+				sample[channel] = value * scale
 			}
 		}
 		at := (y*out.bounds.Dx() + x0 + x) * stride
@@ -1271,4 +1400,53 @@ func (f *tiffPixelFormat) writeComponentRange(out *imageComponents, x0, y, width
 			out.values[at+out.channels] = sample[f.channels-1]
 		}
 	}
+}
+
+// writeFloatRange 将32位浮点存储行的可见区间写入扩展范围原生分量，按需展开预乘透明度
+// 入参: out 浮点原生分量图像, x0 目标起始列, y 目标行, width 可见列数, row 完整交织存储行
+// 返回: error 预乘或透明度非有限错误
+func (f *tiffPixelFormat) writeFloatRange(out *imageComponents, x0, y, width int, row []byte) error {
+	stride := out.channels
+	if out.alpha {
+		stride++
+	}
+	for x := range width {
+		var sample [5]float64
+		for channel := range int(f.channels) {
+			at := (x*int(f.channels) + channel) * 4
+			sample[channel] = float64(math.Float32frombits(f.order.Uint32(row[at:])))
+		}
+		alpha := 1.0
+		if f.alpha != 0 {
+			alpha = sample[f.channels-1]
+			if !geometryFinite(alpha) {
+				return fmt.Errorf("%w: TIFF non-finite alpha", ErrUnsupported)
+			}
+			alpha = colorClamp(alpha)
+		}
+		at := (y*out.bounds.Dx() + x0 + x) * stride
+		for channel := range out.channels {
+			value := sample[channel]
+			if f.alpha == 1 {
+				if alpha == 0 {
+					value = 0
+				} else {
+					value /= alpha
+					if !geometryFinite(value) {
+						return fmt.Errorf("%w: TIFF non-finite color", ErrUnsupported)
+					}
+					if f.photo == 0 {
+						value = 1 - value
+					}
+				}
+			} else if f.photo == 0 {
+				value = 1 - value
+			}
+			out.floating[at+channel] = value
+		}
+		if out.alpha {
+			out.floating[at+out.channels] = alpha
+		}
+	}
+	return nil
 }

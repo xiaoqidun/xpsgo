@@ -16,13 +16,18 @@ package xpsgo
 
 import (
 	"bytes"
+	"cmp"
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"encoding/base64"
 	"encoding/xml"
 	"fmt"
 	"hash"
 	"io"
 	"maps"
+	"math/big"
 	"mime"
 	"net/url"
 	"slices"
@@ -31,13 +36,28 @@ import (
 	"time"
 )
 
-// xmlSignatureNamespace 等常量定义XML数字签名与规范化命名空间
+// xmlSignatureNamespace 等常量定义XML数字签名、规范化与算法命名空间及标识
 const (
-	xmlSignatureNamespace  = "http://www.w3.org/2000/09/xmldsig#"
-	opcSignatureNamespace  = "http://schemas.openxmlformats.org/package/2006/digital-signature"
-	signatureCanonical     = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"
-	signatureComments      = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
-	signatureRelationships = "http://schemas.openxmlformats.org/package/2006/RelationshipTransform"
+	xmlSignatureNamespace   = "http://www.w3.org/2000/09/xmldsig#"
+	xmlSignature11Namespace = "http://www.w3.org/2009/xmldsig11#"
+	opcSignatureNamespace   = "http://schemas.openxmlformats.org/package/2006/digital-signature"
+	signatureCanonical      = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"
+	signatureComments       = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
+	signatureExcNamespace   = "http://www.w3.org/2001/10/xml-exc-c14n#"
+	signatureExcCanonical   = "http://www.w3.org/2001/10/xml-exc-c14n#"
+	signatureExcComments    = "http://www.w3.org/2001/10/xml-exc-c14n#WithComments"
+	signatureCanonical11    = "http://www.w3.org/2006/12/xml-c14n11"
+	signatureComments11     = "http://www.w3.org/2006/12/xml-c14n11#WithComments"
+	signatureRelationships  = "http://schemas.openxmlformats.org/package/2006/RelationshipTransform"
+	signaturePSSNamespace   = "http://www.w3.org/2007/05/xmldsig-more#"
+	signatureMethodMGF1     = "http://www.w3.org/2007/05/xmldsig-more#MGF1"
+	signatureMethodRSAPSS   = "http://www.w3.org/2007/05/xmldsig-more#rsa-pss"
+	signatureMethodPSS256   = "http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1"
+	signatureMethodPSS384   = "http://www.w3.org/2007/05/xmldsig-more#sha384-rsa-MGF1"
+	signatureMethodPSS512   = "http://www.w3.org/2007/05/xmldsig-more#sha512-rsa-MGF1"
+	signatureMethodECDSA256 = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"
+	signatureMethodECDSA384 = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384"
+	signatureMethodECDSA512 = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512"
 )
 
 // opcSignatureOriginType 等常量定义OPC数字签名内容类型与关系
@@ -58,18 +78,31 @@ const (
 	signatureCoverageGroup
 )
 
-// SignatureInfo 保存签名XML中的算法、引用及声明时间，不表示摘要、签名值或证书已经验证
+// SignatureInfo 保存签名XML中的算法、参数、引用及声明时间，不表示摘要、签名值或证书已经验证
 // Certificates保存KeyInfo声明或检索的证书字节，签名XML中的证书优先于独立证书部件
+// PublicKeys保存KeyValue解析出的公钥，PSS保存RSA-PSS参数，InclusiveNamespaces保存Exc-C14N前缀列表
 type SignatureInfo struct {
-	Part             PartInfo
-	ID               string
-	Canonicalization string
-	Method           string
-	Value            []byte
-	References       []SignatureReference
-	Parts            []SignatureReference
-	Time             SignatureTime
-	Certificates     [][]byte
+	Part                PartInfo
+	ID                  string
+	Canonicalization    string
+	InclusiveNamespaces []string
+	Method              string
+	PSS                 *SignaturePSSParams
+	Value               []byte
+	References          []SignatureReference
+	Parts               []SignatureReference
+	Time                SignatureTime
+	Certificates        [][]byte
+	PublicKeys          []crypto.PublicKey
+}
+
+// SignaturePSSParams 保存RSA-PSS签名方法的摘要、掩码函数、盐长度及尾部字段参数
+type SignaturePSSParams struct {
+	DigestMethod string
+	MGFMethod    string
+	MGFDigest    string
+	SaltLength   int
+	TrailerField int
 }
 
 // SignatureReference 保存原始引用及有序变换，Part和ContentType仅用于包部件引用
@@ -83,11 +116,12 @@ type SignatureReference struct {
 	Transforms   []SignatureTransform
 }
 
-// SignatureTransform 保存签名变换算法及关系筛选条件
+// SignatureTransform 保存签名变换算法、Exclusive C14N前缀列表及关系筛选条件
 type SignatureTransform struct {
-	Algorithm         string
-	RelationshipIDs   []string
-	RelationshipTypes []string
+	Algorithm           string
+	InclusiveNamespaces []string
+	RelationshipIDs     []string
+	RelationshipTypes   []string
 }
 
 // SignatureTime 保存OPC声明的时间格式及原始值，不补全日期精度或换算时区
@@ -197,6 +231,30 @@ type signatureRelationship struct {
 	attrs []xml.Attr
 }
 
+// signatureCanonicalOptions 指定C14N1.0、Exclusive C14N1.0或C14N1.1规范化处理方式
+type signatureCanonicalOptions struct {
+	limits        Limits
+	maxBytes      int64
+	algorithm     string
+	comments      bool
+	inclusive     map[string]bool
+	context       context.Context
+	selectElement func(*xmlElement, []xml.Name) bool
+}
+
+// signatureCanonicalWriter 保存Exclusive C14N1.0与C14N1.1规范化输出的流式状态
+type signatureCanonicalWriter struct {
+	options       signatureCanonicalOptions
+	output        packageOutput
+	ancestors     []*xmlElement
+	path          []xml.Name
+	rendered      []map[string]string
+	selected      bool
+	selectedDepth int
+	rootPassed    bool
+	nodes         int
+}
+
 // ReadSignature 读取已通过签名源关联的XML签名声明，校验OPC结构、引用及声明时间，不执行密码学或信任验证
 // 关联与签名读取共用MaxPackageBytes预算，签名XML另受元数据及复杂度上限约束，失败时不返回部分结果
 // 入参: ctx 取消Context，nil采用Background, part 签名部件的包根URI
@@ -261,7 +319,7 @@ func (r *Reader) loadSignaturePart(info PartInfo, graph *signaturePartGraph) (*S
 		if err != nil {
 			return nil, nil, err
 		}
-		if media != reference.ContentType {
+		if !strings.EqualFold(media, reference.ContentType) {
 			return nil, nil, fmt.Errorf("%w: signature content type differs for %s", ErrInvalid, reference.Part)
 		}
 	}
@@ -323,7 +381,7 @@ func readPackageSignatureXML(data []byte, limits Limits, ctx context.Context, gr
 	}
 	index := 2
 	if root.Children[index].Name == (xml.Name{Space: xmlSignatureNamespace, Local: "KeyInfo"}) {
-		result.Certificates, err = p.certificates(root.Children[index])
+		result.Certificates, result.PublicKeys, err = p.certificates(root.Children[index])
 		if err != nil {
 			return nil, err
 		}
@@ -620,6 +678,9 @@ func (g *signaturePartGraph) read() ([]SignaturePart, error) {
 		if relationship.Type != opcSignatureOriginRel {
 			continue
 		}
+		if rooted {
+			return nil, fmt.Errorf("%w: multiple digital signature origin relationships", ErrInvalid)
+		}
 		part, err := g.target("/", relationship, opcSignatureOriginType)
 		if err != nil {
 			return nil, err
@@ -783,7 +844,7 @@ func (r *Reader) signatureCoverage(info *SignatureInfo, graph *signaturePartGrap
 		relations: make(map[signatureCoverageKey]SignatureRelationship), modes: make(map[signatureCoverageKey]int), targets: make(map[signatureCoverageKey]string),
 		bySource: make(map[string][]Relationship), covered: make(map[signatureCoverageKey]bool), ungrouped: make(map[signatureCoverageKey]bool),
 	}
-	if err := c.collect(r); err != nil {
+	if err := c.collect(r, info.Part.Name); err != nil {
 		return nil, err
 	}
 	result := &SignatureCoverage{Part: info.Part}
@@ -846,10 +907,11 @@ func (r *Reader) signatureCoverage(info *SignatureInfo, graph *signaturePartGrap
 	return result, nil
 }
 
-// collect 按当前固定布局建立签名覆盖规则与可选部件集合
-// 入参: reader 已持有读锁的阅读器
+// collect 按当前固定布局与有效关系建立签名覆盖规则与可选部件集合，支持会签其他已关联签名并排除自身及孤立部件
+// 入参: reader 已持有读锁的阅读器, selfPart 当前检查或签署的签名部件URI
 // 返回: error 关联、目标、资源或取消错误
-func (c *signatureCoverageGraph) collect(reader *Reader) error {
+func (c *signatureCoverageGraph) collect(reader *Reader, selfPart string) error {
+	selfKey := strings.ToLower(selfPart)
 	c.owners["/"] = "root"
 	c.owners[strings.ToLower(reader.sequence)] = "sequence"
 	c.parts[strings.ToLower(reader.sequence)], c.required[strings.ToLower(reader.sequence)] = true, true
@@ -861,29 +923,54 @@ func (c *signatureCoverageGraph) collect(reader *Reader) error {
 			c.owners[key], c.parts[key], c.required[key] = "page", true, true
 		}
 	}
-	keys := make([]string, 0, len(c.graph.pkg.parts))
-	for key := range c.graph.pkg.parts {
+	rootRelations, err := c.graph.pkg.relationships("/")
+	if err != nil {
+		return err
+	}
+	c.bySource["/"] = rootRelations
+	origin := ""
+	for _, relationship := range rootRelations {
 		if err := c.graph.context.Err(); err != nil {
 			return err
 		}
-		keys = append(keys, key)
-		if key == strings.ToLower(opcTypesName) || opcRelationshipName(key) {
+		if relationship.Type != opcSignatureOriginRel {
 			continue
 		}
-		media, err := c.graph.pkg.contentType(key)
+		if origin != "" {
+			return &PartError{Part: "/", Err: fmt.Errorf("%w: multiple digital signature origin relationships", ErrInvalid)}
+		}
+		target, err := c.graph.target("/", relationship, opcSignatureOriginType)
+		if err != nil {
+			return &PartError{Part: "/", Err: err}
+		}
+		origin = target.Name
+		c.owners[strings.ToLower(origin)] = "origin"
+	}
+	if origin != "" {
+		originRelations, err := c.graph.pkg.relationships(origin)
 		if err != nil {
 			return err
 		}
-		switch {
-		case strings.EqualFold(media, opcCoreType), strings.EqualFold(media, opcCertificateType), strings.EqualFold(media, fixedContentType("discard-control")), strings.EqualFold(media, printTicketType):
-			c.parts[key] = true
-		case strings.EqualFold(media, opcSignatureOriginType):
-			c.parts[key], c.owners[key] = true, "origin"
-		case strings.EqualFold(media, opcSignatureType):
-			c.owners[key] = "signature"
+		c.bySource[strings.ToLower(origin)] = originRelations
+		for _, relationship := range originRelations {
+			if err := c.graph.context.Err(); err != nil {
+				return err
+			}
+			if relationship.Type != opcSignatureRel {
+				continue
+			}
+			target, err := c.graph.target(origin, relationship, opcSignatureType)
+			if err != nil {
+				return &PartError{Part: origin, Err: err}
+			}
+			targetKey := strings.ToLower(target.Name)
+			c.owners[targetKey] = "signature"
+			if targetKey != selfKey {
+				c.parts[targetKey] = true
+			}
 		}
 	}
-	slices.Sort(keys)
+	keys := slices.Sorted(maps.Keys(c.graph.pkg.parts))
 	for _, key := range keys {
 		if err := c.graph.context.Err(); err != nil {
 			return err
@@ -893,11 +980,15 @@ func (c *signatureCoverageGraph) collect(reader *Reader) error {
 		}
 		source := relationshipSource(c.graph.pkg.names[key])
 		sourceKey := strings.ToLower(source)
-		relations, err := c.graph.pkg.relationships(source)
-		if err != nil {
-			return err
+		relations, cached := c.bySource[sourceKey]
+		if !cached {
+			var err error
+			relations, err = c.graph.pkg.relationships(source)
+			if err != nil {
+				return err
+			}
+			c.bySource[sourceKey] = relations
 		}
-		c.bySource[sourceKey] = relations
 		for _, relationship := range relations {
 			if err := c.graph.context.Err(); err != nil {
 				return err
@@ -949,7 +1040,7 @@ func (c *signatureCoverageGraph) rule(owner, typ string) (int, string) {
 		return signatureCoverageRequiredPart, ""
 	case owner == "document" && typ == namespace+"/restricted-font":
 		return signatureCoverageRequiredRelationship, ""
-	case (owner == "root" || owner == "page" || owner == "document" && c.format == FormatXPS) && typ == thumbnailRelationship:
+	case (owner == "root" || owner == "document" || owner == "page") && typ == thumbnailRelationship:
 		return signatureCoverageRequiredPart, ""
 	case owner == "root" && typ == opcCoreRel:
 		return signatureCoverageOptionalPart, opcCoreType
@@ -1122,17 +1213,21 @@ func signatureNamespaces(info *SignatureInfo, data []byte, graph *signaturePartG
 // 返回: map[string]bool 本次检查专用集合
 func signatureKnownNamespaces(media string, format Format) map[string]bool {
 	known := map[string]bool{"": true, xmlNamespace: true, mcNamespace: true}
-	switch media {
+	if knownPrint, capabilities := printResourceMedia(media); knownPrint && !capabilities {
+		for _, namespace := range []string{printFrameworkNS, printKeywordsNS, printValueNS, xsiNamespace} {
+			known[namespace] = true
+		}
+		return known
+	}
+	switch strings.ToLower(media) {
 	case opcRelsType:
 		known[opcRelsNS] = true
 	case opcSignatureType:
-		known[xmlSignatureNamespace], known[opcSignatureNamespace] = true, true
-	case opcCoreType:
-		for _, namespace := range []string{opcCoreNS, dcNamespace, dcTermsNS, xsiNamespace} {
+		for _, namespace := range []string{xmlSignatureNamespace, xmlSignature11Namespace, opcSignatureNamespace, signatureExcNamespace, signaturePSSNamespace} {
 			known[namespace] = true
 		}
-	case printTicketType:
-		for _, namespace := range []string{printFrameworkNS, printKeywordsNS, printValueNS, xsiNamespace} {
+	case opcCoreType:
+		for _, namespace := range []string{opcCoreNS, dcNamespace, dcTermsNS, xsiNamespace} {
 			known[namespace] = true
 		}
 	case fixedContentType("signaturedefinitions"):
@@ -1264,6 +1359,9 @@ func (p *signatureNamespaceScan) walk(node *xmlElement, inherited compatibilityS
 			if err != nil {
 				return err
 			}
+			if len(uris) == 0 {
+				return fmt.Errorf("%w: signed Choice Requires is empty", ErrInvalid)
+			}
 			for _, uri := range uris {
 				add(uri)
 			}
@@ -1386,41 +1484,65 @@ func (p *signatureXML) packageObject(node *xmlElement, result *SignatureInfo) er
 	return nil
 }
 
-// certificates 读取KeyInfo直接声明或包内检索的证书，不访问远程位置
+// certificates 读取KeyInfo直接声明或包内检索的证书及ECKeyValue公钥，不访问远程位置
 // 入参: node KeyInfo元素
-// 返回: [][]byte 独立证书字节，失败无部分结果, error 结构、引用、能力、编码或取消错误
-func (p *signatureXML) certificates(node *xmlElement) ([][]byte, error) {
+// 返回: [][]byte 独立证书字节, []crypto.PublicKey 解析出的公钥, error 结构、引用、能力、编码或取消错误
+func (p *signatureXML) certificates(node *xmlElement) ([][]byte, []crypto.PublicKey, error) {
 	if _, err := signatureAttributes(node, "Id"); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(node.Children) == 0 || !xmlWhitespace(node.Text) {
-		return nil, fmt.Errorf("%w: empty signature KeyInfo", ErrInvalid)
+		return nil, nil, fmt.Errorf("%w: empty signature KeyInfo", ErrInvalid)
 	}
 	var result [][]byte
 	var retrievedParts [][]byte
+	var publicKeys []crypto.PublicKey
 	for _, child := range node.Children {
 		if err := checkContext(p.context); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if child.Name.Space != xmlSignatureNamespace {
 			if child.Name.Space == "" {
-				return nil, fmt.Errorf("%w: unqualified KeyInfo extension", ErrInvalid)
+				return nil, nil, fmt.Errorf("%w: unqualified KeyInfo extension", ErrInvalid)
 			}
 			continue
 		}
 		switch child.Name.Local {
-		case "KeyName", "KeyValue", "PGPData", "SPKIData", "MgmtData":
+		case "KeyName", "PGPData", "SPKIData", "MgmtData":
+			continue
+		case "KeyValue":
+			if _, err := signatureAttributes(child); err != nil {
+				return nil, nil, err
+			}
+			for _, value := range child.Children {
+				if err := checkContext(p.context); err != nil {
+					return nil, nil, err
+				}
+				if value.Name == (xml.Name{Space: xmlSignature11Namespace, Local: "ECKeyValue"}) {
+					if len(publicKeys) >= min(signatureMaxCertificates, p.limits.MaxPartCount) {
+						return nil, nil, fmt.Errorf("%w: signer key value count", ErrLimit)
+					}
+					key, err := parseSignatureECKeyValue(value)
+					if err != nil {
+						return nil, nil, err
+					}
+					if err := p.retrievalCharge(int64((key.Curve.Params().BitSize+7)/8)*2 + 1); err != nil {
+						return nil, nil, err
+					}
+					publicKeys = append(publicKeys, key)
+				}
+			}
 			continue
 		case "RetrievalMethod":
 			if err := p.retrievalMethod(child); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			data, embedded, err := p.retrievalCertificates(child)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if len(data) > min(signatureMaxCertificates, p.limits.MaxPartCount)-len(result)-len(retrievedParts) {
-				return nil, fmt.Errorf("%w: retrieved signer certificate count", ErrLimit)
+				return nil, nil, fmt.Errorf("%w: retrieved signer certificate count", ErrLimit)
 			}
 			if embedded {
 				result = append(result, data...)
@@ -1430,21 +1552,21 @@ func (p *signatureXML) certificates(node *xmlElement) ([][]byte, error) {
 			continue
 		case "X509Data":
 		default:
-			return nil, fmt.Errorf("%w: unexpected KeyInfo element", ErrInvalid)
+			return nil, nil, fmt.Errorf("%w: unexpected KeyInfo element", ErrInvalid)
 		}
 		if _, err := signatureAttributes(child); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if len(child.Children) == 0 || !xmlWhitespace(child.Text) {
-			return nil, fmt.Errorf("%w: empty or invalid X509Data", ErrInvalid)
+			return nil, nil, fmt.Errorf("%w: empty or invalid X509Data", ErrInvalid)
 		}
 		for _, certificate := range child.Children {
 			if err := checkContext(p.context); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if certificate.Name.Space != xmlSignatureNamespace {
 				if certificate.Name.Space == "" {
-					return nil, fmt.Errorf("%w: unqualified X509Data extension", ErrInvalid)
+					return nil, nil, fmt.Errorf("%w: unqualified X509Data extension", ErrInvalid)
 				}
 				continue
 			}
@@ -1453,28 +1575,28 @@ func (p *signatureXML) certificates(node *xmlElement) ([][]byte, error) {
 				continue
 			case "X509Certificate":
 			default:
-				return nil, fmt.Errorf("%w: unexpected X509Data element", ErrInvalid)
+				return nil, nil, fmt.Errorf("%w: unexpected X509Data element", ErrInvalid)
 			}
 			if _, err := signatureAttributes(certificate); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			data, err := signatureBinary(certificate)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if err := p.retrievalCharge(int64(len(data))); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if len(result)+len(retrievedParts) >= min(signatureMaxCertificates, p.limits.MaxPartCount) {
-				return nil, fmt.Errorf("%w: embedded signer certificate count", ErrLimit)
+				return nil, nil, fmt.Errorf("%w: embedded signer certificate count", ErrLimit)
 			}
 			result = append(result, data)
 		}
 	}
 	if len(result) == 0 {
-		return retrievedParts, nil
+		return retrievedParts, publicKeys, nil
 	}
-	return result, nil
+	return result, publicKeys, nil
 }
 
 // retrievalMethod 校验KeyInfo的RetrievalMethod引用并拒绝包外远程证书位置
@@ -1501,7 +1623,7 @@ func (p *signatureXML) retrievalMethod(node *xmlElement) error {
 	certificate := typ == xmlSignatureNamespace+"X509Data" || typ == xmlSignatureNamespace+"rawX509Certificate"
 	nonCertificate := false
 	switch typ {
-	case xmlSignatureNamespace + "DSAKeyValue", xmlSignatureNamespace + "RSAKeyValue", xmlSignatureNamespace + "PGPData", xmlSignatureNamespace + "SPKIData", xmlSignatureNamespace + "MgmtData":
+	case xmlSignatureNamespace + "DSAKeyValue", xmlSignatureNamespace + "RSAKeyValue", xmlSignature11Namespace + "ECKeyValue", xmlSignatureNamespace + "PGPData", xmlSignatureNamespace + "SPKIData", xmlSignatureNamespace + "MgmtData":
 		nonCertificate = true
 	}
 	if reference.Scheme != "" || strings.HasPrefix(uri, "//") {
@@ -1523,7 +1645,11 @@ func (p *signatureXML) retrievalMethod(node *xmlElement) error {
 			return fmt.Errorf("%w: unresolved RetrievalMethod fragment", ErrInvalid)
 		}
 		if len(node.Children) == 0 {
-			if target.Name != (xml.Name{Space: xmlSignatureNamespace, Local: strings.TrimPrefix(typ, xmlSignatureNamespace)}) {
+			want := xml.Name{Space: xmlSignatureNamespace, Local: strings.TrimPrefix(typ, xmlSignatureNamespace)}
+			if strings.HasPrefix(typ, xmlSignature11Namespace) {
+				want = xml.Name{Space: xmlSignature11Namespace, Local: strings.TrimPrefix(typ, xmlSignature11Namespace)}
+			}
+			if target.Name != want {
 				return fmt.Errorf("%w: RetrievalMethod target differs from Type", ErrInvalid)
 			}
 			return nil
@@ -1563,12 +1689,16 @@ func (p *signatureXML) retrievalTransforms(node *xmlElement) error {
 		if err != nil {
 			return err
 		}
-		algorithm := strings.Trim(attrs["Algorithm"], " \t\r\n")
-		if algorithm == "" || !uriReference(algorithm) {
-			return fmt.Errorf("%w: RetrievalMethod transform algorithm", ErrInvalid)
+		algorithm, present := attrs["Algorithm"]
+		algorithm = strings.Trim(algorithm, " \t\r\n")
+		if !present || algorithm == "" || !uriReference(algorithm) {
+			return fmt.Errorf("%w: missing or invalid signature algorithm", ErrInvalid)
 		}
 		if !signatureCanonicalMethod(algorithm) {
 			return fmt.Errorf("%w: OPC M6.19 forbids KeyInfo retrieval transform", ErrInvalid)
+		}
+		if _, _, err := signatureCanonicalNode(transform); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1604,7 +1734,7 @@ func readSignatureTime(node *xmlElement) (SignatureTime, error) {
 	return result, nil
 }
 
-// signatureTimeValue 检查OPC2006的六种时间粒度、日历及字段范围，小数秒采用该模式规定的一位数字
+// signatureTimeValue 检查OPC2006的六种时间粒度、日历及字段范围，小数秒支持一位或多位ASCII数字
 // 入参: format 格式声明, value 时间值
 // 返回: bool 是否符合声明的词法格式及字段范围
 func signatureTimeValue(format, value string) bool {
@@ -1656,10 +1786,16 @@ func signatureTimeValue(format, value string) bool {
 	if length >= 19 && (value[16] != ':' || signatureTimeDigits(value[17:19]) < 0 || signatureTimeDigits(value[17:19]) > 59) {
 		return false
 	}
-	if length == 21 && (value[19] != '.' || value[20] < '0' || value[20] > '9') {
-		return false
+	zonePos := length
+	if length == 21 {
+		if value[19] != '.' || value[20] < '0' || value[20] > '9' {
+			return false
+		}
+		for zonePos < len(value) && value[zonePos] >= '0' && value[zonePos] <= '9' {
+			zonePos++
+		}
 	}
-	zone := value[length:]
+	zone := value[zonePos:]
 	if zone == "Z" {
 		return true
 	}
@@ -1687,14 +1823,14 @@ func (p *signatureXML) signedInfo(node *xmlElement, result *SignatureInfo) error
 		return fmt.Errorf("%w: SignedInfo child order", ErrInvalid)
 	}
 	var err error
-	result.Canonicalization, err = signatureAlgorithm(node.Children[0])
+	result.Canonicalization, result.InclusiveNamespaces, err = signatureCanonicalNode(node.Children[0])
 	if err != nil {
 		return err
 	}
 	if !signatureCanonicalMethod(result.Canonicalization) {
 		return fmt.Errorf("%w: signature canonicalization method", ErrUnsupported)
 	}
-	result.Method, err = signatureAlgorithm(node.Children[1])
+	result.Method, result.PSS, err = signatureMethodNode(node.Children[1])
 	if err != nil {
 		return err
 	}
@@ -1801,9 +1937,11 @@ func (p *signatureXML) transforms(node *xmlElement, packagePart bool, part strin
 		transform := SignatureTransform{Algorithm: algorithm}
 		switch {
 		case signatureCanonicalMethod(algorithm):
-			if len(child.Children) != 0 || !xmlWhitespace(child.Text) {
-				return nil, fmt.Errorf("%w: canonical transform parameters", ErrUnsupported)
+			_, inclusive, err := signatureCanonicalNode(child)
+			if err != nil {
+				return nil, err
 			}
+			transform.InclusiveNamespaces = inclusive
 		case algorithm == signatureRelationships:
 			if !packagePart || !opcRelationshipName(part) {
 				return nil, fmt.Errorf("%w: relationship transform on non-relationship reference", ErrInvalid)
@@ -1826,8 +1964,9 @@ func (p *signatureXML) transforms(node *xmlElement, packagePart bool, part strin
 						return nil, err
 					}
 					value, present := attrs["SourceId"]
-					if !present {
-						return nil, fmt.Errorf("%w: missing relationship SourceId", ErrInvalid)
+					value = strings.Trim(value, " \t\r\n")
+					if !present || !xmlNCName(value) {
+						return nil, fmt.Errorf("%w: invalid or missing relationship SourceId", ErrInvalid)
 					}
 					transform.RelationshipIDs = append(transform.RelationshipIDs, value)
 				case "RelationshipsGroupReference":
@@ -1877,11 +2016,309 @@ func signatureAlgorithm(node *xmlElement) (string, error) {
 	return value, nil
 }
 
-// signatureCanonicalMethod 判断OPC要求支持的两个C14N1.0算法标识
+// signatureCanonicalMethod 判断支持的C14N1.0、Exclusive C14N1.0及C14N1.1规范化算法标识
 // 入参: value 算法URI
 // 返回: bool 是否为支持的规范化算法
 func signatureCanonicalMethod(value string) bool {
-	return value == signatureCanonical || value == signatureComments
+	switch value {
+	case signatureCanonical, signatureComments, signatureExcCanonical, signatureExcComments, signatureCanonical11, signatureComments11:
+		return true
+	}
+	return false
+}
+
+// signatureCanonicalComments 判断规范化算法是否保留XML注释
+// 入参: value 算法URI
+// 返回: bool 是否为保留注释的规范化算法
+func signatureCanonicalComments(value string) bool {
+	return value == signatureComments || value == signatureExcComments || value == signatureComments11
+}
+
+// signatureCanonicalExclusive 判断规范化算法是否属于Exclusive C14N1.0
+// 入参: value 算法URI
+// 返回: bool 是否为Exclusive C14N1.0算法
+func signatureCanonicalExclusive(value string) bool {
+	return value == signatureExcCanonical || value == signatureExcComments
+}
+
+// signatureCanonicalNode 解析规范化算法及Exclusive C14N可选InclusiveNamespaces前缀列表
+// 入参: node CanonicalizationMethod或Transform元素
+// 返回: string 算法URI, []string 前缀列表, error 结构、前缀或能力错误
+func signatureCanonicalNode(node *xmlElement) (string, []string, error) {
+	attrs, err := signatureAttributes(node, "Algorithm")
+	if err != nil {
+		return "", nil, err
+	}
+	value, present := attrs["Algorithm"]
+	value = strings.Trim(value, " \t\r\n")
+	if !present || value == "" || !uriReference(value) {
+		return "", nil, fmt.Errorf("%w: missing or invalid signature algorithm", ErrInvalid)
+	}
+	if !signatureCanonicalExclusive(value) {
+		if len(node.Children) != 0 || !xmlWhitespace(node.Text) {
+			return "", nil, fmt.Errorf("%w: canonical transform parameters", ErrUnsupported)
+		}
+		return value, nil, nil
+	}
+	if !xmlWhitespace(node.Text) {
+		return "", nil, fmt.Errorf("%w: exclusive canonical transform text", ErrInvalid)
+	}
+	if len(node.Children) == 0 {
+		return value, nil, nil
+	}
+	if len(node.Children) != 1 || node.Children[0].Name != (xml.Name{Space: signatureExcNamespace, Local: "InclusiveNamespaces"}) {
+		return "", nil, fmt.Errorf("%w: exclusive canonical transform parameters", ErrUnsupported)
+	}
+	child := node.Children[0]
+	if len(child.Children) != 0 || !xmlWhitespace(child.Text) {
+		return "", nil, fmt.Errorf("%w: InclusiveNamespaces element content", ErrInvalid)
+	}
+	childAttrs, err := signatureAttributes(child, "PrefixList")
+	if err != nil {
+		return "", nil, err
+	}
+	prefixList, hasPrefixList := childAttrs["PrefixList"]
+	if !hasPrefixList {
+		return "", nil, fmt.Errorf("%w: InclusiveNamespaces missing PrefixList", ErrInvalid)
+	}
+	prefixes := compatibilityWords(prefixList)
+	for _, prefix := range prefixes {
+		if prefix != "#default" && (!xmlNCName(prefix) || prefix == "xmlns") {
+			return "", nil, fmt.Errorf("%w: InclusiveNamespaces prefix %q", ErrInvalid, prefix)
+		}
+	}
+	return value, prefixes, nil
+}
+
+// signatureMethodNode 解析SignatureMethod算法及RSA-PSS参数，拒绝未知算法参数
+// 入参: node SignatureMethod元素
+// 返回: string 签名方法URI, *SignaturePSSParams 可选RSA-PSS参数, error 结构、参数或能力错误
+func signatureMethodNode(node *xmlElement) (string, *SignaturePSSParams, error) {
+	attrs, err := signatureAttributes(node, "Algorithm")
+	if err != nil {
+		return "", nil, err
+	}
+	value, present := attrs["Algorithm"]
+	value = strings.Trim(value, " \t\r\n")
+	if !present || value == "" || !uriReference(value) {
+		return "", nil, fmt.Errorf("%w: missing or invalid signature algorithm", ErrInvalid)
+	}
+	switch value {
+	case signatureMethodRSAPSS:
+		params, err := parseSignaturePSSParams(node)
+		if err != nil {
+			return "", nil, err
+		}
+		return value, params, nil
+	case signatureMethodPSS256:
+		if len(node.Children) != 0 || !xmlWhitespace(node.Text) {
+			return "", nil, fmt.Errorf("%w: signature algorithm parameters", ErrUnsupported)
+		}
+		return value, &SignaturePSSParams{DigestMethod: "http://www.w3.org/2001/04/xmlenc#sha256", MGFMethod: signatureMethodMGF1, MGFDigest: "http://www.w3.org/2001/04/xmlenc#sha256", SaltLength: 32, TrailerField: 1}, nil
+	case signatureMethodPSS384:
+		if len(node.Children) != 0 || !xmlWhitespace(node.Text) {
+			return "", nil, fmt.Errorf("%w: signature algorithm parameters", ErrUnsupported)
+		}
+		return value, &SignaturePSSParams{DigestMethod: "http://www.w3.org/2001/04/xmldsig-more#sha384", MGFMethod: signatureMethodMGF1, MGFDigest: "http://www.w3.org/2001/04/xmldsig-more#sha384", SaltLength: 48, TrailerField: 1}, nil
+	case signatureMethodPSS512:
+		if len(node.Children) != 0 || !xmlWhitespace(node.Text) {
+			return "", nil, fmt.Errorf("%w: signature algorithm parameters", ErrUnsupported)
+		}
+		return value, &SignaturePSSParams{DigestMethod: "http://www.w3.org/2001/04/xmlenc#sha512", MGFMethod: signatureMethodMGF1, MGFDigest: "http://www.w3.org/2001/04/xmlenc#sha512", SaltLength: 64, TrailerField: 1}, nil
+	default:
+		if len(node.Children) != 0 || !xmlWhitespace(node.Text) {
+			return "", nil, fmt.Errorf("%w: signature algorithm parameters", ErrUnsupported)
+		}
+		return value, nil, nil
+	}
+}
+
+// parseSignaturePSSParams 按RFC6931与RFC9231解析RSAPSSParams元素并补全标准缺省参数
+// 入参: node SignatureMethod元素
+// 返回: *SignaturePSSParams 解析并补全后的RSA-PSS参数, error 结构、参数值或能力错误
+func parseSignaturePSSParams(node *xmlElement) (*SignaturePSSParams, error) {
+	if !xmlWhitespace(node.Text) || len(node.Children) > 1 {
+		return nil, fmt.Errorf("%w: RSA-PSS SignatureMethod children", ErrInvalid)
+	}
+	params := &SignaturePSSParams{DigestMethod: xmlSignatureNamespace + "sha1", MGFMethod: signatureMethodMGF1, TrailerField: 1}
+	hasMGFDigest, hasSalt := false, false
+	if len(node.Children) == 1 {
+		root := node.Children[0]
+		if root.Name != (xml.Name{Space: signaturePSSNamespace, Local: "RSAPSSParams"}) || !xmlWhitespace(root.Text) {
+			return nil, fmt.Errorf("%w: expected RSAPSSParams element", ErrInvalid)
+		}
+		if _, err := signatureAttributes(root); err != nil {
+			return nil, err
+		}
+		order := 0
+		for _, child := range root.Children {
+			rank := 0
+			switch child.Name {
+			case xml.Name{Space: xmlSignatureNamespace, Local: "DigestMethod"}:
+				rank = 1
+			case xml.Name{Space: signaturePSSNamespace, Local: "MaskGenerationFunction"}:
+				rank = 2
+			case xml.Name{Space: signaturePSSNamespace, Local: "SaltLength"}:
+				rank = 3
+			case xml.Name{Space: signaturePSSNamespace, Local: "TrailerField"}:
+				rank = 4
+			}
+			if rank <= order {
+				return nil, fmt.Errorf("%w: RSAPSSParams child order or element", ErrInvalid)
+			}
+			order = rank
+			switch rank {
+			case 1:
+				digest, err := signatureAlgorithm(child)
+				if err != nil {
+					return nil, err
+				}
+				params.DigestMethod = digest
+			case 2:
+				mgfAttrs, err := signatureAttributes(child, "Algorithm")
+				if err != nil {
+					return nil, err
+				}
+				mgf := strings.Trim(mgfAttrs["Algorithm"], " \t\r\n")
+				if mgf == "" || !uriReference(mgf) {
+					return nil, fmt.Errorf("%w: MaskGenerationFunction algorithm", ErrInvalid)
+				}
+				if mgf != signatureMethodMGF1 {
+					return nil, fmt.Errorf("%w: unsupported MaskGenerationFunction %s", ErrUnsupported, mgf)
+				}
+				if !xmlWhitespace(child.Text) || len(child.Children) > 1 {
+					return nil, fmt.Errorf("%w: MaskGenerationFunction children", ErrInvalid)
+				}
+				params.MGFMethod = mgf
+				if len(child.Children) == 1 {
+					if child.Children[0].Name != (xml.Name{Space: xmlSignatureNamespace, Local: "DigestMethod"}) {
+						return nil, fmt.Errorf("%w: MaskGenerationFunction DigestMethod", ErrInvalid)
+					}
+					mgfDigest, err := signatureAlgorithm(child.Children[0])
+					if err != nil {
+						return nil, err
+					}
+					params.MGFDigest = mgfDigest
+					hasMGFDigest = true
+				}
+			case 3:
+				if len(child.Children) != 0 {
+					return nil, fmt.Errorf("%w: SaltLength children", ErrInvalid)
+				}
+				if _, err := signatureAttributes(child); err != nil {
+					return nil, err
+				}
+				text := strings.Trim(child.Text, " \t\r\n")
+				if !printInteger(text) {
+					return nil, fmt.Errorf("%w: SaltLength integer", ErrInvalid)
+				}
+				value, err := strconv.Atoi(text)
+				if err != nil || value < 0 {
+					return nil, fmt.Errorf("%w: SaltLength range", ErrInvalid)
+				}
+				if value > signatureMaxKeyBits/8 {
+					return nil, fmt.Errorf("%w: SaltLength limit", ErrLimit)
+				}
+				params.SaltLength = value
+				hasSalt = true
+			case 4:
+				if len(child.Children) != 0 {
+					return nil, fmt.Errorf("%w: TrailerField children", ErrInvalid)
+				}
+				if _, err := signatureAttributes(child); err != nil {
+					return nil, err
+				}
+				text := strings.Trim(child.Text, " \t\r\n")
+				if !printInteger(text) {
+					return nil, fmt.Errorf("%w: TrailerField integer", ErrInvalid)
+				}
+				value, err := strconv.Atoi(text)
+				if err != nil {
+					return nil, fmt.Errorf("%w: TrailerField integer", ErrInvalid)
+				}
+				if value != 1 {
+					return nil, fmt.Errorf("%w: unsupported RSA-PSS TrailerField %d", ErrUnsupported, value)
+				}
+				params.TrailerField = value
+			}
+		}
+	}
+	if !hasMGFDigest {
+		params.MGFDigest = params.DigestMethod
+	}
+	if !hasSalt {
+		switch params.DigestMethod {
+		case xmlSignatureNamespace + "sha1":
+			params.SaltLength = 20
+		case "http://www.w3.org/2001/04/xmlenc#sha256":
+			params.SaltLength = 32
+		case "http://www.w3.org/2001/04/xmldsig-more#sha384":
+			params.SaltLength = 48
+		case "http://www.w3.org/2001/04/xmlenc#sha512":
+			params.SaltLength = 64
+		default:
+			params.SaltLength = -1
+		}
+	}
+	return params, nil
+}
+
+// parseSignatureECKeyValue 按XML-DSig1.1解析dsig11:ECKeyValue命名曲线与未压缩椭圆曲线公钥点
+// 入参: node ECKeyValue元素
+// 返回: *ecdsa.PublicKey 独立椭圆曲线公钥, error 结构、曲线或公钥点错误
+func parseSignatureECKeyValue(node *xmlElement) (*ecdsa.PublicKey, error) {
+	if _, err := signatureAttributes(node, "Id"); err != nil {
+		return nil, err
+	}
+	if !xmlWhitespace(node.Text) || len(node.Children) != 2 {
+		return nil, fmt.Errorf("%w: ECKeyValue structure", ErrInvalid)
+	}
+	curveNode, keyNode := node.Children[0], node.Children[1]
+	if curveNode.Name == (xml.Name{Space: xmlSignature11Namespace, Local: "ECParameters"}) {
+		return nil, fmt.Errorf("%w: explicit ECKeyValue parameters", ErrUnsupported)
+	}
+	if curveNode.Name != (xml.Name{Space: xmlSignature11Namespace, Local: "NamedCurve"}) || len(curveNode.Children) != 0 || !xmlWhitespace(curveNode.Text) {
+		return nil, fmt.Errorf("%w: ECKeyValue NamedCurve", ErrInvalid)
+	}
+	curveAttrs, err := signatureAttributes(curveNode, "URI")
+	if err != nil {
+		return nil, err
+	}
+	uri := strings.Trim(curveAttrs["URI"], " \t\r\n")
+	if uri == "" || !uriReference(uri) {
+		return nil, fmt.Errorf("%w: ECKeyValue NamedCurve URI", ErrInvalid)
+	}
+	var curve elliptic.Curve
+	switch uri {
+	case "urn:oid:1.2.840.10045.3.1.7":
+		curve = elliptic.P256()
+	case "urn:oid:1.3.132.0.34":
+		curve = elliptic.P384()
+	case "urn:oid:1.3.132.0.35":
+		curve = elliptic.P521()
+	default:
+		return nil, fmt.Errorf("%w: ECKeyValue NamedCurve %s", ErrUnsupported, uri)
+	}
+	if keyNode.Name != (xml.Name{Space: xmlSignature11Namespace, Local: "PublicKey"}) {
+		return nil, fmt.Errorf("%w: ECKeyValue PublicKey", ErrInvalid)
+	}
+	if _, err := signatureAttributes(keyNode); err != nil {
+		return nil, err
+	}
+	raw, err := signatureBinary(keyNode)
+	if err != nil {
+		return nil, err
+	}
+	coordLen := (curve.Params().BitSize + 7) / 8
+	if len(raw) != 1+2*coordLen || raw[0] != 0x04 {
+		return nil, fmt.Errorf("%w: ECKeyValue uncompressed point", ErrInvalid)
+	}
+	x := new(big.Int).SetBytes(raw[1 : 1+coordLen])
+	y := new(big.Int).SetBytes(raw[1+coordLen:])
+	if x.Cmp(curve.Params().P) >= 0 || y.Cmp(curve.Params().P) >= 0 || !curve.IsOnCurve(x, y) {
+		return nil, fmt.Errorf("%w: ECKeyValue point off curve", ErrInvalid)
+	}
+	return &ecdsa.PublicKey{Curve: curve, X: x, Y: y}, nil
 }
 
 // signatureBinary 按XML Schema的base64Binary读取字节，仅移除XML空白并检查填充位
@@ -2124,4 +2561,507 @@ func signatureRelationshipOutput(content *xmlContentReader, items []xmlContent, 
 		return nil, err
 	}
 	return output.Bytes(), nil
+}
+
+// signatureInclusiveSet 将InclusiveNamespaces前缀切片转换为查找集合，并将#default映射为空前缀
+// 入参: prefixes 已校验前缀列表
+// 返回: map[string]bool 前缀查找集合
+func signatureInclusiveSet(prefixes []string) map[string]bool {
+	if len(prefixes) == 0 {
+		return nil
+	}
+	result := make(map[string]bool, len(prefixes))
+	for _, prefix := range prefixes {
+		if prefix == "#default" {
+			result[""] = true
+		} else {
+			result[prefix] = true
+		}
+	}
+	return result
+}
+
+// signatureCanonicalXML 按C14N1.0、Exclusive C14N1.0或C14N1.1规范化XML文档或选定子树
+// 入参: data XML原始字节, options 规范化算法、预算、前缀列表及取消选项
+// 返回: []byte 独立规范化UTF-8字节, error 解析、选择、命名空间或预算错误
+func signatureCanonicalXML(data []byte, options signatureCanonicalOptions) ([]byte, error) {
+	if !signatureCanonicalMethod(options.algorithm) {
+		return nil, fmt.Errorf("%w: signature canonicalization algorithm", ErrUnsupported)
+	}
+	if options.algorithm == signatureCanonical || options.algorithm == signatureComments {
+		return canonicalXML(data, canonicalXMLOptions{limits: options.limits, maxBytes: options.maxBytes, comments: options.comments, context: options.context, selectElement: options.selectElement})
+	}
+	options.limits = mergeLimits(DefaultLimits(), options.limits)
+	if err := validateLimits(options.limits); err != nil {
+		return nil, err
+	}
+	limit := min(options.limits.MaxPartBytes, options.limits.MaxPackageBytes)
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("%w: canonical XML input bytes", ErrLimit)
+	}
+	if options.maxBytes == 0 {
+		options.maxBytes = limit
+	}
+	if options.maxBytes < 0 {
+		return nil, fmt.Errorf("%w: canonical XML output limit", ErrInvalid)
+	}
+	if err := checkContext(options.context); err != nil {
+		return nil, err
+	}
+	var output bytes.Buffer
+	w := signatureCanonicalWriter{options: options, output: packageOutput{writer: &output, context: options.context, limit: min(limit, options.maxBytes)}}
+	if _, err := decodeXMLVisit(data, options.limits, w.token); err != nil {
+		return nil, err
+	}
+	if options.selectElement != nil && !w.selected {
+		return nil, fmt.Errorf("%w: canonical element not found", ErrInvalid)
+	}
+	if err := checkContext(options.context); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}
+
+// token 按已校验词元流式输出Exclusive C14N1.0或C14N1.1规范化结果
+// 入参: token 保留原始前缀的词元, node 当前元素或词元所属元素
+// 返回: error 选择、命名空间、取消或输出错误
+func (w *signatureCanonicalWriter) token(token xml.Token, node *xmlElement) error {
+	if err := checkContext(w.options.context); err != nil {
+		return err
+	}
+	if _, end := token.(xml.EndElement); !end {
+		w.nodes++
+		if w.nodes > w.options.limits.MaxXMLNodes {
+			return fmt.Errorf("%w: canonical XML token count", ErrLimit)
+		}
+	}
+	switch token := token.(type) {
+	case xml.StartElement:
+		for _, attr := range token.Attr {
+			if attr.Name.Space != "xmlns" && attr.Name != (xml.Name{Local: "xmlns"}) {
+				continue
+			}
+			namespace := attr.Value
+			if namespace != "" {
+				uri, err := opcURI(namespace)
+				if err != nil || uri.Scheme == "" {
+					return fmt.Errorf("%w: relative or invalid canonical namespace", ErrInvalid)
+				}
+			}
+		}
+		w.path = append(w.path, node.Name)
+		selected := w.options.selectElement != nil && w.options.selectElement(node, w.path)
+		if selected {
+			if w.selected {
+				return fmt.Errorf("%w: multiple canonical elements", ErrInvalid)
+			}
+			w.selected, w.selectedDepth = true, len(w.path)
+		}
+		if w.options.selectElement == nil || w.selectedDepth != 0 {
+			if err := w.start(token, node, selected); err != nil {
+				return err
+			}
+		}
+		w.ancestors = append(w.ancestors, node)
+	case xml.EndElement:
+		if w.options.selectElement == nil || w.selectedDepth != 0 {
+			if err := w.write("</" + canonicalQName(token.Name) + ">"); err != nil {
+				return err
+			}
+			w.rendered = w.rendered[:len(w.rendered)-1]
+		}
+		if len(w.path) == w.selectedDepth {
+			w.selectedDepth = 0
+		}
+		if len(w.path) == 1 {
+			w.rootPassed = true
+		}
+		w.path = w.path[:len(w.path)-1]
+		w.ancestors = w.ancestors[:len(w.ancestors)-1]
+	case xml.CharData:
+		if len(w.path) != 0 && (w.options.selectElement == nil || w.selectedDepth != 0) {
+			return w.escaped(string(token), false)
+		}
+	case xml.Comment:
+		if w.options.comments && (w.options.selectElement == nil || w.selectedDepth != 0) {
+			return w.misc("<!--" + canonicalLineFeeds.Replace(string(token)) + "-->")
+		}
+	case xml.ProcInst:
+		if token.Target != "xml" && (w.options.selectElement == nil || w.selectedDepth != 0) {
+			value := "<?" + token.Target
+			if len(token.Inst) != 0 {
+				value += " " + canonicalLineFeeds.Replace(string(token.Inst))
+			}
+			return w.misc(value + "?>")
+		}
+	}
+	return nil
+}
+
+// start 按Exclusive C14N1.0或C14N1.1规则输出起始标签、命名空间声明及排序属性
+// 入参: token 起始词元, node 当前元素, selected 是否为选定子树根
+// 返回: error 名称、URI合并或输出错误
+func (w *signatureCanonicalWriter) start(token xml.StartElement, node *xmlElement, selected bool) error {
+	if err := w.write("<" + canonicalQName(token.Name)); err != nil {
+		return err
+	}
+	var parent map[string]string
+	if len(w.rendered) != 0 {
+		parent = w.rendered[len(w.rendered)-1]
+	}
+	exclusive := signatureCanonicalExclusive(w.options.algorithm)
+	var prefixes []string
+	var nextRendered map[string]string
+	if exclusive {
+		visiblyUtilized := map[string]bool{token.Name.Space: true}
+		for _, attr := range token.Attr {
+			if attr.Name.Space != "" && attr.Name.Space != "xmlns" && attr.Name.Space != "xml" {
+				visiblyUtilized[attr.Name.Space] = true
+			}
+		}
+		nextRendered = make(map[string]string, len(parent)+len(node.Namespaces))
+		maps.Copy(nextRendered, parent)
+		if visiblyUtilized[""] || w.options.inclusive[""] {
+			defaultNS := node.Namespaces[""]
+			if defaultNS != parent[""] {
+				prefixes = append(prefixes, "")
+				nextRendered[""] = defaultNS
+			}
+		}
+		for prefix, namespace := range node.Namespaces {
+			if prefix == "" || prefix == "xml" {
+				continue
+			}
+			if (visiblyUtilized[prefix] || w.options.inclusive[prefix]) && namespace != parent[prefix] {
+				prefixes = append(prefixes, prefix)
+				nextRendered[prefix] = namespace
+			}
+		}
+	} else {
+		nextRendered = node.Namespaces
+		for prefix, namespace := range node.Namespaces {
+			if prefix != "xml" && namespace != parent[prefix] {
+				prefixes = append(prefixes, prefix)
+			}
+		}
+	}
+	slices.Sort(prefixes)
+	for _, prefix := range prefixes {
+		name := xml.Name{Local: "xmlns"}
+		if prefix != "" {
+			name = xml.Name{Space: "xmlns", Local: prefix}
+		}
+		if err := w.attribute(name, nextRendered[prefix]); err != nil {
+			return err
+		}
+	}
+	var attributes []canonicalAttribute
+	inherited := make(map[string]string)
+	ancestorBase, hasBase := "", false
+	if selected && !exclusive {
+		for _, ancestor := range w.ancestors {
+			for _, attr := range ancestor.Attr {
+				if attr.Name.Space != xmlNamespace {
+					continue
+				}
+				switch attr.Name.Local {
+				case "lang", "space":
+					inherited[attr.Name.Local] = attr.Value
+				case "base":
+					if !hasBase {
+						ancestorBase, hasBase = attr.Value, true
+					} else {
+						var err error
+						ancestorBase, err = c14n11JoinURI(ancestorBase, attr.Value)
+						if err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, attr := range token.Attr {
+		if attr.Name.Space == "xmlns" || attr.Name == (xml.Name{Local: "xmlns"}) {
+			continue
+		}
+		name, err := xmlExpandedName(node.Namespaces, attr.Name, false)
+		if err != nil {
+			return err
+		}
+		value := attr.Value
+		if selected && !exclusive && name == (xml.Name{Space: xmlNamespace, Local: "base"}) && hasBase {
+			value, err = c14n11JoinURI(ancestorBase, value)
+			if err != nil {
+				return err
+			}
+			hasBase = false
+		}
+		attributes = append(attributes, canonicalAttribute{attr.Name, name, value})
+		if name.Space == xmlNamespace {
+			delete(inherited, name.Local)
+		}
+	}
+	if selected && !exclusive && hasBase {
+		attributes = append(attributes, canonicalAttribute{xml.Name{Space: "xml", Local: "base"}, xml.Name{Space: xmlNamespace, Local: "base"}, ancestorBase})
+	}
+	for local, value := range inherited {
+		attributes = append(attributes, canonicalAttribute{xml.Name{Space: "xml", Local: local}, xml.Name{Space: xmlNamespace, Local: local}, value})
+	}
+	slices.SortFunc(attributes, func(a, b canonicalAttribute) int {
+		if order := cmp.Compare(a.name.Space, b.name.Space); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.name.Local, b.name.Local)
+	})
+	for _, attr := range attributes {
+		if err := w.attribute(attr.raw, attr.value); err != nil {
+			return err
+		}
+	}
+	w.rendered = append(w.rendered, nextRendered)
+	return w.write(">")
+}
+
+// attribute 以双引号及C14N字符引用输出单个属性或命名空间声明
+// 入参: name 原始QName, value 已完成XML输入规范化的值
+// 返回: error 输出错误
+func (w *signatureCanonicalWriter) attribute(name xml.Name, value string) error {
+	if err := w.write(" " + canonicalQName(name) + "=\""); err != nil {
+		return err
+	}
+	if err := w.escaped(value, true); err != nil {
+		return err
+	}
+	return w.write("\"")
+}
+
+// escaped 按C14N规则逐段转义文本或属性值
+// 入参: value XML解析后的内容, attribute 是否为属性值
+// 返回: error 输出或取消错误
+func (w *signatureCanonicalWriter) escaped(value string, attribute bool) error {
+	start := 0
+	for i := range len(value) {
+		escape := ""
+		switch value[i] {
+		case '&':
+			escape = "&amp;"
+		case '<':
+			escape = "&lt;"
+		case '>':
+			if !attribute {
+				escape = "&gt;"
+			}
+		case '"':
+			if attribute {
+				escape = "&quot;"
+			}
+		case '\t':
+			if attribute {
+				escape = "&#x9;"
+			}
+		case '\n':
+			if attribute {
+				escape = "&#xA;"
+			}
+		case '\r':
+			escape = "&#xD;"
+		}
+		if escape != "" {
+			if err := w.write(value[start:i]); err != nil {
+				return err
+			}
+			if err := w.write(escape); err != nil {
+				return err
+			}
+			start = i + 1
+		}
+	}
+	return w.write(value[start:])
+}
+
+// misc 按处理指令或注释相对文档根的位置添加规范化换行
+// 入参: value 完整标记
+// 返回: error 输出错误
+func (w *signatureCanonicalWriter) misc(value string) error {
+	if len(w.path) == 0 && w.rootPassed {
+		if err := w.write("\n"); err != nil {
+			return err
+		}
+	}
+	if err := w.write(value); err != nil {
+		return err
+	}
+	if len(w.path) == 0 && !w.rootPassed {
+		return w.write("\n")
+	}
+	return nil
+}
+
+// write 在统一输出预算及取消检查下写入规范化片段
+// 入参: value 输出片段
+// 返回: error 输出错误
+func (w *signatureCanonicalWriter) write(value string) error {
+	_, err := io.WriteString(&w.output, value)
+	return err
+}
+
+// c14n11JoinURI 按C14N1.1附录A与RFC3986合并祖先及当前节点的xml:base URI
+// 入参: base 基准URI, ref 待合并的相对或绝对URI
+// 返回: string 合并规范化后的URI, error 非法URI语法错误
+func c14n11JoinURI(base, ref string) (string, error) {
+	if base == "" {
+		return ref, nil
+	}
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("%w: invalid C14N1.1 xml:base URI", ErrInvalid)
+	}
+	refURL, err := url.Parse(ref)
+	if err != nil {
+		return "", fmt.Errorf("%w: invalid C14N1.1 xml:base URI", ErrInvalid)
+	}
+	baseHasAuth := baseURL.Host != "" || strings.HasPrefix(base, "//") || strings.Contains(base, "://")
+	refHasAuth := refURL.Host != "" || strings.HasPrefix(ref, "//") || strings.Contains(ref, "://")
+	var scheme, authority, path, query string
+	hasAuth, hasQuery := false, false
+	if refURL.Scheme != "" {
+		scheme = refURL.Scheme
+		hasAuth = refHasAuth
+		authority = c14n11Authority(refURL)
+		path = c14n11RemoveDotSegments(refURL.EscapedPath(), true)
+		query, hasQuery = refURL.RawQuery, refURL.ForceQuery || refURL.RawQuery != ""
+	} else {
+		scheme = baseURL.Scheme
+		if refHasAuth {
+			hasAuth = true
+			authority = c14n11Authority(refURL)
+			path = c14n11RemoveDotSegments(refURL.EscapedPath(), scheme != "")
+			query, hasQuery = refURL.RawQuery, refURL.ForceQuery || refURL.RawQuery != ""
+		} else {
+			hasAuth = baseHasAuth
+			authority = c14n11Authority(baseURL)
+			refPath := refURL.EscapedPath()
+			if refPath == "" {
+				path = baseURL.EscapedPath()
+				if refURL.ForceQuery || refURL.RawQuery != "" {
+					query, hasQuery = refURL.RawQuery, true
+				} else {
+					query, hasQuery = baseURL.RawQuery, baseURL.ForceQuery || baseURL.RawQuery != ""
+				}
+			} else {
+				if strings.HasPrefix(refPath, "/") {
+					path = c14n11RemoveDotSegments(refPath, scheme != "" || hasAuth)
+				} else {
+					basePath := baseURL.EscapedPath()
+					var merged string
+					if hasAuth && basePath == "" {
+						merged = "/" + refPath
+					} else if slash := strings.LastIndexByte(basePath, '/'); slash >= 0 {
+						merged = basePath[:slash+1] + refPath
+					} else {
+						merged = refPath
+					}
+					path = c14n11RemoveDotSegments(merged, scheme != "" || hasAuth)
+				}
+				query, hasQuery = refURL.RawQuery, refURL.ForceQuery || refURL.RawQuery != ""
+			}
+		}
+	}
+	var out strings.Builder
+	if scheme != "" {
+		out.WriteString(scheme)
+		out.WriteByte(':')
+	}
+	if hasAuth {
+		out.WriteString("//")
+		out.WriteString(authority)
+	}
+	out.WriteString(path)
+	if hasQuery {
+		out.WriteByte('?')
+		out.WriteString(query)
+	}
+	return out.String(), nil
+}
+
+// c14n11Authority 组合URI的用户信息与主机授权段
+// 入参: u 已解析URI
+// 返回: string 授权段字符串
+func c14n11Authority(u *url.URL) string {
+	if u.User == nil {
+		return u.Host
+	}
+	return u.User.String() + "@" + u.Host
+}
+
+// c14n11RemoveDotSegments 按C14N1.1附录A移除路径中的点段并在相对路径中保留必要上级段
+// 入参: input 待化简路径, absolute 是否为绝对URI路径
+// 返回: string 化简后的路径
+func c14n11RemoveDotSegments(input string, absolute bool) string {
+	absolute = absolute || strings.HasPrefix(input, "/")
+	output := ""
+	for input != "" {
+		if strings.HasPrefix(input, "./") {
+			input = input[2:]
+		} else if strings.HasPrefix(input, "../") {
+			if !absolute {
+				output += "../"
+			}
+			input = input[3:]
+		} else if strings.HasPrefix(input, "/./") {
+			input = "/" + input[3:]
+		} else if input == "/." {
+			input = "/"
+		} else if strings.HasPrefix(input, "/../") || input == "/.." {
+			tail := ""
+			if strings.HasPrefix(input, "/../") {
+				tail = input[4:]
+			}
+			slash := strings.LastIndexByte(output, '/')
+			last := output[slash+1:]
+			if !absolute && (output == "" || last == "..") {
+				if output == "" {
+					output = ".."
+				} else {
+					output += "/.."
+				}
+				input = "/" + tail
+			} else if slash >= 0 {
+				output = output[:slash]
+				input = "/" + tail
+			} else {
+				output = ""
+				if !absolute {
+					input = tail
+				} else {
+					input = "/" + tail
+				}
+			}
+		} else if input == "." {
+			input = ""
+		} else if input == ".." {
+			if !absolute {
+				output += "../"
+			}
+			input = ""
+		} else {
+			start := 0
+			if input[0] == '/' {
+				start = 1
+			}
+			next := strings.IndexByte(input[start:], '/')
+			if next < 0 {
+				output += input
+				input = ""
+			} else {
+				output += input[:start+next]
+				input = input[start+next:]
+			}
+		}
+	}
+	if !absolute && (output == ".." || strings.HasSuffix(output, "/..")) {
+		output += "/"
+	}
+	return output
 }

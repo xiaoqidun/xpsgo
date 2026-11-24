@@ -16,7 +16,9 @@ package xpsgo
 
 import (
 	"bytes"
+	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"maps"
 	"net/url"
@@ -1395,8 +1397,8 @@ func (x *compositionExecution) sameRawTicket(left, right compositionOrigin) (boo
 	return bytes.Equal(partLeft.data, partRight.data), nil
 }
 
-// validateTickets 在预算内比较迁移后的票据及缺省状态，复用已逐字节确认的等价类
-// 返回: error 层级冲突、缺失、预算或取消错误
+// validateTickets 在预算内比较迁移后的票据及缺省状态，同级不同内容标准票据按Print Schema语义合并
+// 返回: error 层级冲突、缺失、保护、预算或取消错误
 func (x *compositionExecution) validateTickets() error {
 	var classes map[string]*compositionTicketClass
 	for _, scope := range slices.Sorted(maps.Keys(x.tickets)) {
@@ -1406,6 +1408,7 @@ func (x *compositionExecution) validateTickets() error {
 		}
 		firstKey := strings.ToLower(tickets[0])
 		first, exists := x.output.parts[firstKey]
+		needsMerge := false
 		for _, ticket := range tickets[1:] {
 			if err := x.plan.budget.step(1); err != nil {
 				return err
@@ -1415,10 +1418,14 @@ func (x *compositionExecution) validateTickets() error {
 			if tickets[0] == "" && ticket == "" {
 				continue
 			}
-			if !exists || !present || first.media != value.media || len(first.data) != len(value.data) {
+			if !exists || !present || first.media != value.media {
 				return fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
 			}
 			if firstKey == key {
+				continue
+			}
+			if len(first.data) != len(value.data) {
+				needsMerge = true
 				continue
 			}
 			a, b := classes[firstKey], classes[key]
@@ -1438,7 +1445,8 @@ func (x *compositionExecution) validateTickets() error {
 				return err
 			}
 			if !bytes.Equal(first.data, value.data) {
-				return fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
+				needsMerge = true
+				continue
 			}
 			if classes == nil {
 				classes = make(map[string]*compositionTicketClass)
@@ -1455,7 +1463,124 @@ func (x *compositionExecution) validateTickets() error {
 				a.join(b)
 			}
 		}
+		if needsMerge {
+			if err := x.mergeScopeTickets(scope, tickets, first.media); err != nil {
+				return err
+			}
+		}
 	}
+	return nil
+}
+
+// mergeScopeTickets 对同级不同内容的标准打印票据执行语义合并，写入独立部件并更新作用域关系
+// 入参: scope 小写作用域部件键, tickets 同级全部已迁移票据部件名, media 共享票据媒体类型
+// 返回: error 格式不支持、受限、预算或取消错误
+func (x *compositionExecution) mergeScopeTickets(scope string, tickets []string, media string) error {
+	if known, capabilities := printResourceMedia(media); !known || capabilities {
+		return fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
+	}
+	sourceName := ""
+	level := PrintScopeUnknown
+	if x.output.sequence != "" && strings.EqualFold(x.output.sequence, scope) {
+		sourceName, level = x.output.sequence, PrintScopeJob
+	} else {
+		for _, doc := range x.output.documents {
+			if strings.EqualFold(doc.Part, scope) {
+				sourceName, level = doc.Part, PrintScopeDocument
+				break
+			}
+			for _, page := range doc.Pages {
+				if strings.EqualFold(page.Part, scope) {
+					sourceName, level = page.Part, PrintScopePage
+					break
+				}
+			}
+			if sourceName != "" {
+				break
+			}
+		}
+	}
+	options := &PrintSettingsOptions{Limits: x.plan.budget.limits, Scope: level}
+	var merged *PrintSettings
+	lastKey := ""
+	for _, ticket := range tickets {
+		if err := x.plan.budget.step(1); err != nil {
+			return err
+		}
+		key := strings.ToLower(ticket)
+		part, present := x.output.parts[key]
+		if !present || part.media != media {
+			return fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
+		}
+		if key == lastKey {
+			continue
+		}
+		lastKey = key
+		parsed, err := ParsePrintSettings(x.plan.budget.context, part.data, options)
+		if err != nil {
+			if errors.Is(err, ErrLimit) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			return fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
+		}
+		if merged == nil {
+			merged = parsed
+			continue
+		}
+		merged, err = MergePrintSettings(x.plan.budget.context, merged, parsed, options)
+		if err != nil {
+			if errors.Is(err, ErrLimit) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			return fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
+		}
+	}
+	var buffer bytes.Buffer
+	if _, err := EncodePrintSettings(x.plan.budget.context, &buffer, merged, options); err != nil {
+		return err
+	}
+	if sourceName == "" {
+		return nil
+	}
+	first := x.output.parts[strings.ToLower(tickets[0])]
+	dir := first.name[:strings.LastIndexByte(first.name, '/')+1]
+	if dir == "" {
+		dir = "/"
+	}
+	pattern := dir + "PrintTicket_%d.xml"
+	partName, err := x.output.newName(pattern, nil)
+	if err != nil {
+		return err
+	}
+	if err := x.output.store(partName, media, buffer.Bytes()); err != nil {
+		return err
+	}
+	x.output.commitName(pattern, partName)
+	kind := formatNamespace(x.plan.format) + "/printticket"
+	relations := slices.Clone(x.output.originalRels[scope])
+	if len(relations) == 0 {
+		relations = slices.Clone(x.output.relations[scope])
+	}
+	updated := false
+	for index := range relations {
+		if relations[index].Type == kind {
+			relations[index].Target, relations[index].TargetMode = partName, TargetModeInternal
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		nextID := createdRelationshipIDs(relations)
+		relations = append(relations, Relationship{ID: nextID(), Type: kind, Target: partName, TargetMode: TargetModeInternal})
+	}
+	relData, err := createdRelationshipMarkup(relations, x.plan.budget.limits, x.plan.budget.context)
+	if err != nil {
+		return err
+	}
+	if err := x.output.setRelationshipMarkup(sourceName, relData, x.plan.budget.context); err != nil {
+		return err
+	}
+	x.output.originalRels[scope] = relations
 	return nil
 }
 

@@ -747,10 +747,9 @@ func (g *contentGraph) emitUnreferenced(page *contentPage) error {
 	return nil
 }
 
-// Text 按指定阅读顺序连接Glyphs声明的Unicode文字，不猜测换行、重塑形或由字形编号虚构字符
-// 缺少Unicode声明时返回明确能力错误；绘制元素及位置参数仍可通过Content读取
+// Text 按指定阅读顺序连接Glyphs声明的Unicode文字，跳过合法省略UnicodeString的字形元素
 // 入参: ctx 取消Context，nil采用Background, docIndex 零基固定文档序号, options 内容参数，nil采用默认值
-// 返回: string 完整声明文字，失败时为空字符串, error 读取、缺少Unicode、预算或取消错误
+// 返回: string 完整声明文字，失败时为空字符串, error 读取、预算或取消错误
 func (r *Reader) Text(ctx context.Context, docIndex int, options *ContentOptions) (string, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
@@ -774,7 +773,7 @@ func (r *Reader) Text(ctx context.Context, docIndex int, options *ContentOptions
 		}
 		if glyphs, ok := item.Element.(*Glyphs); ok {
 			if _, present := glyphs.source.attribute("UnicodeString"); !present {
-				return "", &PartError{Part: item.Part, Element: "Glyphs", Err: fmt.Errorf("%w: glyph run has no Unicode text", ErrUnsupported)}
+				continue
 			}
 			if int64(len(glyphs.Text)) > remaining || len(glyphs.Text) > int(^uint(0)>>1)-text.Len() {
 				return "", fmt.Errorf("%w: content text byte budget", ErrLimit)
@@ -1223,7 +1222,7 @@ func ParseGlyphIndices(text string) ([]GlyphCluster, error) {
 			if err != nil {
 				return nil, fmt.Errorf("glyph entry %d: %w", i+j, err)
 			}
-			if !glyph.HasIndex && cluster.HasMapping {
+			if !glyph.HasIndex && count > 1 {
 				return nil, fmt.Errorf("%w: glyph entry %d: explicit cluster requires a glyph index", ErrInvalid, i+j)
 			}
 			cluster.Glyphs = append(cluster.Glyphs, glyph)
@@ -1258,7 +1257,7 @@ func ValidateGlyphIndices(clusters []GlyphCluster, rawUnicodeString string) erro
 			return fmt.Errorf("%w: cluster %d: missing explicit glyph count", ErrInvalid, i)
 		}
 		for _, glyph := range cluster.Glyphs {
-			if !glyph.HasIndex && (unicodeString == "" || cluster.HasMapping) {
+			if !glyph.HasIndex && (unicodeString == "" || len(cluster.Glyphs) != 1) {
 				return fmt.Errorf("%w: cluster %d: glyph index cannot be inferred", ErrInvalid, i)
 			}
 			if glyph.HasAdvanceWidth && (!geometryFinite(glyph.AdvanceWidth) || glyph.AdvanceWidth < 0) {
@@ -1271,6 +1270,7 @@ func ValidateGlyphIndices(clusters []GlyphCluster, rawUnicodeString string) erro
 		if unicodeString == "" {
 			continue
 		}
+		scalars := 0
 		for units := cluster.CodeUnitCount; units > 0; {
 			if remaining == "" {
 				return fmt.Errorf("%w: cluster %d: exceeds UnicodeString UTF-16 length", ErrInvalid, i)
@@ -1285,6 +1285,10 @@ func ValidateGlyphIndices(clusters []GlyphCluster, rawUnicodeString string) erro
 			}
 			units -= width
 			remaining = remaining[size:]
+			scalars++
+		}
+		if len(cluster.Glyphs) == 1 && !cluster.Glyphs[0].HasIndex && scalars != 1 {
+			return fmt.Errorf("%w: cluster %d: glyph index cannot be inferred", ErrInvalid, i)
 		}
 	}
 	for _, r := range remaining {

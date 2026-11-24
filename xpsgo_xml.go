@@ -43,8 +43,11 @@ const (
 	mcNamespace      = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 )
 
-// xmlDatePattern 匹配XML Schema日期联合类型的词法结构，数值范围由xmlDateValue校验
-var xmlDatePattern = regexp.MustCompile(`^-?([0-9]{4,})(?:-([0-9]{2})(?:-([0-9]{2})(?:T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]+))?)?)?)?(Z|[+-][0-9]{2}:[0-9]{2})?$`)
+// xmlDateTimePattern 匹配XML Schema dateTime词法结构，数值范围由xmlDateValue校验
+var xmlDateTimePattern = regexp.MustCompile(`^-?([0-9]{4,})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]+))?(Z|[+-][0-9]{2}:[0-9]{2})?$`)
+
+// xmlW3CDTFPattern 严格匹配W3CDTF六种标准日期时间粒度，不含负年份或无时间时区
+var xmlW3CDTFPattern = regexp.MustCompile(`^([0-9]{4})(?:-([0-9]{2})(?:-([0-9]{2})(?:T([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.([0-9]+))?)?(Z|[+-][0-9]{2}:[0-9]{2}))?)?)?$`)
 
 // canonicalLineFeeds 规范化注释和处理指令中的字面换行，不解释实体或字符引用
 var canonicalLineFeeds = strings.NewReplacer("\r\n", "\n", "\r", "\n")
@@ -128,10 +131,12 @@ type xmlUTF8Stream struct {
 	consumed int64
 }
 
-// compatibilityScope 保存按命名空间URI解析的可忽略规则和内容处理规则
+// compatibilityScope 保存按命名空间URI解析的可忽略、内容处理及保留规则
 type compatibilityScope struct {
-	ignorable map[string]bool
-	process   map[xml.Name]bool
+	ignorable          map[string]bool
+	process            map[xml.Name]bool
+	preserveElements   map[xml.Name]bool
+	preserveAttributes map[xml.Name]bool
 }
 
 // compatibilityProcessor 保存调用方声明理解的命名空间集合
@@ -841,12 +846,16 @@ func xmlTextValid(value string) bool {
 	return true
 }
 
-// xmlDateValue 校验XML Schema1.0日期词法与公历约束，不用time.Time的年份或精度范围缩小合法声明
-// 入参: value 已去除首尾XML空白的日期, full 是否必须为dateTime，否则接受W3CDTF联合类型
+// xmlDateValue 校验W3CDTF或XML Schema dateTime词法与公历约束，不用time.Time的年份或精度范围缩小合法声明
+// 入参: value 已去除首尾XML空白的日期, full 为true时必须为xs:dateTime，否则严格校验W3CDTF
 // 返回: bool 是否为合法声明
 func xmlDateValue(value string, full bool) bool {
-	fields := xmlDatePattern.FindStringSubmatch(value)
-	if fields == nil || fields[1] == "0000" || len(fields[1]) > 4 && fields[1][0] == '0' || full && fields[4] == "" {
+	pattern := xmlW3CDTFPattern
+	if full {
+		pattern = xmlDateTimePattern
+	}
+	fields := pattern.FindStringSubmatch(value)
+	if fields == nil || fields[1] == "0000" || full && len(fields[1]) > 4 && fields[1][0] == '0' {
 		return false
 	}
 	if zone := fields[8]; zone != "" && zone != "Z" {
@@ -878,7 +887,14 @@ func xmlDateValue(value string, full bool) bool {
 		}
 	}
 	if fields[4] != "" {
-		hour, minute, second := xmlDatePair(fields[4]), xmlDatePair(fields[5]), xmlDatePair(fields[6])
+		hour, minute := xmlDatePair(fields[4]), xmlDatePair(fields[5])
+		second := 0
+		if fields[6] != "" {
+			second = xmlDatePair(fields[6])
+		}
+		if !full {
+			return hour <= 23 && minute <= 59 && second <= 59
+		}
 		if hour > 24 || minute > 59 || second > 59 || hour == 24 && (minute != 0 || second != 0 || strings.Trim(fields[7], "0") != "") {
 			return false
 		}
@@ -1526,6 +1542,13 @@ func (p *compatibilityProcessor) contents(node *xmlElement, scope compatibilityS
 // 入参: node 当前元素, inherited 祖先兼容性作用域
 // 返回: compatibilityScope 当前作用域, error 错误信息
 func (p *compatibilityProcessor) rules(node *xmlElement, inherited compatibilityScope) (compatibilityScope, error) {
+	return p.rulesChecked(node, inherited, true)
+}
+
+// rulesChecked 按需校验MustUnderstand并构造不修改祖先的作用域，供候选分支延后检查使用
+// 入参: node 当前元素, inherited 祖先兼容性作用域, checkMustUnderstand 是否立即校验MustUnderstand
+// 返回: compatibilityScope 当前作用域, error 错误信息
+func (p *compatibilityProcessor) rulesChecked(node *xmlElement, inherited compatibilityScope, checkMustUnderstand bool) (compatibilityScope, error) {
 	scope := inherited
 	local := make(map[string]bool)
 	if value, ok := node.attributeNS(mcNamespace, "Ignorable"); ok {
@@ -1542,6 +1565,14 @@ func (p *compatibilityProcessor) rules(node *xmlElement, inherited compatibility
 			if scope.process == nil {
 				scope.process = make(map[xml.Name]bool)
 			}
+			scope.preserveElements = maps.Clone(inherited.preserveElements)
+			if scope.preserveElements == nil {
+				scope.preserveElements = make(map[xml.Name]bool)
+			}
+			scope.preserveAttributes = maps.Clone(inherited.preserveAttributes)
+			if scope.preserveAttributes == nil {
+				scope.preserveAttributes = make(map[xml.Name]bool)
+			}
 			for _, uri := range uris {
 				local[uri] = true
 				scope.ignorable[uri] = true
@@ -1549,6 +1580,16 @@ func (p *compatibilityProcessor) rules(node *xmlElement, inherited compatibility
 			for name := range scope.process {
 				if local[name.Space] {
 					delete(scope.process, name)
+				}
+			}
+			for name := range scope.preserveElements {
+				if local[name.Space] {
+					delete(scope.preserveElements, name)
+				}
+			}
+			for name := range scope.preserveAttributes {
+				if local[name.Space] {
+					delete(scope.preserveAttributes, name)
 				}
 			}
 		}
@@ -1560,13 +1601,9 @@ func (p *compatibilityProcessor) rules(node *xmlElement, inherited compatibility
 		switch attr.Name.Local {
 		case "Ignorable":
 		case "MustUnderstand":
-			uris, err := compatibilityPrefixes(node, attr.Value)
-			if err != nil {
-				return scope, err
-			}
-			for _, uri := range uris {
-				if !p.understood[uri] {
-					return scope, fmt.Errorf("%w: MustUnderstand namespace %q", ErrUnsupported, uri)
+			if checkMustUnderstand {
+				if err := p.checkMustUnderstand(node, attr.Value); err != nil {
+					return scope, err
 				}
 			}
 		case "ProcessContent", "PreserveElements", "PreserveAttributes":
@@ -1578,8 +1615,13 @@ func (p *compatibilityProcessor) rules(node *xmlElement, inherited compatibility
 				if !local[name.Space] {
 					return scope, fmt.Errorf("%w: %s name %q requires Ignorable on the same element", ErrInvalid, attr.Name.Local, word)
 				}
-				if attr.Name.Local == "ProcessContent" {
+				switch attr.Name.Local {
+				case "ProcessContent":
 					scope.process[name] = true
+				case "PreserveElements":
+					scope.preserveElements[name] = true
+				case "PreserveAttributes":
+					scope.preserveAttributes[name] = true
 				}
 			}
 		default:
@@ -1587,6 +1629,22 @@ func (p *compatibilityProcessor) rules(node *xmlElement, inherited compatibility
 		}
 	}
 	return scope, nil
+}
+
+// checkMustUnderstand 校验MustUnderstand属性中的前缀列表是否全部属于已理解命名空间
+// 入参: node 当前元素, value 前缀列表文本
+// 返回: error 未声明前缀或未理解命名空间错误
+func (p *compatibilityProcessor) checkMustUnderstand(node *xmlElement, value string) error {
+	uris, err := compatibilityPrefixes(node, value)
+	if err != nil {
+		return err
+	}
+	for _, uri := range uris {
+		if !p.understood[uri] {
+			return fmt.Errorf("%w: MustUnderstand namespace %q", ErrUnsupported, uri)
+		}
+	}
+	return nil
 }
 
 // processes 判断展开名称是否命中内容处理规则
@@ -1654,14 +1712,15 @@ func (p *compatibilityProcessor) alternate(node *xmlElement, scope compatibility
 	return p.contents(selection.selected, selection.scope)
 }
 
-// alternative 校验候选分支的属性与顺序，不解释未选分支的内部内容
+// alternative 校验候选分支的属性与顺序，仅对选中分支校验MustUnderstand且不解释未选分支内部内容
 // 入参: node 当前候选或可忽略包装, inherited 祖先作用域, selection 选择状态
 // 返回: error 错误信息
 func (p *compatibilityProcessor) alternative(node *xmlElement, inherited compatibilityScope, selection *compatibilitySelection) error {
 	if node == nil {
 		return fmt.Errorf("%w: nil AlternateContent child", ErrInvalid)
 	}
-	scope, err := p.rules(node, inherited)
+	branch := node.Name.Space == mcNamespace && (node.Name.Local == "Choice" || node.Name.Local == "Fallback")
+	scope, err := p.rulesChecked(node, inherited, !branch)
 	if err != nil {
 		return err
 	}
@@ -1685,7 +1744,7 @@ func (p *compatibilityProcessor) alternative(node *xmlElement, inherited compati
 		}
 		return nil
 	}
-	if node.Name.Space != mcNamespace || node.Name.Local != "Choice" && node.Name.Local != "Fallback" {
+	if !branch {
 		return fmt.Errorf("%w: unexpected AlternateContent child %s", ErrInvalid, node.Name.Local)
 	}
 	if _, err := p.attributes(node, scope, true); err != nil {
@@ -1705,6 +1764,9 @@ func (p *compatibilityProcessor) alternative(node *xmlElement, inherited compati
 		if err != nil {
 			return err
 		}
+		if len(uris) == 0 {
+			return fmt.Errorf("%w: empty Choice Requires", ErrInvalid)
+		}
 		for _, uri := range uris {
 			if !p.understood[uri] {
 				selectable = false
@@ -1717,6 +1779,11 @@ func (p *compatibilityProcessor) alternative(node *xmlElement, inherited compati
 		selection.fallback = true
 	}
 	if selection.selected == nil && selectable {
+		if value, ok := node.attributeNS(mcNamespace, "MustUnderstand"); ok {
+			if err := p.checkMustUnderstand(node, value); err != nil {
+				return err
+			}
+		}
 		selection.selected = node
 		selection.scope = scope
 	}

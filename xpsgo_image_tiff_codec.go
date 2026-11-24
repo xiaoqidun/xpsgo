@@ -16,12 +16,14 @@ package xpsgo
 
 import (
 	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
+	"io"
 )
 
 // tiffFaxVertical 等常量表示TIFF传真压缩编码模式
@@ -552,11 +554,8 @@ func faxStrip(dst, src []byte, width int, compression, fillOrder, options uint32
 		} else {
 			var end bool
 			changes, end, err = f.line2(row, width, reference, changes[:0])
-			if end && compression == 4 {
-				return nil
-			}
 			if end {
-				return fmt.Errorf("%w: TIFF T.4 unexpected EOFB", ErrInvalid)
+				return fmt.Errorf("%w: TIFF fax premature EOFB", ErrInvalid)
 			}
 		}
 		if err != nil {
@@ -579,6 +578,34 @@ func faxStrip(dst, src []byte, width int, compression, fillOrder, options uint32
 		if compression == 2 {
 			f.position = (f.position + 7) &^ 7
 		}
+	}
+	return nil
+}
+
+// decodeTIFFDeflate 按TIFF补充规范解压zlib流，拒绝截断、超长或尾部冗余字节
+// 入参: dst 目标字节, src 压缩条带或图块字节
+// 返回: error zlib解压、校验或长度错误
+func decodeTIFFDeflate(dst, src []byte) error {
+	input := bytes.NewReader(src)
+	reader, err := zlib.NewReader(input)
+	if err != nil {
+		return fmt.Errorf("%w: TIFF deflate stream: %w", ErrInvalid, err)
+	}
+	if _, err := io.ReadFull(reader, dst); err != nil {
+		_ = reader.Close()
+		return fmt.Errorf("%w: TIFF deflate data: %w", ErrInvalid, err)
+	}
+	var extra [1]byte
+	n, err := reader.Read(extra[:])
+	if n != 0 || err != io.EOF {
+		_ = reader.Close()
+		return fmt.Errorf("%w: excessive TIFF deflate output", ErrInvalid)
+	}
+	if err := reader.Close(); err != nil {
+		return fmt.Errorf("%w: TIFF deflate checksum: %w", ErrInvalid, err)
+	}
+	if input.Len() != 0 {
+		return fmt.Errorf("%w: trailing TIFF deflate data", ErrInvalid)
 	}
 	return nil
 }
@@ -1733,16 +1760,13 @@ func (l *tiffLegacyJPEG) losslessBlockDecode(out *rasterImage, data []byte, regi
 	if width < 1 || height < 1 || width > 65535 || height > 65535 {
 		return fmt.Errorf("%w: lossless JPEG dimensions", ErrLimit)
 	}
-	if l.restart != 0 && int(l.restart)%width != 0 {
-		return fmt.Errorf("%w: lossless JPEG restart row alignment", ErrInvalid)
-	}
 	if uint64(width)*uint64(height)*uint64(l.channels) > rasterMaxWork || uint64(len(data)) > rasterMaxWork {
 		return fmt.Errorf("%w: lossless JPEG decoding budget", ErrLimit)
 	}
 	rows := make([]uint16, width*l.channels*2)
 	previous, current := rows[:width*l.channels], rows[width*l.channels:]
 	b := losslessBits{data: data}
-	startRow, lastRestart := 0, -1
+	restartMCU, lastRestart := 0, -1
 	visible := region.Intersect(out.bounds())
 	maximum := uint32((1 << l.bits) - 1)
 	scale := uint32(65535) / maximum
@@ -1750,28 +1774,32 @@ func (l *tiffLegacyJPEG) losslessBlockDecode(out *rasterImage, data []byte, regi
 		scale = 0
 	}
 	for y := range height {
-		if y != 0 && l.restart != 0 && y*width%int(l.restart) == 0 {
-			var err error
-			lastRestart, err = b.restart(lastRestart)
-			if err != nil {
-				return err
-			}
-			if l.strictRestart && lastRestart != (y*width/int(l.restart)-1)&7 {
-				return fmt.Errorf("%w: TIFF lossless JPEG initial restart", ErrInvalid)
-			}
-			startRow = y
-		}
 		for x := range width {
+			mcu := y*width + x
+			if mcu != 0 && l.restart != 0 && mcu%int(l.restart) == 0 {
+				var err error
+				lastRestart, err = b.restart(lastRestart)
+				if err != nil {
+					return err
+				}
+				if l.strictRestart && lastRestart != (mcu/int(l.restart)-1)&7 {
+					return fmt.Errorf("%w: TIFF lossless JPEG initial restart", ErrInvalid)
+				}
+				restartMCU = mcu
+			}
+			since := mcu - restartMCU
 			var sample [4]uint16
 			for scanIndex := range l.channels {
 				c := int(l.scanOrder[scanIndex])
 				at := x*l.channels + c
 				prediction := 1 << (l.bits - l.point[c] - 1)
-				if x != 0 && y == startRow {
-					prediction = int(current[at-l.channels])
-				} else if y != startRow {
-					prediction = int(previous[at])
+				if since > 0 && since < width {
 					if x != 0 {
+						prediction = int(current[at-l.channels])
+					}
+				} else if since >= width {
+					prediction = int(previous[at])
+					if x != 0 && since > width {
 						prediction = losslessPrediction(l.predictor[c], int(current[at-l.channels]), int(previous[at]), int(previous[at-l.channels]))
 					}
 				}

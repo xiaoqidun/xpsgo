@@ -357,11 +357,12 @@ func rewriteEntry(archive zipEntryWriter, file *zip.File, compression Compressio
 	return closeErr
 }
 
-// interleavePriorities 计算交错写出优先级，将内容类型流、包根关系、签名及打印票据置于普通部件之前
+// interleavePriorities 计算交错写出优先级，将流式前置元数据、签名、票据及文档目录部件置于普通部件之前
 // 入参: ctx 取消Context
 // 返回: map[string]int 优先级, error 部件类型、票据引用或取消错误
 func (r *Reader) interleavePriorities(ctx context.Context) (map[string]int, error) {
-	priority := map[string]int{strings.ToLower(opcTypesName): 4, "/_rels/.rels": 3}
+	priority := map[string]int{strings.ToLower(opcTypesName): 7, "/_rels/.rels": 6}
+	discardMedia := fixedContentType("discard-control")
 	for key := range r.pkg.parts {
 		if err := checkContext(ctx); err != nil {
 			return nil, err
@@ -373,13 +374,31 @@ func (r *Reader) interleavePriorities(ctx context.Context) (map[string]int, erro
 		if err != nil {
 			return nil, err
 		}
-		if slices.Contains([]string{opcSignatureOriginType, opcSignatureType, opcCertificateType}, strings.ToLower(media)) {
-			priority[key] = 2
-			priority[strings.ToLower(createdRelationshipPart(r.pkg.names[key]))] = 2
+		lower := strings.ToLower(media)
+		if lower == discardMedia {
+			priority[key] = max(priority[key], 5)
+		} else if slices.Contains([]string{opcSignatureOriginType, opcSignatureType, opcCertificateType}, lower) {
+			priority[key] = max(priority[key], 4)
+			relKey := strings.ToLower(createdRelationshipPart(r.pkg.names[key]))
+			priority[relKey] = max(priority[relKey], 4)
 		}
 	}
+	if rootRels, err := r.pkg.relationships("/"); err == nil {
+		if target, err := discardControlTarget(rootRels, r.format); err == nil && target != "" {
+			key := strings.ToLower(target)
+			priority[key] = max(priority[key], 5)
+		}
+	}
+	seqKey := strings.ToLower(r.sequence)
+	priority[seqKey] = max(priority[seqKey], 2)
+	seqRelKey := strings.ToLower(createdRelationshipPart(r.sequence))
+	priority[seqRelKey] = max(priority[seqRelKey], 2)
 	owners := []string{r.sequence}
 	for _, document := range r.documents {
+		docKey := strings.ToLower(document.Part)
+		priority[docKey] = max(priority[docKey], 1)
+		docRelKey := strings.ToLower(createdRelationshipPart(document.Part))
+		priority[docRelKey] = max(priority[docRelKey], 1)
 		owners = append(owners, document.Part)
 		for _, page := range document.Pages {
 			owners = append(owners, page.Part)
@@ -408,7 +427,7 @@ func (r *Reader) interleavePriorities(ctx context.Context) (map[string]int, erro
 			if _, exists := r.pkg.parts[key]; !exists {
 				return nil, fmt.Errorf("%w: missing interleaved PrintTicket %s", ErrInvalid, target)
 			}
-			priority[key] = max(priority[key], 1)
+			priority[key] = max(priority[key], 3)
 		}
 	}
 	return priority, nil

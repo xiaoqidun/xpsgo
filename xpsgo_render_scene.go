@@ -29,10 +29,11 @@ import (
 	"unicode/utf8"
 )
 
-// sceneTileSize 等常量定义场景光栅化图块边长与复用池像素上限
+// sceneTileSize 等常量定义场景光栅化图块边长、嵌套深度与复用池像素上限
 const (
 	sceneTileSize       = 32
 	sceneScratchPoolMax = 32 * 8 * 32 * 8
+	sceneMaxDepth       = 1024
 )
 
 // sceneWorkerPool 复用场景多核光栅化工作Goroutine的临时图块缓冲
@@ -81,6 +82,7 @@ type sceneRenderOptions struct {
 	printProfiles *sceneColorCache
 	printSide     bool
 	workers       int
+	pageSubClip   *image.Rectangle
 }
 
 // sceneSample 同时接收当前覆盖采样点和所属设备像素中心，保持嵌套图块的采样相位
@@ -967,13 +969,104 @@ func renderPageCoversBounds(width, height float64, transform Matrix, bounds imag
 	return minX <= float64(bounds.Min.X) && minY <= float64(bounds.Min.Y) && maxX >= float64(bounds.Max.X) && maxY >= float64(bounds.Max.Y)
 }
 
+// renderSubClipBound 求与光栅化像素中心归属规则一致的半开子像素边界整数索引
+// 入参: v 子像素空间有限边界坐标
+// 返回: int 满足idx+0.5>=v的最小整数索引
+func renderSubClipBound(v float64) int {
+	idx := int(math.Ceil(v - 0.5))
+	for float64(idx-1)+0.5 >= v {
+		idx--
+	}
+	for float64(idx)+0.5 < v {
+		idx++
+	}
+	return idx
+}
+
+// renderSubClipInterval 将子像素实数区间裁剪至目标范围并换算为精确整数半开子像素区间
+// 入参: lo 实数下界, hi 实数上界, minBound 目标范围下界, maxBound 目标范围上界
+// 返回: int 整数下界, int 整数上界
+func renderSubClipInterval(lo, hi float64, minBound, maxBound int) (int, int) {
+	if hi <= float64(minBound)-0.5 || lo >= float64(maxBound)+0.5 {
+		return minBound, minBound
+	}
+	start := minBound
+	if lo > float64(minBound)-0.5 {
+		start = max(minBound, renderSubClipBound(lo))
+	}
+	end := maxBound
+	if hi < float64(maxBound)+0.5 {
+		end = min(maxBound, renderSubClipBound(hi))
+	}
+	if end < start {
+		return start, start
+	}
+	return start, end
+}
+
+// renderAxisAlignedPageClip 计算纯轴对齐变换页面矩形对应的精确子像素半开裁剪范围
+// 入参: width 页面宽度, height 页面高度, transform 页面到设备的变换, bounds 输出像素范围, samples 线性采样倍率
+// 返回: image.Rectangle 子像素半开裁剪范围, bool 变换是否为纯轴对齐且可无隔离裁剪
+func renderAxisAlignedPageClip(width, height float64, transform Matrix, bounds image.Rectangle, samples int) (image.Rectangle, bool) {
+	if !geometryFinite(width, height) || width <= 0 || height <= 0 || !geometryFillMatrixFinite(transform) || geometryMatrixSingular(transform) || samples < 1 {
+		return image.Rectangle{}, false
+	}
+	if !(transform.B == 0 && transform.C == 0 || transform.A == 0 && transform.D == 0) {
+		return image.Rectangle{}, false
+	}
+	p0, err0 := geometryFillPoint(transform, Point{})
+	p1, err1 := geometryFillPoint(transform, Point{width, height})
+	if err0 != nil || err1 != nil {
+		return image.Rectangle{}, false
+	}
+	scale := float64(samples)
+	sx0, sx1 := min(p0.X, p1.X)*scale, max(p0.X, p1.X)*scale
+	sy0, sy1 := min(p0.Y, p1.Y)*scale, max(p0.Y, p1.Y)*scale
+	if !geometryFinite(sx0, sx1, sy0, sy1) {
+		return image.Rectangle{}, false
+	}
+	x0, x1 := renderSubClipInterval(sx0, sx1, bounds.Min.X*samples, bounds.Max.X*samples)
+	y0, y1 := renderSubClipInterval(sy0, sy1, bounds.Min.Y*samples, bounds.Max.Y*samples)
+	return image.Rect(x0, y0, x1, y1), true
+}
+
+// renderFloorDiv 计算向下取整的整数商，确保负子像素坐标映射至正确的粗像素索引
+// 入参: a 被除数, b 正除数
+// 返回: int 向下取整商
+func renderFloorDiv(a, b int) int {
+	q := a / b
+	if a < 0 && a%b != 0 {
+		q--
+	}
+	return q
+}
+
+// renderCeilDiv 计算向上取整的整数商，确保非对齐子像素上界覆盖完整粗像素
+// 入参: a 被除数, b 正除数
+// 返回: int 向上取整商
+func renderCeilDiv(a, b int) int {
+	q := a / b
+	if a > 0 && a%b != 0 {
+		q++
+	}
+	return q
+}
+
 // renderLoadedPage 在调用方持有读锁时绘制已经解析的页面，单次调用独占所有资源缓存
 // 入参: page 已解析页面, transform 页面到设备的变换, bounds 输出范围, options 绘制参数
 // 返回: *image.NRGBA 页面图像, error 资源、绘制或能力错误
 func (r *Reader) renderLoadedPage(page *Page, transform Matrix, bounds image.Rectangle, options sceneRenderOptions) (*image.NRGBA, error) {
 	var clip *Geometry
 	if !renderPageCoversBounds(page.Width, page.Height, transform, bounds) {
-		clip = renderBoxGeometry(Rect{Width: page.Width, Height: page.Height})
+		if len(options.printPlan) == 0 {
+			if subClip, ok := renderAxisAlignedPageClip(page.Width, page.Height, transform, bounds, options.samples); ok {
+				options.pageSubClip = &subClip
+			} else {
+				clip = renderBoxGeometry(Rect{Width: page.Width, Height: page.Height})
+			}
+		} else {
+			clip = renderBoxGeometry(Rect{Width: page.Width, Height: page.Height})
+		}
 	}
 	root := &Canvas{ElementProperties: ElementProperties{Part: page.Part, Opacity: 1, Clip: clip}, Elements: page.Elements}
 	return r.renderLoadedElements([]Element{root}, transform, bounds, options)
@@ -1158,7 +1251,7 @@ func validateSceneOutput(bounds image.Rectangle, transform Matrix, options scene
 	if options.workers < 0 || options.samples != 1 && options.samples != 2 && options.samples != 4 && options.samples != 8 || !geometryFinite(options.tolerance) || options.tolerance <= 0 || options.pixels < 0 || options.elements < 0 || options.edges < 0 || options.glyphs < 0 || options.fonts < 0 || options.fontBytes < 0 || options.images < 0 || options.imageBytes < 0 || options.profiles < 0 || options.profileBytes < 0 || !geometryFillMatrixFinite(transform) {
 		return 0, fmt.Errorf("%w: scene render options", ErrInvalid)
 	}
-	if options.edges > rasterMaxEdges {
+	if options.edges > int(^uint(0)>>1)/4 {
 		return 0, fmt.Errorf("%w: scene max edges", ErrLimit)
 	}
 	if options.space != renderSRGB && options.space != renderScRGB {
@@ -1226,7 +1319,7 @@ func (r *sceneRenderer) prepare(elements []Element, transform Matrix, aliased bo
 	if err := r.charge(0); err != nil {
 		return nil, err
 	}
-	if depth > 128 || len(elements) > r.elements {
+	if depth > sceneMaxDepth || len(elements) > r.elements {
 		return nil, fmt.Errorf("%w: scene depth or element count", ErrLimit)
 	}
 	r.elements -= len(elements)
@@ -1327,7 +1420,7 @@ func (r *sceneRenderer) node(element Element, transform Matrix, aliased bool, de
 		n.clip = &region
 	}
 	if properties.OpacityMask != nil {
-		n.mask, err = r.brush(properties.OpacityMask, transform, aliased, depth)
+		n.mask, err = r.brushMode(properties.OpacityMask, transform, aliased, depth, true)
 		if err != nil {
 			return nil, err
 		}
@@ -1479,6 +1572,13 @@ func (r *sceneRenderer) region(edges []geometryEdge, rule GeometryFillRule, alia
 // 入参: brush 输入画刷, transform 所属元素的有效设备变换, aliased 继承的边缘模式, depth 当前元素深度
 // 返回: sceneSample 颜色采样器, error 画刷或能力错误
 func (r *sceneRenderer) brush(brush *Brush, transform Matrix, aliased bool, depth int) (sceneSample, error) {
+	return r.brushMode(brush, transform, aliased, depth, false)
+}
+
+// brushMode 按是否用于透明度掩模创建画刷采样器，透明度掩模图像画刷仅读取透明度通道
+// 入参: brush 输入画刷, transform 所属元素的有效设备变换, aliased 继承的边缘模式, depth 当前元素深度, maskOnly 是否仅需透明度掩模
+// 返回: sceneSample 颜色采样器, error 画刷或能力错误
+func (r *sceneRenderer) brushMode(brush *Brush, transform Matrix, aliased bool, depth int, maskOnly bool) (sceneSample, error) {
 	r.nativeSample = nil
 	r.brushMeta = sceneBrushMeta{}
 	if r.printRuntime != nil {
@@ -1540,7 +1640,7 @@ func (r *sceneRenderer) brush(brush *Brush, transform Matrix, aliased bool, dept
 		if err != nil {
 			return nil, err
 		}
-		sampler, err := newImageSampler(brush, data, transform, space)
+		sampler, err := newImageSamplerMode(brush, data, transform, space, maskOnly)
 		if err != nil {
 			return nil, err
 		}
@@ -1716,12 +1816,18 @@ func (r *sceneRenderer) tile(nodes []*sceneNode, surface *renderSurface, output 
 	} else {
 		clear(surface.pixels)
 	}
-	for _, node := range nodes {
-		if node.opacity != 0 && node.bounds.Overlaps(bounds) {
-			touched = true
-		}
-		if err := r.draw(node, surface, bounds, 0, worker); err != nil {
-			return err
+	subClip := surface.bounds
+	if r.options.pageSubClip != nil {
+		subClip = subClip.Intersect(*r.options.pageSubClip)
+	}
+	if !subClip.Empty() {
+		for _, node := range nodes {
+			if node.opacity != 0 && node.bounds.Overlaps(bounds) {
+				touched = true
+			}
+			if err := r.draw(node, surface, bounds, subClip, 0, worker); err != nil {
+				return err
+			}
 		}
 	}
 	if err := r.charge(uint64(len(surface.pixels))); err != nil {
@@ -1877,9 +1983,9 @@ func sceneRegionEdgeCost(region rasterRegion, minY, maxY float64) uint64 {
 }
 
 // draw 先完成节点内部绘制，再施加节点裁剪、透明度掩模及整体透明度
-// 入参: node 绘制节点, target 背景表面, bounds 输出像素范围, isoDepth 当前隔离嵌套深度, worker 工作Goroutine独占状态
+// 入参: node 绘制节点, target 背景表面, bounds 输出像素范围, subClip 有效子像素半开裁剪范围, isoDepth 当前隔离嵌套深度, worker 工作Goroutine独占状态
 // 返回: error 带部件位置的绘制错误
-func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds image.Rectangle, isoDepth int, worker *sceneWorkerState) (err error) {
+func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds, subClip image.Rectangle, isoDepth int, worker *sceneWorkerState) (err error) {
 	defer func() {
 		if err != nil {
 			err = wrapPartError(node.part, node.kind, err)
@@ -1889,7 +1995,7 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds imag
 		return err
 	}
 	nodeTile := node.bounds.Intersect(bounds)
-	if node.opacity == 0 || nodeTile.Empty() {
+	if node.opacity == 0 || nodeTile.Empty() || subClip.Empty() {
 		return nil
 	}
 	samples := r.options.samples
@@ -1897,8 +2003,9 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds imag
 	surface := target
 	nextDepth := isoDepth
 	drawBounds := bounds
+	childClip := subClip
 	if isolated {
-		isoBounds := image.Rect(nodeTile.Min.X*samples, nodeTile.Min.Y*samples, nodeTile.Max.X*samples, nodeTile.Max.Y*samples).Intersect(target.bounds)
+		isoBounds := image.Rect(nodeTile.Min.X*samples, nodeTile.Min.Y*samples, nodeTile.Max.X*samples, nodeTile.Max.Y*samples).Intersect(subClip)
 		if isoBounds.Empty() {
 			return nil
 		}
@@ -1913,6 +2020,7 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds imag
 		}()
 		nextDepth = isoDepth + 1
 		drawBounds = nodeTile
+		childClip = isoBounds
 	}
 	scale := float64(samples)
 	for _, paint := range node.paints {
@@ -1920,7 +2028,7 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds imag
 		if paintTile.Empty() {
 			continue
 		}
-		subBounds := image.Rect(paintTile.Min.X*samples, paintTile.Min.Y*samples, paintTile.Max.X*samples, paintTile.Max.Y*samples).Intersect(surface.bounds)
+		subBounds := image.Rect(paintTile.Min.X*samples, paintTile.Min.Y*samples, paintTile.Max.X*samples, paintTile.Max.Y*samples).Intersect(childClip)
 		if subBounds.Empty() {
 			continue
 		}
@@ -1978,7 +2086,7 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds imag
 		}
 	}
 	for _, child := range node.children {
-		if err := r.draw(child, surface, drawBounds, nextDepth, worker); err != nil {
+		if err := r.draw(child, surface, drawBounds, childClip, nextDepth, worker); err != nil {
 			return err
 		}
 	}
@@ -1993,14 +2101,14 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds imag
 	return r.composite(node, surface, target, drawBounds, worker)
 }
 
-// coverageScratch 生成统一采样空间的二值掩模并复用工作Goroutine的扫描与字节缓冲
-// 入参: regions 取并集的绘制区域, aliased 是否使用输出像素中心, bounds 按输出像素对齐的子像素范围, dst 输出掩模缓冲, worker 工作Goroutine独占状态
+// coverageScratch 生成统一采样空间的二值掩模并复用工作Goroutine的扫描与字节缓冲，支持非对齐子像素裁剪范围
+// 入参: regions 取并集的绘制区域, aliased 是否使用输出像素中心, bounds 子像素裁剪范围, dst 输出掩模缓冲, worker 工作Goroutine独占状态
 // 返回: *image.Alpha 仅含零和满覆盖的掩模, error 光栅化错误
 func (r *sceneRenderer) coverageScratch(regions []rasterRegion, aliased bool, bounds image.Rectangle, dst *image.Alpha, worker *sceneWorkerState) (*image.Alpha, error) {
 	samples := r.options.samples
 	coarse := bounds
 	if aliased {
-		coarse = image.Rect(bounds.Min.X/samples, bounds.Min.Y/samples, bounds.Max.X/samples, bounds.Max.Y/samples)
+		coarse = image.Rect(renderFloorDiv(bounds.Min.X, samples), renderFloorDiv(bounds.Min.Y, samples), renderCeilDiv(bounds.Max.X, samples), renderCeilDiv(bounds.Max.Y, samples))
 	}
 	scratch := &worker.raster
 	coarseDst := dst
@@ -2008,6 +2116,9 @@ func (r *sceneRenderer) coverageScratch(regions []rasterRegion, aliased bool, bo
 		coarseDst = &worker.coarse
 	}
 	partDst := &worker.part
+	maxPixels := max(uint64(rasterMaxPixels), uint64(max(0, r.options.pixels)))
+	maxEdges := max(rasterMaxEdges, r.options.edges)
+	maxWork := max(uint64(rasterMaxWork), r.options.work)
 	var mask *image.Alpha
 	for first := 0; first < len(regions) || mask == nil; first += rasterMaxRegions {
 		last := min(first+rasterMaxRegions, len(regions))
@@ -2015,7 +2126,7 @@ func (r *sceneRenderer) coverageScratch(regions []rasterRegion, aliased bool, bo
 		if mask == nil {
 			target = coarseDst
 		}
-		part, err := rasterRegionsCoverageScratch(regions[first:last], coarse, true, 1, target, scratch)
+		part, err := rasterRegionsCoverageBudget(regions[first:last], coarse, true, 1, maxPixels, maxEdges, maxWork, target, scratch)
 		if err != nil {
 			return nil, err
 		}
@@ -2042,18 +2153,26 @@ func (r *sceneRenderer) coverageScratch(regions []rasterRegion, aliased bool, bo
 	cw, ch := coarse.Dx(), coarse.Dy()
 	fullStride := full.Stride
 	for cy := range ch {
+		gy := coarse.Min.Y + cy
+		yStart := max(bounds.Min.Y, gy*samples)
+		yEnd := min(bounds.Max.Y, (gy+1)*samples)
+		if yStart >= yEnd {
+			continue
+		}
 		srcRow := mask.Pix[cy*mask.Stride : cy*mask.Stride+cw]
-		firstRowOff := cy * samples * fullStride
-		firstRow := full.Pix[firstRowOff : firstRowOff+cw*samples]
+		firstRowOff := (yStart - bounds.Min.Y) * fullStride
+		firstRow := full.Pix[firstRowOff : firstRowOff+fullStride]
 		for cx, value := range srcRow {
-			base := cx * samples
-			for i := range samples {
-				firstRow[base+i] = value
+			gx := coarse.Min.X + cx
+			xStart := max(bounds.Min.X, gx*samples) - bounds.Min.X
+			xEnd := min(bounds.Max.X, (gx+1)*samples) - bounds.Min.X
+			for x := xStart; x < xEnd; x++ {
+				firstRow[x] = value
 			}
 		}
-		for j := 1; j < samples; j++ {
-			dstOff := (cy*samples + j) * fullStride
-			copy(full.Pix[dstOff:dstOff+cw*samples], firstRow)
+		for y := yStart + 1; y < yEnd; y++ {
+			dstOff := (y - bounds.Min.Y) * fullStride
+			copy(full.Pix[dstOff:dstOff+fullStride], firstRow)
 		}
 	}
 	return full, nil

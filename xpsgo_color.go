@@ -60,6 +60,15 @@ const (
 	iccStageMatrix iccStageKind = iota
 	iccStageCurves
 	iccStageCLUT
+	iccStageFloatMatrix
+	iccStageSegmentedCurves
+)
+
+// iccMaxChannels 等常量限制ICC色彩通道、管线元素与命名色条目上限
+const (
+	iccMaxChannels    = 15
+	iccMaxElements    = 4096
+	iccMaxNamedColors = 1 << 20
 )
 
 // colorDecimalPattern 匹配十进制颜色分量词法
@@ -113,26 +122,45 @@ type iccInverseCurve struct {
 	upper float64
 }
 
+// iccFloatCurveSegment 保存多阶段浮点曲线的单个公式段或采样段，采样字节共享只读配置存储
+type iccFloatCurveSegment struct {
+	sampled    bool
+	function   uint16
+	parameters [5]float64
+	values     []byte
+	startValue float64
+}
+
+// iccSegmentedCurve 保存按断点有序划分的浮点分段传递曲线
+type iccSegmentedCurve struct {
+	breakpoints []float64
+	segments    []iccFloatCurveSegment
+}
+
 // iccStageKind 表示色彩转换中的矩阵、逐通道曲线或多维查找表
 type iccStageKind uint8
 
 // iccStage 保存一个转换阶段，查找表字节与原配置文件共享只读存储
 type iccStage struct {
-	kind      iccStageKind
-	matrix    [12]float64
-	curves    []iccCurve
-	grid      []int
-	data      []byte
-	precision int
-	outputs   int
+	kind        iccStageKind
+	matrix      [12]float64
+	floatMatrix []float64
+	curves      []iccCurve
+	segCurves   []iccSegmentedCurve
+	grid        []int
+	data        []byte
+	precision   int
+	inputs      int
+	outputs     int
 }
 
-// iccPipeline 保存按处理顺序排列的转换阶段，输入输出均采用ICC归一化编码
+// iccPipeline 保存按处理顺序排列的转换阶段，整数管线采用归一化编码而浮点管线保留无裁剪数值
 type iccPipeline struct {
 	inputs         int
 	outputs        int
 	stages         []iccStage
 	legacyLab      bool
+	floating       bool
 	inputPrecision int
 }
 
@@ -387,9 +415,9 @@ func renderSourceOver(source, destination renderColor) (renderColor, error) {
 	return result, nil
 }
 
-// renderColorModulate 将不透明度与覆盖率施加于预乘RGB和alpha
+// renderColorModulate 将不透明度与覆盖率施加于预乘RGB和alpha，下溢为零时安全归零
 // 入参: c 预乘颜色, opacity 单位区间内的不透明度, coverage 单位区间内的覆盖率
-// 返回: renderColor 调制结果, error 非法输入或不可表示的浮点下溢错误
+// 返回: renderColor 调制结果, error 非法输入错误
 func renderColorModulate(c renderColor, opacity, coverage float64) (renderColor, error) {
 	if err := c.validate(); err != nil {
 		return renderColor{}, err
@@ -399,14 +427,11 @@ func renderColorModulate(c renderColor, opacity, coverage float64) (renderColor,
 	}
 	factor := opacity * coverage
 	if factor == 0 {
-		if opacity != 0 && coverage != 0 && c.a != 0 {
-			return renderColor{}, fmt.Errorf("%w: compositor modulation underflow", ErrLimit)
-		}
 		return renderColor{}, nil
 	}
 	result := renderColor{c.r * factor, c.g * factor, c.b * factor, c.a * factor}
-	if result.a == 0 && (result.r != 0 || result.g != 0 || result.b != 0) {
-		return renderColor{}, fmt.Errorf("%w: compositor alpha underflow", ErrLimit)
+	if result.a == 0 {
+		return renderColor{}, nil
 	}
 	return result, nil
 }
@@ -468,8 +493,8 @@ func parseICCNamedColor(profile *iccProfile) ([]iccNamedColor, error) {
 			return nil, fmt.Errorf("%w: ICC named color padding", ErrInvalid)
 		}
 	}
-	if count > 8 {
-		return nil, fmt.Errorf("%w: OpenXPS named color count", ErrUnsupported)
+	if count > iccMaxNamedColors {
+		return nil, fmt.Errorf("%w: ICC named color count", ErrLimit)
 	}
 	if err := iccNamedASCII(data[20:52]); err != nil {
 		return nil, err
@@ -629,7 +654,7 @@ func (c iccCurve) evaluate(value float64) (float64, error) {
 			result = math.Pow(value, p[0])
 		case 1, 2:
 			if value >= -p[2]/p[1] {
-				result = math.Pow(p[1]*value+p[2], p[0])
+				result = math.Pow(max(0, p[1]*value+p[2]), p[0])
 			}
 			if c.function == 2 {
 				result += p[3]
@@ -722,7 +747,7 @@ func validateICCInverseCurve(c iccCurve, ctx context.Context) error {
 		if c.function == 0 && p[0] <= 0 || c.function != 0 && (p[0] <= 0 || p[1] <= 0) || c.function >= 3 && p[3] < 0 {
 			return fmt.Errorf("%w: ICC target parametric curve inverse", ErrUnsupported)
 		}
-		if c.function != 0 && boundary < 1 && p[1]*max(0, boundary)+p[2] < 0 {
+		if c.function >= 3 && boundary < 1 && p[1]*max(0, boundary)+p[2] < 0 {
 			return fmt.Errorf("%w: ICC target curve power domain", ErrUnsupported)
 		}
 	}
@@ -848,7 +873,7 @@ func parseICCLUT(data []byte, inputXYZ bool) (*iccPipeline, error) {
 	if inputs == 0 || outputs == 0 {
 		return nil, fmt.Errorf("%w: ICC LUT channels", ErrInvalid)
 	}
-	if inputs > 8 || outputs > 8 {
+	if inputs > iccMaxChannels || outputs > iccMaxChannels {
 		return nil, fmt.Errorf("%w: ICC LUT channel count", ErrUnsupported)
 	}
 	if points < 2 {
@@ -908,40 +933,82 @@ func parseICCLUT(data []byte, inputXYZ bool) (*iccPipeline, error) {
 	return p, nil
 }
 
-// evaluate 执行有界归一化转换，保留阶段之间的浮点精度，不分配每个颜色的临时切片
-// 入参: input 归一化源分量
-// 返回: [8]float64 目标分量，数量由管线定义, error 输入或阶段错误
-func (p *iccPipeline) evaluate(input []float64) ([8]float64, error) {
-	if p == nil || len(input) != p.inputs || p.inputs < 1 || p.inputs > 8 || p.outputs < 1 || p.outputs > 8 {
-		return [8]float64{}, fmt.Errorf("%w: ICC pipeline channels", ErrInvalid)
+// evaluate 执行有界转换，保留阶段之间的浮点精度且浮点管线不裁剪范围
+// 入参: input 源分量
+// 返回: [iccMaxChannels]float64 目标分量，数量由管线定义, error 输入或阶段错误
+func (p *iccPipeline) evaluate(input []float64) ([iccMaxChannels]float64, error) {
+	if p == nil || len(input) != p.inputs || p.inputs < 1 || p.inputs > iccMaxChannels || p.outputs < 1 || p.outputs > iccMaxChannels {
+		return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC pipeline channels", ErrInvalid)
 	}
-	var values [8]float64
+	var values [iccMaxChannels]float64
 	for i, value := range input {
 		if !geometryFinite(value) {
-			return [8]float64{}, fmt.Errorf("%w: ICC pipeline input", ErrInvalid)
+			return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC pipeline input", ErrInvalid)
 		}
-		values[i] = colorClamp(value)
+		if p.floating {
+			values[i] = value
+		} else {
+			values[i] = colorClamp(value)
+		}
 	}
 	count := p.inputs
 	for _, stage := range p.stages {
 		switch stage.kind {
 		case iccStageMatrix:
 			if count != 3 {
-				return [8]float64{}, fmt.Errorf("%w: ICC matrix stage channels", ErrInvalid)
+				return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC matrix stage channels", ErrInvalid)
 			}
 			original := values
 			for row := range 3 {
 				m := stage.matrix[row*3:]
-				values[row] = colorClamp(m[0]*original[0] + m[1]*original[1] + m[2]*original[2] + stage.matrix[9+row])
+				v := m[0]*original[0] + m[1]*original[1] + m[2]*original[2] + stage.matrix[9+row]
+				if !geometryFinite(v) {
+					return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC matrix stage range", ErrLimit)
+				}
+				if p.floating {
+					values[row] = v
+				} else {
+					values[row] = colorClamp(v)
+				}
 			}
+		case iccStageFloatMatrix:
+			if count != stage.inputs || stage.outputs < 1 || stage.outputs > iccMaxChannels || len(stage.floatMatrix) != stage.outputs*stage.inputs+stage.outputs {
+				return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC float matrix stage channels", ErrInvalid)
+			}
+			var next [iccMaxChannels]float64
+			offsetBase := stage.outputs * stage.inputs
+			for row := range stage.outputs {
+				sum := stage.floatMatrix[offsetBase+row]
+				rowBase := row * stage.inputs
+				for col := range stage.inputs {
+					sum += stage.floatMatrix[rowBase+col] * values[col]
+				}
+				if !geometryFinite(sum) {
+					return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC float matrix stage range", ErrLimit)
+				}
+				next[row] = sum
+			}
+			values = next
+			count = stage.outputs
 		case iccStageCurves:
 			if len(stage.curves) != count {
-				return [8]float64{}, fmt.Errorf("%w: ICC curve stage channels", ErrInvalid)
+				return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC curve stage channels", ErrInvalid)
 			}
 			for i, curve := range stage.curves {
 				value, err := curve.evaluate(values[i])
 				if err != nil {
-					return [8]float64{}, err
+					return [iccMaxChannels]float64{}, err
+				}
+				values[i] = value
+			}
+		case iccStageSegmentedCurves:
+			if len(stage.segCurves) != count {
+				return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC segmented curve stage channels", ErrInvalid)
+			}
+			for i, curve := range stage.segCurves {
+				value, err := curve.evaluate(values[i])
+				if err != nil {
+					return [iccMaxChannels]float64{}, err
 				}
 				values[i] = value
 			}
@@ -949,53 +1016,62 @@ func (p *iccPipeline) evaluate(input []float64) ([8]float64, error) {
 			var err error
 			values, err = stage.lookup(values[:count])
 			if err != nil {
-				return [8]float64{}, err
+				return [iccMaxChannels]float64{}, err
 			}
 			count = stage.outputs
 		default:
-			return [8]float64{}, fmt.Errorf("%w: ICC stage kind", ErrInvalid)
+			return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC stage kind", ErrInvalid)
 		}
 	}
 	if count != p.outputs {
-		return [8]float64{}, fmt.Errorf("%w: ICC pipeline output channels", ErrInvalid)
+		return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC pipeline output channels", ErrInvalid)
 	}
 	return values, nil
 }
 
-// lookup 按首通道变化最慢的表布局执行多线性插值，最多计算八维单元的256个角点
-// 入参: input 当前阶段归一化分量
-// 返回: [8]float64 插值输出, error 布局或参数错误
-func (s iccStage) lookup(input []float64) ([8]float64, error) {
+// lookup 按首通道变化最慢的表布局执行多线性插值，支持八位、十六位及三十二位浮点查找表
+// 入参: input 当前阶段分量
+// 返回: [iccMaxChannels]float64 插值输出, error 布局或参数错误
+func (s iccStage) lookup(input []float64) ([iccMaxChannels]float64, error) {
 	n := len(s.grid)
-	if n < 1 || n > 8 || len(input) != n || s.outputs < 1 || s.outputs > 8 || s.precision != 1 && s.precision != 2 {
-		return [8]float64{}, fmt.Errorf("%w: ICC CLUT layout", ErrInvalid)
+	if n < 1 || n > iccMaxChannels || len(input) != n || s.outputs < 1 || s.outputs > iccMaxChannels || s.precision != 1 && s.precision != 2 && s.precision != 4 {
+		return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC CLUT layout", ErrInvalid)
 	}
-	var fractions [8]float64
-	var lower, stride [8]int
-	cells := s.outputs
+	var activeFrac [iccMaxChannels]float64
+	var activeStride [iccMaxChannels]int
+	active, baseIndex, cells := 0, 0, s.outputs
 	for i := n - 1; i >= 0; i-- {
 		if s.grid[i] < 2 || cells > len(s.data)/s.precision/s.grid[i] {
-			return [8]float64{}, fmt.Errorf("%w: ICC CLUT data", ErrInvalid)
+			return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC CLUT data", ErrInvalid)
 		}
-		stride[i] = cells
+		curStride := cells
 		cells *= s.grid[i]
 		if !geometryFinite(input[i]) {
-			return [8]float64{}, fmt.Errorf("%w: ICC CLUT input", ErrInvalid)
+			return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC CLUT input", ErrInvalid)
 		}
 		position := colorClamp(input[i]) * float64(s.grid[i]-1)
-		lower[i] = min(int(position), s.grid[i]-2)
-		fractions[i] = position - float64(lower[i])
+		low := min(int(position), s.grid[i]-2)
+		frac := position - float64(low)
+		if frac == 0 {
+			baseIndex += low * curStride
+		} else if frac == 1 {
+			baseIndex += (low + 1) * curStride
+		} else {
+			baseIndex += low * curStride
+			activeStride[active] = curStride
+			activeFrac[active] = frac
+			active++
+		}
 	}
-	var out [8]float64
-	for corner := 0; corner < 1<<n; corner++ {
-		index, weight := 0, 1.0
-		for i := range n {
-			upper := corner >> i & 1
-			index += (lower[i] + upper) * stride[i]
-			if upper != 0 {
-				weight *= fractions[i]
+	var out [iccMaxChannels]float64
+	for corner := 0; corner < 1<<active; corner++ {
+		index, weight := baseIndex, 1.0
+		for i := range active {
+			if corner>>i&1 != 0 {
+				index += activeStride[i]
+				weight *= activeFrac[i]
 			} else {
-				weight *= 1 - fractions[i]
+				weight *= 1 - activeFrac[i]
 			}
 		}
 		if weight == 0 {
@@ -1003,16 +1079,27 @@ func (s iccStage) lookup(input []float64) ([8]float64, error) {
 		}
 		for channel := range s.outputs {
 			value := 0.0
-			if s.precision == 1 {
+			switch s.precision {
+			case 1:
 				value = float64(s.data[index+channel]) / 255
-			} else {
+			case 2:
 				value = float64(binary.BigEndian.Uint16(s.data[(index+channel)*2:])) / 65535
+			case 4:
+				value = float64(math.Float32frombits(binary.BigEndian.Uint32(s.data[(index+channel)*4:])))
+				if !geometryFinite(value) {
+					return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC CLUT float value", ErrInvalid)
+				}
 			}
 			out[channel] += value * weight
 		}
 	}
 	for channel := range s.outputs {
-		out[channel] = colorClamp(out[channel])
+		if !geometryFinite(out[channel]) {
+			return [iccMaxChannels]float64{}, fmt.Errorf("%w: ICC CLUT output range", ErrLimit)
+		}
+		if s.precision != 4 {
+			out[channel] = colorClamp(out[channel])
+		}
 	}
 	return out, nil
 }
@@ -1032,7 +1119,7 @@ func parseICCMultiLUT(data []byte) (*iccPipeline, error) {
 	if inputs == 0 || outputs == 0 {
 		return nil, fmt.Errorf("%w: ICC multi-stage LUT channels", ErrInvalid)
 	}
-	if inputs > 8 || outputs > 8 {
+	if inputs > iccMaxChannels || outputs > iccMaxChannels {
 		return nil, fmt.Errorf("%w: ICC multi-stage LUT channel count", ErrUnsupported)
 	}
 	var offsets [5]uint64
@@ -1152,7 +1239,7 @@ func iccEmbeddedCurves(data []byte, offset uint64, count int) (iccStage, []iccSt
 // 入参: data CLUT定义及后续数据, inputs 输入通道数, outputs 输出通道数
 // 返回: iccStage 查找表阶段, int 元素字节数, error 数据或资源错误
 func iccEmbeddedCLUT(data []byte, inputs, outputs int) (iccStage, int, error) {
-	if len(data) < 20 || inputs < 1 || inputs > 8 || outputs < 1 || outputs > 8 {
+	if len(data) < 20 || inputs < 1 || inputs > iccMaxChannels || outputs < 1 || outputs > iccMaxChannels {
 		return iccStage{}, 0, fmt.Errorf("%w: ICC embedded CLUT header", ErrInvalid)
 	}
 	precision := int(data[16])
@@ -1179,4 +1266,369 @@ func iccEmbeddedCLUT(data []byte, inputs, outputs int) (iccStage, int, error) {
 	size := 20 + int(cells)*precision
 	stage.data = data[20:size]
 	return stage, size, nil
+}
+
+// iccFloat32 解码大端IEEE 754单精度浮点数并校验有限性
+// 入参: data 至少四字节切片
+// 返回: float64 有限浮点值, error 非有限数值错误
+func iccFloat32(data []byte) (float64, error) {
+	value := float64(math.Float32frombits(binary.BigEndian.Uint32(data)))
+	if !geometryFinite(value) {
+		return 0, fmt.Errorf("%w: ICC non-finite float32", ErrInvalid)
+	}
+	return value, nil
+}
+
+// parseICCMultiProcess 解析ICC v4.3 multiProcessElementsType浮点管线，支持cvst、matf、clut、bACS与eACS
+// 入参: data mpet标签完整字节
+// 返回: *iccPipeline 无裁剪浮点转换管线, error 格式、能力或资源错误
+func parseICCMultiProcess(data []byte) (*iccPipeline, error) {
+	if len(data) < 16 || string(data[:4]) != "mpet" || binary.BigEndian.Uint32(data[4:]) != 0 {
+		return nil, fmt.Errorf("%w: ICC multi-process header", ErrInvalid)
+	}
+	inputs, outputs := int(binary.BigEndian.Uint16(data[8:])), int(binary.BigEndian.Uint16(data[10:]))
+	if inputs == 0 || outputs == 0 {
+		return nil, fmt.Errorf("%w: ICC multi-process channels", ErrInvalid)
+	}
+	if inputs > iccMaxChannels || outputs > iccMaxChannels {
+		return nil, fmt.Errorf("%w: ICC multi-process channel count", ErrUnsupported)
+	}
+	count := uint64(binary.BigEndian.Uint32(data[12:]))
+	if count > iccMaxElements {
+		return nil, fmt.Errorf("%w: ICC multi-process element count", ErrLimit)
+	}
+	first := uint64(16) + 8*count
+	if first > uint64(len(data)) {
+		return nil, fmt.Errorf("%w: ICC multi-process table", ErrInvalid)
+	}
+	if count == 0 {
+		if inputs != outputs {
+			return nil, fmt.Errorf("%w: ICC empty multi-process channels", ErrInvalid)
+		}
+		return &iccPipeline{inputs: inputs, outputs: outputs, floating: true}, nil
+	}
+	positions := make([]iccTag, int(count))
+	ranges := make([]iccTag, int(count))
+	for i := range count {
+		entry := data[16+8*i : 24+8*i]
+		pos := iccTag{offset: binary.BigEndian.Uint32(entry[:4]), size: binary.BigEndian.Uint32(entry[4:])}
+		if uint64(pos.offset) < first || pos.offset%4 != 0 || pos.size < 12 || uint64(pos.offset)+uint64(pos.size) > uint64(len(data)) {
+			return nil, fmt.Errorf("%w: ICC multi-process element range", ErrInvalid)
+		}
+		positions[i] = pos
+		ranges[i] = pos
+	}
+	slices.SortFunc(ranges, func(a, b iccTag) int {
+		if value := cmp.Compare(a.offset, b.offset); value != 0 {
+			return value
+		}
+		return cmp.Compare(a.size, b.size)
+	})
+	for i := 1; i < len(ranges); i++ {
+		a, b := ranges[i-1], ranges[i]
+		if uint64(b.offset) < uint64(a.offset)+uint64(a.size) && a != b {
+			return nil, fmt.Errorf("%w: overlapping ICC multi-process elements", ErrInvalid)
+		}
+	}
+	p := &iccPipeline{inputs: inputs, outputs: outputs, floating: true}
+	current := inputs
+	for _, pos := range positions {
+		elem := data[uint64(pos.offset) : uint64(pos.offset)+uint64(pos.size)]
+		if binary.BigEndian.Uint32(elem[4:]) != 0 {
+			return nil, fmt.Errorf("%w: ICC process element reserved field", ErrInvalid)
+		}
+		inCh, outCh := int(binary.BigEndian.Uint16(elem[8:])), int(binary.BigEndian.Uint16(elem[10:]))
+		if inCh != current || outCh == 0 {
+			return nil, fmt.Errorf("%w: ICC process element channels", ErrInvalid)
+		}
+		if inCh > iccMaxChannels || outCh > iccMaxChannels {
+			return nil, fmt.Errorf("%w: ICC process element channel count", ErrUnsupported)
+		}
+		switch string(elem[:4]) {
+		case "bACS", "eACS":
+			if len(elem) != 16 || inCh != outCh {
+				return nil, fmt.Errorf("%w: ICC ACS process element", ErrInvalid)
+			}
+		case "matf":
+			total := uint64(outCh)*uint64(inCh) + uint64(outCh)
+			if uint64(len(elem)) != 12+4*total {
+				return nil, fmt.Errorf("%w: ICC matrix process element size", ErrInvalid)
+			}
+			matrix := make([]float64, int(total))
+			for i := range matrix {
+				v, err := iccFloat32(elem[12+4*i:])
+				if err != nil {
+					return nil, err
+				}
+				matrix[i] = v
+			}
+			p.stages = append(p.stages, iccStage{kind: iccStageFloatMatrix, floatMatrix: matrix, inputs: inCh, outputs: outCh})
+		case "clut":
+			if len(elem) < 28 {
+				return nil, fmt.Errorf("%w: ICC float CLUT header", ErrInvalid)
+			}
+			for _, unused := range elem[12+inCh : 28] {
+				if unused != 0 {
+					return nil, fmt.Errorf("%w: ICC unused float CLUT grid", ErrInvalid)
+				}
+			}
+			grid := make([]int, inCh)
+			cells := uint64(outCh)
+			avail := uint64(len(elem)-28) / 4
+			for i := range inCh {
+				g := int(elem[12+i])
+				if g < 2 {
+					return nil, fmt.Errorf("%w: ICC float CLUT grid", ErrInvalid)
+				}
+				if cells > avail/uint64(g) {
+					return nil, fmt.Errorf("%w: ICC float CLUT size", ErrInvalid)
+				}
+				cells *= uint64(g)
+				grid[i] = g
+			}
+			if uint64(len(elem)-28) != cells*4 {
+				return nil, fmt.Errorf("%w: ICC float CLUT length", ErrInvalid)
+			}
+			for off := 28; off < len(elem); off += 4 {
+				if binary.BigEndian.Uint32(elem[off:])&0x7f800000 == 0x7f800000 {
+					return nil, fmt.Errorf("%w: ICC float CLUT non-finite entry", ErrInvalid)
+				}
+			}
+			p.stages = append(p.stages, iccStage{kind: iccStageCLUT, precision: 4, grid: grid, inputs: inCh, outputs: outCh, data: elem[28:]})
+		case "cvst":
+			if inCh != outCh {
+				return nil, fmt.Errorf("%w: ICC curve set channels", ErrInvalid)
+			}
+			curves, err := parseICCCurveSet(elem, inCh)
+			if err != nil {
+				return nil, err
+			}
+			p.stages = append(p.stages, iccStage{kind: iccStageSegmentedCurves, segCurves: curves, inputs: inCh, outputs: outCh})
+		default:
+			return nil, fmt.Errorf("%w: ICC process element type %q", ErrUnsupported, string(elem[:4]))
+		}
+		current = outCh
+	}
+	if current != outputs {
+		return nil, fmt.Errorf("%w: ICC multi-process output channels", ErrInvalid)
+	}
+	return p, nil
+}
+
+// parseICCCurveSet 解析cvst曲线集内各通道的偏移表与分段曲线定义，支持共享曲线与非紧邻布局
+// 入参: data cvst元素完整字节, channels 通道数
+// 返回: []iccSegmentedCurve 逐通道分段曲线, error 格式、能力或资源错误
+func parseICCCurveSet(data []byte, channels int) ([]iccSegmentedCurve, error) {
+	first := uint64(12) + 8*uint64(channels)
+	if first > uint64(len(data)) {
+		return nil, fmt.Errorf("%w: ICC curve set table", ErrInvalid)
+	}
+	positions := make([]iccTag, channels)
+	ranges := make([]iccTag, channels)
+	for i := range channels {
+		entry := data[12+8*i : 20+8*i]
+		pos := iccTag{offset: binary.BigEndian.Uint32(entry[:4]), size: binary.BigEndian.Uint32(entry[4:])}
+		if uint64(pos.offset) < first || pos.offset%4 != 0 || pos.size < 12 || uint64(pos.offset)+uint64(pos.size) > uint64(len(data)) {
+			return nil, fmt.Errorf("%w: ICC curve set entry range", ErrInvalid)
+		}
+		positions[i] = pos
+		ranges[i] = pos
+	}
+	slices.SortFunc(ranges, func(a, b iccTag) int {
+		if value := cmp.Compare(a.offset, b.offset); value != 0 {
+			return value
+		}
+		return cmp.Compare(a.size, b.size)
+	})
+	for i := 1; i < len(ranges); i++ {
+		a, b := ranges[i-1], ranges[i]
+		if uint64(b.offset) < uint64(a.offset)+uint64(a.size) && a != b {
+			return nil, fmt.Errorf("%w: overlapping ICC curve set entries", ErrInvalid)
+		}
+	}
+	curves := make([]iccSegmentedCurve, channels)
+	for i, pos := range positions {
+		curve, err := parseICCSegmentedCurve(data[uint64(pos.offset) : uint64(pos.offset)+uint64(pos.size)])
+		if err != nil {
+			return nil, err
+		}
+		curves[i] = curve
+	}
+	return curves, nil
+}
+
+// parseICCSegmentedCurve 解析单通道curf分段曲线及内部的parf公式段与samf采样段
+// 入参: data curf曲线完整字节
+// 返回: iccSegmentedCurve 断点与分段列表, error 格式、能力或资源错误
+func parseICCSegmentedCurve(data []byte) (iccSegmentedCurve, error) {
+	if len(data) < 12 || string(data[:4]) != "curf" || binary.BigEndian.Uint32(data[4:]) != 0 || binary.BigEndian.Uint16(data[10:]) != 0 {
+		return iccSegmentedCurve{}, fmt.Errorf("%w: ICC segmented curve header", ErrInvalid)
+	}
+	segCount := int(binary.BigEndian.Uint16(data[8:]))
+	if segCount == 0 {
+		return iccSegmentedCurve{}, fmt.Errorf("%w: ICC segmented curve count", ErrInvalid)
+	}
+	if segCount > iccMaxElements {
+		return iccSegmentedCurve{}, fmt.Errorf("%w: ICC segmented curve count", ErrLimit)
+	}
+	offset := uint64(12) + 4*uint64(segCount-1)
+	if offset > uint64(len(data)) {
+		return iccSegmentedCurve{}, fmt.Errorf("%w: ICC segmented curve breakpoints", ErrInvalid)
+	}
+	var breakpoints []float64
+	if segCount > 1 {
+		breakpoints = make([]float64, segCount-1)
+		for i := range breakpoints {
+			bp, err := iccFloat32(data[12+4*i:])
+			if err != nil {
+				return iccSegmentedCurve{}, err
+			}
+			if i > 0 && bp < breakpoints[i-1] {
+				return iccSegmentedCurve{}, fmt.Errorf("%w: ICC segmented curve breakpoint order", ErrInvalid)
+			}
+			breakpoints[i] = bp
+		}
+	}
+	segments := make([]iccFloatCurveSegment, segCount)
+	for i := range segCount {
+		if offset+12 > uint64(len(data)) || binary.BigEndian.Uint32(data[offset+4:]) != 0 {
+			return iccSegmentedCurve{}, fmt.Errorf("%w: ICC curve segment header", ErrInvalid)
+		}
+		switch string(data[offset : offset+4]) {
+		case "parf":
+			fn := binary.BigEndian.Uint16(data[offset+8:])
+			if binary.BigEndian.Uint16(data[offset+10:]) != 0 {
+				return iccSegmentedCurve{}, fmt.Errorf("%w: ICC formula curve reserved field", ErrInvalid)
+			}
+			paramCount := 0
+			switch fn {
+			case 0:
+				paramCount = 4
+			case 1, 2:
+				paramCount = 5
+			default:
+				return iccSegmentedCurve{}, fmt.Errorf("%w: ICC formula curve function %d", ErrUnsupported, fn)
+			}
+			end := offset + 12 + 4*uint64(paramCount)
+			if end > uint64(len(data)) {
+				return iccSegmentedCurve{}, fmt.Errorf("%w: ICC formula curve parameters", ErrInvalid)
+			}
+			seg := iccFloatCurveSegment{function: fn}
+			for j := range paramCount {
+				v, err := iccFloat32(data[offset+12+4*uint64(j):])
+				if err != nil {
+					return iccSegmentedCurve{}, err
+				}
+				seg.parameters[j] = v
+			}
+			segments[i] = seg
+			offset = end
+		case "samf":
+			if i == 0 || i == segCount-1 {
+				return iccSegmentedCurve{}, fmt.Errorf("%w: ICC sampled curve segment requires finite bounds", ErrInvalid)
+			}
+			count := uint64(binary.BigEndian.Uint32(data[offset+8:]))
+			if count == 0 {
+				return iccSegmentedCurve{}, fmt.Errorf("%w: ICC sampled curve segment count", ErrInvalid)
+			}
+			if count > iccMaxCurveSamples {
+				return iccSegmentedCurve{}, fmt.Errorf("%w: ICC sampled curve segment count", ErrLimit)
+			}
+			if count > (uint64(len(data))-offset-12)/4 {
+				return iccSegmentedCurve{}, fmt.Errorf("%w: ICC sampled curve segment data", ErrInvalid)
+			}
+			end := offset + 12 + 4*count
+			values := data[offset+12 : end]
+			for pos := 0; pos < len(values); pos += 4 {
+				if binary.BigEndian.Uint32(values[pos:])&0x7f800000 == 0x7f800000 {
+					return iccSegmentedCurve{}, fmt.Errorf("%w: ICC sampled curve non-finite entry", ErrInvalid)
+				}
+			}
+			prevLo, prevHi := 0.0, 0.0
+			if i >= 2 {
+				prevLo, prevHi = breakpoints[i-2], breakpoints[i-1]
+			}
+			startVal, err := segments[i-1].evaluateAt(breakpoints[i-1], prevLo, prevHi)
+			if err != nil {
+				return iccSegmentedCurve{}, err
+			}
+			segments[i] = iccFloatCurveSegment{sampled: true, values: values, startValue: startVal}
+			offset = end
+		default:
+			return iccSegmentedCurve{}, fmt.Errorf("%w: ICC curve segment type %q", ErrUnsupported, string(data[offset:offset+4]))
+		}
+	}
+	if offset != uint64(len(data)) {
+		return iccSegmentedCurve{}, fmt.Errorf("%w: ICC segmented curve length", ErrInvalid)
+	}
+	return iccSegmentedCurve{breakpoints: breakpoints, segments: segments}, nil
+}
+
+// evaluate 按断点选择所属分段并无裁剪求值
+// 入参: x 有限浮点输入
+// 返回: float64 有限浮点输出, error 输入或求值错误
+func (c iccSegmentedCurve) evaluate(x float64) (float64, error) {
+	if !geometryFinite(x) || len(c.segments) == 0 {
+		return 0, fmt.Errorf("%w: ICC segmented curve input", ErrInvalid)
+	}
+	idx := len(c.segments) - 1
+	for i, bp := range c.breakpoints {
+		if x <= bp {
+			idx = i
+			break
+		}
+	}
+	lo, hi := 0.0, 0.0
+	if idx > 0 && idx < len(c.segments)-1 {
+		lo, hi = c.breakpoints[idx-1], c.breakpoints[idx]
+	}
+	return c.segments[idx].evaluateAt(x, lo, hi)
+}
+
+// evaluateAt 求单个公式段或采样段在指定坐标的值，采样段以左断点延续值作为起点线性插值
+// 入参: x 输入值, lo 采样段左断点, hi 采样段右断点
+// 返回: float64 有限输出值, error 非实数或溢出错误
+func (s iccFloatCurveSegment) evaluateAt(x, lo, hi float64) (float64, error) {
+	var result float64
+	if s.sampled {
+		count := len(s.values) / 4
+		if count == 0 {
+			return 0, fmt.Errorf("%w: ICC sampled curve segment", ErrInvalid)
+		}
+		if hi <= lo || x >= hi {
+			result = float64(math.Float32frombits(binary.BigEndian.Uint32(s.values[(count-1)*4:])))
+		} else if x <= lo {
+			result = s.startValue
+		} else {
+			pos := (x - lo) / (hi - lo) * float64(count)
+			idx := int(pos)
+			if idx >= count {
+				result = float64(math.Float32frombits(binary.BigEndian.Uint32(s.values[(count-1)*4:])))
+			} else {
+				frac := pos - float64(idx)
+				y0 := s.startValue
+				if idx > 0 {
+					y0 = float64(math.Float32frombits(binary.BigEndian.Uint32(s.values[(idx-1)*4:])))
+				}
+				y1 := float64(math.Float32frombits(binary.BigEndian.Uint32(s.values[idx*4:])))
+				result = y0*(1-frac) + y1*frac
+			}
+		}
+	} else {
+		p := s.parameters
+		switch s.function {
+		case 0:
+			result = math.Pow(p[1]*x+p[2], p[0]) + p[3]
+		case 1:
+			result = p[1]*math.Log10(p[2]*math.Pow(x, p[0])+p[3]) + p[4]
+		case 2:
+			result = p[0]*math.Pow(p[1], p[2]*x+p[3]) + p[4]
+		default:
+			return 0, fmt.Errorf("%w: ICC formula curve function", ErrUnsupported)
+		}
+	}
+	if !geometryFinite(result) {
+		return 0, fmt.Errorf("%w: non-finite ICC segmented curve value", ErrInvalid)
+	}
+	return result, nil
 }

@@ -1343,7 +1343,7 @@ func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges i
 	if path == nil || path.Data == nil || !geometryFillMatrixFinite(transform) || !geometryFinite(tolerance) || tolerance <= 0 || maxEdges < 0 {
 		return nil, fmt.Errorf("%w: stroke path parameters", ErrInvalid)
 	}
-	if maxEdges > rasterMaxEdges {
+	if maxEdges > int(^uint(0)>>1)/4 {
 		return nil, fmt.Errorf("%w: stroke max edges", ErrLimit)
 	}
 	style := strokeOutlineStyle{path.StrokeThickness, path.StrokeStartLineCap, path.StrokeEndLineCap, path.StrokeLineJoin, path.StrokeMiterLimit}
@@ -1361,12 +1361,12 @@ func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges i
 	if !geometryFillMatrixFinite(geometry) {
 		return nil, fmt.Errorf("%w: stroke geometry transform", ErrInvalid)
 	}
-	segments := 0
+	segments, segmentLimit := 0, max(rasterMaxEdges, maxEdges)
 	for _, figure := range path.Data.Figures {
 		if !geometryFinite(figure.StartPoint.X, figure.StartPoint.Y) {
 			return nil, fmt.Errorf("%w: stroke figure start", ErrInvalid)
 		}
-		if len(figure.Segments)+1 > rasterMaxEdges-segments {
+		if segments >= segmentLimit || len(figure.Segments) > segmentLimit-1-segments {
 			return nil, fmt.Errorf("%w: stroke segment budget", ErrLimit)
 		}
 		segments += len(figure.Segments) + 1
@@ -1376,7 +1376,7 @@ func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges i
 			}
 		}
 	}
-	if path.Stroke == nil || geometryMatrixSingular(geometry) || geometryMatrixSingular(transform) {
+	if path.Stroke == nil || geometryMatrixSingular(transform) {
 		return nil, nil
 	}
 	transform.E = geometryLinearCombination(transform.E, transform.A, geometry.E, transform.C, geometry.F)
@@ -1401,11 +1401,13 @@ func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges i
 	planningPath := *path
 	deviceSpace := nominal && style.thickness == 0
 	if deviceSpace {
+		geometrySingular := geometryMatrixSingular(geometry)
+		geometryZero := geometry.A == 0 && geometry.B == 0 && geometry.C == 0 && geometry.D == 0
 		curveGeometry = strokePathCompose(transform, geometry)
 		curveDevice = IdentityMatrix()
 		planningPath.StrokeThickness = 1
 		lengthTolerance = tolerance / float64(max(1, segments)) / 8
-		if !geometryFillMatrixFinite(curveGeometry) || geometryMatrixSingular(curveGeometry) {
+		if !geometryFillMatrixFinite(curveGeometry) || !geometrySingular && geometryMatrixSingular(curveGeometry) || !geometryZero && curveGeometry.A == 0 && curveGeometry.B == 0 && curveGeometry.C == 0 && curveGeometry.D == 0 {
 			return nil, fmt.Errorf("%w: nominal stroke transform precision", ErrLimit)
 		}
 	}
@@ -1414,7 +1416,7 @@ func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges i
 		return nil, err
 	}
 	remaining := maxEdges
-	dashWork := strokeDashMaxWork
+	dashWork := max(strokeDashMaxWork, maxEdges)
 	metric := curveDevice
 	curveAngle := angularTolerance
 	if dashed {
