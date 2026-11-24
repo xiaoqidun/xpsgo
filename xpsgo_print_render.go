@@ -53,15 +53,20 @@ var printResourceRules = [...]struct {
 	{"DocumentCoverBackSource", "DocumentCoverBack", []string{"PrintFront", "PrintBack", "PrintBoth"}, "CoverBackSource", printResourceContent},
 }
 
-// PrintRenderOptions 设置单页打印布局与栅格输出，Render.Transform须为nil，Region采用介质设备坐标，默认白色背景
-// Watermark提供源页文字水印字体与排版配置并与正文共用字体缓存；反色在源页合成后执行，灰度/单色在降采样后执行
-// Signatures应用有效作业签名策略（需错误报告纸时应使用PrintPlan），Color供设备输出入口指定设备条件与覆盖策略
+// PrintRenderOptions 设置单页或拼版纸面的打印绘制、水印、签名、色彩与加载预算，默认白色背景且Render.Transform须为nil
+// Print用于单页打印入口；Transform在DPI缩放前应用于介质输出，MaxPages、MaxPageBytes、MaxResourceBytes与MaxXMLNodes用于拼版纸面入口
+// MaxPages默认4096，MaxPageBytes与MaxResourceBytes默认64MiB，MaxXMLNodes零值采用阅读器上限
 type PrintRenderOptions struct {
-	Print      PrintLayoutOptions
-	Render     RenderOptions
-	Watermark  *PrintWatermarkOptions
-	Signatures *PrintSignatureOptions
-	Color      *PrintColorOptions
+	Print            PrintLayoutOptions
+	Render           RenderOptions
+	Transform        *Matrix
+	Watermark        *PrintWatermarkOptions
+	Signatures       *PrintSignatureOptions
+	Color            *PrintColorOptions
+	MaxPages         int
+	MaxPageBytes     int64
+	MaxResourceBytes int64
+	MaxXMLNodes      int
 }
 
 // printSideXMLLoader 保存单次纸面绘制的XML预算及只读字典树，不与其他调用共享可变状态
@@ -115,31 +120,39 @@ type printResourceCollector struct {
 	references []printResourceReference
 }
 
-// DefaultPrintRenderOptions 返回白色背景及默认打印设置与绘制参数的单页打印绘制配置
+// DefaultPrintRenderOptions 返回白色背景及默认打印设置、绘制与拼版加载预算的打印绘制配置
 // 返回: PrintRenderOptions 打印绘制参数
 func DefaultPrintRenderOptions() PrintRenderOptions {
 	render := DefaultRenderOptions()
 	render.Background = color.White
-	return PrintRenderOptions{Print: PrintLayoutOptions{Settings: DefaultPrintSettingsOptions()}, Render: render}
+	limits := DefaultLimits()
+	return PrintRenderOptions{
+		Print:            PrintLayoutOptions{Settings: DefaultPrintSettingsOptions()},
+		Render:           render,
+		MaxPages:         4096,
+		MaxPageBytes:     64 << 20,
+		MaxResourceBytes: 64 << 20,
+		MaxXMLNodes:      limits.MaxXMLNodes,
+	}
 }
 
 // RenderPrint 按有效票据映射页面到物理介质，并同时应用页面边界和可打印区域裁剪
 // 不执行设备约束求解、作业编排、设备色彩管理或通道打包；相关Feature须由上层处理后移除
-// 入参: ctx 取消Context，nil采用Background, index 页面序号, options 打印及绘制参数，nil采用默认值
+// 入参: ctx 取消Context，nil采用Background, pageIndex 从零开始的全局页号, options 打印及绘制参数，nil采用默认值
 // 返回: *image.NRGBA 独立打印栅格，错误为nil, error 设置、页面、资源、绘制或取消错误
-func (r *Reader) RenderPrint(ctx context.Context, index int, options *PrintRenderOptions) (*image.NRGBA, error) {
+func (r *Reader) RenderPrint(ctx context.Context, pageIndex int, options *PrintRenderOptions) (*image.NRGBA, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
 	}
 	defer r.mu.RUnlock()
-	return r.renderPrint(ctx, index, options, nil)
+	return r.renderPrint(ctx, pageIndex, options, nil)
 }
 
 // renderPrint 在调用方持有读锁时共用打印场景，设备输出不改写预览契约
-// 入参: ctx 取消Context, index 页面序号, options 打印参数, device 可选目标状态
+// 入参: ctx 取消Context, pageIndex 从零开始的全局页号, options 打印参数, device 可选目标状态
 // 返回: *image.NRGBA 预览，设备输出时为nil, error 设置、资源、绘制或取消错误
-func (r *Reader) renderPrint(ctx context.Context, index int, options *PrintRenderOptions, device *deviceRenderState) (*image.NRGBA, error) {
+func (r *Reader) renderPrint(ctx context.Context, pageIndex int, options *PrintRenderOptions, device *deviceRenderState) (*image.NRGBA, error) {
 	if r.closed {
 		return nil, ErrClosed
 	}
@@ -160,12 +173,21 @@ func (r *Reader) renderPrint(ctx context.Context, index int, options *PrintRende
 	if err != nil {
 		return nil, err
 	}
+	if configuration.Transform != nil {
+		if !geometryFillMatrixFinite(*configuration.Transform) {
+			return nil, fmt.Errorf("%w: print transform", ErrInvalid)
+		}
+		transform = transform.Mul(*configuration.Transform)
+		if !geometryFillMatrixFinite(transform) {
+			return nil, fmt.Errorf("%w: print transform range", ErrLimit)
+		}
+	}
 	if device != nil {
 		if err := device.apply(&settings); err != nil {
 			return nil, err
 		}
 	}
-	page, ticket, layout, err := r.readPrintPageHeader(ctx, index, configuration.Print)
+	page, ticket, layout, err := r.readPrintPageHeader(ctx, pageIndex, configuration.Print)
 	if err != nil {
 		return nil, err
 	}
@@ -239,9 +261,9 @@ func (r *Reader) renderPrint(ctx context.Context, index int, options *PrintRende
 
 // RenderPrintDevice 按打印布局将单页编码至目标ICC设备图像，未支持的票据Feature返回ErrUnsupported
 // 原生分量透传须在Color中声明设备条件，显式意图与票据冲突时须设置Color.Override，默认白色背景
-// 入参: ctx 取消Context，nil采用Background, index 页面序号, device 必需目标配置, options 打印及绘制参数
+// 入参: ctx 取消Context，nil采用Background, pageIndex 从零开始的全局页号, device 必需目标配置, options 打印及绘制参数
 // 返回: *DeviceImage 独立设备图像，失败为nil, error 设置、资源、转换或取消错误
-func (r *Reader) RenderPrintDevice(ctx context.Context, index int, device *DeviceColorTarget, options *PrintRenderOptions) (*DeviceImage, error) {
+func (r *Reader) RenderPrintDevice(ctx context.Context, pageIndex int, device *DeviceColorTarget, options *PrintRenderOptions) (*DeviceImage, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
@@ -256,21 +278,21 @@ func (r *Reader) RenderPrintDevice(ctx context.Context, index int, device *Devic
 	if err != nil {
 		return nil, err
 	}
-	_, err = r.renderPrint(ctx, index, &configuration, state)
+	_, err = r.renderPrint(ctx, pageIndex, &configuration, state)
 	return state.output(err)
 }
 
 // RenderPrintSideDevice 将完整拼版纸面的高精度合成结果编码至指定目标ICC，共享全部源页资源预算
 // 各放置保留独立源页颜色政策，目标冲突须显式设置覆盖，默认白色背景
-// 入参: ctx 取消Context，nil采用Background, side 纸面布局, device 必需目标配置, options 绘制及页面加载预算
+// 入参: ctx 取消Context，nil采用Background, side 纸面布局, device 必需目标配置, options 打印及页面加载预算
 // 返回: *DeviceImage 独立纸面设备图像，失败为nil, error 布局、资源、转换或取消错误
-func (r *Reader) RenderPrintSideDevice(ctx context.Context, side *PrintSide, device *DeviceColorTarget, options *PrintSideRenderOptions) (*DeviceImage, error) {
+func (r *Reader) RenderPrintSideDevice(ctx context.Context, side *PrintSide, device *DeviceColorTarget, options *PrintRenderOptions) (*DeviceImage, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
 	}
 	defer r.mu.RUnlock()
-	var configuration PrintSideRenderOptions
+	var configuration PrintRenderOptions
 	if options != nil {
 		configuration = *options
 	}
@@ -557,8 +579,6 @@ func (r *printWatermarkRenderer) elements(part string, elements []Element, water
 	alpha := float64(mark.Color.A) / 255
 	if mark.HasTransparency {
 		alpha *= 1 - mark.Transparency/100
-	} else if mark.Layer == PrintWatermarkOverlay {
-		alpha = 1
 	}
 	if err := r.resource(); err != nil {
 		return nil, err

@@ -32,9 +32,9 @@ import (
 
 const (
 	// TargetModeInternal 表示OPC关系指向包内部件
-	TargetModeInternal = "Internal"
+	TargetModeInternal TargetMode = "Internal"
 	// TargetModeExternal 表示OPC关系指向包外资源
-	TargetModeExternal = "External"
+	TargetModeExternal TargetMode = "External"
 )
 
 // opcTypesNS 等常量定义OPC包命名空间、内容类型与核心部件名
@@ -57,12 +57,15 @@ const (
 	packageZIPDigitalSignature    = 0x05054b50
 )
 
-// Relationship 表示OPC关系，Target保留原始URI，TargetMode缺省时为Internal
+// TargetMode 表示OPC关系的目标模式，合法取值为TargetModeInternal或TargetModeExternal
+type TargetMode string
+
+// Relationship 表示OPC关系，Target保留原始URI，TargetMode缺省时为TargetModeInternal
 type Relationship struct {
 	ID         string
 	Type       string
 	Target     string
-	TargetMode string
+	TargetMode TargetMode
 }
 
 // packageReader 持有只读OPC索引，不接管输入生命周期，可在底层ReaderAt支持时并发读取
@@ -693,7 +696,7 @@ func parseRelationship(source string, element xml.StartElement, attrs map[string
 	if err := opcAttributes(attrs, "Id", "Type", "Target", "TargetMode"); err != nil {
 		return Relationship{}, err
 	}
-	rel := Relationship{ID: strings.Trim(attrs["Id"], " \t\r\n"), Type: attrs["Type"], Target: attrs["Target"], TargetMode: attrs["TargetMode"]}
+	rel := Relationship{ID: strings.Trim(attrs["Id"], " \t\r\n"), Type: attrs["Type"], Target: attrs["Target"], TargetMode: TargetMode(attrs["TargetMode"])}
 	if !xmlNCName(rel.ID) || ids[rel.ID] {
 		return Relationship{}, fmt.Errorf("%w: invalid or duplicate relationship ID %q", ErrInvalid, rel.ID)
 	}
@@ -725,13 +728,6 @@ func parseRelationship(source string, element xml.StartElement, attrs map[string
 		return Relationship{}, fmt.Errorf("%w: invalid TargetMode %q", ErrInvalid, rel.TargetMode)
 	}
 	return rel, nil
-}
-
-// opcMetadata 校验两层OPC元数据，仅关系部件执行兼容性预处理
-// 入参: data XML数据, limits 资源上限, namespace 预期命名空间, root 根元素名, visit 子元素处理函数
-// 返回: error 错误信息
-func opcMetadata(data []byte, limits Limits, namespace, root string, visit func(xml.StartElement, map[string]string) error) error {
-	return opcMetadataContext(nil, data, limits, namespace, root, visit)
 }
 
 // opcMetadataContext 在取消检查下校验两层OPC元数据，仅关系部件执行兼容性预处理

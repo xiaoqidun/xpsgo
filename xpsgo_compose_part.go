@@ -361,7 +361,7 @@ func (c *compositionFontCheck) parse(part packagePart, whole bool) (*composition
 			indexRoot = index.raw
 		}
 	}
-	if int64(len(part.data)) > c.budget.limits.MaxMetadataBytes {
+	if int64(len(part.data)) > c.budget.limits.MaxPartBytes {
 		return nil, fmt.Errorf("%w: composition font markup bytes", ErrLimit)
 	}
 	if index == nil {
@@ -519,7 +519,7 @@ func (c *compositionFontCheck) document(document packagePart) (map[string]bool, 
 		if err != nil || relation.Type != formatNamespace(c.source.format)+"/restricted-font" {
 			return err
 		}
-		if relation.TargetMode != "Internal" {
+		if relation.TargetMode != TargetModeInternal {
 			return fmt.Errorf("%w: external composition restricted font", ErrInvalid)
 		}
 		target, err := resolvePart(document.name, relation.Target)
@@ -878,7 +878,7 @@ func rewriteCompositionMarkup(value packagePart, options compositionMarkupOption
 	if err := budget.step(1); err != nil {
 		return nil, err
 	}
-	maximum := min(budget.limits.MaxMetadataBytes, budget.limits.MaxPartBytes, budget.limits.MaxPackageBytes, int64(math.MaxInt))
+	maximum := min(budget.limits.MaxPartBytes, budget.limits.MaxPackageBytes, int64(math.MaxInt))
 	if int64(len(value.data)) > maximum {
 		return nil, fmt.Errorf("%w: composition markup input size", ErrLimit)
 	}
@@ -1358,7 +1358,7 @@ func (n *compositionNames) document(format Format, document int, order []int, pa
 						}
 						counter++
 						suffix := "_" + strconv.Itoa(counter)
-						if int64(len(prefix)) > n.budget.limits.MaxMetadataBytes-int64(len(suffix)) {
+						if int64(len(prefix)) > n.budget.limits.MaxPartBytes-int64(len(suffix)) {
 							return fmt.Errorf("%w: composition name length", ErrLimit)
 						}
 						if err := n.budget.scan(int64(len(prefix)) + int64(len(suffix))); err != nil {
@@ -1409,7 +1409,7 @@ func (c *compositionNameCollector) root(part packagePart, local string) (*xmlEle
 		}
 		return index.active, nil
 	}
-	if int64(len(part.data)) > min(c.budget.limits.MaxMetadataBytes, c.budget.limits.MaxPartBytes) {
+	if int64(len(part.data)) > c.budget.limits.MaxPartBytes {
 		return nil, fmt.Errorf("%w: composition name XML size", ErrLimit)
 	}
 	if err := c.budget.scan(int64(len(part.data))); err != nil {
@@ -1766,7 +1766,7 @@ func (c *compositionNavigation) rewrite(source int, original, destination, value
 		}
 		fragment = uri.EscapedFragment()
 	}
-	maximum := min(b.limits.MaxMetadataBytes, b.limits.MaxPartBytes, b.limits.MaxPackageBytes, int64(math.MaxInt))
+	maximum := min(b.limits.MaxPartBytes, b.limits.MaxPackageBytes, int64(math.MaxInt))
 	size := int64(len(target))
 	if fragment != "" {
 		if int64(len(fragment))+1 > maximum-size {
@@ -1816,7 +1816,7 @@ func compositionNavigationFragment(name string, budget *compositionBudget) (stri
 	if err := budget.scan(int64(len(name))); err != nil {
 		return "", err
 	}
-	maximum := min(budget.limits.MaxMetadataBytes, budget.limits.MaxPartBytes, budget.limits.MaxPackageBytes, int64(math.MaxInt))
+	maximum := min(budget.limits.MaxPartBytes, budget.limits.MaxPackageBytes, int64(math.MaxInt))
 	var size int64
 	for i := range len(name) {
 		count := int64(1)
@@ -2298,7 +2298,11 @@ func (g *compositionProtectionGraph) markup(part packagePart) error {
 		}
 		return g.budget.step(0)
 	}
-	if int64(len(part.data)) > g.budget.limits.MaxMetadataBytes {
+	limit := g.budget.limits.MaxPartBytes
+	if !layout {
+		limit = min(limit, g.budget.limits.MaxMetadataBytes)
+	}
+	if int64(len(part.data)) > limit {
 		return fmt.Errorf("%w: protected markup bytes", ErrLimit)
 	}
 	var index *compositionIndex
@@ -2462,14 +2466,14 @@ func (g *compositionProtectionGraph) relationships(source packagePart) error {
 			return err
 		}
 		if relation.Type == formatNamespace(g.source.format)+"/restricted-font" {
-			if !strings.EqualFold(source.media, fixedContentType("fixeddocument")) || relation.TargetMode != "Internal" {
+			if !strings.EqualFold(source.media, fixedContentType("fixeddocument")) || relation.TargetMode != TargetModeInternal {
 				return fmt.Errorf("%w: protected restricted font relationship", ErrInvalid)
 			}
 			if _, root := g.roots[strings.ToLower(source.name)]; root {
 				g.roots[strings.ToLower(source.name)] = true
 			}
 		}
-		if relation.TargetMode == "External" {
+		if relation.TargetMode == TargetModeExternal {
 			return nil
 		}
 		target, err := resolvePart(source.name, relation.Target)
@@ -2557,7 +2561,7 @@ func compositionResourceAttribute(source, destination string, node *xmlElement, 
 	if err := budget.step(1); err != nil {
 		return "", false, err
 	}
-	maximum := min(budget.limits.MaxMetadataBytes, budget.limits.MaxPartBytes, budget.limits.MaxPackageBytes, int64(math.MaxInt))
+	maximum := min(budget.limits.MaxPartBytes, budget.limits.MaxPackageBytes, int64(math.MaxInt))
 	if int64(len(attribute.Value)) > maximum {
 		return "", false, fmt.Errorf("%w: composition resource attribute size", ErrLimit)
 	}

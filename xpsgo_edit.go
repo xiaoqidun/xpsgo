@@ -72,19 +72,19 @@ type extractionLinkScope struct {
 }
 
 // SetPage 替换指定页面的类型化内容并更新链接目标，保留原部件名和附属关系
-// 入参: ctx 取消Context，nil采用Background, document 文档序号, index 文档内页面序号, page 页面模型，Part须为空或与原名称等价
+// 入参: ctx 取消Context，nil采用Background, docIndex 文档序号, pageIndex 文档内页面序号, page 页面模型，Part须为空或与原名称等价
 // 返回: error 序号、模型、故事绑定、取消或资源预算错误
-func (p *Package) SetPage(ctx context.Context, document, index int, page *Page) error {
+func (p *Package) SetPage(ctx context.Context, docIndex, pageIndex int, page *Page) error {
 	ctx = normalizeContext(ctx)
 	if err := p.lock(); err != nil {
 		return err
 	}
 	defer p.mu.Unlock()
-	if page == nil || document < 0 || document >= len(p.documents) || index < 0 || index >= len(p.documents[document].Pages) {
+	if page == nil || docIndex < 0 || docIndex >= len(p.documents) || pageIndex < 0 || pageIndex >= len(p.documents[docIndex].Pages) {
 		return fmt.Errorf("%w: document index or page", ErrInvalid)
 	}
-	part := p.documents[document].Pages[index].Part
-	if err := p.editable(p.documents[document].Part, part); err != nil {
+	part := p.documents[docIndex].Pages[pageIndex].Part
+	if err := p.editable(p.documents[docIndex].Part, part); err != nil {
 		return err
 	}
 	if page.Part != "" {
@@ -99,45 +99,45 @@ func (p *Package) SetPage(ctx context.Context, document, index int, page *Page) 
 	value := *page
 	value.Part = part
 	if p.hasStoryRelationship(part, "storyfragments") {
-		return p.setStoryPage(document, index, &value, ctx)
+		return p.setStoryPage(docIndex, pageIndex, &value, ctx)
 	}
 	targets, err := p.storePage(&value, ctx)
 	if err != nil {
 		return err
 	}
-	p.documents[document].Pages[index] = PageReference{Part: part, LinkTargets: targets}
-	p.dirty[strings.ToLower(p.documents[document].Part)] = true
+	p.documents[docIndex].Pages[pageIndex] = PageReference{Part: part, LinkTargets: targets}
+	p.dirty[strings.ToLower(p.documents[docIndex].Part)] = true
 	return nil
 }
 
 // MovePage 调整页面位置并维护故事归属，页面部件名及绘制内容保持不变
-// 入参: document 来源文档序号, index 来源页面序号, target 目标文档序号, position 移动完成后的页面序号
+// 入参: docIndex 来源文档序号, pageIndex 来源页面序号, targetDocIndex 目标文档序号, targetPageIndex 移动完成后的页面序号
 // 返回: error 序号、结构、绑定或资源错误
-func (p *Package) MovePage(document, index, target, position int) error {
+func (p *Package) MovePage(docIndex, pageIndex, targetDocIndex, targetPageIndex int) error {
 	if err := p.lock(); err != nil {
 		return err
 	}
 	defer p.mu.Unlock()
-	if document < 0 || document >= len(p.documents) || target < 0 || target >= len(p.documents) || index < 0 || index >= len(p.documents[document].Pages) {
+	if docIndex < 0 || docIndex >= len(p.documents) || targetDocIndex < 0 || targetDocIndex >= len(p.documents) || pageIndex < 0 || pageIndex >= len(p.documents[docIndex].Pages) {
 		return fmt.Errorf("%w: document or page index", ErrInvalid)
 	}
-	count := len(p.documents[target].Pages)
-	if document == target {
+	count := len(p.documents[targetDocIndex].Pages)
+	if docIndex == targetDocIndex {
 		count--
 	}
-	if position < 0 || position > count {
+	if targetPageIndex < 0 || targetPageIndex > count {
 		return fmt.Errorf("%w: target page position", ErrInvalid)
 	}
-	if document == target && index == position {
+	if docIndex == targetDocIndex && pageIndex == targetPageIndex {
 		return nil
 	}
-	if err := p.editable(p.documents[document].Part, p.documents[target].Part, p.documents[document].Pages[index].Part); err != nil {
+	if err := p.editable(p.documents[docIndex].Part, p.documents[targetDocIndex].Part, p.documents[docIndex].Pages[pageIndex].Part); err != nil {
 		return err
 	}
-	if p.hasStoryRelationship(p.documents[document].Part, "documentstructure") || document != target && p.hasStoryRelationship(p.documents[target].Part, "documentstructure") {
-		return p.moveStoryPage(document, index, target, position)
+	if p.hasStoryRelationship(p.documents[docIndex].Part, "documentstructure") || docIndex != targetDocIndex && p.hasStoryRelationship(p.documents[targetDocIndex].Part, "documentstructure") {
+		return p.moveStoryPage(docIndex, pageIndex, targetDocIndex, targetPageIndex)
 	}
-	p.movePage(document, index, target, position)
+	p.movePage(docIndex, pageIndex, targetDocIndex, targetPageIndex)
 	return nil
 }
 
@@ -153,23 +153,23 @@ func (p *Package) movePage(document, index, target, position int) {
 
 // DeletePage 删除页面及其源关系并更新故事页码，不删除共享资源
 // 删除后允许暂时空文档，写出时仍要求每个文档至少有一页
-// 入参: document 文档序号, index 文档内页面序号
+// 入参: docIndex 文档序号, pageIndex 文档内页面序号
 // 返回: error 序号、结构、绑定或资源错误
-func (p *Package) DeletePage(document, index int) error {
+func (p *Package) DeletePage(docIndex, pageIndex int) error {
 	if err := p.lock(); err != nil {
 		return err
 	}
 	defer p.mu.Unlock()
-	if document < 0 || document >= len(p.documents) || index < 0 || index >= len(p.documents[document].Pages) {
+	if docIndex < 0 || docIndex >= len(p.documents) || pageIndex < 0 || pageIndex >= len(p.documents[docIndex].Pages) {
 		return fmt.Errorf("%w: document or page index", ErrInvalid)
 	}
-	if err := p.editable(p.documents[document].Part, p.documents[document].Pages[index].Part); err != nil {
+	if err := p.editable(p.documents[docIndex].Part, p.documents[docIndex].Pages[pageIndex].Part); err != nil {
 		return err
 	}
-	if p.hasStoryRelationship(p.documents[document].Part, "documentstructure") {
-		return p.deleteStoryPage(document, index)
+	if p.hasStoryRelationship(p.documents[docIndex].Part, "documentstructure") {
+		return p.deleteStoryPage(docIndex, pageIndex)
 	}
-	p.deletePage(document, index)
+	p.deletePage(docIndex, pageIndex)
 	return nil
 }
 
@@ -183,54 +183,54 @@ func (p *Package) deletePage(document, index int) {
 }
 
 // MoveDocument 调整文档序列中的顺序，不改变文档部件和页面内容
-// 入参: index 来源文档序号, position 移动完成后的文档序号
+// 入参: docIndex 来源文档序号, position 移动完成后的文档序号
 // 返回: error 序号错误
-func (p *Package) MoveDocument(index, position int) error {
+func (p *Package) MoveDocument(docIndex, position int) error {
 	if err := p.lock(); err != nil {
 		return err
 	}
 	defer p.mu.Unlock()
-	if index < 0 || index >= len(p.documents) || position < 0 || position >= len(p.documents) {
+	if docIndex < 0 || docIndex >= len(p.documents) || position < 0 || position >= len(p.documents) {
 		return fmt.Errorf("%w: document index", ErrInvalid)
 	}
-	if index == position {
+	if docIndex == position {
 		return nil
 	}
 	if err := p.editable(p.sequence); err != nil {
 		return err
 	}
-	document := p.documents[index]
-	p.documents = slices.Delete(p.documents, index, index+1)
+	document := p.documents[docIndex]
+	p.documents = slices.Delete(p.documents, docIndex, docIndex+1)
 	p.documents = slices.Insert(p.documents, position, document)
 	p.dirty[strings.ToLower(p.sequence)] = true
 	return nil
 }
 
 // DeleteDocument 删除指定文档及其全部页面和源关系，不隐式删除共享资源
-// 入参: index 文档序号
+// 入参: docIndex 文档序号
 // 返回: error 序号错误
-func (p *Package) DeleteDocument(index int) error {
+func (p *Package) DeleteDocument(docIndex int) error {
 	if err := p.lock(); err != nil {
 		return err
 	}
 	defer p.mu.Unlock()
-	if index < 0 || index >= len(p.documents) {
+	if docIndex < 0 || docIndex >= len(p.documents) {
 		return fmt.Errorf("%w: document index", ErrInvalid)
 	}
-	if err := p.editable(p.documents[index].Part, p.sequence); err != nil {
+	if err := p.editable(p.documents[docIndex].Part, p.sequence); err != nil {
 		return err
 	}
-	for _, page := range p.documents[index].Pages {
+	for _, page := range p.documents[docIndex].Pages {
 		if err := p.editable(page.Part); err != nil {
 			return err
 		}
 	}
-	for _, page := range p.documents[index].Pages {
+	for _, page := range p.documents[docIndex].Pages {
 		p.removePart(page.Part)
 	}
-	p.pageCount -= len(p.documents[index].Pages)
-	p.removePart(p.documents[index].Part)
-	p.documents = slices.Delete(p.documents, index, index+1)
+	p.pageCount -= len(p.documents[docIndex].Pages)
+	p.removePart(p.documents[docIndex].Part)
+	p.documents = slices.Delete(p.documents, docIndex, docIndex+1)
 	p.dirty[strings.ToLower(p.sequence)] = true
 	return nil
 }
@@ -259,6 +259,10 @@ func (p *Package) DeletePart(part string) error {
 		return err
 	}
 	p.removePart(canonical)
+	if p.deleted == nil {
+		p.deleted = make(map[string]bool)
+	}
+	p.deleted[key] = true
 	return nil
 }
 
@@ -358,9 +362,9 @@ func (p *Package) SetPrintTicket(source, part string) error {
 		relations = slices.Delete(relations, index, index+1)
 	} else if index < 0 {
 		nextID := createdRelationshipIDs(append(slices.Clone(relations), p.originalRels[key]...))
-		relations = append(relations, Relationship{ID: nextID(), Type: kind, Target: part, TargetMode: "Internal"})
+		relations = append(relations, Relationship{ID: nextID(), Type: kind, Target: part, TargetMode: TargetModeInternal})
 	} else {
-		relations[index].Target, relations[index].TargetMode = part, "Internal"
+		relations[index].Target, relations[index].TargetMode = part, TargetModeInternal
 	}
 	return p.setRelationships(canonical, relations)
 }
@@ -387,17 +391,17 @@ func (p *Package) printTicketScope(source string) PrintScope {
 
 // SetSignatureDefinitions 替换固定文档的签名定义关联，保留其他关系及可复用关系ID，空列表仅移除关联
 // 目标部件须已通过SetPart存入模型，不删除可能共用的请求部件，内容在生成阅读器或写出时校验
-// 入参: document 从零开始的固定文档序号, parts 请求部件URI列表，等价目标合并
+// 入参: docIndex 从零开始的固定文档序号, parts 请求部件URI列表，等价目标合并
 // 返回: error 序号、目标、关系或资源错误，失败时不改变包
-func (p *Package) SetSignatureDefinitions(document int, parts []string) error {
+func (p *Package) SetSignatureDefinitions(docIndex int, parts []string) error {
 	if err := p.lock(); err != nil {
 		return err
 	}
 	defer p.mu.Unlock()
-	if document < 0 || document >= len(p.documents) {
+	if docIndex < 0 || docIndex >= len(p.documents) {
 		return fmt.Errorf("%w: signature definition document index", ErrInvalid)
 	}
-	source := p.documents[document].Part
+	source := p.documents[docIndex].Part
 	kind := formatNamespace(p.format) + "/signature-definitions"
 	key := strings.ToLower(source)
 	var result []Relationship
@@ -407,7 +411,7 @@ func (p *Package) SetSignatureDefinitions(document int, parts []string) error {
 			result = append(result, relation)
 			continue
 		}
-		if relation.TargetMode == "Internal" {
+		if relation.TargetMode == TargetModeInternal {
 			if target, err := resolvePart(source, relation.Target); err == nil && existing[strings.ToLower(target)] == "" {
 				existing[strings.ToLower(target)] = relation.ID
 			}
@@ -433,7 +437,7 @@ func (p *Package) SetSignatureDefinitions(document int, parts []string) error {
 			id = nextID()
 		}
 		used[partKey] = true
-		result = append(result, Relationship{ID: id, Type: kind, Target: value.name, TargetMode: "Internal"})
+		result = append(result, Relationship{ID: id, Type: kind, Target: value.name, TargetMode: TargetModeInternal})
 	}
 	return p.setRelationships(source, result)
 }
@@ -493,7 +497,7 @@ func (p *Package) SetThumbnail(ctx context.Context, source, part string) error {
 		if id == "" {
 			id = createdRelationshipIDs(append(slices.Clone(relations), p.originalRels[key]...))()
 		}
-		retained = append(retained, Relationship{ID: id, Type: thumbnailRelationship, Target: part, TargetMode: "Internal"})
+		retained = append(retained, Relationship{ID: id, Type: thumbnailRelationship, Target: part, TargetMode: TargetModeInternal})
 	}
 	q := p.signingCopy()
 	if err := q.setRelationships(source, retained); err != nil {
@@ -571,9 +575,9 @@ func (p *Package) SetDiscardControl(ctx context.Context, part string) error {
 		relations = slices.Delete(relations, index, index+1)
 	} else if index < 0 {
 		nextID := createdRelationshipIDs(append(slices.Clone(relations), p.originalRels["/"]...))
-		relations = append(relations, Relationship{ID: nextID(), Type: kind, Target: part, TargetMode: "Internal"})
+		relations = append(relations, Relationship{ID: nextID(), Type: kind, Target: part, TargetMode: TargetModeInternal})
 	} else {
-		relations[index].Target, relations[index].TargetMode = part, "Internal"
+		relations[index].Target, relations[index].TargetMode = part, TargetModeInternal
 	}
 	if err := checkContext(ctx); err != nil {
 		return err
@@ -650,8 +654,18 @@ func (p *Package) composeRelationships(pkg *packageReader, source string, wanted
 		if err != nil {
 			return err
 		}
-		if !needed[identity] && p.dirty[key] {
-			continue
+		if !needed[identity] {
+			if p.dirty[key] {
+				continue
+			}
+			if old.Type == formatNamespace(p.format)+"/required-resource" {
+				if target, targetErr := resolvePart(source, old.Target); targetErr == nil {
+					targetKey := strings.ToLower(target)
+					if _, exists := pkg.parts[targetKey]; !exists && p.deleted[targetKey] {
+						continue
+					}
+				}
+			}
 		}
 		if _, conflict := byID[old.ID]; conflict {
 			old.ID = nextID()
@@ -714,7 +728,7 @@ func (p *Package) composeRelationships(pkg *packageReader, source string, wanted
 // 入参: source 来源部件, relation 包内模型关系
 // 返回: string 类型与目标组成的键, error 关系目标错误
 func relationshipIdentity(source string, relation Relationship) (string, error) {
-	if relation.TargetMode != "" && relation.TargetMode != "Internal" {
+	if relation.TargetMode != "" && relation.TargetMode != TargetModeInternal {
 		return "", fmt.Errorf("%w: external model relationship", ErrInvalid)
 	}
 	part, err := resolvePart(source, relation.Target)
@@ -976,7 +990,7 @@ func (p *Package) protectImported(r *Reader, ctx context.Context) error {
 			if relation.Type != formatNamespace(p.format)+"/restricted-font" {
 				continue
 			}
-			if relation.TargetMode != "Internal" {
+			if relation.TargetMode != TargetModeInternal {
 				return &PartError{Part: document.Part, Err: fmt.Errorf("%w: external restricted font", ErrInvalid)}
 			}
 			part, err := resolvePart(document.Part, relation.Target)
@@ -1062,7 +1076,7 @@ func (p *Package) protectImported(r *Reader, ctx context.Context) error {
 			}
 			visited[key], p.protected[key] = true, true
 			for _, relation := range p.originalRels[key] {
-				if relation.TargetMode == "Internal" {
+				if relation.TargetMode == TargetModeInternal {
 					target, err := resolvePart(resources[position], relation.Target)
 					if err != nil {
 						return err
@@ -1383,7 +1397,7 @@ func (p *Package) commitStory(q *Package) {
 	p.documents, p.pageCount = q.documents, q.pageCount
 	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
 	p.names, p.parents, p.allocated, p.layout = q.names, q.parents, q.allocated, q.layout
-	p.dirty, p.dirtyRels = q.dirty, q.dirtyRels
+	p.dirty, p.dirtyRels, p.deleted = q.dirty, q.dirtyRels, q.deleted
 }
 
 // validateStoryEdit 检查候选状态的结构模式、片段及页面名称绑定，不生成中间ZIP
@@ -1516,7 +1530,7 @@ func (p *Package) writeStoryStructure(document int, value *DocumentStructure, ow
 	}
 	if value.Part != "" {
 		original := p.parts[strings.ToLower(value.Part)].data
-		data, err = restoreXMLEncoding(original, data, min(p.limits.MaxPartBytes, p.limits.MaxMetadataBytes), nil)
+		data, err = restoreXMLEncoding(original, data, p.limits.MaxPartBytes, nil)
 		if err != nil {
 			return err
 		}
@@ -1561,7 +1575,7 @@ func (p *Package) replaceStoryRelationship(source, kind, target string) error {
 		used := append(slices.Clone(p.originalRels[key]), previous...)
 		id = createdRelationshipIDs(used)()
 	}
-	result = append(result, Relationship{ID: id, Type: typ, Target: target, TargetMode: "Internal"})
+	result = append(result, Relationship{ID: id, Type: typ, Target: target, TargetMode: TargetModeInternal})
 	return p.setRelationships(source, result)
 }
 
@@ -1756,7 +1770,7 @@ func newCreatedStoryEncoder(format Format, limits Limits, ctx context.Context) (
 	if namespace == "" {
 		return nil, fmt.Errorf("%w: invalid structure format", ErrInvalid)
 	}
-	limits.MaxPartBytes = min(limits.MaxPartBytes, limits.MaxMetadataBytes, limits.MaxPackageBytes)
+	limits.MaxPartBytes = min(limits.MaxPartBytes, limits.MaxPackageBytes)
 	p := &createdStoryEncoder{namespace: namespace, limits: limits, context: ctx}
 	if err := p.reserve(int64(len(namespace) + 9)); err != nil {
 		return nil, err
@@ -2139,7 +2153,7 @@ func (p *Package) renamePageStories(r *Reader, page string, renames map[string]s
 			return err
 		}
 	}
-	data, err = restoreXMLEncoding(p.parts[strings.ToLower(fragments.Part)].data, data, min(p.limits.MaxPartBytes, p.limits.MaxMetadataBytes), nil)
+	data, err = restoreXMLEncoding(p.parts[strings.ToLower(fragments.Part)].data, data, p.limits.MaxPartBytes, nil)
 	if err != nil {
 		return err
 	}
@@ -2169,7 +2183,7 @@ func storyFragmentOwners(r *Reader, part string) (int, error) {
 			return 0, err
 		}
 		for _, relation := range relations {
-			if relation.Type != formatNamespace(r.format)+"/storyfragments" || relation.TargetMode != "Internal" {
+			if relation.Type != formatNamespace(r.format)+"/storyfragments" || relation.TargetMode != TargetModeInternal {
 				continue
 			}
 			target, err := resolvePart(page.Part, relation.Target)
@@ -2187,9 +2201,9 @@ func storyFragmentOwners(r *Reader, part string) (int, error) {
 
 // ExtractDocument 提取指定固定文档及其引用资源为独立可编辑包，不修改源数据，重编序列页码
 // 新包不继承源签名与释放提示，跨文档引用、未知引用语义及受限字体改写返回错误
-// 入参: ctx 取消Context，nil采用Background, index 零基文档序号, options 输出资源选项，nil沿用读取上限
+// 入参: ctx 取消Context，nil采用Background, docIndex 零基文档序号, options 输出资源选项，nil沿用读取上限
 // 返回: *Package 独立文档包，失败为nil, error 结构、引用、许可、资源、关闭或取消错误
-func (r *Reader) ExtractDocument(ctx context.Context, index int, options *PackageOptions) (*Package, error) {
+func (r *Reader) ExtractDocument(ctx context.Context, docIndex int, options *PackageOptions) (*Package, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
@@ -2198,7 +2212,7 @@ func (r *Reader) ExtractDocument(ctx context.Context, index int, options *Packag
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	if index < 0 || index >= len(r.documents) {
+	if docIndex < 0 || docIndex >= len(r.documents) {
 		return nil, fmt.Errorf("%w: document index", ErrInvalid)
 	}
 	configuration := PackageOptions{Limits: r.limits}
@@ -2216,14 +2230,14 @@ func (r *Reader) ExtractDocument(ctx context.Context, index int, options *Packag
 	p.sequence = r.sequence
 	p.original = make(map[string]packagePart)
 	p.originalRels = make(map[string][]Relationship)
-	document := r.documents[index]
+	document := r.documents[docIndex]
 	document.Pages = slices.Clone(document.Pages)
 	if len(document.Pages) > p.limits.MaxPageCount {
 		return nil, fmt.Errorf("%w: extracted page count", ErrLimit)
 	}
 	p.documents, p.pageCount = []Document{document}, len(document.Pages)
 	s := documentExtraction{reader: r, output: p, context: ctx, count: len(document.Pages), queued: make(map[extractionPart]bool), scanned: make(map[string]bool), scopes: make(map[string]extractionLinkScope), targets: make(map[string]map[string]int), work: p.limits.MaxXMLNodes}
-	for _, prior := range r.documents[:index] {
+	for _, prior := range r.documents[:docIndex] {
 		if err := s.step(1); err != nil {
 			return nil, err
 		}
@@ -2357,7 +2371,7 @@ func (s *documentExtraction) load(part string) (packagePart, error) {
 	if err != nil {
 		return packagePart{}, err
 	}
-	if compositionXML(media) || opcRelationshipName(part) {
+	if opcMetadataPart(part, media) {
 		limit = min(limit, p.limits.MaxMetadataBytes)
 	}
 	data, err := s.reader.pkg.readItems(key, limit)
@@ -2426,7 +2440,7 @@ func (s *documentExtraction) relationships(source, owner string) error {
 			s.output.dirtyRels[sourceKey] = true
 			continue
 		}
-		if relation.TargetMode == "Internal" {
+		if relation.TargetMode == TargetModeInternal {
 			target, err := resolvePart(source, relation.Target)
 			if err != nil {
 				return err

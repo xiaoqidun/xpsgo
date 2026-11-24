@@ -611,15 +611,15 @@ func (s *PrintSettings) ColorPlan(ctx context.Context, options *PrintSettingsOpt
 }
 
 // PrintColorPlan 解析指定源页的有效颜色票据，不执行设备默认选择或颜色转换
-// 入参: ctx 取消Context，nil采用Background, index 页面序号, defaults 消费者基础设置, options 票据解析预算
+// 入参: ctx 取消Context，nil采用Background, pageIndex 从零开始的全局页号, defaults 消费者基础设置, options 票据解析预算
 // 返回: *PrintColorPlan 独立颜色计划，未声明时为nil, error 结构、引用、预算或取消错误
-func (r *Reader) PrintColorPlan(ctx context.Context, index int, defaults *PrintSettings, options *PrintSettingsOptions) (*PrintColorPlan, error) {
+func (r *Reader) PrintColorPlan(ctx context.Context, pageIndex int, defaults *PrintSettings, options *PrintSettingsOptions) (*PrintColorPlan, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
 	}
 	defer r.mu.RUnlock()
-	settings, err := r.readPrintSettings(ctx, index, defaults, options)
+	settings, err := r.readPrintSettings(ctx, pageIndex, defaults, options)
 	if err != nil {
 		return nil, err
 	}
@@ -943,12 +943,17 @@ func (r *sceneRenderer) renderPrintColorScene(elements []Element, transform Matr
 		return nil, err
 	}
 	samples := r.options.samples
-	background := printNativeColor{alpha: r.options.background.a, space: &printWorkingSpace{space: ColorScRGB, channels: 3}}
-	if r.options.space == renderSRGB {
-		background.space.space = ColorSRGB
-	}
-	if background.alpha != 0 {
-		background.value = [8]float64{r.options.background.r / background.alpha, r.options.background.g / background.alpha, r.options.background.b / background.alpha}
+	var background printNativeColor
+	if r.options.background.a != 0 {
+		space := ColorScRGB
+		if r.options.space == renderSRGB {
+			space = ColorSRGB
+		}
+		background = printNativeColor{
+			value: [8]float64{r.options.background.r / r.options.background.a, r.options.background.g / r.options.background.a, r.options.background.b / r.options.background.a},
+			alpha: r.options.background.a,
+			space: &printWorkingSpace{space: space, channels: 3},
+		}
 	}
 	if bounds.Empty() {
 		return nil, nil
@@ -1200,11 +1205,15 @@ func (r *sceneRenderer) printColorTile(nodes []*sceneNode, storage *printSurface
 	samples := r.options.samples
 	tile := image.Rect(tileOut.Min.X*samples, tileOut.Min.Y*samples, tileOut.Max.X*samples, tileOut.Max.Y*samples)
 	pixels := storage.pixels[:tile.Dx()*tile.Dy()]
-	if err := r.charge(uint64(len(pixels))); err != nil {
-		return err
-	}
-	for i := range pixels {
-		pixels[i] = background
+	if background.alpha != 0 {
+		if err := r.charge(uint64(len(pixels))); err != nil {
+			return err
+		}
+		for i := range pixels {
+			pixels[i] = background
+		}
+	} else {
+		clear(pixels)
 	}
 	for _, node := range nodes {
 		if err := r.drawPrintColor(node, pixels, tile, 0, worker); err != nil {
@@ -1369,10 +1378,10 @@ func (r *sceneRenderer) samplePrintPaint(node *sceneNode, paint scenePaint, poin
 	return node.color.color(nil, [8]float64{value.r / value.a, value.g / value.a, value.b / value.a}, value.a, space, false)
 }
 
-// drawPrintColorPaint 按覆盖掩码逐像素采样并合成单条打印画笔，并发遇非无锁画刷时以defer保障互斥锁释放
-// 入参: node 所属节点, paint 画笔, mask 覆盖掩码, surface 目标表面, bounds 子像素范围, scale 采样缩放系数
+// drawPrintColorPaint 按相交覆盖掩码逐像素采样并合成单条打印画笔，并发遇非无锁画刷时以Defer保障互斥锁释放
+// 入参: node 所属节点, paint 画笔, mask 覆盖掩码, surface 目标表面, bounds 目标表面子像素范围, subBounds 实际绘制子像素范围, scale 采样缩放系数
 // 返回: error 采样、预算或合成错误
-func (r *sceneRenderer) drawPrintColorPaint(node *sceneNode, paint scenePaint, mask *image.Alpha, surface []printNativeColor, bounds image.Rectangle, scale float64) error {
+func (r *sceneRenderer) drawPrintColorPaint(node *sceneNode, paint scenePaint, mask *image.Alpha, surface []printNativeColor, bounds, subBounds image.Rectangle, scale float64) error {
 	needLock := r.concurrent && (paint.visual || paint.native == nil)
 	locked := false
 	if needLock {
@@ -1382,8 +1391,10 @@ func (r *sceneRenderer) drawPrintColorPaint(node *sceneNode, paint scenePaint, m
 			}
 		}()
 	}
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+	stride := bounds.Dx()
+	for y := subBounds.Min.Y; y < subBounds.Max.Y; y++ {
+		rowBase := (y - bounds.Min.Y) * stride
+		for x := subBounds.Min.X; x < subBounds.Max.X; x++ {
 			if mask.AlphaAt(x, y).A == 0 {
 				continue
 			}
@@ -1396,7 +1407,7 @@ func (r *sceneRenderer) drawPrintColorPaint(node *sceneNode, paint scenePaint, m
 			if err != nil {
 				return err
 			}
-			at := (y-bounds.Min.Y)*bounds.Dx() + x - bounds.Min.X
+			at := rowBase + x - bounds.Min.X
 			surface[at], err = r.printOver(value, surface[at], locked)
 			if err != nil {
 				return err
@@ -1406,22 +1417,30 @@ func (r *sceneRenderer) drawPrintColorPaint(node *sceneNode, paint scenePaint, m
 	return nil
 }
 
-// drawPrintColor 复用区域覆盖和层级隔离规则，在八通道表面完成合成
+// drawPrintColor 复用区域覆盖和层级隔离规则，在八通道表面按实际相交子区域完成合成
 // 入参: node 节点, target 背景表面, bounds 子像素范围, isoDepth 当前隔离嵌套深度, worker 工作Goroutine独占状态
 // 返回: error 采样、资源或颜色错误
 func (r *sceneRenderer) drawPrintColor(node *sceneNode, target []printNativeColor, bounds image.Rectangle, isoDepth int, worker *sceneWorkerState) error {
 	if err := r.charge(1); err != nil {
 		return err
 	}
-	coarse := image.Rect(bounds.Min.X/r.options.samples, bounds.Min.Y/r.options.samples, bounds.Max.X/r.options.samples, bounds.Max.Y/r.options.samples)
-	if node.opacity == 0 || !node.bounds.Overlaps(coarse) {
+	samples := r.options.samples
+	coarse := image.Rect(bounds.Min.X/samples, bounds.Min.Y/samples, bounds.Max.X/samples, bounds.Max.Y/samples)
+	nodeTile := node.bounds.Intersect(coarse)
+	if node.opacity == 0 || nodeTile.Empty() {
 		return nil
 	}
 	isolated := node.opacity != 1 || node.mask != nil || node.clip != nil || node.negative
 	surface := target
+	surfaceBounds := bounds
+	drawBounds := coarse
 	nextDepth := isoDepth
 	if isolated {
-		isoBuf, err := r.acquirePrintIsolatedSurface(bounds, isoDepth, worker)
+		isoBounds := image.Rect(nodeTile.Min.X*samples, nodeTile.Min.Y*samples, nodeTile.Max.X*samples, nodeTile.Max.Y*samples).Intersect(bounds)
+		if isoBounds.Empty() {
+			return nil
+		}
+		isoBuf, err := r.acquirePrintIsolatedSurface(isoBounds, isoDepth, worker)
 		if err != nil {
 			return err
 		}
@@ -1431,28 +1450,55 @@ func (r *sceneRenderer) drawPrintColor(node *sceneNode, target []printNativeColo
 			r.releaseLive(reserved)
 		}()
 		surface = isoBuf.pixels
+		surfaceBounds = isoBounds
+		drawBounds = nodeTile
 		nextDepth = isoDepth + 1
 	}
-	scale := float64(r.options.samples)
+	scale := float64(samples)
 	for _, paint := range node.paints {
-		if err := r.charge(uint64(len(surface))); err != nil {
+		paintTile := paint.bounds.Intersect(drawBounds)
+		if paintTile.Empty() {
+			continue
+		}
+		subBounds := image.Rect(paintTile.Min.X*samples, paintTile.Min.Y*samples, paintTile.Max.X*samples, paintTile.Max.Y*samples).Intersect(surfaceBounds)
+		if subBounds.Empty() {
+			continue
+		}
+		regions := paint.regions
+		if len(paint.regionBounds) == len(paint.regions) {
+			filtered := worker.regions[:0]
+			for i, rb := range paint.regionBounds {
+				if rb.Overlaps(paintTile) {
+					filtered = append(filtered, paint.regions[i])
+				}
+			}
+			worker.regions = filtered
+			if len(filtered) == 0 {
+				continue
+			}
+			regions = filtered
+		}
+		minY, maxY := float64(subBounds.Min.Y), float64(subBounds.Max.Y)
+		if paint.aliased {
+			minY, maxY = float64(paintTile.Min.Y), float64(paintTile.Max.Y)
+		}
+		var edgeCost uint64
+		for _, region := range regions {
+			edgeCost += sceneRegionEdgeCost(region, minY, maxY)
+		}
+		if err := r.charge(uint64(subBounds.Dx())*uint64(subBounds.Dy()) + edgeCost); err != nil {
 			return err
 		}
-		for _, region := range paint.regions {
-			if err := r.charge(uint64(len(region.edges))); err != nil {
-				return err
-			}
-		}
-		mask, err := r.coverageScratch(paint.regions, paint.aliased, bounds, &worker.mask, worker)
+		mask, err := r.coverageScratch(regions, paint.aliased, subBounds, &worker.mask, worker)
 		if err != nil {
 			return err
 		}
-		if err := r.drawPrintColorPaint(node, paint, mask, surface, bounds, scale); err != nil {
+		if err := r.drawPrintColorPaint(node, paint, mask, surface, surfaceBounds, subBounds, scale); err != nil {
 			return err
 		}
 	}
 	for _, child := range node.children {
-		if err := r.drawPrintColor(child, surface, bounds, nextDepth, worker); err != nil {
+		if err := r.drawPrintColor(child, surface, surfaceBounds, nextDepth, worker); err != nil {
 			return err
 		}
 	}
@@ -1461,11 +1507,15 @@ func (r *sceneRenderer) drawPrintColor(node *sceneNode, target []printNativeColo
 	}
 	var clip *image.Alpha
 	if node.clip != nil {
-		if err := r.charge(uint64(len(node.clip.edges))); err != nil {
+		minY, maxY := float64(surfaceBounds.Min.Y), float64(surfaceBounds.Max.Y)
+		if node.aliased {
+			minY, maxY = float64(nodeTile.Min.Y), float64(nodeTile.Max.Y)
+		}
+		if err := r.charge(sceneRegionEdgeCost(*node.clip, minY, maxY)); err != nil {
 			return err
 		}
 		var err error
-		clip, err = r.coverageScratch([]rasterRegion{*node.clip}, node.aliased, bounds, &worker.clip, worker)
+		clip, err = r.coverageScratch([]rasterRegion{*node.clip}, node.aliased, surfaceBounds, &worker.clip, worker)
 		if err != nil {
 			return err
 		}
@@ -1479,10 +1529,14 @@ func (r *sceneRenderer) drawPrintColor(node *sceneNode, target []printNativeColo
 			}
 		}()
 	}
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			at := (y-bounds.Min.Y)*bounds.Dx() + x - bounds.Min.X
-			value := surface[at]
+	srcStride := surfaceBounds.Dx()
+	dstStride := bounds.Dx()
+	for y := surfaceBounds.Min.Y; y < surfaceBounds.Max.Y; y++ {
+		srcRowBase := (y - surfaceBounds.Min.Y) * srcStride
+		dstRowBase := (y - bounds.Min.Y) * dstStride
+		for x := surfaceBounds.Min.X; x < surfaceBounds.Max.X; x++ {
+			srcAt := srcRowBase + x - surfaceBounds.Min.X
+			value := surface[srcAt]
 			if value.alpha == 0 || clip != nil && clip.AlphaAt(x, y).A == 0 {
 				continue
 			}
@@ -1522,8 +1576,9 @@ func (r *sceneRenderer) drawPrintColor(node *sceneNode, target []printNativeColo
 					value.value[i] = 1 - value.value[i]
 				}
 			}
+			dstAt := dstRowBase + x - bounds.Min.X
 			var err error
-			target[at], err = r.printOver(value, target[at], maskLocked)
+			target[dstAt], err = r.printOver(value, target[dstAt], maskLocked)
 			if err != nil {
 				return err
 			}

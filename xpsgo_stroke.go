@@ -67,9 +67,9 @@ type strokeDistanceRange struct {
 // strokeOutlineStyle 保存已解析的折线描边样式，枚举值与Path属性一致
 type strokeOutlineStyle struct {
 	thickness float64
-	startCap  string
-	endCap    string
-	join      string
+	startCap  LineCap
+	endCap    LineCap
+	join      LineJoin
 	miter     float64
 }
 
@@ -148,8 +148,8 @@ type strokePathPiece struct {
 	directions  []strokePathDirection
 	startDir    Point
 	endDir      Point
-	startCap    string
-	endCap      string
+	startCap    LineCap
+	endCap      LineCap
 	closed      bool
 	figureStart bool
 	figureEnd   bool
@@ -519,8 +519,8 @@ func strokePathPositionCheck(run strokePathRun, distance float64, outgoing bool,
 // strokeOutlineCapValid 检查描边端帽枚举，不隐式填入默认样式
 // 入参: cap 端帽属性值
 // 返回: bool 是否为支持的端帽
-func strokeOutlineCapValid(cap string) bool {
-	return cap == "Flat" || cap == "Square" || cap == "Round" || cap == "Triangle"
+func strokeOutlineCapValid(cap LineCap) bool {
+	return cap == LineCapFlat || cap == LineCapSquare || cap == LineCapRound || cap == LineCapTriangle
 }
 
 // strokeOutlineDirection 计算不同有限端点之间的单位方向，避免差值及长度溢出
@@ -717,14 +717,14 @@ func (b *strokeOutlineBuilder) round(center, from, to Point) error {
 // cap 构造半方形、半圆或等高三角形描边端帽
 // 入参: p 端点, outward 向路径外侧的单位切向, cap 端帽枚举
 // 返回: error 数值表示或预算错误
-func (b *strokeOutlineBuilder) cap(p, outward Point, cap string) error {
+func (b *strokeOutlineBuilder) cap(p, outward Point, cap LineCap) error {
 	n := Point{outward.Y, -outward.X}
 	switch cap {
-	case "Flat":
+	case LineCapFlat:
 		return nil
-	case "Round":
+	case LineCapRound:
 		return b.round(p, n, Point{-n.X, -n.Y})
-	case "Square", "Triangle":
+	case LineCapSquare, LineCapTriangle:
 		var vertices [4]Point
 		right, err := b.outlinePoint(p, n, b.radius)
 		if err != nil {
@@ -735,7 +735,7 @@ func (b *strokeOutlineBuilder) cap(p, outward Point, cap string) error {
 			return err
 		}
 		vertices[0] = right
-		if cap == "Triangle" {
+		if cap == LineCapTriangle {
 			vertices[1], err = b.outlinePoint(p, outward, b.radius)
 			vertices[2] = left
 			if err != nil {
@@ -760,8 +760,8 @@ func (b *strokeOutlineBuilder) cap(p, outward Point, cap string) error {
 // join 补齐路径外角连接，Miter超限时在角平分线法向平面裁剪
 // 入参: p 连接点, incoming 入射单位方向, outgoing 出射单位方向, join 连接枚举, limit 有效尖角限制
 // 返回: error 数值表示或预算错误
-func (b *strokeOutlineBuilder) join(p, incoming, outgoing Point, join string, limit float64) error {
-	if join == "Miter" {
+func (b *strokeOutlineBuilder) join(p, incoming, outgoing Point, join LineJoin, limit float64) error {
+	if join == LineJoinMiter {
 		return b.miter(p, incoming, outgoing, limit)
 	}
 	cross := strokeOutlineTriangleSign([3]Point{{}, incoming, outgoing})
@@ -773,13 +773,13 @@ func (b *strokeOutlineBuilder) join(p, incoming, outgoing Point, join string, li
 	if cross < 0 {
 		n1, n2 = Point{-n1.X, -n1.Y}, Point{-n2.X, -n2.Y}
 	}
-	if join == "Round" {
+	if join == LineJoinRound {
 		if cross < 0 {
 			n1, n2 = n2, n1
 		}
 		return b.round(p, n1, n2)
 	}
-	if join == "Bevel" {
+	if join == LineJoinBevel {
 		return b.polygon(p, []Point{{}, n1, n2}, b.radius)
 	}
 	return fmt.Errorf("%w: stroke join", ErrInvalid)
@@ -1340,11 +1340,14 @@ func (b *strokeOutlineBuilder) miter(p, incoming, outgoing Point, limit float64)
 // 入参: path 已填入规范默认值的路径, transform 有效设备变换, tolerance 正的设备误差容限, maxEdges 非负几何输出及中心线预算
 // 返回: []geometryEdge 供非零规则统一覆盖的描边边集, error 参数、能力、数值或资源限制错误，失败时无部分结果
 func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges int) ([]geometryEdge, error) {
-	if path == nil || path.Data == nil || !geometryFillMatrixFinite(transform) || !geometryFinite(tolerance) || tolerance <= 0 || maxEdges < 0 || maxEdges > rasterMaxEdges {
+	if path == nil || path.Data == nil || !geometryFillMatrixFinite(transform) || !geometryFinite(tolerance) || tolerance <= 0 || maxEdges < 0 {
 		return nil, fmt.Errorf("%w: stroke path parameters", ErrInvalid)
 	}
+	if maxEdges > rasterMaxEdges {
+		return nil, fmt.Errorf("%w: stroke max edges", ErrLimit)
+	}
 	style := strokeOutlineStyle{path.StrokeThickness, path.StrokeStartLineCap, path.StrokeEndLineCap, path.StrokeLineJoin, path.StrokeMiterLimit}
-	if !geometryFinite(style.thickness, style.miter, path.StrokeDashOffset) || style.thickness < 0 || style.miter < 1 || !strokeOutlineCapValid(style.startCap) || !strokeOutlineCapValid(style.endCap) || !strokeOutlineCapValid(path.StrokeDashCap) || style.join != "Miter" && style.join != "Bevel" && style.join != "Round" {
+	if !geometryFinite(style.thickness, style.miter, path.StrokeDashOffset) || style.thickness < 0 || style.miter < 1 || !strokeOutlineCapValid(style.startCap) || !strokeOutlineCapValid(style.endCap) || !strokeOutlineCapValid(path.StrokeDashCap) || style.join != LineJoinMiter && style.join != LineJoinBevel && style.join != LineJoinRound {
 		return nil, fmt.Errorf("%w: stroke path style", ErrInvalid)
 	}
 	dashed, nominal, err := strokePathDashMode(path.StrokeDashArray, path.StrokeDashOffset)
@@ -1733,7 +1736,7 @@ func strokePathPieces(runs []strokePathRun, closed bool, path *Path, dashed bool
 			piece.figureStart = span.start == 0 && run.start
 			piece.figureEnd = span.end == length && run.end
 			piece.positive = span.end > span.start
-			piece.startCap, piece.endCap = "Flat", "Flat"
+			piece.startCap, piece.endCap = LineCapFlat, LineCapFlat
 			if dashed {
 				piece.startCap, piece.endCap = path.StrokeDashCap, path.StrokeDashCap
 			}
@@ -1761,7 +1764,7 @@ func strokePathPieces(runs []strokePathRun, closed bool, path *Path, dashed bool
 func strokePathClosePieces(pieces []strokePathPiece, firstRunEnd int) []strokePathPiece {
 	if len(pieces) == 1 && pieces[0].figureStart && pieces[0].figureEnd {
 		pieces[0].closed = true
-		pieces[0].startCap, pieces[0].endCap = "Flat", "Flat"
+		pieces[0].startCap, pieces[0].endCap = LineCapFlat, LineCapFlat
 		return pieces
 	}
 	firstIndex, lastIndex := -1, -1
@@ -1783,7 +1786,7 @@ func strokePathClosePieces(pieces []strokePathPiece, firstRunEnd int) []strokePa
 	first, last := &pieces[firstIndex], &pieces[lastIndex]
 	if firstIndex == lastIndex {
 		first.closed = true
-		first.startCap, first.endCap = "Flat", "Flat"
+		first.startCap, first.endCap = LineCapFlat, LineCapFlat
 		return pieces
 	}
 	last.joins[len(last.joins)-1] = true
@@ -1905,7 +1908,7 @@ func (b *strokeOutlineBuilder) pathPiece(piece strokePathPiece, style strokeOutl
 			}
 		}
 		if previous >= 0 {
-			join, limit := "Round", style.miter
+			join, limit := LineJoinRound, style.miter
 			if piece.joins[i-1] {
 				join = style.join
 			}

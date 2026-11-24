@@ -16,6 +16,7 @@ package xpsgo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -85,27 +86,33 @@ type sceneRenderOptions struct {
 // sceneSample 同时接收当前覆盖采样点和所属设备像素中心，保持嵌套图块的采样相位
 type sceneSample func(point, center Point) (renderColor, error)
 
+// sceneSampleCached 使用工作Goroutine独占缓存执行并发安全画刷采样
+type sceneSampleCached func(point, center Point, cache *imageSampleCache) (renderColor, error)
+
 // sceneBrushMeta 记录最近构造画刷的快速路径与并发特性
 type sceneBrushMeta struct {
-	solid      bool
-	solidColor renderColor
-	gradient   *gradientSampler
-	image      *imageSampler
-	visual     bool
+	solid        bool
+	solidColor   renderColor
+	gradient     *gradientSampler
+	image        *imageSampler
+	visual       bool
+	sampleCached sceneSampleCached
 }
 
 // scenePaint 保存设备空间绘制区域及包含画刷透明度的颜色采样器
 type scenePaint struct {
-	regions    []rasterRegion
-	bounds     image.Rectangle
-	sample     sceneSample
-	aliased    bool
-	native     printNativeSample
-	solid      bool
-	solidColor renderColor
-	gradient   *gradientSampler
-	image      *imageSampler
-	visual     bool
+	regions      []rasterRegion
+	regionBounds []image.Rectangle
+	bounds       image.Rectangle
+	sample       sceneSample
+	sampleCached sceneSampleCached
+	aliased      bool
+	native       printNativeSample
+	solid        bool
+	solidColor   renderColor
+	gradient     *gradientSampler
+	image        *imageSampler
+	visual       bool
 }
 
 // sceneNode 保存已解析局部绘制状态的隔离合成节点，不引用可变的源几何
@@ -116,6 +123,7 @@ type sceneNode struct {
 	opacity      float64
 	aliased      bool
 	mask         sceneSample
+	maskCached   sceneSampleCached
 	maskVisual   bool
 	maskGradient *gradientSampler
 	maskImage    *imageSampler
@@ -130,6 +138,7 @@ type sceneNode struct {
 // sceneWorkerState 保存单个工作Goroutine独占的可复用扫描线、掩模及隔离表面缓冲
 type sceneWorkerState struct {
 	raster        rasterScratch
+	regions       []rasterRegion
 	mask          image.Alpha
 	coarse        image.Alpha
 	part          image.Alpha
@@ -160,6 +169,7 @@ type sceneRenderer struct {
 	cancelled        atomic.Bool
 	budgetMu         sync.Mutex
 	visualMu         sync.Mutex
+	cleanups         []func()
 	printTargetReady atomic.Uint32
 	printSpaceIndex  map[*printWorkingSpace]int
 	printSpaceFlags  []atomic.Uint32
@@ -232,7 +242,8 @@ func (p *sceneParser) elementValue(node *xmlElement) (Element, error) {
 	case "Canvas":
 		value := NewCanvas()
 		value.ElementProperties = properties
-		value.EdgeMode, _ = node.attribute("RenderOptions.EdgeMode")
+		edgeMode, _ := node.attribute("RenderOptions.EdgeMode")
+		value.EdgeMode = EdgeMode(edgeMode)
 		value.AutomationName, _ = node.attribute("AutomationProperties.Name")
 		value.AutomationHelpText, _ = node.attribute("AutomationProperties.HelpText")
 		for _, child := range node.Children {
@@ -316,8 +327,19 @@ func (p *sceneParser) pathValue(node *xmlElement, properties ElementProperties) 
 	}
 	for _, item := range []struct {
 		name   string
+		target *LineCap
+	}{{"StrokeDashCap", &value.StrokeDashCap}, {"StrokeStartLineCap", &value.StrokeStartLineCap}, {"StrokeEndLineCap", &value.StrokeEndLineCap}} {
+		if text, present := node.attribute(item.name); present {
+			*item.target = LineCap(text)
+		}
+	}
+	if text, present := node.attribute("StrokeLineJoin"); present {
+		value.StrokeLineJoin = LineJoin(text)
+	}
+	for _, item := range []struct {
+		name   string
 		target *string
-	}{{"StrokeDashCap", &value.StrokeDashCap}, {"StrokeStartLineCap", &value.StrokeStartLineCap}, {"StrokeEndLineCap", &value.StrokeEndLineCap}, {"StrokeLineJoin", &value.StrokeLineJoin}, {"AutomationProperties.Name", &value.AutomationName}, {"AutomationProperties.HelpText", &value.AutomationHelpText}} {
+	}{{"AutomationProperties.Name", &value.AutomationName}, {"AutomationProperties.HelpText", &value.AutomationHelpText}} {
 		if text, present := node.attribute(item.name); present {
 			*item.target = text
 		}
@@ -362,7 +384,7 @@ func (p *sceneParser) glyphValue(node *xmlElement, properties ElementProperties)
 		value.IsSideways = strings.Trim(text, " \t\r\n") == "true"
 	}
 	if text, present := node.attribute("StyleSimulations"); present {
-		value.StyleSimulations = text
+		value.StyleSimulations = StyleSimulation(text)
 	}
 	text, _ := node.attribute("UnicodeString")
 	value.Text = strings.TrimPrefix(text, "{}")
@@ -610,6 +632,20 @@ func (p *sceneParser) binding(node *xmlElement, property, key, kind string) (*re
 	return definition, nil
 }
 
+// wrapPartError 为错误附加部件及元素位置，内层已含同部件PartError时保留最内层定位
+// 入参: part 部件URI, element 可选元素名, err 原始错误
+// 返回: error 包装后的错误，err为nil时返回nil
+func wrapPartError(part, element string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var existing *PartError
+	if errors.As(err, &existing) && strings.EqualFold(existing.Part, part) {
+		return err
+	}
+	return &PartError{Part: part, Element: element, Err: err}
+}
+
 // elementError 为绘制数据错误补充元素所属部件
 // 入参: node 出错元素, err 原始错误
 // 返回: error 带部件位置的错误信息
@@ -617,7 +653,7 @@ func (p *sceneParser) elementError(node *xmlElement, err error) error {
 	if node == nil {
 		return err
 	}
-	return &PartError{Part: p.resources.Parts[node], Element: node.Name.Local, Err: err}
+	return wrapPartError(p.resources.Parts[node], node.Name.Local, err)
 }
 
 // visualAttributes 校验绘制元素的属性集合和属性元素顺序
@@ -702,7 +738,7 @@ func validateVisual(node *xmlElement, format Format) error {
 	}
 	switch node.Name.Local {
 	case "Canvas":
-		if value, ok := attrs["RenderOptions.EdgeMode"]; ok && value != "Aliased" {
+		if value, ok := attrs["RenderOptions.EdgeMode"]; ok && EdgeMode(value) != EdgeModeAliased {
 			return fmt.Errorf("%w: invalid EdgeMode %q", ErrInvalid, value)
 		}
 	case "Path":
@@ -726,11 +762,11 @@ func validatePathAttributes(attrs map[string]string) error {
 		}
 	}
 	for _, name := range []string{"StrokeDashCap", "StrokeEndLineCap", "StrokeStartLineCap"} {
-		if value, ok := attrs[name]; ok && value != "Flat" && value != "Round" && value != "Square" && value != "Triangle" {
+		if value, ok := attrs[name]; ok && !strokeOutlineCapValid(LineCap(value)) {
 			return fmt.Errorf("%w: invalid %s %q", ErrInvalid, name, value)
 		}
 	}
-	if value, ok := attrs["StrokeLineJoin"]; ok && value != "Miter" && value != "Bevel" && value != "Round" {
+	if value, ok := attrs["StrokeLineJoin"]; ok && LineJoin(value) != LineJoinMiter && LineJoin(value) != LineJoinBevel && LineJoin(value) != LineJoinRound {
 		return fmt.Errorf("%w: invalid StrokeLineJoin %q", ErrInvalid, value)
 	}
 	if _, err := geometryXMLBool(attrs, "SnapsToDevicePixels", false); err != nil {
@@ -795,8 +831,12 @@ func validateGlyphAttributes(attrs map[string]string, format Format) error {
 	if sideways && level%2 != 0 {
 		return fmt.Errorf("%w: sideways Glyphs cannot use an odd BidiLevel", ErrInvalid)
 	}
-	if value, ok := attrs["StyleSimulations"]; ok && value != "None" && value != "ItalicSimulation" && value != "BoldSimulation" && value != "BoldItalicSimulation" {
-		return fmt.Errorf("%w: invalid StyleSimulations %q", ErrInvalid, value)
+	if value, ok := attrs["StyleSimulations"]; ok {
+		switch StyleSimulation(value) {
+		case StyleSimulationNone, StyleSimulationItalic, StyleSimulationBold, StyleSimulationBoldItalic:
+		default:
+			return fmt.Errorf("%w: invalid StyleSimulations %q", ErrInvalid, value)
+		}
 	}
 	for _, name := range []string{"UnicodeString", "DeviceFontName"} {
 		if value, ok := attrs[name]; ok {
@@ -886,6 +926,12 @@ func releaseSceneWorker(state *sceneWorkerState) {
 	if cap(state.raster.prepared) > 4096 {
 		state.raster = rasterScratch{}
 	}
+	if cap(state.regions) > 4096 {
+		state.regions = nil
+	} else {
+		state.regions = state.regions[:0]
+	}
+	state.imageCache.sampler = nil
 	state.imageCache.valid = false
 	state.imageCache.jxr.source = nil
 	state.imageCache.jxr.valid = [2]bool{}
@@ -898,11 +944,37 @@ func defaultSceneRenderOptions() sceneRenderOptions {
 	return sceneRenderOptions{samples: 8, tolerance: 0.025, space: renderSRGB, pixels: 1 << 24, elements: 1 << 20, edges: 1 << 20, work: 1 << 28, glyphs: 1 << 20, fonts: 256, fontBytes: 64 << 20, format: FormatOpenXPS, images: 256, imagePixels: 1 << 24, imageBytes: 64 << 20, profiles: 256, profileBytes: 64 << 20, context: context.Background()}
 }
 
+// renderPageCoversBounds 判断页面矩形经轴对齐有效变换后是否完全覆盖输出像素范围
+// 入参: width 页面宽度, height 页面高度, transform 页面到设备的变换, bounds 输出像素范围
+// 返回: bool 页面矩形是否完全覆盖输出范围
+func renderPageCoversBounds(width, height float64, transform Matrix, bounds image.Rectangle) bool {
+	if bounds.Empty() {
+		return true
+	}
+	if !geometryFinite(width, height) || width <= 0 || height <= 0 || !geometryFillMatrixFinite(transform) || geometryMatrixSingular(transform) {
+		return false
+	}
+	if !(transform.B == 0 && transform.C == 0 || transform.A == 0 && transform.D == 0) {
+		return false
+	}
+	p0, err0 := geometryFillPoint(transform, Point{})
+	p1, err1 := geometryFillPoint(transform, Point{width, height})
+	if err0 != nil || err1 != nil {
+		return false
+	}
+	minX, maxX := min(p0.X, p1.X), max(p0.X, p1.X)
+	minY, maxY := min(p0.Y, p1.Y), max(p0.Y, p1.Y)
+	return minX <= float64(bounds.Min.X) && minY <= float64(bounds.Min.Y) && maxX >= float64(bounds.Max.X) && maxY >= float64(bounds.Max.Y)
+}
+
 // renderLoadedPage 在调用方持有读锁时绘制已经解析的页面，单次调用独占所有资源缓存
 // 入参: page 已解析页面, transform 页面到设备的变换, bounds 输出范围, options 绘制参数
 // 返回: *image.NRGBA 页面图像, error 资源、绘制或能力错误
 func (r *Reader) renderLoadedPage(page *Page, transform Matrix, bounds image.Rectangle, options sceneRenderOptions) (*image.NRGBA, error) {
-	clip := renderBoxGeometry(Rect{Width: page.Width, Height: page.Height})
+	var clip *Geometry
+	if !renderPageCoversBounds(page.Width, page.Height, transform, bounds) {
+		clip = renderBoxGeometry(Rect{Width: page.Width, Height: page.Height})
+	}
 	root := &Canvas{ElementProperties: ElementProperties{Part: page.Part, Opacity: 1, Clip: clip}, Elements: page.Elements}
 	return r.renderLoadedElements([]Element{root}, transform, bounds, options)
 }
@@ -972,6 +1044,7 @@ func renderScene(elements []Element, transform Matrix, bounds image.Rectangle, o
 		return nil, err
 	}
 	r := sceneRenderer{options: options, active: make(map[Element]bool), elements: options.elements, edges: options.edges, work: options.work, live: pixels, glyphs: options.glyphs, exact: rasterMaxExact}
+	defer r.cleanup()
 	if len(options.printPlan) != 0 {
 		return r.renderPrintColorScene(elements, transform, bounds)
 	}
@@ -1084,6 +1157,9 @@ func validateSceneOutput(bounds image.Rectangle, transform Matrix, options scene
 	}
 	if options.workers < 0 || options.samples != 1 && options.samples != 2 && options.samples != 4 && options.samples != 8 || !geometryFinite(options.tolerance) || options.tolerance <= 0 || options.pixels < 0 || options.elements < 0 || options.edges < 0 || options.glyphs < 0 || options.fonts < 0 || options.fontBytes < 0 || options.images < 0 || options.imageBytes < 0 || options.profiles < 0 || options.profileBytes < 0 || !geometryFillMatrixFinite(transform) {
 		return 0, fmt.Errorf("%w: scene render options", ErrInvalid)
+	}
+	if options.edges > rasterMaxEdges {
+		return 0, fmt.Errorf("%w: scene max edges", ErrLimit)
 	}
 	if options.space != renderSRGB && options.space != renderScRGB {
 		return 0, fmt.Errorf("%w: scene color space", ErrUnsupported)
@@ -1211,7 +1287,7 @@ func (r *sceneRenderer) node(element Element, transform Matrix, aliased bool, de
 	}
 	defer func() {
 		if err != nil {
-			err = &PartError{Part: properties.Part, Element: kind, Err: err}
+			err = wrapPartError(properties.Part, kind, err)
 		}
 	}()
 	if !geometryFinite(properties.Opacity) || properties.Opacity < 0 || properties.Opacity > 1 {
@@ -1229,7 +1305,7 @@ func (r *sceneRenderer) node(element Element, transform Matrix, aliased bool, de
 	if canvas, ok := element.(*Canvas); ok {
 		switch canvas.EdgeMode {
 		case "":
-		case "Aliased":
+		case EdgeModeAliased:
 			aliased = true
 		default:
 			return nil, fmt.Errorf("%w: canvas edge mode", ErrInvalid)
@@ -1256,6 +1332,7 @@ func (r *sceneRenderer) node(element Element, transform Matrix, aliased bool, de
 			return nil, err
 		}
 		n.nativeMask = r.nativeSample
+		n.maskCached = r.brushMeta.sampleCached
 		n.maskVisual = r.brushMeta.visual
 		n.maskGradient = r.brushMeta.gradient
 		n.maskImage = r.brushMeta.image
@@ -1274,7 +1351,7 @@ func (r *sceneRenderer) node(element Element, transform Matrix, aliased bool, de
 				return nil, e
 			}
 			meta := r.brushMeta
-			n.paints = append(n.paints, scenePaint{regions: []rasterRegion{region}, sample: sample, aliased: aliased, native: r.nativeSample, solid: meta.solid, solidColor: meta.solidColor, gradient: meta.gradient, image: meta.image, visual: meta.visual})
+			n.paints = append(n.paints, scenePaint{regions: []rasterRegion{region}, sample: sample, sampleCached: meta.sampleCached, aliased: aliased, native: r.nativeSample, solid: meta.solid, solidColor: meta.solidColor, gradient: meta.gradient, image: meta.image, visual: meta.visual})
 		}
 		if value.Stroke != nil {
 			if err := r.geometryWork(value.Data); err != nil {
@@ -1294,7 +1371,7 @@ func (r *sceneRenderer) node(element Element, transform Matrix, aliased bool, de
 				return nil, e
 			}
 			meta := r.brushMeta
-			n.paints = append(n.paints, scenePaint{regions: []rasterRegion{region}, sample: sample, aliased: aliased, native: r.nativeSample, solid: meta.solid, solidColor: meta.solidColor, gradient: meta.gradient, image: meta.image, visual: meta.visual})
+			n.paints = append(n.paints, scenePaint{regions: []rasterRegion{region}, sample: sample, sampleCached: meta.sampleCached, aliased: aliased, native: r.nativeSample, solid: meta.solid, solidColor: meta.solidColor, gradient: meta.gradient, image: meta.image, visual: meta.visual})
 		}
 	case *Glyphs:
 		n.paints, err = r.glyphPaint(value, transform, aliased, depth)
@@ -1304,8 +1381,15 @@ func (r *sceneRenderer) node(element Element, transform Matrix, aliased bool, de
 	}
 	for i := range n.paints {
 		var paintBounds image.Rectangle
-		for _, region := range n.paints[i].regions {
-			paintBounds = paintBounds.Union(r.regionBounds(region, n.paints[i].aliased))
+		if len(n.paints[i].regions) > 1 {
+			n.paints[i].regionBounds = make([]image.Rectangle, len(n.paints[i].regions))
+		}
+		for j, region := range n.paints[i].regions {
+			rb := r.regionBounds(region, n.paints[i].aliased)
+			if n.paints[i].regionBounds != nil {
+				n.paints[i].regionBounds[j] = rb
+			}
+			paintBounds = paintBounds.Union(rb)
 		}
 		n.paints[i].bounds = paintBounds
 		n.bounds = n.bounds.Union(paintBounds)
@@ -1462,25 +1546,30 @@ func (r *sceneRenderer) brush(brush *Brush, transform Matrix, aliased bool, dept
 		}
 		sampler.charge = r.charge
 		sampler.reserve = r.reservePixels
+		sampler.release = r.releaseLive
 		if sampler.filterX || sampler.filterY {
 			r.hasFiltered = true
 		}
-		r.brushMeta = sceneBrushMeta{image: sampler}
+		r.registerCleanup(sampler.releaseFilter)
+		cached := func(point, center Point, cache *imageSampleCache) (renderColor, error) {
+			return sampler.sampleAtCached(point, center, cache, r.concurrent)
+		}
+		r.brushMeta = sceneBrushMeta{image: sampler, sampleCached: cached}
 		return func(point, center Point) (renderColor, error) {
 			if !r.concurrent {
 				return sampler.sampleAt(point, center)
 			}
-			var local imageSampleCache
-			return sampler.sampleAtCached(point, center, &local, true)
+			return sampler.sampleAtPooled(point, center)
 		}, nil
 	case BrushVisual:
 		sample, err := r.visualBrush(brush, transform, aliased, depth)
 		if err != nil {
 			return nil, err
 		}
+		cached := r.brushMeta.sampleCached
 		r.visualCount++
 		r.hasFiltered = true
-		r.brushMeta = sceneBrushMeta{visual: true}
+		r.brushMeta = sceneBrushMeta{visual: true, sampleCached: cached}
 		return sample, nil
 	default:
 		return nil, fmt.Errorf("%w: scene brush kind %d", ErrUnsupported, brush.Kind)
@@ -1528,6 +1617,29 @@ func (r *sceneRenderer) releaseLive(count int) {
 		return
 	}
 	r.live -= count
+}
+
+// registerCleanup 线程安全地登记单次绘制结束时执行的资源与存活像素预算清理回调
+// 入参: fn 清理回调
+func (r *sceneRenderer) registerCleanup(fn func()) {
+	if fn == nil {
+		return
+	}
+	if r.concurrent {
+		r.budgetMu.Lock()
+		r.cleanups = append(r.cleanups, fn)
+		r.budgetMu.Unlock()
+		return
+	}
+	r.cleanups = append(r.cleanups, fn)
+}
+
+// cleanup 逆序执行已登记的过滤缓存清理回调并归还全部临时存活像素预算
+func (r *sceneRenderer) cleanup() {
+	for i := len(r.cleanups) - 1; i >= 0; i-- {
+		r.cleanups[i]()
+	}
+	r.cleanups = nil
 }
 
 // reservePixels 线程安全地扣减同时存活的像素预算，与隔离表面及预乘缓存共用限额
@@ -1744,26 +1856,53 @@ func (r *sceneRenderer) tile(nodes []*sceneNode, surface *renderSurface, output 
 	return nil
 }
 
+// sceneRegionEdgeCost 统计区域内落入当前图块纵范围的非水平边数，用于按实际扫描规模计费
+// 入参: region 采样空间区域, minY 图块纵范围下界, maxY 图块纵范围上界
+// 返回: uint64 落入当前图块纵范围的边数
+func sceneRegionEdgeCost(region rasterRegion, minY, maxY float64) uint64 {
+	var count uint64
+	for _, edge := range region.edges {
+		lo, hi := edge.start.Y, edge.end.Y
+		if lo == hi {
+			continue
+		}
+		if lo > hi {
+			lo, hi = hi, lo
+		}
+		if lo < maxY && hi > minY {
+			count++
+		}
+	}
+	return count
+}
+
 // draw 先完成节点内部绘制，再施加节点裁剪、透明度掩模及整体透明度
 // 入参: node 绘制节点, target 背景表面, bounds 输出像素范围, isoDepth 当前隔离嵌套深度, worker 工作Goroutine独占状态
 // 返回: error 带部件位置的绘制错误
 func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds image.Rectangle, isoDepth int, worker *sceneWorkerState) (err error) {
 	defer func() {
 		if err != nil {
-			err = &PartError{Part: node.part, Element: node.kind, Err: err}
+			err = wrapPartError(node.part, node.kind, err)
 		}
 	}()
 	if err := r.charge(1); err != nil {
 		return err
 	}
-	if node.opacity == 0 || !node.bounds.Overlaps(bounds) {
+	nodeTile := node.bounds.Intersect(bounds)
+	if node.opacity == 0 || nodeTile.Empty() {
 		return nil
 	}
+	samples := r.options.samples
 	isolated := node.opacity != 1 || node.mask != nil || node.clip != nil || node.negative
 	surface := target
 	nextDepth := isoDepth
+	drawBounds := bounds
 	if isolated {
-		surface, err = r.acquireIsolatedSurface(target.bounds, isoDepth, worker)
+		isoBounds := image.Rect(nodeTile.Min.X*samples, nodeTile.Min.Y*samples, nodeTile.Max.X*samples, nodeTile.Max.Y*samples).Intersect(target.bounds)
+		if isoBounds.Empty() {
+			return nil
+		}
+		surface, err = r.acquireIsolatedSurface(isoBounds, isoDepth, worker)
 		if err != nil {
 			return err
 		}
@@ -1773,24 +1912,44 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds imag
 			r.releaseLive(count)
 		}()
 		nextDepth = isoDepth + 1
+		drawBounds = nodeTile
 	}
-	samples := r.options.samples
 	scale := float64(samples)
 	for _, paint := range node.paints {
-		if err := r.charge(uint64(len(surface.pixels))); err != nil {
-			return err
-		}
-		for _, region := range paint.regions {
-			if err := r.charge(uint64(len(region.edges))); err != nil {
-				return err
-			}
-		}
-		paintTile := paint.bounds.Intersect(bounds)
+		paintTile := paint.bounds.Intersect(drawBounds)
 		if paintTile.Empty() {
 			continue
 		}
-		subBounds := image.Rect(paintTile.Min.X*samples, paintTile.Min.Y*samples, paintTile.Max.X*samples, paintTile.Max.Y*samples)
-		mask, err := r.coverageScratch(paint.regions, paint.aliased, subBounds, &worker.mask, worker)
+		subBounds := image.Rect(paintTile.Min.X*samples, paintTile.Min.Y*samples, paintTile.Max.X*samples, paintTile.Max.Y*samples).Intersect(surface.bounds)
+		if subBounds.Empty() {
+			continue
+		}
+		regions := paint.regions
+		if len(paint.regionBounds) == len(paint.regions) {
+			filtered := worker.regions[:0]
+			for i, rb := range paint.regionBounds {
+				if rb.Overlaps(paintTile) {
+					filtered = append(filtered, paint.regions[i])
+				}
+			}
+			worker.regions = filtered
+			if len(filtered) == 0 {
+				continue
+			}
+			regions = filtered
+		}
+		minY, maxY := float64(subBounds.Min.Y), float64(subBounds.Max.Y)
+		if paint.aliased {
+			minY, maxY = float64(paintTile.Min.Y), float64(paintTile.Max.Y)
+		}
+		var edgeCost uint64
+		for _, region := range regions {
+			edgeCost += sceneRegionEdgeCost(region, minY, maxY)
+		}
+		if err := r.charge(uint64(subBounds.Dx())*uint64(subBounds.Dy()) + edgeCost); err != nil {
+			return err
+		}
+		mask, err := r.coverageScratch(regions, paint.aliased, subBounds, &worker.mask, worker)
 		if err != nil {
 			return err
 		}
@@ -1801,6 +1960,12 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds imag
 			err = surface.paintBinaryGradient(mask, scale, paint.gradient)
 		case paint.image != nil:
 			err = surface.paintBinaryImage(mask, scale, paint.image, &worker.imageCache, r.concurrent)
+		case paint.sampleCached != nil:
+			var lock *sync.Mutex
+			if paint.visual && r.concurrent {
+				lock = &r.visualMu
+			}
+			err = surface.paintBinarySampleCached(mask, scale, paint.sampleCached, &worker.imageCache, lock)
 		default:
 			var lock *sync.Mutex
 			if paint.visual && r.concurrent {
@@ -1813,7 +1978,7 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds imag
 		}
 	}
 	for _, child := range node.children {
-		if err := r.draw(child, surface, bounds, nextDepth, worker); err != nil {
+		if err := r.draw(child, surface, drawBounds, nextDepth, worker); err != nil {
 			return err
 		}
 	}
@@ -1825,7 +1990,7 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds imag
 	if !isolated {
 		return nil
 	}
-	return r.composite(node, surface, target, bounds, worker)
+	return r.composite(node, surface, target, drawBounds, worker)
 }
 
 // coverageScratch 生成统一采样空间的二值掩模并复用工作Goroutine的扫描与字节缓冲
@@ -1898,20 +2063,26 @@ func (r *sceneRenderer) coverageScratch(regions []rasterRegion, aliased bool, bo
 // 入参: node 隔离节点, source 内部绘制完成的表面, target 背景表面, bounds 当前图块输出像素范围, worker 工作Goroutine独占状态
 // 返回: error 裁剪、采样或合成错误
 func (r *sceneRenderer) composite(node *sceneNode, source, target *renderSurface, bounds image.Rectangle, worker *sceneWorkerState) error {
-	if err := r.charge(uint64(len(source.pixels))); err != nil {
-		return err
-	}
 	samples := r.options.samples
 	compTile := node.bounds.Intersect(bounds)
-	if node.clip != nil {
-		if err := r.charge(uint64(len(node.clip.edges))); err != nil {
-			return err
-		}
-	}
 	if compTile.Empty() {
 		return nil
 	}
-	subBounds := image.Rect(compTile.Min.X*samples, compTile.Min.Y*samples, compTile.Max.X*samples, compTile.Max.Y*samples)
+	subBounds := image.Rect(compTile.Min.X*samples, compTile.Min.Y*samples, compTile.Max.X*samples, compTile.Max.Y*samples).Intersect(source.bounds).Intersect(target.bounds)
+	if subBounds.Empty() {
+		return nil
+	}
+	cost := uint64(subBounds.Dx()) * uint64(subBounds.Dy())
+	if node.clip != nil {
+		minY, maxY := float64(subBounds.Min.Y), float64(subBounds.Max.Y)
+		if node.aliased {
+			minY, maxY = float64(compTile.Min.Y), float64(compTile.Max.Y)
+		}
+		cost += sceneRegionEdgeCost(*node.clip, minY, maxY)
+	}
+	if err := r.charge(cost); err != nil {
+		return err
+	}
 	var clip *image.Alpha
 	if node.clip != nil {
 		var err error
@@ -1921,14 +2092,17 @@ func (r *sceneRenderer) composite(node *sceneNode, source, target *renderSurface
 		}
 	}
 	width := subBounds.Dx()
-	surfStride := source.bounds.Dx()
-	surfColOff := subBounds.Min.X - source.bounds.Min.X
+	srcStride := source.bounds.Dx()
+	srcColOff := subBounds.Min.X - source.bounds.Min.X
+	dstStride := target.bounds.Dx()
+	dstColOff := subBounds.Min.X - target.bounds.Min.X
 	scale := float64(samples)
 	if node.mask == nil && node.opacity == 1 && r.options.space == renderSRGB {
 		for y := subBounds.Min.Y; y < subBounds.Max.Y; y++ {
-			sOff := (y-source.bounds.Min.Y)*surfStride + surfColOff
+			sOff := (y-source.bounds.Min.Y)*srcStride + srcColOff
+			tOff := (y-target.bounds.Min.Y)*dstStride + dstColOff
 			srcRow := source.pixels[sOff : sOff+width]
-			dstRow := target.pixels[sOff : sOff+width]
+			dstRow := target.pixels[tOff : tOff+width]
 			if clip != nil {
 				cOff := (y-clip.Rect.Min.Y)*clip.Stride + (subBounds.Min.X - clip.Rect.Min.X)
 				clipRow := clip.Pix[cOff : cOff+width]
@@ -1977,9 +2151,10 @@ func (r *sceneRenderer) composite(node *sceneNode, source, target *renderSurface
 		}()
 	}
 	for y := subBounds.Min.Y; y < subBounds.Max.Y; y++ {
-		sOff := (y-source.bounds.Min.Y)*surfStride + surfColOff
+		sOff := (y-source.bounds.Min.Y)*srcStride + srcColOff
+		tOff := (y-target.bounds.Min.Y)*dstStride + dstColOff
 		srcRow := source.pixels[sOff : sOff+width]
-		dstRow := target.pixels[sOff : sOff+width]
+		dstRow := target.pixels[tOff : tOff+width]
 		var clipRow []byte
 		if clip != nil {
 			cOff := (y-clip.Rect.Min.Y)*clip.Stride + (subBounds.Min.X - clip.Rect.Min.X)
@@ -2008,7 +2183,13 @@ func (r *sceneRenderer) composite(node *sceneNode, source, target *renderSurface
 						r.visualMu.Lock()
 						visualLocked = true
 					}
-					c, err = node.mask(point, Point{math.Floor(px) + 0.5, cy})
+					if node.maskCached != nil {
+						c, err = node.maskCached(point, Point{math.Floor(px) + 0.5, cy}, &worker.imageCache)
+					} else {
+						c, err = node.mask(point, Point{math.Floor(px) + 0.5, cy})
+					}
+				case node.maskCached != nil:
+					c, err = node.maskCached(point, Point{math.Floor(px) + 0.5, cy}, &worker.imageCache)
 				default:
 					c, err = node.mask(point, Point{math.Floor(px) + 0.5, cy})
 				}

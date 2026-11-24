@@ -105,7 +105,7 @@ func (r *sceneRenderer) glyphPaint(glyphs *Glyphs, transform Matrix, aliased boo
 		return nil, err
 	}
 	meta := r.brushMeta
-	paint := scenePaint{sample: sample, aliased: aliased, native: r.nativeSample, solid: meta.solid, solidColor: meta.solidColor, gradient: meta.gradient, image: meta.image, visual: meta.visual}
+	paint := scenePaint{sample: sample, sampleCached: meta.sampleCached, aliased: aliased, native: r.nativeSample, solid: meta.solid, solidColor: meta.solidColor, gradient: meta.gradient, image: meta.image, visual: meta.visual}
 	for _, glyph := range run.glyphs {
 		if err := r.charge(0); err != nil {
 			return nil, err
@@ -179,6 +179,13 @@ func (r *sceneRenderer) glyphBitmapPaint(source *fontSource, glyphs *Glyphs, sel
 	capacity := min(fontBitmapMaxPixels, max(0, r.options.pixels-r.live), int(min(r.work/2, uint64(^uint(0)>>1))))
 	components := min(fontBitmapMaxComponents, int(min(r.work/2, uint64(^uint(0)>>1))))
 	decoder := fontBitmapDecode{font: source.bitmaps, strike: &source.bitmaps.strikes[selection.strike], path: make(map[uint16]bool), cache: make(map[uint16]fontBitmapDecoded), components: components, pixels: capacity}
+	bitmapLive := 0
+	committed := false
+	defer func() {
+		if !committed && bitmapLive != 0 {
+			r.releaseLive(bitmapLive)
+		}
+	}()
 	decode := func(gid uint16) (fontBitmapDecoded, error) {
 		if err := r.charge(0); err != nil {
 			return fontBitmapDecoded{}, err
@@ -190,6 +197,7 @@ func (r *sceneRenderer) glyphBitmapPaint(source *fontSource, glyphs *Glyphs, sel
 		decoded, present, err := decoder.decode(gid)
 		consumed := beforePixels - decoder.pixels
 		r.live += consumed
+		bitmapLive += consumed
 		if charged := r.charge(uint64(beforeComponents-decoder.components) + uint64(consumed)); charged != nil {
 			return fontBitmapDecoded{}, charged
 		}
@@ -223,7 +231,8 @@ func (r *sceneRenderer) glyphBitmapPaint(source *fontSource, glyphs *Glyphs, sel
 	if err != nil {
 		return nil, err
 	}
-	paint := scenePaint{aliased: aliased, visual: r.brushMeta.visual}
+	brushMeta := r.brushMeta
+	paint := scenePaint{aliased: aliased, visual: brushMeta.visual}
 	native := r.nativeSample
 	var bitmaps []sceneBitmapGlyph
 	for _, glyph := range run.glyphs {
@@ -308,6 +317,27 @@ func (r *sceneRenderer) glyphBitmapPaint(source *fontSource, glyphs *Glyphs, sel
 		}
 		return renderColorModulate(color, 1, float64(alpha)/255)
 	}
+	if brushMeta.sampleCached != nil {
+		brushCached := brushMeta.sampleCached
+		paint.sampleCached = func(point, center Point, cache *imageSampleCache) (renderColor, error) {
+			position := point
+			if aliased {
+				position = center
+			}
+			alpha, err := index.coverage(r, 0, position)
+			if err != nil {
+				return renderColor{}, err
+			}
+			if alpha == 0 {
+				return renderColor{}, nil
+			}
+			color, err := brushCached(point, center, cache)
+			if err != nil {
+				return renderColor{}, err
+			}
+			return renderColorModulate(color, 1, float64(alpha)/255)
+		}
+	}
 	if native != nil {
 		paint.native = func(point, center Point) (printNativeColor, error) {
 			position := point
@@ -322,6 +352,11 @@ func (r *sceneRenderer) glyphBitmapPaint(source *fontSource, glyphs *Glyphs, sel
 			value.alpha *= float64(alpha) / 255
 			return value, err
 		}
+	}
+	committed = true
+	if bitmapLive != 0 {
+		reserved := bitmapLive
+		r.registerCleanup(func() { r.releaseLive(reserved) })
 	}
 	return []scenePaint{paint}, nil
 }

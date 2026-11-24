@@ -79,17 +79,44 @@ func jxrDecodeWorkers(ctx context.Context, maxPixels, memoryLimit uint64) int {
 	return budgetXPSWorkers(resolveXPSWorkers(requested, tasks), memoryLimit, 2<<20)
 }
 
-// decodeJXRImage 使用JXRGo重建原生分量，保留ICC及设备通道，不将码流当作文档规定的文件容器
-// 入参: ctx 已规范化取消Context, data JPEG XR文件, maxPixels 剩余RGBA64等价容量
+// jxrDecodeMemoryLimit 依据字节与像素预算推导JPEG XR解码工作内存上限，执行饱和防溢出保护
+// 入参: inputBytes 输入文件字节数, maxPixels 剩余RGBA64等价容量, maxBytes 调用方声明的图像字节上限
+// 返回: uint64 受地址空间保护的工作内存上限
+func jxrDecodeMemoryLimit(inputBytes, maxPixels, maxBytes uint64) uint64 {
+	const maxAddressable = uint64(^uint(0) >> 1)
+	limit := uint64(rasterMaxWork)
+	if maxBytes > limit {
+		limit = min(maxBytes, maxAddressable)
+	}
+	if inputBytes > limit {
+		limit = min(inputBytes, maxAddressable)
+	}
+	var pixelBytes uint64
+	if maxPixels > maxAddressable/16 {
+		pixelBytes = maxAddressable
+	} else {
+		pixelBytes = maxPixels * 16
+	}
+	if pixelBytes > limit {
+		limit = pixelBytes
+	}
+	return limit
+}
+
+// decodeJXRImage 使用JXRGo重建原生分量，并结合调用方字节与像素预算推导工作内存上限
+// 入参: ctx 已规范化取消Context, data JPEG XR文件, maxPixels 剩余RGBA64等价容量, maxBytes 调用方图像字节上限
 // 返回: *rasterImage 独立原生图像, error 数据、能力、资源或取消错误
-func decodeJXRImage(ctx context.Context, data []byte, maxPixels uint64) (*rasterImage, error) {
+func decodeJXRImage(ctx context.Context, data []byte, maxPixels, maxBytes uint64) (*rasterImage, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	if maxPixels == 0 || uint64(len(data)) >= rasterMaxWork-4096 {
-		return nil, fmt.Errorf("%w: JPEG XR input and metadata memory", ErrLimit)
+	if maxPixels == 0 {
+		return nil, fmt.Errorf("%w: JPEG XR document pixel capacity", ErrLimit)
 	}
-	memoryLimit := rasterMaxWork - uint64(len(data)) - 4096
+	if maxBytes > 0 && uint64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%w: JPEG XR input byte budget", ErrLimit)
+	}
+	memoryLimit := jxrDecodeMemoryLimit(uint64(len(data)), maxPixels, maxBytes)
 	workers := jxrDecodeWorkers(ctx, maxPixels, memoryLimit)
 	limits := jxrgo.Limits{MaxInputBytes: uint64(max(1, len(data))), MaxPixels: maxPixels, MaxMemoryBytes: memoryLimit}
 	decoder, err := jxrgo.NewDecoderAt(ctx, bytes.NewReader(data), int64(len(data)), &jxrgo.DecodeOptions{Workers: workers, Limits: limits})
@@ -202,24 +229,24 @@ func validateJXRLinearAlpha(ctx context.Context, component jxrgo.Component, boun
 	return nil
 }
 
-// jxrUnpremultiply 展开JPEG XR预乘颜色分量，正溢出钳位为1并拒绝非有限结果
+// jxrUnpremultiply 展开JPEG XR预乘颜色分量，线性空间保留扩展高光并统一拒绝非有限结果
 // 入参: value 源颜色分量, alpha 已校验的单位区间透明度, linear 是否为线性颜色空间
 // 返回: float64 非预乘颜色分量, error 非有限颜色错误
 func jxrUnpremultiply(value, alpha float64, linear bool) (float64, error) {
-	if linear && !geometryFinite(value) || math.IsNaN(value) {
+	if !geometryFinite(value) {
 		return 0, fmt.Errorf("%w: JPEG XR non-finite color", ErrUnsupported)
 	}
 	if alpha == 0 {
 		return 0, nil
 	}
 	unpremultiplied := value / alpha
-	if math.IsInf(unpremultiplied, 1) {
-		return 1, nil
-	}
 	if !geometryFinite(unpremultiplied) {
 		return 0, fmt.Errorf("%w: JPEG XR non-finite color", ErrUnsupported)
 	}
-	return min(1, unpremultiplied), nil
+	if linear {
+		return unpremultiplied, nil
+	}
+	return colorClamp(unpremultiplied), nil
 }
 
 // sample 读取原生分量并展开预乘，非预乘线性颜色保留扩展范围，整数采用十六位取样
@@ -244,6 +271,9 @@ func (source *jxrImage) sample(x, y int, components []float64) (float64, error) 
 			if err != nil {
 				return 0, jxrImageError(err)
 			}
+			if !geometryFinite(value) {
+				return 0, fmt.Errorf("%w: JPEG XR non-finite color", ErrUnsupported)
+			}
 			components[channel] = value
 		}
 		return alpha, nil
@@ -258,7 +288,7 @@ func (source *jxrImage) sample(x, y int, components []float64) (float64, error) 
 			if err != nil {
 				return 0, err
 			}
-		} else if !source.linear && math.IsNaN(value) {
+		} else if !geometryFinite(value) {
 			return 0, fmt.Errorf("%w: JPEG XR non-finite color", ErrUnsupported)
 		}
 		if !source.linear {
@@ -353,9 +383,15 @@ func (source *jxrImage) readRow(y int, buf *jxrRowBuffer) error {
 					row[x] = math.Floor(colorClamp(unpremultiplied)*65535+0.5) / 65535
 				}
 			}
-		} else if !source.linear {
+		} else if source.linear {
+			for _, value := range row {
+				if !geometryFinite(value) {
+					return fmt.Errorf("%w: JPEG XR non-finite color", ErrUnsupported)
+				}
+			}
+		} else {
 			for x, value := range row {
-				if math.IsNaN(value) {
+				if !geometryFinite(value) {
 					return fmt.Errorf("%w: JPEG XR non-finite color", ErrUnsupported)
 				}
 				row[x] = math.Floor(colorClamp(value)*65535+0.5) / 65535

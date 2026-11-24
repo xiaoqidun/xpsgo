@@ -676,7 +676,7 @@ func (x *compositionExecution) rootRelationships(source int) error {
 			return err
 		}
 		relation := &relations[index]
-		if relation.TargetMode == "External" {
+		if relation.TargetMode == TargetModeExternal {
 			continue
 		}
 		target, err := resolvePart("/", relation.Target)
@@ -857,7 +857,7 @@ func rewriteCompositionScopeURI(destination, value, target string, budget *compo
 		return value, false, nil
 	}
 	fragment := uri.EscapedFragment()
-	maximum := min(budget.limits.MaxMetadataBytes, budget.limits.MaxPartBytes, budget.limits.MaxPackageBytes)
+	maximum := min(budget.limits.MaxPartBytes, budget.limits.MaxPackageBytes)
 	size := int64(len(target))
 	if fragment != "" {
 		if int64(len(fragment))+1 > maximum-size {
@@ -1232,7 +1232,7 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 				continue
 			}
 			ticket := relation.Type == formatNamespace(source.format)+"/printticket"
-			if ticket && relation.TargetMode != "Internal" {
+			if ticket && relation.TargetMode != TargetModeInternal {
 				return fmt.Errorf("%w: external composition ticket", ErrInvalid)
 			}
 			mapped := relation
@@ -1241,9 +1241,9 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 				if story == "" || storyAssigned {
 					continue
 				}
-				mapped.Target, mapped.TargetMode = story, "Internal"
+				mapped.Target, mapped.TargetMode = story, TargetModeInternal
 				storyAssigned = true
-			} else if relation.TargetMode == "Internal" {
+			} else if relation.TargetMode == TargetModeInternal {
 				part, err := resolvePart(origin.part, relation.Target)
 				if err != nil {
 					return err
@@ -1267,7 +1267,7 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 					firstTicketTarget = mapped.Target
 				}
 			}
-			if mapped.TargetMode == "Internal" {
+			if mapped.TargetMode == TargetModeInternal {
 				if resolved, err := resolvePart(target, relation.Target); err == nil && strings.EqualFold(resolved, mapped.Target) {
 					mapped.Target = relation.Target
 				}
@@ -1297,7 +1297,7 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 			kind = "storyfragments"
 		}
 		next := createdRelationshipIDs(relations)
-		relations = append(relations, Relationship{ID: next(), Type: formatNamespace(x.plan.format) + "/" + kind, Target: story, TargetMode: "Internal"})
+		relations = append(relations, Relationship{ID: next(), Type: formatNamespace(x.plan.format) + "/" + kind, Target: story, TargetMode: TargetModeInternal})
 	}
 	if len(relations) == 0 && !hasRaw {
 		return nil
@@ -1560,7 +1560,7 @@ func (x *compositionExecution) relationshipTargets(origin compositionOrigin, own
 		if changed || node.Name != (xml.Name{Space: opcRelsNS, Local: "Relationship"}) {
 			return nil
 		}
-		if mode, _ := node.attribute("TargetMode"); mode == "External" {
+		if mode, _ := node.attribute("TargetMode"); TargetMode(mode) == TargetModeExternal {
 			return nil
 		}
 		kind, _ := node.attribute("Type")

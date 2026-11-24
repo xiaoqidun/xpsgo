@@ -31,42 +31,54 @@ const (
 
 const (
 	// LineCapFlat 表示平头线帽样式
-	LineCapFlat = "Flat"
+	LineCapFlat LineCap = "Flat"
 	// LineCapRound 表示圆头线帽样式
-	LineCapRound = "Round"
+	LineCapRound LineCap = "Round"
 	// LineCapSquare 表示方头线帽样式
-	LineCapSquare = "Square"
+	LineCapSquare LineCap = "Square"
 	// LineCapTriangle 表示三角线帽样式
-	LineCapTriangle = "Triangle"
+	LineCapTriangle LineCap = "Triangle"
 )
 
 const (
 	// LineJoinMiter 表示尖角线段连接样式
-	LineJoinMiter = "Miter"
+	LineJoinMiter LineJoin = "Miter"
 	// LineJoinBevel 表示斜切线段连接样式
-	LineJoinBevel = "Bevel"
+	LineJoinBevel LineJoin = "Bevel"
 	// LineJoinRound 表示圆角线段连接样式
-	LineJoinRound = "Round"
+	LineJoinRound LineJoin = "Round"
 )
 
 const (
 	// EdgeModeAliased 表示禁用抗锯齿的像素对齐边缘模式
-	EdgeModeAliased = "Aliased"
+	EdgeModeAliased EdgeMode = "Aliased"
 )
 
 const (
 	// StyleSimulationNone 表示不启用字体样式模拟
-	StyleSimulationNone = "None"
+	StyleSimulationNone StyleSimulation = "None"
 	// StyleSimulationBold 表示启用粗体样式模拟
-	StyleSimulationBold = "BoldSimulation"
+	StyleSimulationBold StyleSimulation = "BoldSimulation"
 	// StyleSimulationItalic 表示启用斜体样式模拟
-	StyleSimulationItalic = "ItalicSimulation"
+	StyleSimulationItalic StyleSimulation = "ItalicSimulation"
 	// StyleSimulationBoldItalic 表示同时启用粗体与斜体样式模拟
-	StyleSimulationBoldItalic = "BoldItalicSimulation"
+	StyleSimulationBoldItalic StyleSimulation = "BoldItalicSimulation"
 )
 
 // ReadingOrder 选择按页面或按故事组织内容，不从版面位置覆盖作者指定的顺序
 type ReadingOrder uint8
+
+// LineCap 表示路径描边端点及虚线帽样式
+type LineCap string
+
+// LineJoin 表示路径描边折角连接样式
+type LineJoin string
+
+// EdgeMode 表示画布渲染边缘对齐模式
+type EdgeMode string
+
+// StyleSimulation 表示字形合成样式模拟选项
+type StyleSimulation string
 
 // ContentLimits 规定单次内容读取的解压字节、节点、关联及字形字体预算，零值采用默认值
 // Text输出的UTF-8字节数另受MaxBytes约束，XML解析同时受阅读器上限约束
@@ -218,7 +230,7 @@ type ElementProperties struct {
 type Canvas struct {
 	ElementProperties
 	Elements           []Element
-	EdgeMode           string
+	EdgeMode           EdgeMode
 	AutomationName     string
 	AutomationHelpText string
 }
@@ -234,10 +246,10 @@ type Path struct {
 	StrokeThickness     float64
 	StrokeDashArray     []float64
 	StrokeDashOffset    float64
-	StrokeDashCap       string
-	StrokeStartLineCap  string
-	StrokeEndLineCap    string
-	StrokeLineJoin      string
+	StrokeDashCap       LineCap
+	StrokeStartLineCap  LineCap
+	StrokeEndLineCap    LineCap
+	StrokeLineJoin      LineJoin
 	StrokeMiterLimit    float64
 	SnapsToDevicePixels *bool
 	AutomationName      string
@@ -260,7 +272,7 @@ type Glyphs struct {
 	IsSideways          bool
 	Text                string
 	Indices             []GlyphCluster
-	StyleSimulations    string
+	StyleSimulations    StyleSimulation
 	CaretStops          string
 	DeviceFontName      string
 }
@@ -346,9 +358,9 @@ func DefaultContentOptions() ContentOptions {
 
 // Content 读取固定文档的绑定内容和阅读顺序，出错或取消时不返回部分结果
 // 调用期间保持阅读器读锁，Context在各处理步骤间检查取消状态
-// 入参: ctx 取消Context，nil采用Background, index 零基固定文档序号, options 内容参数，nil采用默认值
+// 入参: ctx 取消Context，nil采用Background, docIndex 零基固定文档序号, options 内容参数，nil采用默认值
 // 返回: *DocumentContent 独立内容结果, error 读取、关联、预算或取消错误
-func (r *Reader) Content(ctx context.Context, index int, options *ContentOptions) (*DocumentContent, error) {
+func (r *Reader) Content(ctx context.Context, docIndex int, options *ContentOptions) (*DocumentContent, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
@@ -358,7 +370,7 @@ func (r *Reader) Content(ctx context.Context, index int, options *ContentOptions
 	if err != nil {
 		return nil, err
 	}
-	return r.readContent(ctx, index, configuration)
+	return r.readContent(ctx, docIndex, configuration)
 }
 
 // readContent 在调用方持有阅读器读锁时构建绑定内容和阅读顺序
@@ -737,9 +749,9 @@ func (g *contentGraph) emitUnreferenced(page *contentPage) error {
 
 // Text 按指定阅读顺序连接Glyphs声明的Unicode文字，不猜测换行、重塑形或由字形编号虚构字符
 // 缺少Unicode声明时返回明确能力错误；绘制元素及位置参数仍可通过Content读取
-// 入参: ctx 取消Context，nil采用Background, index 零基固定文档序号, options 内容参数，nil采用默认值
+// 入参: ctx 取消Context，nil采用Background, docIndex 零基固定文档序号, options 内容参数，nil采用默认值
 // 返回: string 完整声明文字，失败时为空字符串, error 读取、缺少Unicode、预算或取消错误
-func (r *Reader) Text(ctx context.Context, index int, options *ContentOptions) (string, error) {
+func (r *Reader) Text(ctx context.Context, docIndex int, options *ContentOptions) (string, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return "", err
@@ -750,7 +762,7 @@ func (r *Reader) Text(ctx context.Context, index int, options *ContentOptions) (
 		return "", err
 	}
 	configuration.ResolveGlyphs = false
-	content, err := r.readContent(ctx, index, configuration)
+	content, err := r.readContent(ctx, docIndex, configuration)
 	if err != nil {
 		return "", err
 	}

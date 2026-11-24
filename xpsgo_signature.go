@@ -189,7 +189,7 @@ type signatureNamespaceScan struct {
 	context  context.Context
 }
 
-// signatureRelationship 保存关系变换使用的原始属性，不补写缺省目标模式或改写URI
+// signatureRelationship 保存关系变换筛选与规范化后的关系属性
 type signatureRelationship struct {
 	node  *xmlElement
 	id    string
@@ -715,7 +715,7 @@ func (g *signaturePartGraph) target(source string, relationship Relationship, me
 	if err := g.context.Err(); err != nil {
 		return PartInfo{}, err
 	}
-	if relationship.TargetMode != "Internal" {
+	if relationship.TargetMode != TargetModeInternal {
 		return PartInfo{}, fmt.Errorf("%w: external digital signature relationship %s", ErrInvalid, relationship.ID)
 	}
 	name, err := resolvePart(source, relationship.Target)
@@ -997,7 +997,7 @@ func (c *signatureCoverageGraph) selectRelationships(reference SignatureReferenc
 		return err
 	}
 	grouped := slices.Contains(selection.RelationshipTypes, opcSignatureRel)
-	return opcMetadata(data, c.graph.pkg.limits, opcRelsNS, "Relationships", func(element xml.StartElement, attrs map[string]string) error {
+	return opcMetadataContext(c.graph.context, data, c.graph.pkg.limits, opcRelsNS, "Relationships", func(element xml.StartElement, attrs map[string]string) error {
 		if err := c.graph.context.Err(); err != nil {
 			return err
 		}
@@ -1011,6 +1011,31 @@ func (c *signatureCoverageGraph) selectRelationships(reference SignatureReferenc
 		}
 		return nil
 	})
+}
+
+// signatureIsMetadataPart 判断签署部件是否属于受元数据字节上限约束的元数据XML
+// 入参: part 部件路径, media 无参数内容类型
+// 返回: bool 是否为元数据部件
+func signatureIsMetadataPart(part, media string) bool {
+	if opcRelationshipName(part) || strings.EqualFold(part, opcTypesName) || strings.EqualFold(media, opcRelsType) || strings.EqualFold(media, opcCoreType) || strings.EqualFold(media, opcSignatureType) {
+		return true
+	}
+	if strings.EqualFold(media, fixedContentType("signaturedefinitions")) || strings.EqualFold(media, fixedContentType("discard-control")) {
+		return true
+	}
+	known, _ := printResourceMedia(media)
+	return known
+}
+
+// signaturePartByteLimit 按部件类别返回元数据或正文XML部件的字节上限，避免大页面被元数据限额拦截
+// 入参: part 部件路径, media 无参数内容类型, limits 资源上限
+// 返回: int64 部件允许的最大字节数
+func signaturePartByteLimit(part, media string, limits Limits) int64 {
+	limit := min(limits.MaxPartBytes, limits.MaxPackageBytes)
+	if signatureIsMetadataPart(part, media) {
+		return min(limit, limits.MaxMetadataBytes)
+	}
+	return limit
 }
 
 // signatureNamespaces 扫描签署XML与签名对象的全部MCE分支并收集未理解命名空间
@@ -1031,7 +1056,8 @@ func signatureNamespaces(info *SignatureInfo, data []byte, graph *signaturePartG
 			}
 			known[namespace] = true
 		}
-		unknown, err := scanSignatureNamespaces(data, ids, known, graph.pkg.limits, graph.context)
+		limit := signaturePartByteLimit(part, media, graph.pkg.limits)
+		unknown, err := scanSignatureNamespaces(data, ids, known, graph.pkg.limits, limit, graph.context)
 		if err != nil {
 			return &PartError{Part: part, Err: err}
 		}
@@ -1071,7 +1097,7 @@ func signatureNamespaces(info *SignatureInfo, data []byte, graph *signaturePartG
 		if !compositionXML(media) {
 			continue
 		}
-		data, err := graph.pkg.readItems(key, min(graph.pkg.limits.MaxMetadataBytes, graph.pkg.limits.MaxPartBytes))
+		data, err := graph.pkg.readItems(key, signaturePartByteLimit(reference.Part, media, graph.pkg.limits))
 		if err != nil {
 			return nil, &PartError{Part: reference.Part, Err: err}
 		}
@@ -1121,11 +1147,11 @@ func signatureKnownNamespaces(media string, format Format) map[string]bool {
 	return known
 }
 
-// scanSignatureNamespaces 读取原始树并只检查选定子树，保留其祖先的MCE作用域
-// 入参: data 原始XML, ids 签名对象ID集合，nil表示整个部件, known 理解集合, limits XML上限, ctx 取消Context
+// scanSignatureNamespaces 按指定字节上限读取原始树并扫描选定子树的未理解命名空间
+// 入参: data 原始XML, ids 签名对象ID集合，nil表示整个部件, known 理解集合, limits XML上限, maxBytes 允许字节上限, ctx 取消Context
 // 返回: []string 未理解且影响签署内容的URI, error XML、MCE或取消错误
-func scanSignatureNamespaces(data []byte, ids map[string]bool, known map[string]bool, limits Limits, ctx context.Context) ([]string, error) {
-	if int64(len(data)) > min(limits.MaxMetadataBytes, limits.MaxPartBytes, limits.MaxPackageBytes) {
+func scanSignatureNamespaces(data []byte, ids map[string]bool, known map[string]bool, limits Limits, maxBytes int64, ctx context.Context) ([]string, error) {
+	if int64(len(data)) > maxBytes {
 		return nil, fmt.Errorf("%w: signed XML namespace inspection bytes", ErrLimit)
 	}
 	p := signatureNamespaceScan{known: known, declared: map[string]bool{mcNamespace: true, xmlNamespace: true}, selected: make(map[*xmlElement]bool), needed: make(map[*xmlElement]bool), unknown: make(map[string]bool), context: ctx}
@@ -1942,7 +1968,7 @@ func signaturePartReference(value string) (string, string, error) {
 	return name, media, nil
 }
 
-// signatureRelationshipXML 按OPC2006执行MCE、关系排序筛选及根内首尾清理，保留关系间非元素内容的位置
+// signatureRelationshipXML 按OPC规范执行MCE、关系排序筛选并保留原元素槽位与非元素内容
 // 入参: data 原始关系XML, transform 关系选择条件, limits XML及输出上限, ctx 取消Context
 // 返回: []byte 独立变换XML, error 结构、MCE、预算或取消错误，失败无部分结果
 func signatureRelationshipXML(data []byte, transform SignatureTransform, limits Limits, ctx context.Context) ([]byte, error) {
@@ -1990,17 +2016,18 @@ func signatureRelationshipXML(data []byte, transform SignatureTransform, limits 
 			return nil, err
 		}
 		id, hasID := attrs["Id"]
+		id = strings.Trim(id, " \t\r\n")
 		typ, hasType := attrs["Type"]
 		target, hasTarget := attrs["Target"]
-		if !hasID || !xmlNCName(strings.Trim(id, " \t\r\n")) || ids[strings.Trim(id, " \t\r\n")] || !hasType || !hasTarget || target == "" {
+		if !hasID || !xmlNCName(id) || ids[id] || !hasType || !hasTarget || target == "" {
 			return nil, fmt.Errorf("%w: relationship transform attributes", ErrInvalid)
 		}
-		ids[strings.Trim(id, " \t\r\n")] = true
+		ids[id] = true
 		uri, err := opcURI(typ)
 		if err != nil || uri.Scheme == "" || !uriReference(target) {
 			return nil, fmt.Errorf("%w: relationship transform URI", ErrInvalid)
 		}
-		if mode, present := attrs["TargetMode"]; present && mode != "Internal" && mode != "External" {
+		if mode, hasMode := attrs["TargetMode"]; hasMode && TargetMode(mode) != TargetModeInternal && TargetMode(mode) != TargetModeExternal {
 			return nil, fmt.Errorf("%w: relationship transform TargetMode", ErrInvalid)
 		}
 		item := signatureRelationship{node: child, id: id, typ: typ}
@@ -2047,7 +2074,7 @@ func signatureRelationshipXML(data []byte, transform SignatureTransform, limits 
 	return signatureRelationshipOutput(content, filtered, byNode, limit, ctx)
 }
 
-// signatureRelationshipOutput 输出仅使用关系默认命名空间的XML，原属性保留，所有关系内容移除
+// signatureRelationshipOutput 输出仅使用关系默认命名空间的XML，保留原属性及非元素词元并移除关系内容
 // 入参: content 根外词元, items 排序筛选后的根内内容, relationships 关系属性索引, limit 输出字节上限, ctx 取消Context
 // 返回: []byte 独立XML字节, error 序列化、预算或取消错误
 func signatureRelationshipOutput(content *xmlContentReader, items []xmlContent, relationships map[*xmlElement]signatureRelationship, limit int64, ctx context.Context) ([]byte, error) {

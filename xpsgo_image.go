@@ -165,7 +165,7 @@ func (c *sceneImageCache) load(brush *Brush) (*rasterImage, error) {
 	if err != nil {
 		return nil, &PartError{Part: part, Err: err}
 	}
-	decoded, err := decodeRasterImageContext(normalizeContext(c.context), data, media, c.pixels)
+	decoded, err := decodeRasterImageWithMemory(normalizeContext(c.context), data, media, c.pixels, uint64(c.bytes))
 	if err != nil {
 		return nil, &PartError{Part: part, Err: err}
 	}
@@ -179,6 +179,13 @@ func (c *sceneImageCache) load(brush *Brush) (*rasterImage, error) {
 // 入参: ctx 取消Context, data 图像字节, media 声明内容类型, maxPixels 剩余RGBA64容量
 // 返回: *rasterImage 原生图像, error 数据、能力、资源或取消错误
 func decodeRasterImageContext(ctx context.Context, data []byte, media string, maxPixels uint64) (*rasterImage, error) {
+	return decodeRasterImageWithMemory(ctx, data, media, maxPixels, 0)
+}
+
+// decodeRasterImageWithMemory 检查取消状态并按内容类型解码，同时向JPEG XR传递字节上限预算
+// 入参: ctx 取消Context, data 图像字节, media 声明内容类型, maxPixels 剩余RGBA64容量, maxBytes 图像字节上限
+// 返回: *rasterImage 原生图像, error 数据、能力、资源或取消错误
+func decodeRasterImageWithMemory(ctx context.Context, data []byte, media string, maxPixels, maxBytes uint64) (*rasterImage, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
@@ -202,7 +209,7 @@ func decodeRasterImageContext(ctx context.Context, data []byte, media string, ma
 	case "image/tiff":
 		return decodeTIFFImage(data, maxPixels)
 	case "image/vnd.ms-photo":
-		return decodeJXRImage(ctx, data, maxPixels)
+		return decodeJXRImage(ctx, data, maxPixels, maxBytes)
 	default:
 		return nil, fmt.Errorf("%w: unexpected image content type %q", ErrInvalid, media)
 	}
@@ -417,7 +424,7 @@ func (r *Reader) readImage(ctx context.Context, part string, options *ImageOptio
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	source, err := decodeRasterImageContext(ctx, data, media, configuration.MaxPixels)
+	source, err := decodeRasterImageWithMemory(ctx, data, media, configuration.MaxPixels, uint64(configuration.MaxBytes))
 	if err != nil {
 		return nil, &PartError{Part: part, Err: err}
 	}

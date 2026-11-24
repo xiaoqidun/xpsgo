@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"hash"
 	"math/big"
+	"mime"
 	"net/url"
 	"slices"
 	"strconv"
@@ -91,10 +92,11 @@ type signatureRetrievalPart struct {
 // SignatureStatus 表示当前方言签名策略下的判断，零值不表示验证已经完成
 type SignatureStatus uint8
 
-// SignatureVerifyOptions 设置显式证书信任与调用方理解的MCE扩展命名空间，调用期间不得修改
-// 未提供Trust.Roots时不使用系统根且不拉取远程证书或吊销信息，自建根池采用离线验证
+// SignatureVerifyOptions 设置公钥、显式证书信任与调用方理解的MCE扩展命名空间，调用期间不得修改
+// PublicKey非nil时直接用该公钥验签而不强制证书链校验；未提供Trust.Roots时不使用系统根
 // Namespaces仅声明调用方扩展理解，不为本库渲染器增加对应功能
 type SignatureVerifyOptions struct {
+	PublicKey  crypto.PublicKey
 	Trust      x509.VerifyOptions
 	Namespaces []string
 }
@@ -129,31 +131,6 @@ func (s SignatureStatus) String() string {
 	default:
 		return fmt.Sprintf("SignatureStatus(%d)", s)
 	}
-}
-
-// VerifySignature 使用调用方公钥验证全部声明摘要与签名值，不评估证书信任或XPS覆盖策略
-// 读取与变换分别共用MaxPackageBytes上限，调用方须确保key在调用期间有效且不变
-// 入参: ctx 取消Context，nil采用Background, part 签名部件包根URI, key 调用方公钥
-// 返回: error 结构、摘要、签名、算法、密钥、资源、关闭或取消错误；nil仅表示该公钥下密码学验证成功
-func (r *Reader) VerifySignature(ctx context.Context, part string, key crypto.PublicKey) error {
-	if err := r.readLock(); err != nil {
-		return err
-	}
-	defer r.mu.RUnlock()
-	ctx = normalizeContext(ctx)
-	info, data, graph, err := r.loadSignature(ctx, part)
-	if err != nil {
-		return err
-	}
-	if err := signatureKey(info.Method, key); err != nil {
-		return err
-	}
-	v := signatureVerifier{graph: graph, limits: r.limits, work: r.limits.MaxPackageBytes}
-	canonical, err := v.prepare(info, data)
-	if err != nil {
-		return err
-	}
-	return verifySignatureValue(ctx, info.Method, key, canonical, info.Value)
 }
 
 // prepare 验证所有引用摘要并生成同一次输入的SignedInfo，不执行公钥或证书信任判断
@@ -200,13 +177,20 @@ func (v *signatureVerifier) charge(size int64) error {
 // 入参: data XML字节, algorithm 规范化算法, comments 是否保留当前输入中的注释, selectElement 可选子树选择
 // 返回: []byte 独立规范化输出, error 规范化、预算或取消错误
 func (v *signatureVerifier) canonical(data []byte, algorithm string, comments bool, selectElement func(*xmlElement, []xml.Name) bool) ([]byte, error) {
+	return v.canonicalLimited(data, algorithm, comments, v.limits.MaxMetadataBytes, selectElement)
+}
+
+// canonicalLimited 按指定字节上限对XML字节执行C14N规范化
+// 入参: data XML字节, algorithm 规范化算法, comments 是否保留当前输入中的注释, maxBytes 允许输出字节上限, selectElement 可选子树选择
+// 返回: []byte 独立规范化输出, error 规范化、预算或取消错误
+func (v *signatureVerifier) canonicalLimited(data []byte, algorithm string, comments bool, maxBytes int64, selectElement func(*xmlElement, []xml.Name) bool) ([]byte, error) {
 	if !signatureCanonicalMethod(algorithm) {
 		return nil, fmt.Errorf("%w: signature canonicalization algorithm", ErrUnsupported)
 	}
 	if err := v.charge(int64(len(data))); err != nil {
 		return nil, err
 	}
-	return canonicalXML(data, canonicalXMLOptions{limits: v.limits, maxBytes: v.limits.MaxMetadataBytes, comments: comments, context: v.graph.context, selectElement: selectElement})
+	return canonicalXML(data, canonicalXMLOptions{limits: v.limits, maxBytes: maxBytes, comments: comments, context: v.graph.context, selectElement: selectElement})
 }
 
 // elementDigest 验证同文档引用，首次节点集转换遵守裸ID移除注释及完整XPointer保留注释的区别
@@ -268,7 +252,12 @@ func (v *signatureVerifier) computePartDigest(reference SignatureReference) ([]b
 		}
 		return h.Sum(nil), nil
 	}
-	data, err := v.graph.pkg.readItems(strings.ToLower(reference.Part), min(v.limits.MaxMetadataBytes, v.limits.MaxPartBytes))
+	media, _, err := mime.ParseMediaType(reference.ContentType)
+	if err != nil {
+		return nil, fmt.Errorf("%w: signed part media: %w", ErrInvalid, err)
+	}
+	limit := signaturePartByteLimit(reference.Part, media, v.limits)
+	data, err := v.graph.pkg.readItems(strings.ToLower(reference.Part), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +268,7 @@ func (v *signatureVerifier) computePartDigest(reference SignatureReference) ([]b
 			}
 			data, err = signatureRelationshipXML(data, transform, v.limits, v.graph.context)
 		} else {
-			data, err = v.canonical(data, transform.Algorithm, transform.Algorithm == signatureComments, nil)
+			data, err = v.canonicalLimited(data, transform.Algorithm, transform.Algorithm == signatureComments, limit, nil)
 		}
 		if err != nil {
 			return nil, err
@@ -347,31 +336,6 @@ func (r *Reader) SignatureCertificates(ctx context.Context, part string) ([]*x50
 		return nil, err
 	}
 	return loadSignatureCertificates(info, graph)
-}
-
-// VerifySigner 使用包内证书（内嵌优先）验证全部声明摘要、签名值及调用方显式信任链
-// Roots须显式提供且调用期间不变，未指定KeyUsages时采用Any，不评估XPS覆盖策略或吊销状态
-// 入参: ctx 取消Context，nil采用Background, part 签名部件包根URI, options 调用方X509信任参数
-// 返回: *SignatureSigner 独立签名者与证书链，失败无部分结果, error 数据、密码学、信任、资源、关闭或取消错误
-func (r *Reader) VerifySigner(ctx context.Context, part string, options x509.VerifyOptions) (*SignatureSigner, error) {
-	if err := r.readLock(); err != nil {
-		return nil, err
-	}
-	defer r.mu.RUnlock()
-	ctx = normalizeContext(ctx)
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if options.Roots == nil {
-		return nil, fmt.Errorf("%w: signer verification requires explicit roots", ErrInvalid)
-	}
-	options = signatureTrustOptions(options)
-	info, data, graph, err := r.loadSignature(ctx, part)
-	if err != nil {
-		return nil, err
-	}
-	signer, _, err := verifySignatureSigner(info, data, graph, r.limits, options)
-	return signer, err
 }
 
 // signatureTrustOptions 复制调用方证书池与用途，未提供根时使用空池，不读取系统证书库
@@ -944,11 +908,11 @@ func signatureRetrievalTarget(root *xmlElement, ids map[string]*xmlElement, frag
 	return ids[id], retain, nil
 }
 
-// VerifyDocumentSignature 按当前方言覆盖规则、OPC密码学、显式证书信任及MCE规则综合判定单个签名
-// 同次读取与检查共用包字节预算，不合并多签名；资源、取消或结构错误直接返回错误而非验证结论
+// VerifySignature 按当前方言覆盖规则、OPC密码学、公钥或显式证书信任及MCE规则综合判定单个签名
+// PublicKey非nil时直接用该公钥验签而无需证书链校验；资源、取消或结构错误直接返回错误而非验证结论
 // 入参: ctx 取消Context，nil采用Background, part 已关联签名部件包根URI, options 验证参数，nil不信任任何根
 // 返回: *SignatureVerification 独立结论与证据，操作失败无部分结果, error 结构、能力、资源、关闭或取消错误
-func (r *Reader) VerifyDocumentSignature(ctx context.Context, part string, options *SignatureVerifyOptions) (*SignatureVerification, error) {
+func (r *Reader) VerifySignature(ctx context.Context, part string, options *SignatureVerifyOptions) (*SignatureVerification, error) {
 	if err := r.readLock(); err != nil {
 		return nil, err
 	}
@@ -999,11 +963,73 @@ func validateSignatureVerifyOptions(ctx context.Context, configuration Signature
 // 返回: *SignatureVerification 独立结论，操作失败为空, error 结构、能力、资源或取消错误
 func (r *Reader) verifyLoadedDocumentSignature(info *SignatureInfo, data []byte, graph *signaturePartGraph, configuration SignatureVerifyOptions) (*SignatureVerification, error) {
 	ctx := graph.context
+	if configuration.PublicKey != nil {
+		if err := signatureKey(info.Method, configuration.PublicKey); err != nil {
+			return nil, err
+		}
+	}
 	coverage, err := r.signatureCoverage(info, graph)
 	if err != nil {
 		return nil, err
 	}
 	result := &SignatureVerification{Part: info.Part, Coverage: coverage}
+	if configuration.PublicKey != nil {
+		v := signatureVerifier{graph: graph, limits: r.limits, work: r.limits.MaxPackageBytes}
+		canonical, err := v.prepare(info, data)
+		if err == nil {
+			err = verifySignatureValue(ctx, info.Method, configuration.PublicKey, canonical, info.Value)
+		}
+		if err != nil {
+			var failure *packageReadError
+			if errors.As(err, &failure) {
+				return nil, err
+			}
+			switch {
+			case errors.Is(err, ErrSignature), errors.Is(err, ErrInvalid):
+				result.SignatureError = err
+			default:
+				return nil, err
+			}
+		} else {
+			result.SignatureVerified = true
+		}
+		if len(coverage.UnexpectedParts)+len(coverage.UnexpectedRelationships)+len(coverage.UngroupedSignatures) != 0 {
+			result.Status = SignatureIncompliant
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return result, nil
+		}
+		if len(coverage.MissingParts)+len(coverage.MissingRelationships) != 0 {
+			result.Status = SignatureBroken
+			if r.format == FormatXPS {
+				result.Status = SignatureIncompliant
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return result, nil
+		}
+		if !result.SignatureVerified {
+			result.Status = SignatureBroken
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return result, nil
+		}
+		result.Status = SignatureValid
+		result.UnknownNamespaces, err = signatureNamespaces(info, data, graph, r.format, configuration.Namespaces)
+		if err != nil {
+			return nil, err
+		}
+		if len(result.UnknownNamespaces) != 0 {
+			result.Status = SignatureQuestionable
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
 	if len(coverage.UnexpectedParts)+len(coverage.UnexpectedRelationships)+len(coverage.UngroupedSignatures) != 0 {
 		result.Status = SignatureIncompliant
 		if err := ctx.Err(); err != nil {

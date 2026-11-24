@@ -18,14 +18,17 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/xml"
 	"fmt"
+	"image/color"
 	"io"
 	"maps"
 	"math"
 	"mime"
 	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -69,6 +72,7 @@ type Package struct {
 	comment        string
 	dirty          map[string]bool
 	dirtyRels      map[string]bool
+	deleted        map[string]bool
 	protected      map[string]bool
 }
 
@@ -175,17 +179,17 @@ func (p *Package) PageCount() int {
 }
 
 // Document 返回独立的文档和页面索引
-// 入参: index 从零开始的文档序号
+// 入参: docIndex 从零开始的文档序号
 // 返回: Document 索引副本, error 序号错误
-func (p *Package) Document(index int) (Document, error) {
+func (p *Package) Document(docIndex int) (Document, error) {
 	if err := p.lock(); err != nil {
 		return Document{}, err
 	}
 	defer p.mu.Unlock()
-	if index < 0 || index >= len(p.documents) {
+	if docIndex < 0 || docIndex >= len(p.documents) {
 		return Document{}, fmt.Errorf("%w: document index", ErrInvalid)
 	}
-	value := p.documents[index]
+	value := p.documents[docIndex]
 	value.Pages = slices.Clone(value.Pages)
 	for index := range value.Pages {
 		value.Pages[index].LinkTargets = slices.Clone(value.Pages[index].LinkTargets)
@@ -201,6 +205,13 @@ func (p *Package) AddDocument(part string) (int, error) {
 		return 0, err
 	}
 	defer p.mu.Unlock()
+	return p.addDocumentLocked(part)
+}
+
+// addDocumentLocked 在调用方持有包写锁时新增固定文档
+// 入参: part 文档部件URI，空值自动分配
+// 返回: int 新文档序号, error 名称冲突、编辑许可或资源错误
+func (p *Package) addDocumentLocked(part string) (int, error) {
 	pattern := ""
 	if part == "" {
 		pattern = "/Documents/%d/FixedDoc.fdoc"
@@ -231,10 +242,10 @@ func (p *Package) AddDocument(part string) (int, error) {
 	return len(p.documents) - 1, nil
 }
 
-// AddPage 将类型化页面编码后加入指定文档，不修改调用方模型，资源可在写出前补齐
-// 入参: ctx 取消Context，nil采用Background, document 文档序号, page 页面模型，Part为空时自动分配
-// 返回: int 新页面在文档内的序号, error 模型、名称、编码或资源错误
-func (p *Package) AddPage(ctx context.Context, document int, page *Page) (int, error) {
+// AddPage 将类型化页面加入默认首文档，包尚无文档时自动创建首文档并在失败时回滚
+// 入参: ctx 取消Context，nil采用Background, page 页面模型，Part为空时自动分配
+// 返回: int 新页面在首文档内的序号, error 模型、名称、编码、取消或资源错误
+func (p *Package) AddPage(ctx context.Context, page *Page) (int, error) {
 	ctx = normalizeContext(ctx)
 	if err := p.lock(); err != nil {
 		return 0, err
@@ -243,10 +254,47 @@ func (p *Package) AddPage(ctx context.Context, document int, page *Page) (int, e
 	if err := checkContext(ctx); err != nil {
 		return 0, err
 	}
-	if document < 0 || document >= len(p.documents) || page == nil {
+	if page == nil {
 		return 0, fmt.Errorf("%w: document index or page", ErrInvalid)
 	}
-	if err := p.editable(p.documents[document].Part); err != nil {
+	if len(p.documents) != 0 {
+		return p.addPageLocked(ctx, 0, page)
+	}
+	q := p.storyCopy()
+	if _, err := q.addDocumentLocked(""); err != nil {
+		return 0, err
+	}
+	index, err := q.addPageLocked(ctx, 0, page)
+	if err != nil {
+		return 0, err
+	}
+	p.commitStory(q)
+	return index, nil
+}
+
+// AddPageTo 将类型化页面编码后加入指定文档，不修改调用方模型，资源可在写出前补齐
+// 入参: ctx 取消Context，nil采用Background, docIndex 文档序号, page 页面模型，Part为空时自动分配
+// 返回: int 新页面在文档内的序号, error 模型、名称、编码、取消或资源错误
+func (p *Package) AddPageTo(ctx context.Context, docIndex int, page *Page) (int, error) {
+	ctx = normalizeContext(ctx)
+	if err := p.lock(); err != nil {
+		return 0, err
+	}
+	defer p.mu.Unlock()
+	return p.addPageLocked(ctx, docIndex, page)
+}
+
+// addPageLocked 在调用方持有包写锁时编码并将页面加入指定文档
+// 入参: ctx 取消Context, docIndex 文档序号, page 页面模型
+// 返回: int 新页面在文档内的序号, error 模型、名称、编码、取消或资源错误
+func (p *Package) addPageLocked(ctx context.Context, docIndex int, page *Page) (int, error) {
+	if err := checkContext(ctx); err != nil {
+		return 0, err
+	}
+	if docIndex < 0 || docIndex >= len(p.documents) || page == nil {
+		return 0, fmt.Errorf("%w: document index or page", ErrInvalid)
+	}
+	if err := p.editable(p.documents[docIndex].Part); err != nil {
 		return 0, err
 	}
 	if p.pageCount >= p.limits.MaxPageCount {
@@ -255,7 +303,7 @@ func (p *Package) AddPage(ctx context.Context, document int, page *Page) (int, e
 	value := *page
 	pattern := ""
 	if value.Part == "" {
-		base := p.documents[document].Part
+		base := p.documents[docIndex].Part
 		base = base[:strings.LastIndexByte(base, '/')+1]
 		pattern = base + "Pages/%d.fpage"
 		var err error
@@ -280,11 +328,127 @@ func (p *Package) AddPage(ctx context.Context, document int, page *Page) (int, e
 		return 0, err
 	}
 	p.layout[strings.ToLower(part)] = true
-	p.documents[document].Pages = append(p.documents[document].Pages, PageReference{Part: part, LinkTargets: targets})
+	p.documents[docIndex].Pages = append(p.documents[docIndex].Pages, PageReference{Part: part, LinkTargets: targets})
 	p.pageCount++
-	p.dirty[strings.ToLower(p.documents[document].Part)] = true
+	p.dirty[strings.ToLower(p.documents[docIndex].Part)] = true
 	p.commitName(pattern, part)
-	return len(p.documents[document].Pages) - 1, nil
+	return len(p.documents[docIndex].Pages) - 1, nil
+}
+
+// AddFont 校验字体嵌入许可后按唯一GUID路径混淆存入包中，禁止嵌入的字体返回ErrRestricted
+// 入参: data 原始OpenType或TrueType字体字节
+// 返回: string 混淆字体的包根URI, error 字体格式、许可、名称或资源错误
+func (p *Package) AddFont(data []byte) (string, error) {
+	if err := p.lock(); err != nil {
+		return "", err
+	}
+	defer p.mu.Unlock()
+	if len(data) == 0 {
+		return "", fmt.Errorf("%w: empty font data", ErrInvalid)
+	}
+	if int64(len(data)) > p.limits.MaxPartBytes {
+		return "", fmt.Errorf("%w: font byte budget", ErrLimit)
+	}
+	face, err := parseFontFace(data, 0)
+	if err != nil {
+		return "", err
+	}
+	os2, err := parseFontOS2Metrics(face)
+	if err != nil {
+		return "", err
+	}
+	if os2 == nil {
+		return "", fmt.Errorf("%w: producer font needs OS/2", ErrInvalid)
+	}
+	rights, err := fontEmbeddingRights(os2)
+	if err != nil {
+		return "", err
+	}
+	if rights&2 != 0 {
+		return "", fmt.Errorf("%w: font prohibits embedding", ErrRestricted)
+	}
+	part, err := p.newFontPart()
+	if err != nil {
+		return "", err
+	}
+	obfuscated, err := ObfuscateFont(part, data)
+	if err != nil {
+		return "", err
+	}
+	if err := p.editable(part); err != nil {
+		return "", err
+	}
+	if err := p.storePart(part, "application/vnd.ms-package.obfuscated-opentype", obfuscated, false); err != nil {
+		return "", err
+	}
+	return part, nil
+}
+
+// newFontPart 生成包内不冲突的UUIDv4混淆字体部件路径
+// 返回: string 规范化字体部件URI, error 随机数或冲突错误
+func (p *Package) newFontPart() (string, error) {
+	var raw [16]byte
+	for range 1024 {
+		if _, err := rand.Read(raw[:]); err != nil {
+			return "", err
+		}
+		raw[6] = raw[6]&0x0f | 0x40
+		raw[8] = raw[8]&0x3f | 0x80
+		part := fmt.Sprintf("/Resources/Fonts/%X-%X-%X-%X-%X.odttf", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16])
+		if p.available(part) == nil {
+			return part, nil
+		}
+	}
+	return "", fmt.Errorf("%w: unable to allocate unique font part", ErrLimit)
+}
+
+// AddImage 按魔数识别PNG、JPEG、TIFF或JPEG XR图像并分配唯一路径存入包中
+// 入参: data 原始图像字节
+// 返回: string 图像部件的包根URI, error 格式、预算或名称冲突错误
+func (p *Package) AddImage(data []byte) (string, error) {
+	if err := p.lock(); err != nil {
+		return "", err
+	}
+	defer p.mu.Unlock()
+	if len(data) == 0 {
+		return "", fmt.Errorf("%w: empty image data", ErrInvalid)
+	}
+	media, ext, err := detectImageFormat(data)
+	if err != nil {
+		return "", err
+	}
+	pattern := "/Resources/Images/%d." + ext
+	part, err := p.newName(pattern, nil)
+	if err != nil {
+		return "", err
+	}
+	if err := p.editable(part); err != nil {
+		return "", err
+	}
+	if err := p.storePart(part, media, data, false); err != nil {
+		return "", err
+	}
+	p.commitName(pattern, part)
+	return part, nil
+}
+
+// detectImageFormat 根据文件头魔数识别XPS支持的栅格图像媒体类型与扩展名
+// 入参: data 图像原始字节
+// 返回: string 媒体类型, string 扩展名, error 不支持的图像格式错误
+func detectImageFormat(data []byte) (string, string, error) {
+	if len(data) >= 8 && bytes.Equal(data[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
+		return "image/png", "png", nil
+	}
+	if len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff {
+		return "image/jpeg", "jpg", nil
+	}
+	if len(data) >= 4 && data[0] == 'I' && data[1] == 'I' && data[2] == 0xbc && data[3] == 0x01 {
+		return "image/vnd.ms-photo", "jxr", nil
+	}
+	if len(data) >= 4 && (data[0] == 'I' && data[1] == 'I' && data[2] == 0x2a && data[3] == 0x00 || data[0] == 'M' && data[1] == 'M' && data[2] == 0x00 && data[3] == 0x2a) {
+		return "image/tiff", "tif", nil
+	}
+	return "", "", fmt.Errorf("%w: unsupported image format", ErrUnsupported)
 }
 
 // SetPart 新增或替换资源及扩展部件，名称与数据独立保存，不允许覆盖受文档模型管理的部件
@@ -305,7 +469,11 @@ func (p *Package) SetPart(part, media string, data []byte) error {
 	if err := p.editable(canonical); err != nil {
 		return err
 	}
-	return p.store(canonical, media, data)
+	if err := p.store(canonical, media, data); err != nil {
+		return err
+	}
+	delete(p.deleted, strings.ToLower(canonical))
+	return nil
 }
 
 // ReadPart 返回已经存入模型的页面、资源或扩展部件副本，生成的索引与关系通过Reader读取
@@ -343,20 +511,81 @@ func (p *Package) Reader(ctx context.Context) (*Reader, error) {
 	return snapshot.reader(ctx)
 }
 
-// Write 校验完整只读快照后写出包，不在缺失依赖或非法文档结构时生成部分输出
+// Write 校验完整只读快照后写出包，启用SubsetFonts时仅对临时副本子集化而不修改原包
 // 入参: ctx 取消Context，nil采用Background, output 输出流, options 写出选项，nil采用默认值
-// 返回: int64 已写字节数, error 校验、取消、压缩或输出错误
+// 返回: int64 已写字节数, error 校验、子集化、取消、压缩或输出错误
 func (p *Package) Write(ctx context.Context, output io.Writer, options *WriteOptions) (int64, error) {
 	ctx = normalizeContext(ctx)
-	if output == nil || options != nil && (options.Compression > CompressionOptimize || options.MaxBytes < 0) {
+	if output == nil || !validPackageWriteOptions(options) {
 		return 0, fmt.Errorf("%w: package write parameters", ErrInvalid)
 	}
-	r, err := p.Reader(ctx)
+	r, err := p.writeReader(ctx, options)
 	if err != nil {
 		return 0, err
 	}
 	defer r.Close()
 	return r.Write(ctx, output, options)
+}
+
+// WriteFile 校验完整只读快照后写出到目标文件，写出或关闭失败时清理新建残缺文件
+// 入参: ctx 取消Context，nil采用Background, path 目标文件路径, options 写出选项，nil采用默认值
+// 返回: error 参数、校验、子集化、取消或文件写入错误
+func (p *Package) WriteFile(ctx context.Context, path string, options *WriteOptions) error {
+	ctx = normalizeContext(ctx)
+	if path == "" || !validPackageWriteOptions(options) {
+		return fmt.Errorf("%w: package write parameters", ErrInvalid)
+	}
+	r, err := p.writeReader(ctx, options)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	_, writeErr := r.Write(ctx, file, options)
+	closeErr := file.Close()
+	if writeErr != nil {
+		_ = os.Remove(path)
+		return writeErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(path)
+		return closeErr
+	}
+	return nil
+}
+
+// validPackageWriteOptions 校验Package写出阶段接受的选项参数合法性
+// 入参: options 写出选项，nil表示采用默认值
+// 返回: bool 参数是否合法
+func validPackageWriteOptions(options *WriteOptions) bool {
+	if options == nil {
+		return true
+	}
+	return options.Compression <= CompressionOptimize && options.MaxBytes >= 0 && options.InterleaveBytes >= 0 && options.InterleaveBytes <= compressionBufferLimit && (options.InterleaveBytes != 0 || len(options.PartOrder) == 0)
+}
+
+// writeReader 为包写出准备已校验只读快照，启用SubsetFonts时在独立副本上执行子集化
+// 入参: ctx 取消Context, options 写出选项
+// 返回: *Reader 独立只读快照, error 校验、子集化或取消错误
+func (p *Package) writeReader(ctx context.Context, options *WriteOptions) (*Reader, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if options == nil || !options.SubsetFonts {
+		return p.Reader(ctx)
+	}
+	if err := p.lock(); err != nil {
+		return nil, err
+	}
+	clone := p.storyCopy()
+	p.mu.Unlock()
+	if _, err := clone.SubsetFonts(ctx, nil); err != nil {
+		return nil, err
+	}
+	return clone.reader(ctx)
 }
 
 // WriteTo 将当前模型写入输出流，不关闭调用方输出流
@@ -517,12 +746,12 @@ func createdPageTargets(root *xmlElement) []string {
 	return result
 }
 
-// NewPage 创建OpenXPS页面模型，区域默认覆盖整页，尺寸与语言在编码时校验
+// NewPage 创建页面模型，方言留空以继承目标包格式，尺寸与语言在编码时校验
 // 入参: width 页面宽度, height 页面高度，均以1/96英寸计, language 页面语言
 // 返回: *Page 页面模型
 func NewPage(width, height float64, language string) *Page {
 	box := Rect{Width: width, Height: height}
-	return &Page{Format: FormatOpenXPS, Width: width, Height: height, Language: language, ContentBox: box, BleedBox: box}
+	return &Page{Width: width, Height: height, Language: language, ContentBox: box, BleedBox: box}
 }
 
 // NewCanvas 创建采用标准缺省属性的不透明画布
@@ -535,14 +764,14 @@ func NewCanvas() *Canvas {
 // 入参: data 路径几何，nil表示未指定
 // 返回: *Path 路径模型
 func NewPath(data *Geometry) *Path {
-	return &Path{ElementProperties: ElementProperties{Opacity: 1}, Data: data, StrokeThickness: 1, StrokeMiterLimit: 10, StrokeDashCap: "Flat", StrokeStartLineCap: "Flat", StrokeEndLineCap: "Flat", StrokeLineJoin: "Miter"}
+	return &Path{ElementProperties: ElementProperties{Opacity: 1}, Data: data, StrokeThickness: 1, StrokeMiterLimit: 10, StrokeDashCap: LineCapFlat, StrokeStartLineCap: LineCapFlat, StrokeEndLineCap: LineCapFlat, StrokeLineJoin: LineJoinMiter}
 }
 
 // NewGlyphs 创建采用标准缺省属性的字形模型，不执行排版或字体查询
 // 入参: fontURI 字体URI, size 字号，以1/96英寸计, text 文字，不含标记转义前缀
 // 返回: *Glyphs 字形模型
 func NewGlyphs(fontURI string, size float64, text string) *Glyphs {
-	return &Glyphs{ElementProperties: ElementProperties{Opacity: 1}, FontURI: fontURI, FontRenderingEmSize: size, Text: text, StyleSimulations: "None"}
+	return &Glyphs{ElementProperties: ElementProperties{Opacity: 1}, FontURI: fontURI, FontRenderingEmSize: size, Text: text, StyleSimulations: StyleSimulationNone}
 }
 
 // NewBrush 创建不透明画刷模型，插值和延展方式采用标准缺省值，具体内容由调用方填充
@@ -550,6 +779,107 @@ func NewGlyphs(fontURI string, size float64, text string) *Glyphs {
 // 返回: *Brush 画刷模型
 func NewBrush(kind BrushKind) *Brush {
 	return &Brush{Kind: kind, Opacity: 1}
+}
+
+// SolidBrush 将标准颜色转换为精确8位sRGB纯色画刷，nil返回全透明黑色画刷
+// 入参: c 标准颜色值，nil表示全透明黑色
+// 返回: *Brush 纯色画刷模型
+func SolidBrush(c color.Color) *Brush {
+	return &Brush{Kind: BrushSolidColor, Opacity: 1, Color: colorToSRGB(c)}
+}
+
+// colorToSRGB 将标准颜色转换为满足8位精确编码要求的非预乘sRGB颜色
+// 入参: c 标准颜色值
+// 返回: Color 精确8位sRGB颜色
+func colorToSRGB(c color.Color) Color {
+	if c == nil {
+		return Color{Space: ColorSRGB, Alpha: 0, Components: []float64{0, 0, 0}}
+	}
+	switch value := c.(type) {
+	case color.NRGBA:
+		if value.A == 0 {
+			return Color{Space: ColorSRGB, Alpha: 0, Components: []float64{0, 0, 0}}
+		}
+		return Color{Space: ColorSRGB, Alpha: float64(value.A) / 255, Components: []float64{float64(value.R) / 255, float64(value.G) / 255, float64(value.B) / 255}}
+	case color.NRGBA64:
+		if value.A == 0 {
+			return Color{Space: ColorSRGB, Alpha: 0, Components: []float64{0, 0, 0}}
+		}
+		return Color{Space: ColorSRGB, Alpha: quantizeSRGB8(float64(value.A) / 65535), Components: []float64{quantizeSRGB8(float64(value.R) / 65535), quantizeSRGB8(float64(value.G) / 65535), quantizeSRGB8(float64(value.B) / 65535)}}
+	}
+	r, g, b, a := c.RGBA()
+	if a == 0 {
+		return Color{Space: ColorSRGB, Alpha: 0, Components: []float64{0, 0, 0}}
+	}
+	af := float64(a)
+	return Color{Space: ColorSRGB, Alpha: quantizeSRGB8(af / 65535), Components: []float64{quantizeSRGB8(min(1, float64(r)/af)), quantizeSRGB8(min(1, float64(g)/af)), quantizeSRGB8(min(1, float64(b)/af))}}
+}
+
+// quantizeSRGB8 将归一化分量量化为可由8位无损表示的sRGB浮点值
+// 入参: value 零到一之间的归一化分量
+// 返回: float64 精确8位sRGB分量
+func quantizeSRGB8(value float64) float64 {
+	return math.Round(value*255) / 255
+}
+
+// ImageBrush 创建不透明非平铺图像画刷
+// 入参: imageURI 图像部件URI, viewbox 源图像区域, viewport 目标绘制区域
+// 返回: *Brush 图像画刷模型
+func ImageBrush(imageURI string, viewbox, viewport Rect) *Brush {
+	return &Brush{Kind: BrushImage, Opacity: 1, ImageSource: imageURI, Viewbox: viewbox, Viewport: viewport, TileMode: TileNone}
+}
+
+// AddText 向页面追加文字字形元素，fill为nil时默认使用纯黑画刷，页面为nil时返回nil
+// 入参: fontURI 字体部件URI, origin 基线起点坐标, size 字号，以1/96英寸计, text 文字内容, fill 填充颜色
+// 返回: *Glyphs 新建并已追加的字形元素
+func (p *Page) AddText(fontURI string, origin Point, size float64, text string, fill color.Color) *Glyphs {
+	if p == nil {
+		return nil
+	}
+	if fill == nil {
+		fill = color.Black
+	}
+	glyphs := NewGlyphs(fontURI, size, text)
+	glyphs.Origin = origin
+	glyphs.Fill = SolidBrush(fill)
+	p.Elements = append(p.Elements, glyphs)
+	return glyphs
+}
+
+// AddPath 向页面追加路径元素，页面为nil时返回nil
+// 入参: data 路径几何，nil表示未指定, fill 填充画刷, stroke 描边画刷
+// 返回: *Path 新建并已追加的路径元素
+func (p *Page) AddPath(data *Geometry, fill, stroke *Brush) *Path {
+	if p == nil {
+		return nil
+	}
+	path := NewPath(data)
+	path.Fill, path.Stroke = fill, stroke
+	p.Elements = append(p.Elements, path)
+	return path
+}
+
+// AddImage 向页面追加覆盖目标区域的矩形图像路径元素，页面为nil时返回nil
+// 入参: imageURI 图像部件URI, viewbox 源图像裁切区域, viewport 目标页面矩形区域
+// 返回: *Path 新建并已追加的图像路径元素
+func (p *Page) AddImage(imageURI string, viewbox, viewport Rect) *Path {
+	if p == nil {
+		return nil
+	}
+	geometry := &Geometry{
+		FillRule: GeometryEvenOdd,
+		Figures: []GeometryFigure{{
+			StartPoint: Point{X: viewport.X, Y: viewport.Y},
+			IsClosed:   true,
+			IsFilled:   true,
+			Segments: []GeometrySegment{
+				{Kind: GeometryLine, Point: Point{X: viewport.X + viewport.Width, Y: viewport.Y}, IsStroked: true},
+				{Kind: GeometryLine, Point: Point{X: viewport.X + viewport.Width, Y: viewport.Y + viewport.Height}, IsStroked: true},
+				{Kind: GeometryLine, Point: Point{X: viewport.X, Y: viewport.Y + viewport.Height}, IsStroked: true},
+			},
+		}},
+	}
+	return p.AddPath(geometry, ImageBrush(imageURI, viewbox, viewport), nil)
 }
 
 // validateRequiredResourceLinks 校验待写包全部关系分支的必要资源来源、内部目标及存在性，不解码额外资源
@@ -595,7 +925,7 @@ func (r *Reader) validateRequiredResourceLinks(ctx context.Context) error {
 				return fmt.Errorf("%w: Required Resource relationship must originate from FixedPage", ErrInvalid)
 			}
 			mode, present := node.attribute("TargetMode")
-			if present && mode != "Internal" {
+			if present && TargetMode(mode) != TargetModeInternal {
 				return fmt.Errorf("%w: external Required Resource relationship", ErrInvalid)
 			}
 			uri, present := node.attribute("Target")
@@ -1236,7 +1566,7 @@ func (g *createdStoryGraph) target(source, kind string) (string, error) {
 		if relation.Type != formatNamespace(g.reader.format)+"/"+kind {
 			continue
 		}
-		if relation.TargetMode != "Internal" {
+		if relation.TargetMode != TargetModeInternal {
 			return "", &PartError{Part: source, Err: fmt.Errorf("%w: external %s part", ErrInvalid, kind)}
 		}
 		target, err := resolvePart(source, relation.Target)
@@ -1479,7 +1809,7 @@ func (p *Package) reader(ctx context.Context) (*Reader, error) {
 			return nil, err
 		}
 	}
-	rootRelations := []Relationship{{Type: formatNamespace(p.format) + "/fixedrepresentation", Target: p.sequence, TargetMode: "Internal"}}
+	rootRelations := []Relationship{{Type: formatNamespace(p.format) + "/fixedrepresentation", Target: p.sequence, TargetMode: TargetModeInternal}}
 	if err := p.composeRelationships(pkg, "/", rootRelations, ctx); err != nil {
 		return nil, err
 	}
@@ -1521,7 +1851,7 @@ func (p *Package) reader(ctx context.Context) (*Reader, error) {
 				continue
 			}
 			seen[key] = true
-			relations = append(relations, Relationship{Type: formatNamespace(p.format) + "/required-resource", Target: dependency.Part, TargetMode: "Internal"})
+			relations = append(relations, Relationship{Type: formatNamespace(p.format) + "/required-resource", Target: dependency.Part, TargetMode: TargetModeInternal})
 		}
 		if err := p.composeRelationships(pkg, page.Part, relations, ctx); err != nil {
 			return nil, err
@@ -1566,7 +1896,7 @@ func (p *Package) reader(ctx context.Context) (*Reader, error) {
 				duplicate = duplicate || strings.EqualFold(relation.Target, part)
 			}
 			if !duplicate {
-				restricted[key] = append(restricted[key], Relationship{Type: formatNamespace(p.format) + "/restricted-font", Target: part, TargetMode: "Internal"})
+				restricted[key] = append(restricted[key], Relationship{Type: formatNamespace(p.format) + "/restricted-font", Target: part, TargetMode: TargetModeInternal})
 			}
 		}
 	}
@@ -1694,8 +2024,12 @@ func createdMarkup(root *xmlElement, limits Limits, ctx context.Context) ([]byte
 	if err := validate(root, 1); err != nil {
 		return nil, err
 	}
+	limit := min(limits.MaxPartBytes, limits.MaxPackageBytes)
+	if root.Name.Space == opcTypesNS || root.Name.Space == opcRelsNS {
+		limit = min(limit, limits.MaxMetadataBytes)
+	}
 	var output bytes.Buffer
-	counted := packageOutput{writer: &output, context: ctx, limit: min(limits.MaxPartBytes, limits.MaxMetadataBytes, limits.MaxPackageBytes)}
+	counted := packageOutput{writer: &output, context: ctx, limit: limit}
 	encoder := xml.NewEncoder(&counted)
 	if err := encodePageNode(encoder, root, ctx); err != nil {
 		return nil, err
@@ -1742,7 +2076,7 @@ func createdRelationshipMarkup(relations []Relationship, limits Limits, ctx cont
 		child := createdNode(opcRelsNS, "Relationship")
 		child.Attr = []xml.Attr{{Name: xml.Name{Local: "Id"}, Value: relation.ID}, {Name: xml.Name{Local: "Type"}, Value: relation.Type}, {Name: xml.Name{Local: "Target"}, Value: relation.Target}}
 		if relation.TargetMode != "" {
-			child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Local: "TargetMode"}, Value: relation.TargetMode})
+			child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Local: "TargetMode"}, Value: string(relation.TargetMode)})
 		}
 		root.Children = append(root.Children, child)
 	}

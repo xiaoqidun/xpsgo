@@ -15,6 +15,7 @@
 package xpsgo
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
 	"fmt"
@@ -134,6 +135,79 @@ func (p *CoreProperties) MarshalXML(encoder *xml.Encoder, start xml.StartElement
 		}
 	}
 	return encoder.EncodeToken(start.End())
+}
+
+// SetCoreProperties 编码并写入包级OPC核心属性，复用已有或分配/docProps/core.xml并保留其他根关系
+// 入参: props 核心属性数据，nil字段表示省略
+// 返回: error 属性校验、编辑许可、关系或预算错误，失败时不改变包
+func (p *Package) SetCoreProperties(props CoreProperties) error {
+	if err := p.lock(); err != nil {
+		return err
+	}
+	defer p.mu.Unlock()
+	var output bytes.Buffer
+	encoder := xml.NewEncoder(&output)
+	if err := props.MarshalXML(encoder, xml.StartElement{}); err != nil {
+		return err
+	}
+	if err := encoder.Flush(); err != nil {
+		return err
+	}
+	data := output.Bytes()
+	if int64(len(data)) > min(p.limits.MaxPartBytes, p.limits.MaxMetadataBytes) {
+		return fmt.Errorf("%w: core properties byte budget", ErrLimit)
+	}
+	relations := slices.Clone(p.relations["/"])
+	part, id, pattern := "", "", ""
+	retained := make([]Relationship, 0, len(relations)+1)
+	for _, relation := range relations {
+		if relation.Type != opcCoreRel {
+			retained = append(retained, relation)
+			continue
+		}
+		if part != "" {
+			return fmt.Errorf("%w: multiple package core properties relationships", ErrInvalid)
+		}
+		if relation.TargetMode != "" && relation.TargetMode != TargetModeInternal {
+			return fmt.Errorf("%w: external package core properties", ErrInvalid)
+		}
+		target, err := resolvePart("/", relation.Target)
+		if err != nil {
+			return err
+		}
+		if p.managed(target) || opcRelationshipName(target) {
+			return fmt.Errorf("%w: managed package part", ErrInvalid)
+		}
+		part, id = target, relation.ID
+	}
+	if part == "" {
+		part = "/docProps/core.xml"
+		if err := p.available(part); err != nil {
+			pattern = "/docProps/core%d.xml"
+			part, err = p.newName(pattern, nil)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if id == "" {
+		id = createdRelationshipIDs(append(slices.Clone(relations), p.originalRels["/"]...))()
+	}
+	retained = append(retained, Relationship{ID: id, Type: opcCoreRel, Target: part, TargetMode: TargetModeInternal})
+	q := p.signingCopy()
+	if err := q.editable(part); err != nil {
+		return err
+	}
+	if err := q.store(part, opcCoreType, data); err != nil {
+		return err
+	}
+	if err := q.setRelationships("/", retained); err != nil {
+		return err
+	}
+	q.commitName(pattern, part)
+	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
+	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
+	return nil
 }
 
 // CoreProperties 读取包级关系指向的核心属性，未关联时返回nil，不访问外部Schema或属性扩展

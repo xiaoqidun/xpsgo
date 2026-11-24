@@ -411,6 +411,9 @@ func (p *streamPackage) accept(entry *streamEntry) error {
 		if entry.header.UncompressedSize64 != 0 {
 			return fmt.Errorf("%w: nonempty streamed directory", ErrInvalid)
 		}
+		if _, err := opcPartName("/" + strings.TrimSuffix(name, "/")); err != nil {
+			return fmt.Errorf("directory: %w", err)
+		}
 		return nil
 	}
 	partName, index, last, err := opcPieceName(name)
@@ -1322,6 +1325,28 @@ func (p *streamPackage) reconcile(r *Reader) error {
 	}
 	if position != r.pkg.zipLayout.central || len(known) != 0 {
 		return fmt.Errorf("%w: streamed central coverage", ErrInvalid)
+	}
+	for _, key := range slices.Sorted(maps.Keys(p.parts)) {
+		if err := checkContext(p.context); err != nil {
+			return err
+		}
+		if _, exists := r.pkg.parts[key]; exists {
+			continue
+		}
+		part := p.parts[key]
+		if p.options.OnPart != nil && part.emitted || part.xmlTokens != 0 || part.xmlDone || part.page != nil || part.layout != nil || part.relations != nil || part.control != nil {
+			return fmt.Errorf("%w: streamed provisional part %q conflicts with central directory", ErrInvalid, part.name)
+		}
+		if part.xml != nil {
+			part.xml.Close()
+			part.xml = nil
+			p.xmlActive--
+		}
+		delete(p.parts, key)
+		if p.pagePkg != nil {
+			delete(p.pagePkg.parts, key)
+			delete(p.pagePkg.names, key)
+		}
 	}
 	return nil
 }

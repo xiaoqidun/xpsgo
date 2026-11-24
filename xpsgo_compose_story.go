@@ -151,7 +151,7 @@ func (g *compositionStoryProjector) root(source int, owner, kind, local string) 
 		if relation.Type != formatNamespace(s.format)+"/"+kind {
 			continue
 		}
-		if relation.TargetMode != "Internal" {
+		if relation.TargetMode != TargetModeInternal {
 			return "", nil, false, fmt.Errorf("%w: external composition story", ErrInvalid)
 		}
 		target, err := resolvePart(owner, relation.Target)
@@ -170,7 +170,7 @@ func (g *compositionStoryProjector) root(source int, owner, kind, local string) 
 	if !exists || !strings.EqualFold(value.name, part) || !strings.EqualFold(value.media, fixedContentType(kind)) {
 		return "", nil, false, &PartError{Part: part, Err: fmt.Errorf("%w: composition story part or content type", ErrInvalid)}
 	}
-	if int64(len(value.data)) > min(g.plan.budget.limits.MaxMetadataBytes, g.plan.budget.limits.MaxPartBytes) {
+	if int64(len(value.data)) > g.plan.budget.limits.MaxPartBytes {
 		return "", nil, false, fmt.Errorf("%w: composition story XML bytes", ErrLimit)
 	}
 	if err := g.plan.budget.scan(int64(len(value.data))); err != nil {
@@ -728,7 +728,7 @@ func (g *compositionStoryProjector) visual(page int, name string) error {
 		if !found {
 			return fmt.Errorf("%w: missing composition story page", ErrInvalid)
 		}
-		if int64(len(part.data)) > min(g.plan.budget.limits.MaxMetadataBytes, g.plan.budget.limits.MaxPartBytes) {
+		if int64(len(part.data)) > g.plan.budget.limits.MaxPartBytes {
 			return fmt.Errorf("%w: composition story page bytes", ErrLimit)
 		}
 		if err := g.plan.budget.scan(int64(len(part.data))); err != nil {
@@ -924,7 +924,7 @@ func newCompositionSignatures(plan *compositionPlan, protected []map[string]bool
 				continue
 			}
 			for _, relation := range relations {
-				if relation.Type == formatNamespace(value.format)+"/signature-definitions" && relation.TargetMode == "Internal" {
+				if relation.Type == formatNamespace(value.format)+"/signature-definitions" && relation.TargetMode == TargetModeInternal {
 					part, err := resolvePart(owner, relation.Target)
 					if err != nil {
 						return nil, err

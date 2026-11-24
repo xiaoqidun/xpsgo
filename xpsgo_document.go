@@ -442,15 +442,15 @@ func (r *Reader) readPageReference(source string, node *xmlElement) (PageReferen
 }
 
 // Page 按文档序列中的顺序加载页面，尺寸以页面部件为准
-// 入参: ctx 取消Context，nil采用Background, index 从零开始的页面序号
+// 入参: ctx 取消Context，nil采用Background, pageIndex 从零开始的页面序号
 // 返回: *Page 页面内容, error 错误信息
-func (r *Reader) Page(ctx context.Context, index int) (*Page, error) {
+func (r *Reader) Page(ctx context.Context, pageIndex int) (*Page, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
 	}
 	defer r.mu.RUnlock()
-	return r.readPageSceneLoaders(index, false, nil, nil, ctx)
+	return r.readPageSceneLoaders(pageIndex, false, nil, nil, ctx)
 }
 
 // PagePart 按包内部件URI加载固定页面及资源，包括未列入主索引的辅助页面，不改变主阅读页序
@@ -748,15 +748,15 @@ func parsePageBox(text string, bleed bool) (Rect, error) {
 }
 
 // DocumentStructure 读取指定固定文档的结构，未关联结构部件时返回nil
-// 入参: ctx 取消Context，nil采用Background, index 从零开始的固定文档序号
+// 入参: ctx 取消Context，nil采用Background, docIndex 从零开始的固定文档序号
 // 返回: *DocumentStructure 独立结构数据, error 读取、模式、取消或页码错误
-func (r *Reader) DocumentStructure(ctx context.Context, index int) (*DocumentStructure, error) {
+func (r *Reader) DocumentStructure(ctx context.Context, docIndex int) (*DocumentStructure, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
 	}
 	defer r.mu.RUnlock()
-	return r.readDocumentStructureContext(ctx, index)
+	return r.readDocumentStructureContext(ctx, docIndex)
 }
 
 // readDocumentStructure 在调用方持有读锁时读取固定文档关联的结构
@@ -1092,7 +1092,7 @@ func (r *Reader) readStructurePartContext(ctx context.Context, source, kind, roo
 	if !strings.EqualFold(media, fixedContentType(kind)) {
 		return "", nil, &PartError{Part: part, Err: fmt.Errorf("%w: %s content type %q", ErrInvalid, rootName, media)}
 	}
-	data, err := r.pkg.readItemsContext(ctx, strings.ToLower(part), min(r.limits.MaxPartBytes, r.limits.MaxMetadataBytes))
+	data, err := r.pkg.readItemsContext(ctx, strings.ToLower(part), r.limits.MaxPartBytes)
 	if err != nil {
 		return "", nil, &PartError{Part: part, Err: err}
 	}
@@ -1210,15 +1210,15 @@ func structureName(value string) bool {
 }
 
 // StoryFragments 读取指定页面关联的全部故事片段，未关联部件时返回nil
-// 入参: ctx 取消Context，nil采用Background, index 从零开始的全局页面序号
+// 入参: ctx 取消Context，nil采用Background, pageIndex 从零开始的全局页面序号
 // 返回: *StoryFragments 独立片段数据, error 读取、取消或模式错误
-func (r *Reader) StoryFragments(ctx context.Context, index int) (*StoryFragments, error) {
+func (r *Reader) StoryFragments(ctx context.Context, pageIndex int) (*StoryFragments, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
 	}
 	defer r.mu.RUnlock()
-	return r.readStoryFragmentsContext(ctx, index)
+	return r.readStoryFragmentsContext(ctx, pageIndex)
 }
 
 // readStoryFragments 在调用方持有读锁时读取页面关联的故事片段

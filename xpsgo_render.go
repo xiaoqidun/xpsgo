@@ -64,8 +64,8 @@ type RenderLimits struct {
 }
 
 // RenderOptions 设置页面绘制参数，零值字段采用DefaultRenderOptions默认值，不修改页面内容
-// DPI默认96（先应用Transform再按DPI缩放），Region为nil取变换后整像素范围，Background为nil透明，ColorSpace预览默认ColorSRGB、设备默认ColorScRGB
-// Samples可选1/2/4/8（默认8），Tolerance默认0.025像素，Workers零值自动按核数选择（1为单Goroutine，负数返回ErrInvalid）
+// DPI默认96（先应用Transform再按DPI缩放），Region为nil取变换后整像素范围，Background为nil默认白色（color.Transparent输出透明底）
+// ColorSpace预览默认ColorSRGB、设备默认ColorScRGB，Samples可选1/2/4/8（默认8），Tolerance默认0.025像素，Workers零值自动按核数选择
 type RenderOptions struct {
 	DPI        float64
 	Transform  *Matrix
@@ -165,25 +165,25 @@ func DefaultRenderLimits() RenderLimits {
 	return RenderLimits{MaxPixels: o.pixels, MaxElements: o.elements, MaxEdges: o.edges, MaxWork: o.work, MaxGlyphs: o.glyphs, MaxFonts: o.fonts, MaxFontBytes: o.fontBytes, MaxImages: o.images, MaxImagePixels: o.imagePixels, MaxImageBytes: o.imageBytes, MaxProfiles: o.profiles, MaxProfileBytes: o.profileBytes}
 }
 
-// DefaultRenderOptions 返回九十六DPI、透明背景及八倍线性采样的默认绘制参数
+// DefaultRenderOptions 返回九十六DPI、白色背景及八倍线性采样的默认绘制参数
 // 返回: RenderOptions 绘制参数
 func DefaultRenderOptions() RenderOptions {
 	o := defaultSceneRenderOptions()
-	return RenderOptions{DPI: 96, ColorSpace: ColorSRGB, Samples: o.samples, Tolerance: o.tolerance, Limits: DefaultRenderLimits()}
+	return RenderOptions{DPI: 96, Background: color.White, ColorSpace: ColorSRGB, Samples: o.samples, Tolerance: o.tolerance, Limits: DefaultRenderLimits()}
 }
 
 // Render 绘制指定页面，支持并发调用；关闭阅读器会等待绘制结束
 // 错误或取消时不返回部分图像，Context在绘制步骤检查取消且不承诺中断底层ReaderAt正在进行的读取
-// 入参: ctx 取消Context，nil采用Background, index 从零开始的页面序号, options 绘制参数，nil表示默认配置
+// 入参: ctx 取消Context，nil采用Background, pageIndex 从零开始的页面序号, options 绘制参数，nil表示默认配置
 // 返回: *image.NRGBA 独立页面图像，Bounds保留设备坐标, error 读取、参数、绘制或取消错误
-func (r *Reader) Render(ctx context.Context, index int, options *RenderOptions) (*image.NRGBA, error) {
+func (r *Reader) Render(ctx context.Context, pageIndex int, options *RenderOptions) (*image.NRGBA, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
 	}
 	defer r.mu.RUnlock()
 	return r.renderSelectedPage(ctx, options, func(ctx context.Context) (*Page, error) {
-		return r.readPageHeader(index, nil, ctx)
+		return r.readPageHeader(pageIndex, nil, ctx)
 	}, nil)
 }
 
@@ -285,8 +285,12 @@ func (o RenderOptions) settings(ctx context.Context) (sceneRenderOptions, Matrix
 	if err := o.Limits.apply(&settings); err != nil {
 		return settings, Matrix{}, err
 	}
-	if o.Background != nil {
-		pixel := color.NRGBA64Model.Convert(o.Background).(color.NRGBA64)
+	bg := o.Background
+	if bg == nil {
+		bg = color.White
+	}
+	pixel := color.NRGBA64Model.Convert(bg).(color.NRGBA64)
+	if pixel.A != 0 {
 		background := Color{Space: ColorSRGB, Alpha: float64(pixel.A) / 65535, Components: []float64{float64(pixel.R) / 65535, float64(pixel.G) / 65535, float64(pixel.B) / 65535}}
 		value, err := renderColorFromColor(background, settings.space)
 		if err != nil {
@@ -324,6 +328,9 @@ func (limits RenderLimits) apply(options *sceneRenderOptions) error {
 		if field.value != 0 {
 			*field.to = field.value
 		}
+	}
+	if limits.MaxEdges > rasterMaxEdges {
+		return fmt.Errorf("%w: render max edges", ErrLimit)
 	}
 	for _, field := range []struct {
 		value int64
@@ -381,9 +388,9 @@ func (s *deviceRenderState) printDiagnostic(element, message string) {
 
 // RenderDevice 按显式目标ICC绘制页面，不经过八位sRGB预览或提交打印作业
 // ColorSpace未指定时采用scRGB合成以保留扩展色域，显式sRGB仍采用现有sRGB合成策略
-// 入参: ctx 取消Context，nil采用Background, index 页面序号, device 必需的目标配置, options 绘制参数
+// 入参: ctx 取消Context，nil采用Background, pageIndex 从零开始的页面序号, device 必需的目标配置, options 绘制参数
 // 返回: *DeviceImage 独立设备分量，失败为nil, error 参数、资源、转换或取消错误
-func (r *Reader) RenderDevice(ctx context.Context, index int, device *DeviceColorTarget, options *RenderOptions) (*DeviceImage, error) {
+func (r *Reader) RenderDevice(ctx context.Context, pageIndex int, device *DeviceColorTarget, options *RenderOptions) (*DeviceImage, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
@@ -395,7 +402,7 @@ func (r *Reader) RenderDevice(ctx context.Context, index int, device *DeviceColo
 		return nil, err
 	}
 	_, err = r.renderSelectedPage(ctx, &configuration, func(ctx context.Context) (*Page, error) {
-		return r.readPageHeader(index, nil, ctx)
+		return r.readPageHeader(pageIndex, nil, ctx)
 	}, state)
 	return state.output(err)
 }
@@ -895,6 +902,62 @@ func (s *renderSurface) paintBinarySample(mask *image.Alpha, scale float64, samp
 	return nil
 }
 
+// paintBinarySampleCached 以二值覆盖掩模和工作Goroutine独占缓存采样通用画刷并合成
+// 入参: mask 二值覆盖掩模, scale 子像素缩放倍率, sample 带缓存的颜色采样器, cache 工作Goroutine独占缓存, lock 可选并发保护锁
+// 返回: error 采样或合成错误
+func (s *renderSurface) paintBinarySampleCached(mask *image.Alpha, scale float64, sample sceneSampleCached, cache *imageSampleCache, lock *sync.Mutex) error {
+	bounds := s.bounds.Intersect(mask.Bounds())
+	width := bounds.Dx()
+	if width <= 0 || bounds.Dy() <= 0 {
+		return nil
+	}
+	locked := false
+	if lock != nil {
+		defer func() {
+			if locked {
+				lock.Unlock()
+			}
+		}()
+	}
+	surfStride := s.bounds.Dx()
+	surfColOff := bounds.Min.X - s.bounds.Min.X
+	maskColOff := bounds.Min.X - mask.Rect.Min.X
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		py := (float64(y) + 0.5) / scale
+		cy := math.Floor(py) + 0.5
+		mOff := (y-mask.Rect.Min.Y)*mask.Stride + maskColOff
+		sOff := (y-s.bounds.Min.Y)*surfStride + surfColOff
+		maskRow := mask.Pix[mOff : mOff+width]
+		dstRow := s.pixels[sOff : sOff+width]
+		for col, alpha := range maskRow {
+			if alpha == 0 {
+				continue
+			}
+			if lock != nil && !locked {
+				lock.Lock()
+				locked = true
+			}
+			px := (float64(bounds.Min.X+col) + 0.5) / scale
+			fg, err := sample(Point{px, py}, Point{math.Floor(px) + 0.5, cy}, cache)
+			if err != nil {
+				return err
+			}
+			if err := fg.validate(); err != nil {
+				return err
+			}
+			if fg.a == 0 {
+				continue
+			}
+			pixel, err := renderSourceOver(fg, dstRow[col])
+			if err != nil {
+				return err
+			}
+			dstRow[col] = pixel
+		}
+	}
+	return nil
+}
+
 // profile 按定义部件解析ICC引用，在解压前检查内容类型和字节预算
 // 入参: part 定义部件, uri 配置文件引用
 // 返回: *iccProfile 只读配置文件, error 引用、封装或资源错误
@@ -947,7 +1010,7 @@ func (c *sceneColorCache) profileUsability(part, uri string, ctx context.Context
 func (c *sceneColorCache) profileResolved(part string, ctx context.Context) (result *iccProfile, unusable bool, err error) {
 	defer func() {
 		if err != nil {
-			err = &PartError{Part: part, Err: err}
+			err = wrapPartError(part, "", err)
 		}
 	}()
 	key := strings.ToLower(part)
@@ -1003,7 +1066,7 @@ func (c *sceneColorCache) transform(part, uri string, intent uint32) (*iccTransf
 	}
 	value, err := c.profileTransform(strings.ToLower(part), profile, intent)
 	if err != nil {
-		return nil, &PartError{Part: part, Err: err}
+		return nil, wrapPartError(part, "", err)
 	}
 	return value, nil
 }

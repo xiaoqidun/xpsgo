@@ -918,7 +918,7 @@ func resourceDictionaryIdentity(part packagePart, format Format, limits Limits, 
 	if err != nil {
 		return nil, "", err
 	}
-	data, err = canonicalXML(data, canonicalXMLOptions{limits: limits, context: budget.context, maxBytes: min(limits.MaxMetadataBytes, limits.MaxPartBytes, limits.MaxPackageBytes), comments: true})
+	data, err = canonicalXML(data, canonicalXMLOptions{limits: limits, context: budget.context, maxBytes: min(limits.MaxPartBytes, limits.MaxPackageBytes), comments: true})
 	if err != nil {
 		return nil, "", err
 	}
@@ -1180,10 +1180,10 @@ func (r *Reader) resourceReferenceGraph(budget *resourceMergeBudget) (*resourceR
 					return nil
 				}
 				mode, present := node.attribute("TargetMode")
-				if present && mode == "External" {
+				if present && TargetMode(mode) == TargetModeExternal {
 					return nil
 				}
-				if present && mode != "Internal" {
+				if present && TargetMode(mode) != TargetModeInternal {
 					return fmt.Errorf("%w: resource relationship target mode", ErrInvalid)
 				}
 				uri, present := node.attribute("Target")
@@ -1699,7 +1699,7 @@ func resourceRelationshipTargets(source string, data []byte, aliases map[string]
 			return nil, false, err
 		}
 		relation := &relations[index]
-		if relation.TargetMode != "Internal" {
+		if relation.TargetMode != TargetModeInternal {
 			continue
 		}
 		part, err := resolvePart(source, relation.Target)
@@ -1728,7 +1728,7 @@ func resourceRelationshipTargets(source string, data []byte, aliases map[string]
 		if node.Name != (xml.Name{Space: opcRelsNS, Local: "Relationship"}) {
 			return nil
 		}
-		if mode, _ := node.attribute("TargetMode"); mode == "External" {
+		if mode, _ := node.attribute("TargetMode"); TargetMode(mode) == TargetModeExternal {
 			return nil
 		}
 		value, _ := node.attribute("Target")
@@ -1748,6 +1748,30 @@ func resourceRelationshipTargets(source string, data []byte, aliases map[string]
 		}
 		return data, false, checkContext(budget.context)
 	}
+	type requiredRelationKey struct {
+		kind   string
+		target string
+		mode   TargetMode
+	}
+	seenRequired := make(map[requiredRelationKey]bool)
+	deduped := relations[:0]
+	for _, relation := range relations {
+		if relation.Type == xpsNamespace+"/required-resource" || relation.Type == openXPSNamespace+"/required-resource" {
+			target := strings.ToLower(relation.Target)
+			if relation.TargetMode == TargetModeInternal {
+				if resolved, resolveErr := resolvePart(source, relation.Target); resolveErr == nil {
+					target = strings.ToLower(resolved)
+				}
+			}
+			key := requiredRelationKey{kind: relation.Type, target: target, mode: relation.TargetMode}
+			if seenRequired[key] {
+				continue
+			}
+			seenRequired[key] = true
+		}
+		deduped = append(deduped, relation)
+	}
+	relations = deduped
 	output, err := createdRelationshipMarkup(relations, limits, budget.context)
 	if err != nil {
 		return nil, false, err
@@ -1994,6 +2018,16 @@ func (p *Package) resourceAliases(r *Reader, budget *resourceMergeBudget, reserv
 		}
 		candidates = append(candidates, resourceMergeCandidate{part: part, data: data, kind: kind})
 	}
+	slices.SortFunc(candidates, func(a, b resourceMergeCandidate) int {
+		ap, bp := p.protected[strings.ToLower(a.part.name)], p.protected[strings.ToLower(b.part.name)]
+		if ap != bp {
+			if ap {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(strings.ToLower(a.part.name), strings.ToLower(b.part.name))
+	})
 	for {
 		groups := make(map[resourceMergeKey][]resourceMergeCandidate)
 		count := len(aliases)
@@ -2026,6 +2060,10 @@ func (p *Package) resourceAliases(r *Reader, budget *resourceMergeBudget, reserv
 				}
 				if !bytes.Equal(data, previous.data) {
 					continue
+				}
+				if p.protected[key] {
+					found = true
+					break
 				}
 				aliases[key] = previous.part.name
 				result = append(result, ResourceMerge{Part: part.name, Target: previous.part.name, Bytes: int64(len(part.data))})
@@ -2132,7 +2170,11 @@ func (b *resourceMergeBudget) part(key string, size int) error {
 // 入参: pkg 当前只读快照, key 部件键
 // 返回: []byte 不可修改的数据视图, error 读取、预算或取消错误
 func (b *resourceMergeBudget) readPart(pkg *packageReader, key string) ([]byte, error) {
-	limit := min(pkg.limits.MaxPartBytes, pkg.limits.MaxMetadataBytes)
+	limit := pkg.limits.MaxPartBytes
+	media, _ := pkg.contentType(pkg.names[key])
+	if opcMetadataPart(pkg.names[key], media) {
+		limit = min(limit, pkg.limits.MaxMetadataBytes)
+	}
 	if !b.seen[key] {
 		limit = min(limit, b.bytes)
 	}

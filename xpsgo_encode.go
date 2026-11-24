@@ -647,7 +647,7 @@ func (p *pageEncoder) element(value Element, depth int) (*xmlElement, error) {
 	}
 	switch value := value.(type) {
 	case *Canvas:
-		for _, attr := range []struct{ name, value string }{{"RenderOptions.EdgeMode", value.EdgeMode}, {"AutomationProperties.Name", value.AutomationName}, {"AutomationProperties.HelpText", value.AutomationHelpText}} {
+		for _, attr := range []struct{ name, value string }{{"RenderOptions.EdgeMode", string(value.EdgeMode)}, {"AutomationProperties.Name", value.AutomationName}, {"AutomationProperties.HelpText", value.AutomationHelpText}} {
 			if attr.value != "" {
 				if err := p.attr(node, attr.name, attr.value); err != nil {
 					return nil, err
@@ -746,7 +746,7 @@ func (p *pageEncoder) property(node *xmlElement, name string, value *xmlElement,
 // 入参: node 路径节点, value 路径模型, depth 节点深度
 // 返回: error 属性、几何或预算错误
 func (p *pageEncoder) path(node *xmlElement, value *Path, depth int) error {
-	for _, attr := range []struct{ name, value string }{{"StrokeThickness", encodeNumber(value.StrokeThickness)}, {"StrokeMiterLimit", encodeNumber(value.StrokeMiterLimit)}, {"StrokeDashOffset", encodeNumber(value.StrokeDashOffset)}, {"StrokeDashCap", value.StrokeDashCap}, {"StrokeStartLineCap", value.StrokeStartLineCap}, {"StrokeEndLineCap", value.StrokeEndLineCap}, {"StrokeLineJoin", value.StrokeLineJoin}, {"AutomationProperties.Name", value.AutomationName}, {"AutomationProperties.HelpText", value.AutomationHelpText}} {
+	for _, attr := range []struct{ name, value string }{{"StrokeThickness", encodeNumber(value.StrokeThickness)}, {"StrokeMiterLimit", encodeNumber(value.StrokeMiterLimit)}, {"StrokeDashOffset", encodeNumber(value.StrokeDashOffset)}, {"StrokeDashCap", string(value.StrokeDashCap)}, {"StrokeStartLineCap", string(value.StrokeStartLineCap)}, {"StrokeEndLineCap", string(value.StrokeEndLineCap)}, {"StrokeLineJoin", string(value.StrokeLineJoin)}, {"AutomationProperties.Name", value.AutomationName}, {"AutomationProperties.HelpText", value.AutomationHelpText}} {
 		if attr.value != "" {
 			if err := p.attr(node, attr.name, attr.value); err != nil {
 				return err
@@ -828,7 +828,7 @@ func (p *pageEncoder) glyphs(node *xmlElement, value *Glyphs, depth int) error {
 	if present {
 		font += "#" + strconv.FormatUint(uint64(index), 10)
 	}
-	for _, attr := range []struct{ name, value string }{{"FontUri", font}, {"FontRenderingEmSize", encodeNumber(value.FontRenderingEmSize)}, {"OriginX", encodeNumber(value.Origin.X)}, {"OriginY", encodeNumber(value.Origin.Y)}, {"BidiLevel", strconv.Itoa(value.BidiLevel)}, {"IsSideways", strconv.FormatBool(value.IsSideways)}, {"StyleSimulations", value.StyleSimulations}, {"CaretStops", value.CaretStops}} {
+	for _, attr := range []struct{ name, value string }{{"FontUri", font}, {"FontRenderingEmSize", encodeNumber(value.FontRenderingEmSize)}, {"OriginX", encodeNumber(value.Origin.X)}, {"OriginY", encodeNumber(value.Origin.Y)}, {"BidiLevel", strconv.Itoa(value.BidiLevel)}, {"IsSideways", strconv.FormatBool(value.IsSideways)}, {"StyleSimulations", string(value.StyleSimulations)}, {"CaretStops", value.CaretStops}} {
 		if attr.value != "" {
 			if err := p.attr(node, attr.name, attr.value); err != nil {
 				return err

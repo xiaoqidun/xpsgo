@@ -1492,7 +1492,7 @@ func (s *fontBitmapStrike) parseIndex(data []byte, first, last uint16, dataSize 
 	if !fixed {
 		required += stride
 	}
-	if (required+3)&^uint64(3) > uint64(len(data)) || base < 4 || base > dataSize {
+	if required > uint64(len(data)) || base < 4 || base > dataSize {
 		return fmt.Errorf("%w: bitmap index or image base range", ErrInvalid)
 	}
 	if imageFormat == 5 && !fixed {

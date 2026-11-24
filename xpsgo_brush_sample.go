@@ -23,18 +23,16 @@ import (
 	"sync"
 )
 
+// imageBrushFilterMaxWork 与同组常量限制图像画刷滤波采样工作量及颜色缓存上限
 const (
-	// imageBrushFilterMaxWork 限制独立采样器累计执行的积分及缓存采样工作量
-	imageBrushFilterMaxWork = 1 << 26
-	// imageBrushFilterMaxCache 限制单个采样器的颜色缓存上限
+	imageBrushFilterMaxWork  = 1 << 26
 	imageBrushFilterMaxCache = 1 << 20
 )
 
+// visualBrushFilterSamples 与同组常量限制视觉画刷平均积分点数及条带均值缓存
 const (
-	// visualBrushFilterSamples 指定每个平均方向的参考积分点数
 	visualBrushFilterSamples = 64
-	// visualBrushFilterCache 限制条带均值缓存，覆盖常用抗锯齿子像素行
-	visualBrushFilterCache = 8
+	visualBrushFilterCache   = 8
 )
 
 // imageByteToUnit 缓存八位无符号字节到零至一浮点值的查找表
@@ -42,10 +40,11 @@ var imageByteToUnit = makeImageByteToUnit()
 
 // imageSampleCache 保存单个工作Goroutine独占的像素中心颜色与JPEG XR滑动行缓存
 type imageSampleCache struct {
-	point Point
-	color renderColor
-	valid bool
-	jxr   jxrRowCache
+	sampler *imageSampler
+	point   Point
+	color   renderColor
+	valid   bool
+	jxr     jxrRowCache
 }
 
 // imageSampler 保存图像画刷的设备逆变换、物理坐标及颜色采样状态
@@ -61,12 +60,16 @@ type imageSampler struct {
 	filterY    bool
 	charge     func(uint64) error
 	reserve    func(int) error
+	release    func(int)
+	reserved   int
 	filter     *imageBrushFilter
 	filterErr  error
 	filterWork uint64
 	lastPoint  Point
 	lastColor  renderColor
 	lastValid  bool
+	jxr        jxrRowCache
+	cachePool  sync.Pool
 	convert    func([8]float64, float64) (renderColor, error)
 	mu         sync.Mutex
 }
@@ -114,6 +117,7 @@ type visualBrushFilter struct {
 	lastColor  renderColor
 	lastValid  bool
 	cache      []visualBrushFilterValue
+	reserved   int
 	next       int
 	read       sceneSample
 }
@@ -236,14 +240,39 @@ func imageTileFraction(value float64, flip bool) float64 {
 // 入参: point 当前设备位置, center 映射后的原设备像素中心
 // 返回: renderColor 预乘颜色, error 采样或数值错误
 func (s *imageSampler) sampleAt(point, center Point) (renderColor, error) {
-	return s.sampleAtWith(point, center, &s.lastPoint, &s.lastColor, &s.lastValid, nil, false)
+	return s.sampleAtWith(point, center, &s.lastPoint, &s.lastColor, &s.lastValid, &s.jxr, false)
 }
 
 // sampleAtCached 使用工作Goroutine独占缓存执行并发安全采样，常规未平均路径零锁运行
 // 入参: point 当前设备位置, center 映射后的原设备像素中心, cache 独占单点及行缓存, concurrent 是否处于多核并发阶段
 // 返回: renderColor 预乘颜色, error 采样或数值错误
 func (s *imageSampler) sampleAtCached(point, center Point, cache *imageSampleCache, concurrent bool) (renderColor, error) {
+	if cache == nil {
+		if concurrent {
+			return s.sampleAtPooled(point, center)
+		}
+		return s.sampleAt(point, center)
+	}
+	if cache.sampler != s {
+		cache.valid = false
+		cache.sampler = s
+	}
 	return s.sampleAtWith(point, center, &cache.point, &cache.color, &cache.valid, &cache.jxr, concurrent)
+}
+
+// sampleAtPooled 在并发闭包未透传工作缓存时从采样器对象池复用单点及JPEG XR行缓存
+// 入参: point 当前设备位置, center 映射后的原设备像素中心
+// 返回: renderColor 预乘颜色, error 采样或数值错误
+func (s *imageSampler) sampleAtPooled(point, center Point) (renderColor, error) {
+	var cache *imageSampleCache
+	if pooled, ok := s.cachePool.Get().(*imageSampleCache); ok && pooled != nil {
+		cache = pooled
+	} else {
+		cache = &imageSampleCache{}
+	}
+	c, err := s.sampleAtCached(point, center, cache, true)
+	s.cachePool.Put(cache)
+	return c, err
 }
 
 // sampleAtWith 执行图像画刷覆盖判断、单点缓存查找及透明度调制
@@ -672,15 +701,25 @@ func (s *imageSampler) buildImageFilter() (*imageBrushFilter, error) {
 	if err := s.imageFilterCharge(nx*ny + uint64(count)*4); err != nil {
 		return nil, err
 	}
+	committed := false
 	if s.reserve != nil {
 		if err := s.reserve(count); err != nil {
 			return nil, err
 		}
+		s.reserved += count
+		defer func() {
+			if !committed && s.release != nil && count > 0 {
+				s.reserved -= count
+				s.release(count)
+			}
+		}()
 	}
 	values := make([]renderColor, count)
 	if nx == 0 || ny == 0 {
+		committed = true
 		return &imageBrushFilter{values: values}, nil
 	}
+	var rows jxrRowCache
 	var visited uint64
 	for py := y.first; py < y.last; py++ {
 		wy := y.weight(py)
@@ -695,7 +734,7 @@ func (s *imageSampler) buildImageFilter() (*imageBrushFilter, error) {
 			if weight == 0 {
 				continue
 			}
-			c, err := s.pixelColorWithCache(bounds.Min.X+px, bounds.Min.Y+py, nil)
+			c, err := s.pixelColorWithCache(bounds.Min.X+px, bounds.Min.Y+py, &rows)
 			if err != nil {
 				return nil, err
 			}
@@ -715,7 +754,20 @@ func (s *imageSampler) buildImageFilter() (*imageBrushFilter, error) {
 	if err := s.imageFilterCharge(0); err != nil {
 		return nil, err
 	}
+	committed = true
 	return &imageBrushFilter{values: values, first: first}, nil
+}
+
+// releaseFilter 释放图像画刷过滤与行缓存并归还存活像素预算
+func (s *imageSampler) releaseFilter() {
+	s.filter = nil
+	s.jxr.source = nil
+	s.jxr.valid = [2]bool{}
+	if s.reserved != 0 && s.release != nil {
+		count := s.reserved
+		s.reserved = 0
+		s.release(count)
+	}
 }
 
 // filteredColor 读取缓存均值，未平均轴保持原设备像素中心的线性插值
@@ -828,6 +880,7 @@ func (r *sceneRenderer) visualBrush(brush *Brush, transform Matrix, aliased bool
 			return value, err
 		}
 	}
+	r.brushMeta.sampleCached = s.sampleCached
 	return s.sample, nil
 }
 
@@ -835,11 +888,18 @@ func (r *sceneRenderer) visualBrush(brush *Brush, transform Matrix, aliased bool
 // 入参: point 当前覆盖位置, center 原设备像素中心
 // 返回: renderColor 隔离合成后的预乘颜色, error 采样或资源错误
 func (s *visualSampler) sample(point, center Point) (renderColor, error) {
+	return s.sampleCached(point, center, nil)
+}
+
+// sampleCached 使用调用方提供的图像采样缓存映射并合成视觉图块
+// 入参: point 当前覆盖位置, center 原设备像素中心, cache 可选工作Goroutine图像缓存
+// 返回: renderColor 隔离合成后的预乘颜色, error 采样或资源错误
+func (s *visualSampler) sampleCached(point, center Point, cache *imageSampleCache) (renderColor, error) {
 	p, c, visible, err := s.coordinate(point, center)
 	if err != nil || !visible {
 		return renderColor{}, err
 	}
-	color, err := s.renderer.sampleNode(s.node, p, c)
+	color, err := s.renderer.sampleNode(s.node, p, c, cache)
 	if err != nil {
 		return renderColor{}, err
 	}
@@ -882,12 +942,12 @@ func (s *visualSampler) coordinate(point, center Point) (Point, Point, bool, err
 }
 
 // sampleNode 在单个位置完成视觉节点的内部合成，再应用节点裁剪、掩模及透明度
-// 入参: node 已准备节点, point 基准图块位置, center 映射后的设备像素中心
+// 入参: node 已准备节点, point 基准图块位置, center 映射后的设备像素中心, cache 可选工作Goroutine图像缓存
 // 返回: renderColor 节点隔离颜色, error 带部件位置的绘制错误
-func (r *sceneRenderer) sampleNode(node *sceneNode, point, center Point) (result renderColor, err error) {
+func (r *sceneRenderer) sampleNode(node *sceneNode, point, center Point, cache *imageSampleCache) (result renderColor, err error) {
 	defer func() {
 		if err != nil {
-			err = &PartError{Part: node.part, Element: node.kind, Err: err}
+			err = wrapPartError(node.part, node.kind, err)
 		}
 	}()
 	if err = r.charge(1); err != nil {
@@ -922,7 +982,16 @@ func (r *sceneRenderer) sampleNode(node *sceneNode, point, center Point) (result
 		if !inside {
 			continue
 		}
-		color, e := paint.sample(point, center)
+		var color renderColor
+		var e error
+		switch {
+		case paint.image != nil && cache != nil:
+			color, e = paint.image.sampleAtCached(point, center, cache, r.concurrent)
+		case paint.sampleCached != nil && cache != nil:
+			color, e = paint.sampleCached(point, center, cache)
+		default:
+			color, e = paint.sample(point, center)
+		}
 		if e != nil {
 			return renderColor{}, e
 		}
@@ -932,7 +1001,7 @@ func (r *sceneRenderer) sampleNode(node *sceneNode, point, center Point) (result
 		}
 	}
 	for _, child := range node.children {
-		color, e := r.sampleNode(child, point, center)
+		color, e := r.sampleNode(child, point, center, cache)
 		if e != nil {
 			return renderColor{}, e
 		}
@@ -943,7 +1012,16 @@ func (r *sceneRenderer) sampleNode(node *sceneNode, point, center Point) (result
 	}
 	alpha := 1.0
 	if node.mask != nil {
-		color, e := node.mask(point, center)
+		var color renderColor
+		var e error
+		switch {
+		case node.maskImage != nil && cache != nil:
+			color, e = node.maskImage.sampleAtCached(point, center, cache, r.concurrent)
+		case node.maskCached != nil && cache != nil:
+			color, e = node.maskCached(point, center, cache)
+		default:
+			color, e = node.mask(point, center)
+		}
 		if e != nil {
 			return renderColor{}, e
 		}
@@ -1054,6 +1132,7 @@ func (r *sceneRenderer) filteredVisualBrush(brush *Brush, transform Matrix, alia
 	if r.printRuntime != nil {
 		r.nativeSample = r.printRuntime.filteredVisual(s)
 	}
+	r.brushMeta.sampleCached = s.sampleCached
 	return s.sample, nil
 }
 
@@ -1102,6 +1181,13 @@ func visualFilterPosition(index int, extent float64) float64 {
 // 入参: point 当前覆盖位置, center 设备像素中心
 // 返回: renderColor 平均预乘颜色, error 绘制、预算或取消错误
 func (s *visualBrushFilter) sample(point, center Point) (renderColor, error) {
+	return s.sampleCached(point, center, nil)
+}
+
+// sampleCached 使用调用方图像采样缓存对缩小方向作有界分层积分
+// 入参: point 当前覆盖位置, center 设备像素中心, cache 可选工作Goroutine图像缓存
+// 返回: renderColor 平均预乘颜色, error 绘制、预算或取消错误
+func (s *visualBrushFilter) sampleCached(point, center Point, cache *imageSampleCache) (renderColor, error) {
 	if err := s.renderer.charge(0); err != nil {
 		return renderColor{}, err
 	}
@@ -1142,6 +1228,8 @@ func (s *visualBrushFilter) sample(point, center Point) (renderColor, error) {
 			if err := s.renderer.reservePixels(visualBrushFilterCache * 2); err != nil {
 				return renderColor{}, err
 			}
+			s.reserved += visualBrushFilterCache * 2
+			s.renderer.registerCleanup(s.releaseFilter)
 			s.cache = make([]visualBrushFilterValue, visualBrushFilterCache)
 		}
 		for _, value := range s.cache {
@@ -1179,7 +1267,7 @@ func (s *visualBrushFilter) sample(point, center Point) (renderColor, error) {
 			if s.read != nil {
 				color, err = s.read(q, d)
 			} else {
-				color, err = s.renderer.sampleNode(s.node, q, d)
+				color, err = s.renderer.sampleNode(s.node, q, d, cache)
 			}
 			if err != nil {
 				return renderColor{}, err
@@ -1203,4 +1291,14 @@ func (s *visualBrushFilter) sample(point, center Point) (renderColor, error) {
 		s.next = (s.next + 1) % len(s.cache)
 	}
 	return result, nil
+}
+
+// releaseFilter 释放视觉画刷条带均值缓存并归还存活像素预算
+func (s *visualBrushFilter) releaseFilter() {
+	s.cache = nil
+	if s.reserved != 0 {
+		count := s.reserved
+		s.reserved = 0
+		s.renderer.releaseLive(count)
+	}
 }

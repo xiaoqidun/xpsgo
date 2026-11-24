@@ -228,30 +228,19 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, config
 	}
 	head, _ := face.table("head")
 	short := binary.BigEndian.Uint16(head[50:]) == 0
-	stride := 4
-	if short {
-		stride = 2
-	}
-	loca := make([]byte, (int(font.numGlyphs)+1)*stride)
+	offsets := make([]uint32, int(font.numGlyphs)+1)
 	var glyf []byte
 	for index := 0; index <= int(font.numGlyphs); index++ {
 		if err := checkContext(ctx); err != nil {
 			return nil, err
 		}
-		if short {
-			if len(glyf)/2 > 65535 {
-				return nil, fmt.Errorf("%w: short subset loca range", ErrLimit)
-			}
-			binary.BigEndian.PutUint16(loca[index*stride:], uint16(len(glyf)/2))
-		} else {
-			binary.BigEndian.PutUint32(loca[index*stride:], uint32(len(glyf)))
-		}
+		offsets[index] = uint32(len(glyf))
 		if index == int(font.numGlyphs) || !needed[index] {
 			continue
 		}
 		start, end := font.locations[index], font.locations[index+1]
 		length := uint64(end-start) + uint64((int(end-start))&1)
-		if uint64(len(glyf))+length > uint64(configuration.MaxBytes) {
+		if uint64(len(glyf))+length > uint64(configuration.MaxBytes) || uint64(len(glyf))+length > math.MaxUint32 {
 			return nil, fmt.Errorf("%w: subset glyph byte budget", ErrLimit)
 		}
 		glyf = append(glyf, font.glyf[start:end]...)
@@ -259,9 +248,35 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, config
 			glyf = append(glyf, 0)
 		}
 	}
+	if short {
+		for _, offset := range offsets {
+			if offset&1 != 0 || offset > 131070 {
+				short = false
+				break
+			}
+		}
+	}
+	stride := 4
+	if short {
+		stride = 2
+	}
+	if uint64(len(offsets))*uint64(stride) > uint64(configuration.MaxBytes) {
+		return nil, fmt.Errorf("%w: subset loca byte budget", ErrLimit)
+	}
+	loca := make([]byte, len(offsets)*stride)
+	for index, offset := range offsets {
+		if short {
+			binary.BigEndian.PutUint16(loca[index*stride:], uint16(offset/2))
+		} else {
+			binary.BigEndian.PutUint32(loca[index*stride:], offset)
+		}
+	}
 	tables := map[string][]byte{"glyf": glyf, "loca": loca}
 	if err := profile.apply(face, fontMetrics, tables, ctx); err != nil {
 		return nil, err
+	}
+	if !short {
+		binary.BigEndian.PutUint16(tables["head"][50:], 1)
 	}
 	return encodeSubsetFont(ctx, face, tables, configuration)
 }
@@ -384,13 +399,6 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 		if err != nil {
 			return nil, err
 		}
-		width, _, err := metrics.horizontal(gid)
-		if err != nil {
-			return nil, err
-		}
-		if glyph.width != float64(width) {
-			return nil, fmt.Errorf("%w: CFF glyph %d width differs from hmtx", ErrInvalid, gid)
-		}
 		selected[gid] = glyph
 		if glyph.seac != nil {
 			if font.cid {
@@ -425,10 +433,8 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 		if err != nil {
 			return nil, err
 		}
-		programs[index], err = subsetCFFEmptyGlyph(float64(width), subsetCFFGlyphPrivate(font, uint16(index)))
-		if err != nil {
-			return nil, err
-		}
+		charWidth, hasWidth := subsetCFFEmptyWidth(font, uint16(index), width, metrics.unitsPerEm)
+		programs[index] = subsetCFFEmptyGlyph(charWidth, hasWidth, subsetCFFGlyphPrivate(font, uint16(index)))
 		if len(programs[index]) > remaining {
 			return nil, fmt.Errorf("%w: CFF subset replacement work", ErrLimit)
 		}
@@ -516,63 +522,44 @@ func subsetCFFCloneGeometry(source Geometry) Geometry {
 	return result
 }
 
-// subsetCFFEmptyGlyph 生成无轮廓Type2程序，保持原字符宽度，不把固定点舍入误当作无损
-// 入参: width 原字形宽度, private 原私有字典的宽度参数
-// 返回: []byte 空字形程序, error 宽度无法精确保留
-func subsetCFFEmptyGlyph(width float64, private cffPrivate) ([]byte, error) {
-	if width == private.defaultWidth {
-		return []byte{14}, nil
+// subsetCFFEmptyWidth 按字体矩阵将hmtx水平步进宽换算为CFF字形空间宽度
+// 入参: font 原CFF字体, gid 字形编号, advance hmtx水平步进宽, unitsPerEm SFNT每em设计单位数
+// 返回: float64 字形空间宽度, bool 是否可逆换算
+func subsetCFFEmptyWidth(font *cffFont, gid, advance, unitsPerEm uint16) (float64, bool) {
+	if font.top.matrix == nil && (!font.cid || font.fontDict[font.fdSelect[gid]].matrix == nil) {
+		if unitsPerEm == 1000 {
+			return float64(advance), true
+		}
+		width := float64(advance) * 1000 / float64(unitsPerEm)
+		return width, geometryFinite(width)
+	}
+	matrix, err := font.designMatrix(gid, unitsPerEm)
+	if err != nil || matrix.A == 0 || matrix.B != 0 {
+		return 0, false
+	}
+	width := float64(advance) / matrix.A
+	return width, geometryFinite(width)
+}
+
+// subsetCFFEmptyGlyph 生成无轮廓Type2程序，无法简洁表达宽度时省略宽度以依赖hmtx
+// 入参: width 字形空间宽度, hasWidth 是否具备有效换算宽度, private 原私有字典的宽度参数
+// 返回: []byte 空字形程序
+func subsetCFFEmptyGlyph(width float64, hasWidth bool, private cffPrivate) []byte {
+	if !hasWidth || width == private.defaultWidth {
+		return []byte{14}
 	}
 	delta := width - private.nominalWidth
 	if !geometryFinite(delta) || delta+private.nominalWidth != width {
-		return nil, fmt.Errorf("%w: subset CFF width precision", ErrUnsupported)
+		return []byte{14}
 	}
-	data, err := subsetType2Scalar(delta)
-	if err != nil {
-		return nil, err
+	if delta == math.Trunc(delta) && delta >= -32768 && delta <= 32767 {
+		return append(subsetType2Integer(int(delta)), 14)
 	}
-	return append(data, 14), nil
-}
-
-// subsetType2Scalar 将有限浮点操作数精确编码为Type2整数、16.16定点数或分段算术指令
-// 入参: value Type2宽度操作数
-// 返回: []byte 产生单个操作数的程序, error 非有限数错误
-func subsetType2Scalar(value float64) ([]byte, error) {
-	if !geometryFinite(value) {
-		return nil, fmt.Errorf("%w: non-finite subset Type2 operand", ErrInvalid)
-	}
-	if value == math.Trunc(value) && value >= -32768 && value <= 32767 {
-		return subsetType2Integer(int(value)), nil
-	}
-	fixed := value * 65536
+	fixed := delta * 65536
 	if fixed == math.Trunc(fixed) && fixed >= math.MinInt32 && fixed <= math.MaxInt32 {
-		return binary.BigEndian.AppendUint32([]byte{255}, uint32(int32(fixed))), nil
+		return append(binary.BigEndian.AppendUint32([]byte{255}, uint32(int32(fixed))), 14)
 	}
-	fraction, exponent := math.Frexp(math.Abs(value))
-	mantissa := uint64(math.Ldexp(fraction, 53))
-	data := subsetType2Integer(int(mantissa & 255))
-	for shift := 8; shift <= 48; shift += 8 {
-		data = append(data, subsetType2Integer(256)...)
-		data = append(data, 12, 12)
-		data = append(data, subsetType2Integer(int(mantissa>>uint(shift)&255))...)
-		data = append(data, 12, 10)
-	}
-	power := exponent - 5
-	for power != 0 {
-		step := min(14, int(math.Abs(float64(power))))
-		data = append(data, subsetType2Integer(1<<step)...)
-		if power > 0 {
-			data = append(data, 12, 24)
-			power -= step
-		} else {
-			data = append(data, 12, 12)
-			power += step
-		}
-	}
-	if value < 0 {
-		data = append(data, 12, 14)
-	}
-	return data, nil
+	return []byte{14}
 }
 
 // subsetType2Integer 编码已限定为有符号十六位的Type2整数

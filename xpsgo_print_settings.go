@@ -195,6 +195,13 @@ type printSelectionChecker struct {
 	remaining   int
 }
 
+// printPrefixKey 标识同一父级作用域下同类元素的命名空间与去前缀关键字族
+type printPrefixKey struct {
+	kind  PrintSettingKind
+	space string
+	local string
+}
+
 // String 返回Feature选择方式的名称
 // 返回: string 选择方式名称
 func (s PrintSelection) String() string {
@@ -380,15 +387,15 @@ func (r *Reader) PrintTicket(ctx context.Context, source string) (*PrintTicket, 
 
 // PrintTicketHierarchy 依次读取指定页面的作业、文档及页面票据，省略没有票据的层级
 // 关联层级不等同于参数合并，具体打印语义由票据格式和打印设备决定
-// 入参: ctx 取消Context，nil采用Background, index 从零开始的页面序号
+// 入参: ctx 取消Context，nil采用Background, pageIndex 从零开始的全局页号
 // 返回: []PrintTicket 独立票据数据, error 序号、关联、读取、资源或取消错误
-func (r *Reader) PrintTicketHierarchy(ctx context.Context, index int) ([]PrintTicket, error) {
+func (r *Reader) PrintTicketHierarchy(ctx context.Context, pageIndex int) ([]PrintTicket, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
 	}
 	defer r.mu.RUnlock()
-	return r.readPrintTicketHierarchyOptions(index, r.limits, ctx)
+	return r.readPrintTicketHierarchyOptions(pageIndex, r.limits, ctx)
 }
 
 // readPrintTicketHierarchyOptions 按调用方和阅读器的共同预算读取票据链，在读取步骤检查取消
@@ -530,7 +537,7 @@ func printTicketTarget(source string, relations []Relationship, format Format) (
 		if part != "" {
 			return "", &PartError{Part: source, Err: fmt.Errorf("%w: multiple print ticket relationships", ErrInvalid)}
 		}
-		if relation.TargetMode != "" && relation.TargetMode != "Internal" {
+		if relation.TargetMode != "" && relation.TargetMode != TargetModeInternal {
 			return "", &PartError{Part: source, Err: fmt.Errorf("%w: external print ticket relationship", ErrInvalid)}
 		}
 		var err error
@@ -733,7 +740,7 @@ func parsePrintDocument(root *xmlElement, options printSettingsConfig, capabilit
 		}
 		value.Elements = append(value.Elements, setting)
 	}
-	if err := printSettingsPrefixConflicts(value.Elements, make(map[xml.Name]xml.Name)); err != nil {
+	if err := printSettingsPrefixConflicts(value.Elements); err != nil {
 		return nil, err
 	}
 	if err := validatePrintCommon(value.Elements, PrintSettingUnknown, capabilities); err != nil {
@@ -742,26 +749,45 @@ func parsePrintDocument(root *xmlElement, options printSettingsConfig, capabilit
 	return value, nil
 }
 
-// printSettingsPrefixConflicts 检查同一命名空间内仅作用域前缀不同的关键字冲突
-// 入参: settings 已解析结构, seen 已见到的关键字主体及完整名称
+// printPrefixFamily 提取可参与作用域前缀族比对的键与作用域，仅限声明类Framework元素
+// 入参: value 设置元素
+// 返回: printPrefixKey 关键字族键, PrintScope 作用域层级, bool 是否具备有效作用域前缀族
+func printPrefixFamily(value PrintSetting) (printPrefixKey, PrintScope, bool) {
+	switch value.Kind {
+	case PrintSettingFeature, PrintSettingProperty, PrintSettingScoredProperty, PrintSettingParameterInit, PrintSettingParameterDef:
+	default:
+		return printPrefixKey{}, PrintScopeUnknown, false
+	}
+	scope := printKeywordScope(value.Name)
+	if scope == PrintScopeUnknown {
+		return printPrefixKey{}, PrintScopeUnknown, false
+	}
+	prefix := "Job"
+	if scope == PrintScopeDocument {
+		prefix = "Document"
+	} else if scope == PrintScopePage {
+		prefix = "Page"
+	}
+	suffix := strings.TrimPrefix(value.Name.Local, prefix)
+	if suffix == "" {
+		return printPrefixKey{}, PrintScopeUnknown, false
+	}
+	return printPrefixKey{kind: value.Kind, space: value.Name.Space, local: suffix}, scope, true
+}
+
+// printSettingsPrefixConflicts 检查同一父级作用域内同类元素中仅作用域前缀不同的关键字冲突
+// 入参: settings 当前父级作用域下的直接子元素列表
 // 返回: error 作用域前缀冲突错误
-func printSettingsPrefixConflicts(settings []PrintSetting, seen map[xml.Name]xml.Name) error {
+func printSettingsPrefixConflicts(settings []PrintSetting) error {
+	seen := make(map[printPrefixKey]xml.Name)
 	for _, value := range settings {
-		scope := printKeywordScope(value.Name)
-		if scope != PrintScopeUnknown {
-			prefix := "Job"
-			if scope == PrintScopeDocument {
-				prefix = "Document"
-			} else if scope == PrintScopePage {
-				prefix = "Page"
-			}
-			key := xml.Name{Space: value.Name.Space, Local: strings.TrimPrefix(value.Name.Local, prefix)}
+		if key, _, ok := printPrefixFamily(value); ok {
 			if previous, exists := seen[key]; exists && previous != value.Name {
 				return fmt.Errorf("%w: print settings scope prefix conflict {%s}%s and %s", ErrInvalid, value.Name.Space, previous.Local, value.Name.Local)
 			}
 			seen[key] = value.Name
 		}
-		if err := printSettingsPrefixConflicts(value.Children, seen); err != nil {
+		if err := printSettingsPrefixConflicts(value.Children); err != nil {
 			return err
 		}
 	}
@@ -1072,8 +1098,8 @@ func (t *PrintTicket) Settings(ctx context.Context, options *PrintSettingsOption
 	return ParsePrintSettings(ctx, t.Data, &configuration)
 }
 
-// MergePrintSettings 合并根设置，同一展开关键字由delta整项覆盖，未冲突的baseline设置沿用
-// 作用域过滤分别应用于两个输入，不执行设备默认值、约束求解或作用域自动映射
+// MergePrintSettings 合并根设置，同名项由delta整项覆盖，同族不同作用域前缀按高优先级作用域覆盖低层级项
+// 作用域过滤分别应用于两个输入，不执行设备默认值或约束求解
 // 入参: ctx 取消Context，nil采用Background, baseline 基础设置, delta 优先设置, options 合并结果的关联层级及资源参数
 // 返回: *PrintSettings 独立合并结构, error 结构、资源或取消错误
 func MergePrintSettings(ctx context.Context, baseline, delta *PrintSettings, options *PrintSettingsOptions) (*PrintSettings, error) {
@@ -1097,21 +1123,64 @@ func MergePrintSettings(ctx context.Context, baseline, delta *PrintSettings, opt
 	if err != nil {
 		return nil, err
 	}
-	indices := make(map[xml.Name]int, len(base.Elements))
-	for index, value := range base.Elements {
+	elements := make([]PrintSetting, len(base.Elements))
+	copy(elements, base.Elements)
+	removed := make([]bool, len(elements))
+	indices := make(map[xml.Name]int, len(elements))
+	families := make(map[printPrefixKey]int, len(elements))
+	for index, value := range elements {
 		indices[value.Name] = index
+		if key, _, ok := printPrefixFamily(value); ok {
+			families[key] = index
+		}
 	}
 	for _, value := range change.Elements {
 		if err := checkContext(configuration.context); err != nil {
 			return nil, err
 		}
+		familyKey, scope, hasFamily := printPrefixFamily(value)
+		replacedIndex := -1
+		if hasFamily {
+			if existing, exists := families[familyKey]; exists && elements[existing].Name != value.Name {
+				if scope < printKeywordScope(elements[existing].Name) {
+					continue
+				}
+				delete(indices, elements[existing].Name)
+				delete(families, familyKey)
+				removed[existing] = true
+				replacedIndex = existing
+			}
+		}
 		if index, exists := indices[value.Name]; exists {
-			base.Elements[index] = value
+			if oldKey, _, ok := printPrefixFamily(elements[index]); ok && families[oldKey] == index {
+				delete(families, oldKey)
+			}
+			elements[index] = value
+			if hasFamily {
+				families[familyKey] = index
+			}
+		} else if replacedIndex >= 0 {
+			removed[replacedIndex] = false
+			elements[replacedIndex] = value
+			indices[value.Name] = replacedIndex
+			families[familyKey] = replacedIndex
 		} else {
-			indices[value.Name] = len(base.Elements)
-			base.Elements = append(base.Elements, value)
+			index := len(elements)
+			elements = append(elements, value)
+			removed = append(removed, false)
+			indices[value.Name] = index
+			if hasFamily {
+				families[familyKey] = index
+			}
 		}
 	}
+	merged := make([]PrintSetting, 0, len(elements))
+	for index, value := range elements {
+		if !removed[index] {
+			merged = append(merged, value)
+		}
+	}
+	base.Elements = merged
 	root, err := printSettingsRoot(base, configuration)
 	if err != nil {
 		return nil, err

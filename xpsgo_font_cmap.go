@@ -996,7 +996,7 @@ func parseFontCmap(data []byte, numGlyphs uint32) (*fontCmap, error) {
 		return nil, fmt.Errorf("%w: truncated cmap encoding records", ErrInvalid)
 	}
 	seen := make(map[[3]uint32]bool)
-	best := 10
+	best := 11
 	var chosen *fontCmap
 	for i := uint64(4); i < end; i += 8 {
 		platform := binary.BigEndian.Uint16(data[i:])
@@ -1014,7 +1014,7 @@ func parseFontCmap(data []byte, numGlyphs uint32) (*fontCmap, error) {
 			if seen[key] {
 				return nil, fmt.Errorf("%w: duplicate cmap encoding (%d, %d, %d)", ErrInvalid, platform, encoding, language)
 			}
-			if language != 0 && (platform != 1 || encoding == 0) {
+			if language != 0 && platform != 1 {
 				return nil, fmt.Errorf("%w: cmap language %d for platform %d encoding %d", ErrInvalid, language, platform, encoding)
 			}
 			seen[key] = true
@@ -1036,7 +1036,7 @@ func parseFontCmap(data []byte, numGlyphs uint32) (*fontCmap, error) {
 
 // fontCmapPriority 返回平台与编码组合的cmap选择优先级
 // 入参: platform 平台编号, encoding 编码编号
-// 返回: int 优先级，10表示不在选择列表中
+// 返回: int 优先级，11表示不在选择列表中
 func fontCmapPriority(platform, encoding uint16) int {
 	if platform == 3 {
 		switch encoding {
@@ -1052,12 +1052,20 @@ func fontCmapPriority(platform, encoding uint16) int {
 		}
 	}
 	if platform == 0 {
-		return 7
+		switch encoding {
+		case 4, 6:
+			return 7
+		case 3:
+			return 8
+		case 0, 1, 2:
+			return 9
+		}
+		return 11
 	}
 	if platform == 1 && encoding == 0 {
-		return 8
+		return 10
 	}
-	return 10
+	return 11
 }
 
 // fontCmapSubtable 检查已知基线子表的头部和长度，不猜测未知格式的布局
@@ -1211,7 +1219,7 @@ func (c *fontCmap) validate4() error {
 		start := uint32(binary.BigEndian.Uint16(d[16+2*n+2*i:]))
 		word := 16 + 6*n + 2*i
 		offset := uint32(binary.BigEndian.Uint16(d[word:]))
-		if start > end || i != 0 && end <= previous || offset%2 != 0 {
+		if start > end || i != 0 && start <= previous || offset%2 != 0 {
 			return fmt.Errorf("%w: cmap segment ordering or alignment", ErrInvalid)
 		}
 		if offset != 0 && (word+offset < c.arrayOffset || uint64(word+offset)+2*uint64(end-start+1) > uint64(len(d))) {

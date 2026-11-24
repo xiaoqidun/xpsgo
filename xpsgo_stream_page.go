@@ -457,7 +457,7 @@ func (p *streamPackage) finishPages(r *Reader) error {
 	return p.releaseProcessed()
 }
 
-// streamPageTicketsReady 检查已到达关系或未闭合交错关系前缀中已解析的PrintTicket目标部件是否就绪
+// streamPageTicketsReady 检查已到达或正在交错接收的关系及PrintTicket目标部件是否均已闭合就绪
 // 入参: index 待交付页面序号
 // 返回: string 等待的部件键, bool 是否已就绪
 func (p *streamPackage) streamPageTicketsReady(index int) (string, bool) {
@@ -469,19 +469,15 @@ func (p *streamPackage) streamPageTicketsReady(index int) (string, bool) {
 	for _, source := range []string{p.index.sequence, docPart, pagePart} {
 		relsKey := strings.ToLower(createdRelationshipPart(source))
 		var relations []Relationship
-		var err error
 		if _, complete := p.pagePkg.parts[relsKey]; complete {
+			var err error
 			relations, err = p.index.pkg.relationships(source)
-		} else if relsPart := p.parts[relsKey]; relsPart != nil && relsPart.relations != nil {
-			items, handled, snapErr := p.relationshipSnapshot(source)
-			if !handled || snapErr != nil {
+			if err != nil {
 				continue
 			}
-			relations = items
+		} else if relsPart := p.parts[relsKey]; relsPart != nil && relsPart.relations != nil {
+			relations = relsPart.relations.items
 		} else {
-			continue
-		}
-		if err != nil {
 			continue
 		}
 		target, err := printTicketTarget(source, relations, p.index.format)

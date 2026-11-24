@@ -1023,7 +1023,7 @@ func rewriteXMLMappedAttributes(original []byte, limits Limits, ctx context.Cont
 	if rewrite == nil {
 		return nil, false, fmt.Errorf("%w: missing XML attribute rewriter", ErrInvalid)
 	}
-	maximum := min(limits.MaxMetadataBytes, limits.MaxPartBytes, limits.MaxPackageBytes)
+	maximum := min(limits.MaxPartBytes, limits.MaxPackageBytes)
 	if maximum < 1 {
 		return nil, false, fmt.Errorf("%w: XML attribute rewrite byte limit", ErrInvalid)
 	}
@@ -1819,7 +1819,7 @@ func canonicalXML(data []byte, options canonicalXMLOptions) ([]byte, error) {
 	if err := validateLimits(options.limits); err != nil {
 		return nil, err
 	}
-	limit := min(options.limits.MaxMetadataBytes, options.limits.MaxPartBytes, options.limits.MaxPackageBytes)
+	limit := min(options.limits.MaxPartBytes, options.limits.MaxPackageBytes)
 	if int64(len(data)) > limit {
 		return nil, fmt.Errorf("%w: canonical XML input bytes", ErrLimit)
 	}

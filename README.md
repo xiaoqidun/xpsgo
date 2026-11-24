@@ -11,13 +11,49 @@
 go get -u github.com/xiaoqidun/xpsgo
 ```
 
+# 创建文档
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+
+	"github.com/xiaoqidun/xpsgo"
+)
+
+func main() {
+	ctx := context.Background()
+	pkg, err := xpsgo.NewPackage(xpsgo.FormatXPS, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	font, err := os.ReadFile("font.ttf")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fontURI, err := pkg.AddFont(font)
+	if err != nil {
+		log.Fatal(err)
+	}
+	page := xpsgo.NewPage(794, 1123, "zh-CN")
+	page.AddText(fontURI, xpsgo.Point{X: 76, Y: 100}, 24, "你好，XPSGo！", nil)
+	if _, err := pkg.AddPage(ctx, page); err != nil {
+		log.Fatal(err)
+	}
+	if err := pkg.WriteFile(ctx, "test.xps", nil); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
 # 渲染页面
 ```go
 package main
 
 import (
 	"context"
-	"image/color"
 	"image/png"
 	"log"
 	"os"
@@ -32,7 +68,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer reader.Close()
-	img, err := reader.Render(ctx, 0, &xpsgo.RenderOptions{Background: color.White})
+	img, err := reader.Render(ctx, 0, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -40,11 +76,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer out.Close()
 	if err := png.Encode(out, img); err != nil {
-		out.Close()
-		log.Fatal(err)
-	}
-	if err := out.Close(); err != nil {
 		log.Fatal(err)
 	}
 }

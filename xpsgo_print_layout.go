@@ -436,16 +436,16 @@ func printSetMediaSize(media *PrintMedia, width, height float64) error {
 }
 
 // PrintSettings 合并基础设置和指定页面的作业、文档及页面票据，不执行设备约束或选择默认Option
-// 每份票据先按关联层级过滤，较具体的设置整项覆盖同名根设置；默认保留所有有效层级
-// 入参: ctx 取消Context，nil采用Background, index 页面序号, defaults 基础设置，nil为空设置, options 输出作用域及资源参数
+// 每份票据先按关联层级过滤，较具体的设置整项覆盖同名或低优先级同族根设置；默认保留所有有效层级
+// 入参: ctx 取消Context，nil采用Background, pageIndex 从零开始的全局页号, defaults 基础设置，nil为空设置, options 输出作用域及资源参数
 // 返回: *PrintSettings 独立有效设置, error 序号、票据格式、关联、资源或取消错误
-func (r *Reader) PrintSettings(ctx context.Context, index int, defaults *PrintSettings, options *PrintSettingsOptions) (*PrintSettings, error) {
+func (r *Reader) PrintSettings(ctx context.Context, pageIndex int, defaults *PrintSettings, options *PrintSettingsOptions) (*PrintSettings, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
 	}
 	defer r.mu.RUnlock()
-	return r.readPrintSettings(ctx, index, defaults, options)
+	return r.readPrintSettings(ctx, pageIndex, defaults, options)
 }
 
 // readPrintSettings 在调用方持有读锁时合并票据链，不重复获取阅读器锁或修改输入设置
@@ -496,9 +496,9 @@ func (r *Reader) readPrintSettings(ctx context.Context, index int, defaults *Pri
 }
 
 // PrintLayout 加载页面并应用其有效票据，返回可用于矢量或栅格输出的物理布局
-// 入参: ctx 取消Context，nil采用Background, index 页面序号, options 基础票据、介质及资源参数，nil采用默认值
+// 入参: ctx 取消Context，nil采用Background, pageIndex 从零开始的全局页号, options 基础票据、介质及资源参数，nil采用默认值
 // 返回: *PrintLayout 独立布局, error 页面、票据、设置、资源或取消错误
-func (r *Reader) PrintLayout(ctx context.Context, index int, options *PrintLayoutOptions) (*PrintLayout, error) {
+func (r *Reader) PrintLayout(ctx context.Context, pageIndex int, options *PrintLayoutOptions) (*PrintLayout, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
@@ -508,7 +508,7 @@ func (r *Reader) PrintLayout(ctx context.Context, index int, options *PrintLayou
 	if options != nil {
 		configuration = *options
 	}
-	_, _, layout, err := r.readPrintPage(ctx, index, configuration)
+	_, _, layout, err := r.readPrintPage(ctx, pageIndex, configuration)
 	return layout, err
 }
 
@@ -1115,14 +1115,15 @@ func printBindingGutter(finishing PrintFinishing, side PrintSide, duplex PrintDu
 	}
 	method := finishing.Binding
 	if back {
-		if duplex == PrintDuplexLongEdge {
+		landscape := side.Width > side.Height
+		if duplex == PrintDuplexLongEdge && !landscape || duplex == PrintDuplexShortEdge && landscape {
 			switch method {
 			case PrintBindingLeft, PrintBindingStitchLeft:
 				method = PrintBindingRight
 			case PrintBindingRight, PrintBindingStitchRight:
 				method = PrintBindingLeft
 			}
-		} else if duplex == PrintDuplexShortEdge {
+		} else if duplex == PrintDuplexShortEdge && !landscape || duplex == PrintDuplexLongEdge && landscape {
 			switch method {
 			case PrintBindingTop, PrintBindingStitchTop:
 				method = PrintBindingBottom

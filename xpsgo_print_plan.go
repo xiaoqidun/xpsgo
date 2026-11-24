@@ -184,21 +184,6 @@ type printSheetPacker struct {
 	frontDone bool
 }
 
-// PrintSideRenderOptions 设置单面纸张绘制参数，Render.Transform须为nil，默认白色背景；Transform在DPI缩放前应用于完整纸面
-// MaxPages默认4096，MaxPageBytes与MaxResourceBytes默认64MiB，MaxXMLNodes默认不超过阅读器上限，Render.Limits另约束几何物化与绘制预算
-// Watermark按源页描述物化并与正文共用字体缓存；Signatures默认取票据与纸面中较严策略（非零Policy显式替代）；Color用于设备输出色彩协调
-type PrintSideRenderOptions struct {
-	Render           RenderOptions
-	Transform        *Matrix
-	Watermark        *PrintWatermarkOptions
-	Signatures       *PrintSignatureOptions
-	MaxPages         int
-	MaxPageBytes     int64
-	MaxResourceBytes int64
-	MaxXMLNodes      int
-	Color            *PrintColorOptions
-}
-
 // printSidePage 保存可只读复用的源场景及节点数量，不保留整页资源绑定图
 type printSidePage struct {
 	part     string
@@ -1380,11 +1365,11 @@ func (s PrintSide) ContentBounds() Rect {
 	return Rect{X: minX, Y: minY, Width: maxX - minX, Height: maxY - minY}
 }
 
-// RenderPrintSide 按正常阅读方向绘制单个拼版纸面，可通过PrintSideRenderOptions.Transform应用背面翻面变换
+// RenderPrintSide 按正常阅读方向绘制单个拼版纸面，可通过PrintRenderOptions.Transform应用背面翻面变换
 // 同次调用内重复源页仅解析一次，Gutter排除纸面内容并保留背景，失败时不返回部分图像
-// 入参: ctx 取消Context，nil采用Background, side 纸面布局, options 绘制及页面加载预算，nil采用默认值
+// 入参: ctx 取消Context，nil采用Background, side 纸面布局, options 打印及页面加载预算，nil采用默认值
 // 返回: *image.NRGBA 独立纸面栅格, error 布局、序号、资源、绘制、预算或取消错误
-func (r *Reader) RenderPrintSide(ctx context.Context, side *PrintSide, options *PrintSideRenderOptions) (*image.NRGBA, error) {
+func (r *Reader) RenderPrintSide(ctx context.Context, side *PrintSide, options *PrintRenderOptions) (*image.NRGBA, error) {
 	ctx = normalizeContext(ctx)
 	if err := r.readLock(); err != nil {
 		return nil, err
@@ -1394,13 +1379,13 @@ func (r *Reader) RenderPrintSide(ctx context.Context, side *PrintSide, options *
 }
 
 // renderPrintSide 共用纸面场景、签名、水印及预算，设备转换只替代最终输出编码
-// 入参: ctx 取消Context, side 纸面布局, options 绘制及加载参数, device 可选目标状态
+// 入参: ctx 取消Context, side 纸面布局, options 打印及加载参数, device 可选目标状态
 // 返回: *image.NRGBA 预览，设备输出时为nil, error 布局、资源、绘制或取消错误
-func (r *Reader) renderPrintSide(ctx context.Context, side *PrintSide, options *PrintSideRenderOptions, device *deviceRenderState) (*image.NRGBA, error) {
+func (r *Reader) renderPrintSide(ctx context.Context, side *PrintSide, options *PrintRenderOptions, device *deviceRenderState) (*image.NRGBA, error) {
 	if r.closed {
 		return nil, ErrClosed
 	}
-	configuration := PrintSideRenderOptions{MaxPages: 4096, MaxPageBytes: 64 << 20, MaxResourceBytes: 64 << 20, MaxXMLNodes: r.limits.MaxXMLNodes}
+	configuration := PrintRenderOptions{MaxPages: 4096, MaxPageBytes: 64 << 20, MaxResourceBytes: 64 << 20, MaxXMLNodes: r.limits.MaxXMLNodes}
 	if options != nil {
 		configuration = *options
 		if configuration.MaxPages == 0 {

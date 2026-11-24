@@ -135,7 +135,7 @@ func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates [
 		q.commitName("/Signatures/%d.psdsor", origin)
 		root := slices.Clone(q.relations["/"])
 		nextID := createdRelationshipIDs(append(slices.Clone(root), q.originalRels["/"]...))
-		root = append(root, Relationship{ID: nextID(), Type: opcSignatureOriginRel, Target: origin, TargetMode: "Internal"})
+		root = append(root, Relationship{ID: nextID(), Type: opcSignatureOriginRel, Target: origin, TargetMode: TargetModeInternal})
 		replaced := q.dirtyRels["/"]
 		if err := q.setRelationships("/", root); err != nil {
 			return PartInfo{}, err
@@ -165,7 +165,7 @@ func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates [
 	q.commitName("/Signatures/%d.xml", part)
 	relations := slices.Clone(q.relations[strings.ToLower(origin)])
 	nextID := createdRelationshipIDs(append(slices.Clone(relations), q.originalRels[strings.ToLower(origin)]...))
-	relations = append(relations, Relationship{ID: nextID(), Type: opcSignatureRel, Target: part, TargetMode: "Internal"})
+	relations = append(relations, Relationship{ID: nextID(), Type: opcSignatureRel, Target: part, TargetMode: TargetModeInternal})
 	replaced := q.dirtyRels[strings.ToLower(origin)]
 	if err := q.setRelationships(origin, relations); err != nil {
 		return PartInfo{}, err
@@ -201,8 +201,15 @@ func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates [
 	if !coverage.Complete {
 		return PartInfo{}, fmt.Errorf("%w: generated signature coverage", ErrInvalid)
 	}
-	if err := final.VerifySignature(ctx, part, public); err != nil {
+	verification, err := final.VerifySignature(ctx, part, &SignatureVerifyOptions{PublicKey: public})
+	if err != nil {
 		return PartInfo{}, err
+	}
+	if verification.SignatureError != nil {
+		return PartInfo{}, verification.SignatureError
+	}
+	if !verification.SignatureVerified || verification.Coverage == nil || !verification.Coverage.Complete {
+		return PartInfo{}, fmt.Errorf("%w: generated signature verification", ErrSignature)
 	}
 	if err := ctx.Err(); err != nil {
 		return PartInfo{}, err
@@ -226,7 +233,7 @@ func (p *Package) signingParts(reader *Reader, origin, part string, ctx context.
 		}
 		createdPut(reader.pkg, value.name, value.media, value.data)
 	}
-	wanted := []Relationship{{Type: formatNamespace(p.format) + "/fixedrepresentation", Target: p.sequence, TargetMode: "Internal"}}
+	wanted := []Relationship{{Type: formatNamespace(p.format) + "/fixedrepresentation", Target: p.sequence, TargetMode: TargetModeInternal}}
 	if err := p.composeRelationships(reader.pkg, "/", wanted, ctx); err != nil {
 		return err
 	}
@@ -243,7 +250,7 @@ func (p *Package) signingCopy() *Package {
 		format: p.format, limits: p.limits, sequence: p.sequence, documents: p.documents, pageCount: p.pageCount, maxImagePixels: p.maxImagePixels,
 		parts: maps.Clone(p.parts), relations: maps.Clone(p.relations), relationSizes: maps.Clone(p.relationSizes), total: p.total,
 		names: maps.Clone(p.names), layout: p.layout, parents: maps.Clone(p.parents), allocated: maps.Clone(p.allocated),
-		original: p.original, originalRels: p.originalRels, comment: p.comment, dirty: maps.Clone(p.dirty), dirtyRels: maps.Clone(p.dirtyRels), protected: p.protected,
+		original: p.original, originalRels: p.originalRels, comment: p.comment, dirty: maps.Clone(p.dirty), dirtyRels: maps.Clone(p.dirtyRels), deleted: maps.Clone(p.deleted), protected: p.protected,
 	}
 }
 
@@ -612,28 +619,54 @@ func signatureSigningReferences(reader *Reader, options SignatureSignOptions, ct
 		}
 		result = append(result, SignatureReference{URI: signatureSigningURI(name, media), Part: name, ContentType: media})
 	}
-	bySource := make(map[string]SignatureTransform)
+	type signatureRelationGroup struct {
+		source string
+		typ    string
+	}
+	totals := make(map[signatureRelationGroup]int)
+	included := make(map[signatureRelationGroup][]string)
+	groupEligible := make(map[signatureRelationGroup]bool)
 	for key, relationship := range c.relations {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
+		group := signatureRelationGroup{source: key.source, typ: relationship.Relationship.Type}
+		totals[group]++
 		mode := c.modes[key]
 		include := mode == signatureCoverageRequiredPart || mode == signatureCoverageRequiredRelationship || mode == signatureCoverageOptionalPart && signed[c.targets[key]]
 		if !include && !(mode == signatureCoverageGroup && options.ProtectSignatures) {
 			continue
 		}
-		transform := bySource[key.source]
-		transform.Algorithm = signatureRelationships
-		if !slices.Contains(transform.RelationshipTypes, relationship.Relationship.Type) {
-			transform.RelationshipTypes = append(transform.RelationshipTypes, relationship.Relationship.Type)
+		if _, exists := groupEligible[group]; !exists {
+			groupEligible[group] = true
 		}
-		bySource[key.source] = transform
+		if mode == signatureCoverageOptionalPart {
+			groupEligible[group] = false
+		}
+		included[group] = append(included[group], relationship.Relationship.ID)
+	}
+	bySource := make(map[string]SignatureTransform)
+	for group, ids := range included {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		transform := bySource[group.source]
+		transform.Algorithm = signatureRelationships
+		if groupEligible[group] && len(ids) == totals[group] {
+			if !slices.Contains(transform.RelationshipTypes, group.typ) {
+				transform.RelationshipTypes = append(transform.RelationshipTypes, group.typ)
+			}
+		} else {
+			transform.RelationshipIDs = append(transform.RelationshipIDs, ids...)
+		}
+		bySource[group.source] = transform
 	}
 	for _, source := range slices.Sorted(maps.Keys(bySource)) {
 		name := createdRelationshipPart(source)
 		name = pkg.names[strings.ToLower(name)]
 		transform := bySource[source]
 		slices.Sort(transform.RelationshipTypes)
+		slices.Sort(transform.RelationshipIDs)
 		if err := signatureSigningXML(g, name, opcRelsType, false, options.Validate); err != nil {
 			return nil, nil, err
 		}
@@ -678,7 +711,11 @@ func signatureSigningXML(graph *signaturePartGraph, part, media string, ticket b
 		return graph.context.Err()
 	}
 	key := strings.ToLower(part)
-	data, err := graph.pkg.readItems(key, min(graph.pkg.limits.MaxMetadataBytes, graph.pkg.limits.MaxPartBytes))
+	limit := signaturePartByteLimit(part, typeName, graph.pkg.limits)
+	if ticket {
+		limit = min(limit, graph.pkg.limits.MaxMetadataBytes)
+	}
+	data, err := graph.pkg.readItems(key, limit)
 	if err != nil {
 		return &PartError{Part: part, Err: err}
 	}

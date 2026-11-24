@@ -75,17 +75,16 @@ type tiffFaxNode struct {
 
 // tiffFaxReader 保存单个条带的位位置、位顺序和工作预算，不跨条带保留参考行
 type tiffFaxReader struct {
-	data             []byte
-	position         uint64
-	fillOrder        uint32
-	work             uint64
-	allowLiteral     bool
-	literal          bool
-	literalContinued bool
-	literalWhite     uint8
-	literalBlack     bool
-	literalExit      bool
-	exitBlack        bool
+	data         []byte
+	position     uint64
+	fillOrder    uint32
+	work         uint64
+	allowLiteral bool
+	literal      bool
+	literalWhite uint8
+	literalBlack bool
+	literalExit  bool
+	exitBlack    bool
 }
 
 // tiffJPEGEntropyWriter 保存单个DCT分量的熵编码位及字节填充状态
@@ -202,18 +201,23 @@ func (f *tiffFaxReader) literalWord() error {
 	return fmt.Errorf("%w: TIFF fax uncompressed code", ErrInvalid)
 }
 
+// tiffFaxToggleChange 在指定列切换颜色变化点并抵消同列零长游程，保证变化点严格递增
+// 入参: changes 变色点缓冲区, position 当前列号
+// 返回: []int 更新后的变色点切片
+func tiffFaxToggleChange(changes []int, position int) []int {
+	if len(changes) > 0 && changes[len(changes)-1] == position {
+		return changes[:len(changes)-1]
+	}
+	return append(changes, position)
+}
+
 // literalLine 输出当前行的未压缩像素，T.6字面量可以跨行，退出色作用于恢复压缩的位置
 // 入参: row 当前行, width 行宽, position 起始列, black 当前假定颜色, changes 变色点缓冲区
 // 返回: int 结束列, bool 恢复颜色, []int 变色点, error 字面量或输入错误
 func (f *tiffFaxReader) literalLine(row []byte, width, position int, black bool, changes []int) (int, bool, []int, error) {
-	start := position
 	setColor := func(color bool) {
 		if color != black {
-			if len(changes) > 0 && changes[len(changes)-1] == position {
-				changes = changes[:len(changes)-1]
-			} else {
-				changes = append(changes, position)
-			}
+			changes = tiffFaxToggleChange(changes, position)
 			black = color
 		}
 	}
@@ -232,9 +236,7 @@ func (f *tiffFaxReader) literalLine(row []byte, width, position int, black bool,
 		}
 		if f.literalWhite == 0 && !f.literalBlack && f.literalExit {
 			f.literalExit, f.literal = false, false
-			if !f.literalContinued || position != start {
-				setColor(f.exitBlack)
-			}
+			setColor(f.exitBlack)
 			return position, black, changes, nil
 		}
 		if position == width {
@@ -386,7 +388,7 @@ func (f *tiffFaxReader) line1(row []byte, width int, changes []int) ([]int, erro
 			if _, err := f.bits(12); err != nil {
 				return nil, err
 			}
-			f.literal, f.literalContinued = true, false
+			f.literal = true
 			var err error
 			position, black, changes, err = f.literalLine(row, width, position, black, changes)
 			if err != nil {
@@ -409,7 +411,7 @@ func (f *tiffFaxReader) line1(row []byte, width int, changes []int) ([]int, erro
 		}
 		tiffFaxPaint(row, position, position+length, black)
 		position += length
-		changes = append(changes, position)
+		changes = tiffFaxToggleChange(changes, position)
 		black = !black
 	}
 	return changes, nil
@@ -435,7 +437,7 @@ func (f *tiffFaxReader) line2(row []byte, width int, reference, changes []int) (
 			if position == width {
 				break
 			}
-			started = started || position != before
+			started = started || position != before || black
 			continue
 		}
 		for cursor < len(reference) && (reference[cursor] < position || started && reference[cursor] == position) {
@@ -480,9 +482,9 @@ func (f *tiffFaxReader) line2(row []byte, width int, reference, changes []int) (
 			tiffFaxPaint(row, position, position+first, black)
 			tiffFaxPaint(row, position+first, position+first+second, !black)
 			position += first
-			changes = append(changes, position)
+			changes = tiffFaxToggleChange(changes, position)
 			position += second
-			changes = append(changes, position)
+			changes = tiffFaxToggleChange(changes, position)
 		case tiffFaxVertical:
 			started = true
 			end := b1 + delta
@@ -491,10 +493,10 @@ func (f *tiffFaxReader) line2(row []byte, width int, reference, changes []int) (
 			}
 			tiffFaxPaint(row, position, end, black)
 			position = end
-			changes = append(changes, position)
+			changes = tiffFaxToggleChange(changes, position)
 			black = !black
 		case tiffFaxUncompressed:
-			f.literal, f.literalContinued = true, false
+			f.literal = true
 		case tiffFaxEnd:
 			if actions != 0 {
 				return nil, false, fmt.Errorf("%w: TIFF fax EOFB inside row", ErrInvalid)
@@ -524,7 +526,6 @@ func faxStrip(dst, src []byte, width int, compression, fillOrder, options uint32
 	reference, changes := make([]int, 2, width+3), make([]int, 0, width+3)
 	reference[0], reference[1] = width, width
 	for y := 0; y < len(dst)/rowBytes; y++ {
-		f.literalContinued = f.literal
 		oneDimensional := compression != 4
 		if compression == 3 {
 			if err := f.eol(); err != nil {

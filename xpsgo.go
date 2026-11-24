@@ -16,6 +16,7 @@
 package xpsgo
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -181,6 +182,13 @@ func Open(ctx context.Context, path string, options *ReaderOptions) (*Reader, er
 	return r, nil
 }
 
+// OpenBytes 从内存字节切片打开文档，不额外拷贝原始切片，调用方须保证阅读期间切片不变
+// 入参: ctx 取消Context，nil采用Background, data 完整文档字节切片, options 阅读器选项，nil采用默认值
+// 返回: *Reader 阅读器实例, error 错误信息
+func OpenBytes(ctx context.Context, data []byte, options *ReaderOptions) (*Reader, error) {
+	return NewReader(ctx, bytes.NewReader(data), int64(len(data)), options)
+}
+
 // NewReader 从随机读取器打开文档，不接管输入的关闭责任
 // 调用方须保证输入在阅读器使用期间不变；并发读取还要求输入支持并发ReadAt
 // 入参: ctx 取消Context，nil采用Background, input 输入读取器, size 输入长度, options 阅读器选项，nil采用默认值
@@ -279,17 +287,17 @@ func (r *Reader) PageCount() int {
 }
 
 // Document 返回指定文档的索引信息副本
-// 入参: index 从零开始的文档序号
+// 入参: docIndex 从零开始的文档序号
 // 返回: Document 文档索引, error 错误信息
-func (r *Reader) Document(index int) (Document, error) {
+func (r *Reader) Document(docIndex int) (Document, error) {
 	if err := r.readLock(); err != nil {
 		return Document{}, err
 	}
 	defer r.mu.RUnlock()
-	if index < 0 || index >= len(r.documents) {
-		return Document{}, fmt.Errorf("%w: document index out of range: %d", ErrInvalid, index)
+	if docIndex < 0 || docIndex >= len(r.documents) {
+		return Document{}, fmt.Errorf("%w: document index out of range: %d", ErrInvalid, docIndex)
 	}
-	doc := r.documents[index]
+	doc := r.documents[docIndex]
 	doc.Pages = append([]PageReference(nil), doc.Pages...)
 	for i := range doc.Pages {
 		doc.Pages[i].LinkTargets = append([]string(nil), doc.Pages[i].LinkTargets...)

@@ -18,7 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
+	"sort"
 	"strings"
 )
 
@@ -62,7 +64,7 @@ type WalkClip struct {
 }
 
 // WalkState 保存当前遍历节点累计的规范化图形与文档状态，Index、DocumentIndex与PageIndex为零基页号（辅助页均为-1）
-// Opacity为扁平累计不透明度，按EnterGroup/LeaveGroup构建隔离组时应使用各事件的LocalOpacity避免双重乘算
+// Opacity为扁平累计不透明度，EdgeMode自祖先Canvas向下继承，按EnterGroup/LeaveGroup构建隔离组应使用LocalOpacity避免双重乘算
 // Clip内Geometry指针与OpacityMask指针均为只读零拷贝视图，回调期间及返回后不得修改
 type WalkState struct {
 	PagePart      string
@@ -73,6 +75,7 @@ type WalkState struct {
 	Clip          []WalkClip
 	Opacity       float64
 	OpacityMask   *Brush
+	EdgeMode      EdgeMode
 	Language      string
 	NavigateURI   string
 	Name          string
@@ -90,10 +93,10 @@ type WalkPathEvent struct {
 	StrokeThickness     float64
 	StrokeDashArray     []float64
 	StrokeDashOffset    float64
-	StrokeDashCap       string
-	StrokeStartLineCap  string
-	StrokeEndLineCap    string
-	StrokeLineJoin      string
+	StrokeDashCap       LineCap
+	StrokeStartLineCap  LineCap
+	StrokeEndLineCap    LineCap
+	StrokeLineJoin      LineJoin
 	StrokeMiterLimit    float64
 	SnapsToDevicePixels *bool
 	AutomationName      string
@@ -118,7 +121,7 @@ type WalkGlyphsEvent struct {
 	Indices             []GlyphCluster
 	BidiLevel           int
 	IsSideways          bool
-	StyleSimulations    string
+	StyleSimulations    StyleSimulation
 	CaretStops          string
 	DeviceFontName      string
 	Fill                *Brush
@@ -153,7 +156,7 @@ type WalkGroupEvent struct {
 	Kind                WalkGroupKind
 	Brush               *Brush
 	LocalOpacity        float64
-	EdgeMode            string
+	EdgeMode            EdgeMode
 	NeedsRasterFallback bool
 	FallbackDPI         float64
 }
@@ -224,9 +227,9 @@ func DefaultWalkOptions() WalkOptions {
 
 // Walk 按严格绘制顺序遍历指定页面的矢量、文字与图像场景
 // 调用回调期间不持有阅读器读锁，允许回调安全调用Font、Image或ResolveLink等只读方法
-// 入参: ctx 取消Context，nil采用Background, index 从零开始的全局页号, visitor 事件回调集合, options 遍历选项，nil采用默认值
+// 入参: ctx 取消Context，nil采用Background, pageIndex 从零开始的全局页号, visitor 事件回调集合, options 遍历选项，nil采用默认值
 // 返回: error 页面读取、参数、资源上限、取消或回调返回的错误
-func (r *Reader) Walk(ctx context.Context, index int, visitor *SceneVisitor, options *WalkOptions) error {
+func (r *Reader) Walk(ctx context.Context, pageIndex int, visitor *SceneVisitor, options *WalkOptions) error {
 	ctx = normalizeContext(ctx)
 	if err := checkContext(ctx); err != nil {
 		return err
@@ -235,17 +238,18 @@ func (r *Reader) Walk(ctx context.Context, index int, visitor *SceneVisitor, opt
 	if err != nil {
 		return err
 	}
-	page, docIndex, localIndex, err := r.loadScenePageByIndex(ctx, index, config.limits)
+	page, docIndex, localIndex, err := r.loadScenePageByIndex(ctx, pageIndex, config.limits)
 	if err != nil {
 		return err
 	}
 	walker := newSceneWalker(r, visitor, config)
 	initial := WalkState{
 		PagePart:      page.Part,
-		Index:         index,
+		Index:         pageIndex,
 		DocumentIndex: docIndex,
 		PageIndex:     localIndex,
 		Matrix:        config.rootTransform,
+		Clip:          walkPageRootClips(page, config.rootTransform),
 		Opacity:       1,
 		Language:      page.Language,
 	}
@@ -275,6 +279,7 @@ func (r *Reader) WalkPart(ctx context.Context, part string, visitor *SceneVisito
 		DocumentIndex: docIndex,
 		PageIndex:     localIndex,
 		Matrix:        config.rootTransform,
+		Clip:          walkPageRootClips(page, config.rootTransform),
 		Opacity:       1,
 		Language:      page.Language,
 	}
@@ -569,10 +574,10 @@ func (r *Reader) readWalkFontFace(ctx context.Context, part string, index uint32
 	defer r.mu.RUnlock()
 	size, err := r.pkg.partSize(strings.ToLower(part))
 	if err != nil {
-		return nil, &PartError{Part: part, Err: err}
+		return nil, wrapPartError(part, "", err)
 	}
 	if maximum < 0 || size > uint64(maximum) {
-		return nil, &PartError{Part: part, Err: fmt.Errorf("%w: font byte budget", ErrLimit)}
+		return nil, wrapPartError(part, "", fmt.Errorf("%w: font byte budget", ErrLimit))
 	}
 	return r.pkg.readFontFaceLimit(part, index, maximum)
 }
@@ -652,7 +657,19 @@ func (w *sceneWalker) walkElement(ctx context.Context, element Element, parent W
 	defer delete(w.activeElements, element)
 	state, err := applyElementState(parent, props)
 	if err != nil {
-		return &PartError{Part: state.PagePart, Err: err}
+		return wrapPartError(parent.PagePart, "", err)
+	}
+	if canvas, ok := element.(*Canvas); ok {
+		switch canvas.EdgeMode {
+		case "":
+		case EdgeModeAliased:
+			state.EdgeMode = EdgeModeAliased
+		default:
+			return wrapPartError(state.PagePart, "Canvas", fmt.Errorf("%w: canvas edge mode", ErrInvalid))
+		}
+	}
+	if props.Opacity == 0 || state.Opacity == 0 || geometryMatrixSingular(state.Matrix) {
+		return nil
 	}
 	switch node := element.(type) {
 	case *Canvas:
@@ -674,7 +691,7 @@ func (w *sceneWalker) walkCanvas(ctx context.Context, canvas *Canvas, state Walk
 		State:               state.clone(),
 		Kind:                WalkGroupCanvas,
 		LocalOpacity:        canvas.Opacity,
-		EdgeMode:            canvas.EdgeMode,
+		EdgeMode:            state.EdgeMode,
 		NeedsRasterFallback: w.forceFallback || state.OpacityMask != nil,
 		FallbackDPI:         w.config.fallbackDPI,
 	}
@@ -683,10 +700,16 @@ func (w *sceneWalker) walkCanvas(ctx context.Context, canvas *Canvas, state Walk
 			return err
 		}
 	}
+	prevFallback := w.forceFallback
+	if state.OpacityMask != nil {
+		w.forceFallback = true
+	}
 	childState := state
 	childState.OpacityMask = nil
 	childState.Name = ""
-	if err := w.walkElements(ctx, canvas.Elements, childState, depth+1, brushDepth); err != nil {
+	err := w.walkElements(ctx, canvas.Elements, childState, depth+1, brushDepth)
+	w.forceFallback = prevFallback
+	if err != nil {
 		return err
 	}
 	if w.visitor.LeaveGroup != nil {
@@ -702,6 +725,15 @@ func (w *sceneWalker) walkCanvas(ctx context.Context, canvas *Canvas, state Walk
 // 入参: ctx 取消Context, path 路径元素, state 当前有效状态, depth 元素深度, brushDepth 画刷深度
 // 返回: error 遍历或回调错误
 func (w *sceneWalker) walkPath(ctx context.Context, path *Path, state WalkState, depth, brushDepth int) error {
+	if path.Fill == nil && path.Stroke == nil {
+		return nil
+	}
+	if path.Data == nil {
+		return wrapPartError(state.PagePart, "Path", fmt.Errorf("%w: missing scene geometry", ErrInvalid))
+	}
+	if len(path.Data.Figures) == 0 {
+		return nil
+	}
 	if path.Fill != nil && path.Fill.Kind == BrushImage && w.visitor.Image != nil {
 		if path.Stroke != nil && (path.Opacity < 1 || state.OpacityMask != nil) {
 			if w.visitor.Path != nil {
@@ -925,6 +957,7 @@ func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *
 		Matrix:        visualMatrix,
 		Clip:          groupClips,
 		Opacity:       colorClamp(state.Opacity * brush.Opacity),
+		EdgeMode:      state.EdgeMode,
 		Language:      state.Language,
 		NavigateURI:   state.NavigateURI,
 	}
@@ -933,6 +966,7 @@ func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *
 		Kind:                WalkGroupVisualBrush,
 		Brush:               brush,
 		LocalOpacity:        colorClamp(path.Opacity * brush.Opacity),
+		EdgeMode:            state.EdgeMode,
 		NeedsRasterFallback: w.forceFallback,
 		FallbackDPI:         w.config.fallbackDPI,
 	}
@@ -1036,7 +1070,7 @@ func (w *sceneWalker) populateGlyphPositions(ctx context.Context, glyphs *Glyphs
 	count, err := glyphRunCount(glyphs, w.remainingGlyphs)
 	if err != nil {
 		if errors.Is(err, ErrLimit) {
-			return &PartError{Part: state.PagePart, Element: "Glyphs", Err: err}
+			return wrapPartError(state.PagePart, "Glyphs", err)
 		}
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "Glyphs", Message: err.Error()})
 		event.NeedsRasterFallback = true
@@ -1055,10 +1089,25 @@ func (w *sceneWalker) populateGlyphPositions(ctx context.Context, glyphs *Glyphs
 		return nil
 	}
 	bitmapOnly := fontIsBitmapOnly(source.face)
+	yMax := source.glyphYMax
 	if bitmapOnly {
 		event.NeedsRasterFallback = true
+		if glyphs.IsSideways {
+			bitmapYMax, bitmapErr := w.bitmapGlyphYMax(ctx, source, glyphs, state.Matrix)
+			if bitmapErr != nil {
+				if cerr := walkContextError(ctx, bitmapErr); cerr != nil {
+					return cerr
+				}
+				if errors.Is(bitmapErr, ErrLimit) {
+					return wrapPartError(state.PagePart, "Glyphs", bitmapErr)
+				}
+				w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "Glyphs", Message: bitmapErr.Error()})
+				return nil
+			}
+			yMax = bitmapYMax
+		}
 	}
-	run, err := resolveGlyphRunWithStep(glyphs, source.metrics, source.glyphIndex, source.glyphYMax, count, func() error {
+	run, err := resolveGlyphRunWithStep(glyphs, source.metrics, source.glyphIndex, yMax, count, func() error {
 		return checkContext(ctx)
 	})
 	if err != nil {
@@ -1085,9 +1134,20 @@ func (w *sceneWalker) populateGlyphPositions(ctx context.Context, glyphs *Glyphs
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
-		pos, err := contentGlyphPosition(glyph, state.Matrix, run.rtl)
+		shifted := glyph
+		if run.bold && w.reader.format == FormatOpenXPS {
+			shift := glyphs.FontRenderingEmSize / 100
+			shifted.origin.X += shift
+			shifted.origin.Y -= shift
+			shifted.matrix.E += shift
+			shifted.matrix.F -= shift
+			if !geometryFinite(shifted.origin.X, shifted.origin.Y, shifted.matrix.E, shifted.matrix.F) {
+				return wrapPartError(state.PagePart, "Glyphs", fmt.Errorf("%w: bold glyph transform range", ErrLimit))
+			}
+		}
+		pos, err := contentGlyphPosition(shifted, state.Matrix, run.rtl)
 		if err != nil {
-			return &PartError{Part: state.PagePart, Element: "Glyphs", Err: err}
+			return wrapPartError(state.PagePart, "Glyphs", err)
 		}
 		positions = append(positions, pos)
 		if w.config.resolveGlyphOutlines && !bitmapOnly {
@@ -1104,7 +1164,7 @@ func (w *sceneWalker) populateGlyphPositions(ctx context.Context, glyphs *Glyphs
 						return cerr
 					}
 					if errors.Is(boldErr, ErrLimit) {
-						return &PartError{Part: state.PagePart, Element: "Glyphs", Err: boldErr}
+						return wrapPartError(state.PagePart, "Glyphs", boldErr)
 					}
 					w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "Glyphs", Message: boldErr.Error()})
 					event.NeedsRasterFallback = true
@@ -1113,16 +1173,6 @@ func (w *sceneWalker) populateGlyphPositions(ctx context.Context, glyphs *Glyphs
 				outline = expanded
 			}
 			transform := pos.Transform
-			if run.bold && w.reader.format == FormatOpenXPS {
-				local := glyph.matrix
-				shift := glyphs.FontRenderingEmSize / 100
-				local.E += shift
-				local.F -= shift
-				transform = strokePathCompose(state.Matrix, local)
-				if !geometryFillMatrixFinite(transform) {
-					return &PartError{Part: state.PagePart, Element: "Glyphs", Err: fmt.Errorf("%w: bold glyph transform range", ErrLimit)}
-				}
-			}
 			outline.Transform = &transform
 			outlines[i] = &outline
 		}
@@ -1132,6 +1182,93 @@ func (w *sceneWalker) populateGlyphPositions(ctx context.Context, glyphs *Glyphs
 		event.Outlines = outlines
 	}
 	return nil
+}
+
+// bitmapGlyphYMax 为竖排纯位图字体提供基于EBLC/EBDT位图度量的顶部高度查询回调
+// 入参: ctx 取消Context, source 已加载纯位图字体, glyphs 字形元素, transform 当前有效变换
+// 返回: func(uint16) (float64, error) 字形顶部高度回调, error 取消、预算或位图索引错误
+func (w *sceneWalker) bitmapGlyphYMax(ctx context.Context, source *fontSource, glyphs *Glyphs, transform Matrix) (func(uint16) (float64, error), error) {
+	charge := func(amount uint64) error {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		if amount > w.remainingBoldWork {
+			return fmt.Errorf("%w: scene walk bitmap work budget", ErrLimit)
+		}
+		w.remainingBoldWork -= amount
+		return nil
+	}
+	if err := charge(uint64(source.face.tables["EBLC"].length) + uint64(source.face.tables["EBSC"].length) + 1); err != nil {
+		return nil, err
+	}
+	x, y := math.Hypot(transform.A, transform.B), math.Hypot(transform.C, transform.D)
+	if glyphs.IsSideways {
+		x, y = y, x
+	}
+	x, y = x*glyphs.FontRenderingEmSize, y*glyphs.FontRenderingEmSize
+	px, py := math.Round(x), math.Round(y)
+	var strike *fontBitmapStrike
+	scaleY := 1.0
+	var ppemY uint8
+	if geometryFinite(x, y) && px >= 1 && py >= 1 && px <= 255 && py <= 255 && math.Abs(x-px) <= 1e-9 && math.Abs(y-py) <= 1e-9 {
+		selection, present, err := source.selectBitmapStrikeWithWork(uint16(px), uint16(py), charge)
+		if err != nil {
+			return nil, err
+		}
+		if present {
+			strike = &source.bitmaps.strikes[selection.strike]
+			scaleY = selection.scaleY
+			ppemY = selection.ppemY
+		}
+	}
+	if strike == nil {
+		if err := source.loadBitmaps(charge); err != nil {
+			return nil, err
+		}
+		if source.bitmaps == nil || len(source.bitmaps.strikes) == 0 {
+			return nil, fmt.Errorf("%w: no matching bitmap strike", ErrUnsupported)
+		}
+		bestDist := math.Inf(1)
+		for i := range source.bitmaps.strikes {
+			candidate := &source.bitmaps.strikes[i]
+			if candidate.ppemY == 0 {
+				continue
+			}
+			dist := 0.0
+			if geometryFinite(x, y) {
+				dist = math.Hypot(float64(candidate.ppemX)-x, float64(candidate.ppemY)-y)
+			}
+			if strike == nil || dist < bestDist {
+				strike = candidate
+				ppemY = candidate.ppemY
+				bestDist = dist
+			}
+		}
+	}
+	if strike == nil || ppemY == 0 {
+		return nil, fmt.Errorf("%w: no matching bitmap strike", ErrUnsupported)
+	}
+	return func(gid uint16) (float64, error) {
+		if err := checkContext(ctx); err != nil {
+			return 0, err
+		}
+		i := sort.Search(len(strike.entries), func(i int) bool { return strike.entries[i].gid >= gid })
+		if i == len(strike.entries) || strike.entries[i].gid != gid {
+			return 0, fmt.Errorf("%w: selected bitmap glyph %d is absent", ErrUnsupported, gid)
+		}
+		entry := strike.entries[i]
+		metrics, _, err := strike.imageMetrics(entry, source.bitmaps.data[entry.start:entry.end])
+		if err != nil {
+			return 0, err
+		}
+		if metrics.hasVertical {
+			return 0, nil
+		}
+		if !metrics.hasHorizontal {
+			return 0, fmt.Errorf("%w: bitmap glyph has no positioning metrics", ErrUnsupported)
+		}
+		return math.Round(float64(metrics.horizontal.bearingY)*scaleY) * float64(source.metrics.unitsPerEm) / float64(ppemY), nil
+	}, nil
 }
 
 // loadFont 在单次遍历私有缓存中按需加载字体源，仅在缓存未命中时短暂获取阅读器读锁
@@ -1168,7 +1305,7 @@ func (w *sceneWalker) loadFont(ctx context.Context, fontPart string, collectionI
 	}
 	source, err := newFontSource(face)
 	if err != nil {
-		return nil, &PartError{Part: part, Err: err}
+		return nil, wrapPartError(part, "", err)
 	}
 	w.fontFaces[key] = source
 	return source, nil
@@ -1222,6 +1359,16 @@ func applyElementState(parent WalkState, props *ElementProperties) (WalkState, e
 		state.Clip = clips
 	}
 	return state, nil
+}
+
+// walkPageRootClips 在页面宽高为正时构造初始页面边界裁切栈
+// 入参: page 已加载页面, rootTransform 遍历根变换
+// 返回: []WalkClip 页面根裁切栈
+func walkPageRootClips(page *Page, rootTransform Matrix) []WalkClip {
+	if page == nil || !geometryFinite(page.Width, page.Height) || page.Width <= 0 || page.Height <= 0 {
+		return nil
+	}
+	return []WalkClip{{Geometry: renderBoxGeometry(Rect{Width: page.Width, Height: page.Height}), Matrix: rootTransform}}
 }
 
 // walkPrintPlacementClips 构造拼版放置生效的纸面留白裁切、放置介质裁切及逻辑页裁切栈

@@ -1036,7 +1036,7 @@ func convertCompositionMarkup(part packagePart, source, target Format, budget *c
 				if err != nil {
 					return "", false, err
 				}
-				maximum := min(budget.limits.MaxMetadataBytes, budget.limits.MaxPartBytes, budget.limits.MaxPackageBytes, int64(math.MaxInt))
+				maximum := min(budget.limits.MaxPartBytes, budget.limits.MaxPackageBytes, int64(math.MaxInt))
 				if int64(len(value)) > maximum {
 					return "", false, fmt.Errorf("%w: composition format reference size", ErrLimit)
 				}
@@ -1222,7 +1222,7 @@ func newCompositionIndex(value packagePart, format Format, budget *compositionBu
 	if local == "" || namespace == "" {
 		return nil, fmt.Errorf("%w: composition index input", ErrInvalid)
 	}
-	if int64(len(value.data)) > min(budget.limits.MaxMetadataBytes, budget.limits.MaxPartBytes) {
+	if int64(len(value.data)) > budget.limits.MaxPartBytes {
 		return nil, fmt.Errorf("%w: composition index bytes", ErrLimit)
 	}
 	if err := budget.scan(int64(len(value.data))); err != nil {
@@ -1278,7 +1278,7 @@ func (s *compositionSource) indexPart(value packagePart, budget *compositionBudg
 	if err := budget.step(1); err != nil {
 		return nil, err
 	}
-	if int64(len(value.data)) > min(budget.limits.MaxMetadataBytes, budget.limits.MaxPartBytes) {
+	if int64(len(value.data)) > budget.limits.MaxPartBytes {
 		return nil, fmt.Errorf("%w: composition index bytes", ErrLimit)
 	}
 	key := strings.ToLower(value.name)
@@ -1696,7 +1696,7 @@ func (s *compositionCapture) load(name string) (packagePart, error) {
 		return packagePart{}, err
 	}
 	limit := s.budget.limits.MaxPartBytes
-	if compositionXML(media) || opcRelationshipName(name) || s.opaque[key] {
+	if opcMetadataPart(name, media) || s.opaque[key] {
 		limit = min(limit, s.budget.limits.MaxMetadataBytes)
 	}
 	if size > uint64(limit) {
@@ -1926,17 +1926,17 @@ func (s *compositionCapture) relations(source, owner string) error {
 		if err != nil {
 			return err
 		}
-		if relation.Type == formatNamespace(s.source.format)+"/required-resource" && (s.roles.parts[strings.ToLower(source)] != createdNavigationPage || relation.TargetMode != "Internal") {
+		if relation.Type == formatNamespace(s.source.format)+"/required-resource" && (s.roles.parts[strings.ToLower(source)] != createdNavigationPage || relation.TargetMode != TargetModeInternal) {
 			return fmt.Errorf("%w: required resource relationship owner or mode", ErrInvalid)
 		}
 		restricted := relation.Type == formatNamespace(s.source.format)+"/restricted-font"
-		if restricted && (s.roles.parts[strings.ToLower(source)] != createdNavigationDocument || relation.TargetMode != "Internal") {
+		if restricted && (s.roles.parts[strings.ToLower(source)] != createdNavigationDocument || relation.TargetMode != TargetModeInternal) {
 			return fmt.Errorf("%w: restricted font relationship owner or mode", ErrInvalid)
 		}
 		if source == "/" && relation.Type == opcSignatureOriginRel {
 			s.source.signatureOrigin = true
 		}
-		if source == "/" && s.omitRootRelation(relation) || relation.TargetMode == "External" {
+		if source == "/" && s.omitRootRelation(relation) || relation.TargetMode == TargetModeExternal {
 			return s.budget.step(1)
 		}
 		if err := s.budget.scan(int64(len(relation.Target))); err != nil {

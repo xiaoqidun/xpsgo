@@ -54,11 +54,12 @@ var errCompressionBuffer = errors.New("compression buffer limit exceeded")
 // Compression 选择保留原压缩数据、直接存储、重新Deflate或无损优化，不改变逻辑部件内容
 type Compression uint8
 
-// WriteOptions 设置整包写出压缩方式、交错分片大小、普通部件顺序及输出字节上限
-// 零值保留原压缩数据（内存包默认沿用导入方法或Deflate），Optimize仅在候选更小时替换
-// InterleaveBytes非零时按至多8MiB重新分片并按元数据优先与PartOrder轮转写出，MaxBytes零值沿用包上限
+// WriteOptions 设置整包写出压缩方式、字体子集化、交错分片、普通部件顺序及输出字节上限
+// 零值保留原压缩数据（内存包沿用导入方法或Deflate），Optimize仅在候选更小时替换，SubsetFonts仅作用于Package写出
+// InterleaveBytes非零时按至多8MiB分片并按元数据优先与PartOrder轮转写出，MaxBytes零值沿用包上限
 type WriteOptions struct {
 	Compression     Compression
+	SubsetFonts     bool
 	InterleaveBytes int64
 	PartOrder       []string
 	MaxBytes        int64
@@ -223,6 +224,7 @@ func writeEntryHeader(file *zip.File, compression Compression) (zip.FileHeader, 
 		return zip.FileHeader{}, &PartError{Part: file.Name, Err: err}
 	}
 	header.Extra = nil
+	hasTimestamp := false
 	for extra := file.Extra; len(extra) != 0; {
 		if len(extra) < 4 {
 			return zip.FileHeader{}, fmt.Errorf("%w: ZIP entry %s has truncated extra field", ErrInvalid, file.Name)
@@ -231,7 +233,11 @@ func writeEntryHeader(file *zip.File, compression Compression) (zip.FileHeader, 
 		if length > len(extra) {
 			return zip.FileHeader{}, fmt.Errorf("%w: ZIP entry %s has truncated extra data", ErrInvalid, file.Name)
 		}
-		if binary.LittleEndian.Uint16(extra[:2]) != 1 {
+		tag := binary.LittleEndian.Uint16(extra[:2])
+		if tag == 0x5455 {
+			hasTimestamp = true
+		}
+		if tag != 1 {
 			header.Extra = append(header.Extra, extra[:length]...)
 		}
 		extra = extra[length:]
@@ -239,6 +245,8 @@ func writeEntryHeader(file *zip.File, compression Compression) (zip.FileHeader, 
 	if compression == CompressionStore || compression == CompressionDeflate {
 		header.Modified = time.Time{}
 		header.Flags &^= 6
+	} else if hasTimestamp {
+		header.Modified = time.Time{}
 	}
 	return header, nil
 }

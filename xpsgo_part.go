@@ -253,6 +253,13 @@ func opcRelationshipName(name string) bool {
 	return len(segments) >= 3 && segments[len(segments)-2] == "_rels" && strings.HasSuffix(segments[len(segments)-1], ".rels")
 }
 
+// opcMetadataPart 判断部件是否属于受MaxMetadataBytes约束的OPC元数据部件
+// 入参: name 部件包根URI, media 部件内容类型
+// 返回: bool 是否为关系部件、内容类型流或核心属性部件
+func opcMetadataPart(name, media string) bool {
+	return opcRelationshipName(name) || strings.EqualFold(name, opcTypesName) || strings.EqualFold(media, opcCoreType)
+}
+
 // OpenPart 打开独立逻辑部件读取流并按序拼接分片，使用后须关闭流，读取至EOF后完成全部CRC与尺寸校验
 // 关闭流不影响阅读器，阅读器关闭后流不可读；同一流的Read和Close可并发调用
 // 入参: ctx 取消Context，nil采用Background, name 部件URI, options 读取参数，nil采用默认值
