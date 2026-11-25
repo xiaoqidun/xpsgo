@@ -323,6 +323,23 @@ func (p *Package) addPageLocked(ctx context.Context, docIndex int, page *Page) (
 		return 0, err
 	}
 	value.Part = part
+	if p.hasDiscardControl() {
+		q := p.storyCopy()
+		targets, err := q.storePage(&value, ctx)
+		if err != nil {
+			return 0, err
+		}
+		q.layout[strings.ToLower(part)] = true
+		q.documents[docIndex].Pages = append(q.documents[docIndex].Pages, PageReference{Part: part, LinkTargets: targets})
+		q.pageCount++
+		q.dirty[strings.ToLower(q.documents[docIndex].Part)] = true
+		q.commitName(pattern, part)
+		if err := q.syncDiscardControl(); err != nil {
+			return 0, err
+		}
+		p.commitStory(q)
+		return len(p.documents[docIndex].Pages) - 1, nil
+	}
 	targets, err := p.storePage(&value, ctx)
 	if err != nil {
 		return 0, err
@@ -2171,9 +2188,21 @@ func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlConte
 	ignorable := make(map[string]bool)
 	preserveElems := make(map[string]bool)
 	preserveAttrs := make(map[string]bool)
+	isMCEPrefixList := func(node *xmlElement, attr xml.Attr) bool {
+		return attr.Name.Space == mcNamespace && (attr.Name.Local == "Ignorable" || attr.Name.Local == "MustUnderstand") || node.Name == (xml.Name{Space: mcNamespace, Local: "Choice"}) && attr.Name == (xml.Name{Local: "Requires"})
+	}
+	isMCEQNameList := func(attr xml.Attr) bool {
+		return attr.Name.Space == mcNamespace && (attr.Name.Local == "ProcessContent" || attr.Name.Local == "PreserveElements" || attr.Name.Local == "PreserveAttributes")
+	}
+	lookupNS := func(primary, fallback map[string]string, prefix string) string {
+		if uri := primary[prefix]; uri != "" {
+			return uri
+		}
+		return fallback[prefix]
+	}
 	count := 0
-	var scanPreserved func(*xmlElement, map[string]string, int) error
-	scanPreserved = func(node *xmlElement, fallbackNS map[string]string, depth int) error {
+	var scanPreserved func(*xmlElement, map[string]string, map[string]bool, int) error
+	scanPreserved = func(node *xmlElement, fallbackNS map[string]string, localIgnorable map[string]bool, depth int) error {
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
@@ -2188,6 +2217,26 @@ func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlConte
 		if len(hints) == 0 {
 			hints = fallbackNS
 		}
+		curIgnorable := localIgnorable
+		if value, ok := node.attributeNS(mcNamespace, "Ignorable"); ok {
+			words := compatibilityWords(value)
+			if len(words) != 0 {
+				curIgnorable = maps.Clone(localIgnorable)
+				if curIgnorable == nil {
+					curIgnorable = make(map[string]bool, len(words))
+				}
+				for _, prefix := range words {
+					uri := lookupNS(node.Namespaces, fallbackNS, prefix)
+					if !xmlNCName(prefix) || uri == "" || prefix == "xmlns" {
+						return fmt.Errorf("%w: invalid or undeclared MCE prefix %q", ErrInvalid, prefix)
+					}
+					curIgnorable[uri] = true
+					if _, err := bindPrefix(uri, hints); err != nil {
+						return err
+					}
+				}
+			}
+		}
 		if node.Name.Space != "" && node.Name.Space != defaultNS {
 			if _, err := bindPrefix(node.Name.Space, hints); err != nil {
 				return err
@@ -2197,11 +2246,37 @@ func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlConte
 			if !xmlTextValid(attr.Value) {
 				return fmt.Errorf("%w: invalid generated XML attribute", ErrInvalid)
 			}
+			if isMCEPrefixList(node, attr) {
+				for _, prefix := range compatibilityWords(attr.Value) {
+					uri := lookupNS(node.Namespaces, fallbackNS, prefix)
+					if !xmlNCName(prefix) || uri == "" || prefix == "xmlns" {
+						return fmt.Errorf("%w: invalid or undeclared MCE prefix %q", ErrInvalid, prefix)
+					}
+					if _, err := bindPrefix(uri, hints); err != nil {
+						return err
+					}
+				}
+			} else if isMCEQNameList(attr) {
+				for _, word := range compatibilityWords(attr.Value) {
+					prefix, local, qualified := strings.Cut(word, ":")
+					uri := lookupNS(node.Namespaces, fallbackNS, prefix)
+					if !qualified || !xmlNCName(prefix) || local != "*" && !xmlNCName(local) || uri == "" || prefix == "xmlns" {
+						return fmt.Errorf("%w: invalid or undeclared MCE QName %q", ErrInvalid, word)
+					}
+					if _, err := bindPrefix(uri, hints); err != nil {
+						return err
+					}
+				}
+			}
 			if attr.Name.Space == "" || attr.Name.Space == xmlnsNamespace || attr.Name.Space == xmlNamespace {
 				continue
 			}
-			if _, err := bindPrefix(attr.Name.Space, hints); err != nil {
+			prefix, err := bindPrefix(attr.Name.Space, hints)
+			if err != nil {
 				return err
+			}
+			if attr.Name.Space != mcNamespace && attr.Name.Space != defaultNS && attr.Name.Space != defaultNS+"/resourcedictionary-key" && !curIgnorable[attr.Name.Space] {
+				ignorable[prefix] = true
 			}
 		}
 		for _, attr := range node.PreservedAttributes {
@@ -2209,18 +2284,22 @@ func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlConte
 				return fmt.Errorf("%w: invalid generated XML attribute", ErrInvalid)
 			}
 			if attr.Name.Space != "" && attr.Name.Space != xmlNamespace {
-				if _, err := bindPrefix(attr.Name.Space, hints); err != nil {
+				prefix, err := bindPrefix(attr.Name.Space, hints)
+				if err != nil {
 					return err
+				}
+				if attr.Name.Space != mcNamespace && attr.Name.Space != defaultNS && attr.Name.Space != defaultNS+"/resourcedictionary-key" && !curIgnorable[attr.Name.Space] {
+					ignorable[prefix] = true
 				}
 			}
 		}
 		for _, child := range node.Children {
-			if err := scanPreserved(child, hints, depth+1); err != nil {
+			if err := scanPreserved(child, hints, curIgnorable, depth+1); err != nil {
 				return err
 			}
 		}
 		for _, item := range node.PreservedElements {
-			if err := scanPreserved(item, hints, depth+1); err != nil {
+			if err := scanPreserved(item, hints, curIgnorable, depth+1); err != nil {
 				return err
 			}
 		}
@@ -2247,7 +2326,7 @@ func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlConte
 			if !xmlTextValid(attr.Value) {
 				return fmt.Errorf("%w: invalid generated XML attribute", ErrInvalid)
 			}
-			if attr.Name.Space == "" || attr.Name.Space == xmlnsNamespace || attr.Name.Space == xmlNamespace || attr.Name.Space == node.Name.Space+"/resourcedictionary-key" {
+			if attr.Name.Space == "" || attr.Name.Space == xmlnsNamespace || attr.Name.Space == xmlNamespace {
 				continue
 			}
 			if _, err := bindPrefix(attr.Name.Space, node.Namespaces); err != nil {
@@ -2280,7 +2359,7 @@ func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlConte
 				ignorable[prefix] = true
 				preserveElems[prefix+":"+item.Name.Local] = true
 			}
-			if err := scanPreserved(item, node.Namespaces, depth+1); err != nil {
+			if err := scanPreserved(item, node.Namespaces, nil, depth+1); err != nil {
 				return err
 			}
 		}
@@ -2309,21 +2388,34 @@ func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlConte
 	var output bytes.Buffer
 	counted := packageOutput{writer: &output, context: ctx, limit: limit}
 	encoder := xml.NewEncoder(&counted)
-	var encodeNode func(*xmlElement, bool, bool, bool) error
-	encodeNode = func(node *xmlElement, isRoot, isPreserved, emptyDefault bool) error {
+	rewritePrefix := func(uri string) string {
+		if uri == xmlNamespace {
+			return "xml"
+		}
+		return prefixes[uri]
+	}
+	var encodeNode func(*xmlElement, map[string]string, bool, bool, bool) error
+	encodeNode = func(node *xmlElement, fallbackNS map[string]string, isRoot, isPreserved, emptyDefault bool) error {
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
+		hints := node.Namespaces
+		if len(hints) == 0 {
+			hints = fallbackNS
+		}
 		localName := node.Name.Local
 		needEmptyDefault := false
+		needRestoreDefault := false
 		if node.Name.Space == "" {
-			if isPreserved && !emptyDefault {
+			if isPreserved && defaultNS != "" && !emptyDefault {
 				needEmptyDefault = true
 			}
-		} else if node.Name.Space != defaultNS || emptyDefault {
-			if prefix := prefixes[node.Name.Space]; prefix != "" {
-				localName = prefix + ":" + node.Name.Local
+		} else if node.Name.Space == defaultNS {
+			if emptyDefault && defaultNS != "" {
+				needRestoreDefault = true
 			}
+		} else if prefix := prefixes[node.Name.Space]; prefix != "" {
+			localName = prefix + ":" + node.Name.Local
 		}
 		start := xml.StartElement{Name: xml.Name{Local: localName}}
 		if isRoot {
@@ -2359,8 +2451,32 @@ func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlConte
 			}
 		} else if needEmptyDefault {
 			start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: ""})
+		} else if needRestoreDefault {
+			start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: defaultNS})
 		}
 		appendAttr := func(attr xml.Attr) {
+			if isPreserved {
+				if isMCEPrefixList(node, attr) {
+					words := compatibilityWords(attr.Value)
+					remapped := make([]string, 0, len(words))
+					for _, prefix := range words {
+						if mapped := rewritePrefix(lookupNS(node.Namespaces, fallbackNS, prefix)); mapped != "" {
+							remapped = append(remapped, mapped)
+						}
+					}
+					attr.Value = strings.Join(remapped, " ")
+				} else if isMCEQNameList(attr) {
+					words := compatibilityWords(attr.Value)
+					remapped := make([]string, 0, len(words))
+					for _, word := range words {
+						prefix, local, _ := strings.Cut(word, ":")
+						if mapped := rewritePrefix(lookupNS(node.Namespaces, fallbackNS, prefix)); mapped != "" {
+							remapped = append(remapped, mapped+":"+local)
+						}
+					}
+					attr.Value = strings.Join(remapped, " ")
+				}
+			}
 			switch attr.Name.Space {
 			case xmlnsNamespace:
 				return
@@ -2371,9 +2487,7 @@ func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlConte
 			case xmlNamespace:
 				attr.Name = xml.Name{Local: "xml:" + attr.Name.Local}
 			default:
-				if attr.Name.Space == node.Name.Space+"/resourcedictionary-key" {
-					attr.Name = xml.Name{Local: "r:" + attr.Name.Local}
-				} else if prefix := prefixes[attr.Name.Space]; prefix != "" {
+				if prefix := prefixes[attr.Name.Space]; prefix != "" {
 					attr.Name = xml.Name{Local: prefix + ":" + attr.Name.Local}
 				}
 			}
@@ -2388,7 +2502,12 @@ func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlConte
 		if err := encoder.EncodeToken(start); err != nil {
 			return err
 		}
-		childEmptyDefault := emptyDefault || needEmptyDefault
+		childEmptyDefault := emptyDefault
+		if needEmptyDefault {
+			childEmptyDefault = true
+		} else if needRestoreDefault {
+			childEmptyDefault = false
+		}
 		if ordered != nil {
 			if items, ok := ordered[node]; ok {
 				allowedChild := make(map[*xmlElement]bool, len(node.Children))
@@ -2404,12 +2523,12 @@ func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlConte
 					if item.element != nil {
 						if allowedChild[item.element] {
 							emitted[item.element] = true
-							if err := encodeNode(item.element, false, isPreserved, childEmptyDefault); err != nil {
+							if err := encodeNode(item.element, hints, false, isPreserved, childEmptyDefault); err != nil {
 								return err
 							}
 						} else if allowedPreserved[item.element] {
 							emitted[item.element] = true
-							if err := encodeNode(item.element, false, true, childEmptyDefault); err != nil {
+							if err := encodeNode(item.element, hints, false, true, childEmptyDefault); err != nil {
 								return err
 							}
 						}
@@ -2426,14 +2545,14 @@ func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlConte
 				}
 				for _, child := range node.Children {
 					if !emitted[child] {
-						if err := encodeNode(child, false, isPreserved, childEmptyDefault); err != nil {
+						if err := encodeNode(child, hints, false, isPreserved, childEmptyDefault); err != nil {
 							return err
 						}
 					}
 				}
 				for _, item := range node.PreservedElements {
 					if !emitted[item] {
-						if err := encodeNode(item, false, true, childEmptyDefault); err != nil {
+						if err := encodeNode(item, hints, false, true, childEmptyDefault); err != nil {
 							return err
 						}
 					}
@@ -2447,18 +2566,18 @@ func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlConte
 			}
 		}
 		for _, child := range node.Children {
-			if err := encodeNode(child, false, isPreserved, childEmptyDefault); err != nil {
+			if err := encodeNode(child, hints, false, isPreserved, childEmptyDefault); err != nil {
 				return err
 			}
 		}
 		for _, item := range node.PreservedElements {
-			if err := encodeNode(item, false, true, childEmptyDefault); err != nil {
+			if err := encodeNode(item, hints, false, true, childEmptyDefault); err != nil {
 				return err
 			}
 		}
 		return encoder.EncodeToken(start.End())
 	}
-	if err := encodeNode(root, true, false, false); err != nil {
+	if err := encodeNode(root, root.Namespaces, true, false, false); err != nil {
 		return nil, err
 	}
 	if err := encoder.Flush(); err != nil {

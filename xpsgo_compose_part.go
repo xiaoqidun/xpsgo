@@ -97,10 +97,11 @@ type compositionMarkupOptions struct {
 	budget      *compositionBudget
 }
 
-// compositionNames 保存各输出页面的元素名称映射
+// compositionNames 保存各输出页面的元素名称映射及跨方言同源去重移除的LinkTarget集合
 type compositionNames struct {
-	pages  []map[string]string
-	budget *compositionBudget
+	pages          []map[string]string
+	droppedTargets []map[string]bool
+	budget         *compositionBudget
 }
 
 // compositionNameCollector 汇总原始页面和文档的名称，不过滤已知MCE分支
@@ -370,7 +371,7 @@ func (c *compositionFontCheck) parse(part packagePart, whole bool) (*composition
 		}
 	}
 	result := &compositionFontMarkup{}
-	tracker := newResourceMarkupScopeTracker(c.source.format, false, c.budget.context)
+	tracker := newResourceMarkupScopeTracker(c.source.format, c.source.format == FormatOpenXPS, c.budget.context)
 	visit := func(token xml.Token, node *xmlElement) error {
 		if err := c.budget.step(1); err != nil {
 			return err
@@ -953,7 +954,7 @@ func rewriteCompositionMarkup(value packagePart, options compositionMarkupOption
 		if err := budget.scan(int64(len(value.data))); err != nil {
 			return nil, err
 		}
-		tracker := newResourceMarkupScopeTracker(options.format, false, budget.context)
+		tracker := newResourceMarkupScopeTracker(options.format, options.format == FormatOpenXPS, budget.context)
 		root, err := decodeXMLVisit(value.data, budget.limits, func(token xml.Token, node *xmlElement) error {
 			if err := budget.step(1); err != nil {
 				return err
@@ -973,6 +974,9 @@ func rewriteCompositionMarkup(value packagePart, options compositionMarkupOption
 			}
 			if err := budget.step(len(node.Attr)); err != nil {
 				return err
+			}
+			if options.format == FormatOpenXPS && node.Name.Space == openXPS3DNamespace {
+				return nil
 			}
 			for _, attr := range node.Attr {
 				if attr.Name.Space != "" && scope.ignorable[attr.Name.Space] {
@@ -1038,14 +1042,24 @@ func rewriteCompositionMarkup(value packagePart, options compositionMarkupOption
 	if err := budget.scan(int64(len(value.data))); err != nil {
 		return nil, err
 	}
-	return rewriteExtractMarkup(value.data, budget.limits, budget.context, func(node *xmlElement, attr xml.Attr) (string, bool, error) {
+	var rewriteTracker *resourceMarkupScopeTracker
+	if compositionIndexRoot(value.media) != "" {
+		rewriteTracker = newResourceMarkupIgnoreTracker(options.format, options.format == FormatOpenXPS, budget.context)
+	} else {
+		rewriteTracker = newResourceMarkupScopeTracker(options.format, options.format == FormatOpenXPS, budget.context)
+	}
+	return rewriteExtractMarkup(value.data, budget.limits, budget.context, func(token xml.Token, node *xmlElement) (bool, error) {
+		skip, _, err := rewriteTracker.visit(token, node)
+		return skip, err
+	}, func(node *xmlElement, attr xml.Attr) (string, bool, error) {
 		if err := budget.step(1); err != nil {
 			return "", false, err
 		}
 		if err := budget.scan(int64(len(attr.Value))); err != nil {
 			return "", false, err
 		}
-		if node.Name.Space != namespace || attr.Name.Space != "" {
+		isModel := options.format == FormatOpenXPS && node.Name.Space == openXPS3DNamespace
+		if (node.Name.Space != namespace && !isModel) || attr.Name.Space != "" {
 			return attr.Value, false, nil
 		}
 		if attr.Name.Local == "Name" && slices.Contains([]string{"FixedPage", "Canvas", "Path", "Glyphs"}, node.Name.Local) {
@@ -1172,9 +1186,12 @@ func newCompositionNames(plan *compositionPlan) (*compositionNames, error) {
 	if err := b.step(len(plan.pages)); err != nil {
 		return nil, err
 	}
-	result := &compositionNames{pages: make([]map[string]string, len(plan.pages)), budget: b}
+	result := &compositionNames{pages: make([]map[string]string, len(plan.pages)), droppedTargets: make([]map[string]bool, len(plan.pages)), budget: b}
 	pages := make([]compositionNamePage, len(plan.pages))
+	visualNames := make([]map[string]bool, len(plan.pages))
+	pageOwners := make([]int, len(plan.pages))
 	pageCache := make(map[compositionPartKey]map[string]bool)
+	visualCache := make(map[compositionPartKey]map[string]bool)
 	documentCache := make(map[compositionPartKey]map[string]map[string]bool)
 	for index, instance := range plan.pages {
 		if err := b.step(1); err != nil {
@@ -1191,9 +1208,11 @@ func newCompositionNames(plan *compositionPlan) (*compositionNames, error) {
 		if err != nil {
 			return nil, err
 		}
+		pageOwners[index] = owner
 		original := source.pages[instance.index]
 		output := plan.documents[instance.document]
-		retain := output.complete && output.source == instance.source && output.original == owner && source.format == plan.format
+		sameDialect := source.sourceFormat == FormatUnknown || source.sourceFormat == plan.format
+		retain := output.complete && output.source == instance.source && output.original == owner && source.format == plan.format && sameDialect
 		pageKey := compositionPartKey{source: instance.source, part: strings.ToLower(original.Part), page: instance.index, document: -1}
 		if retain {
 			pageKey.document = owner
@@ -1223,10 +1242,12 @@ func newCompositionNames(plan *compositionPlan) (*compositionNames, error) {
 			if !exists {
 				return nil, fmt.Errorf("%w: composition name page is absent", ErrInvalid)
 			}
-			names, err = collector.page(part)
+			pageOnly, err := collector.page(part)
 			if err != nil {
 				return nil, &PartError{Part: part.name, Err: err}
 			}
+			visualCache[pageKey] = pageOnly
+			names = maps.Clone(pageOnly)
 			for name := range targets[strings.ToLower(original.Part)] {
 				if err := b.step(1); err != nil {
 					return nil, err
@@ -1242,6 +1263,7 @@ func newCompositionNames(plan *compositionPlan) (*compositionNames, error) {
 			}
 			pageCache[pageKey] = names
 		}
+		visualNames[index] = visualCache[pageKey]
 		fixed := false
 		for _, part := range []string{original.Part, source.documents[owner].Part, source.sequence} {
 			if err := b.step(1); err != nil {
@@ -1250,7 +1272,7 @@ func newCompositionNames(plan *compositionPlan) (*compositionNames, error) {
 			_, protected := plan.fixed[compositionPartKey{source: instance.source, part: strings.ToLower(part), document: -1, page: -1}]
 			fixed = fixed || protected
 		}
-		pages[index] = compositionNamePage{names: names, fixed: fixed}
+		pages[index] = compositionNamePage{names: maps.Clone(names), fixed: fixed}
 	}
 	visited := make([]bool, len(plan.pages))
 	for document, instance := range plan.documents {
@@ -1260,7 +1282,48 @@ func newCompositionNames(plan *compositionPlan) (*compositionNames, error) {
 			part := strings.ToLower(source.documents[instance.original].Part)
 			_, preserve = plan.fixed[compositionPartKey{source: instance.source, part: part, document: -1, page: -1}]
 			preserve = preserve || source.retained[part]
-			preserve = preserve && source.format == plan.format
+			sameDialect := source.sourceFormat == FormatUnknown || source.sourceFormat == plan.format
+			preserve = preserve && source.format == plan.format && sameDialect
+		}
+		if plan.format == FormatXPS {
+			type originTargetKey struct {
+				source   int
+				origDoc  int
+				targetID string
+			}
+			firstOrigPage := make(map[originTargetKey]int)
+			for _, page := range instance.pages {
+				pi := plan.pages[page]
+				src := plan.sources[pi.source]
+				if src.sourceFormat != FormatOpenXPS {
+					continue
+				}
+				for _, targetName := range pi.reference.LinkTargets {
+					k := originTargetKey{source: pi.source, origDoc: pageOwners[page], targetID: targetName}
+					if prev, ok := firstOrigPage[k]; !ok || pi.index < prev {
+						firstOrigPage[k] = pi.index
+					}
+				}
+			}
+			for _, page := range instance.pages {
+				pi := plan.pages[page]
+				src := plan.sources[pi.source]
+				if src.sourceFormat != FormatOpenXPS {
+					continue
+				}
+				for _, targetName := range pi.reference.LinkTargets {
+					k := originTargetKey{source: pi.source, origDoc: pageOwners[page], targetID: targetName}
+					if minIdx, ok := firstOrigPage[k]; ok && pi.index > minIdx {
+						if result.droppedTargets[page] == nil {
+							result.droppedTargets[page] = make(map[string]bool)
+						}
+						result.droppedTargets[page][targetName] = true
+						if !visualNames[page][targetName] {
+							delete(pages[page].names, targetName)
+						}
+					}
+				}
+			}
 		}
 		if err := result.document(plan.format, document, instance.pages, pages, plan.pages, visited, preserve); err != nil {
 			return nil, err
@@ -1403,7 +1466,11 @@ func (n *compositionNames) document(format Format, document int, order []int, pa
 // 返回: compositionNameCollector 名称收集器
 func newCompositionNameCollector(format Format, budget *compositionBudget) compositionNameCollector {
 	namespace := formatNamespace(format)
-	return compositionNameCollector{budget: budget, format: format, retain: true, mce: compatibilityProcessor{understood: map[string]bool{namespace: true, namespace + "/resourcedictionary-key": true, structureNamespace(format): true, mcNamespace: true, xmlNamespace: true}, context: budget.context}}
+	understood := map[string]bool{namespace: true, namespace + "/resourcedictionary-key": true, structureNamespace(format): true, mcNamespace: true, xmlNamespace: true}
+	if format == FormatOpenXPS {
+		understood[openXPS3DNamespace] = true
+	}
+	return compositionNameCollector{budget: budget, format: format, retain: true, mce: compatibilityProcessor{understood: understood, context: budget.context}}
 }
 
 // root 校验原始部件并计入扫描预算，不以过滤后的树替代保留标记
@@ -1436,7 +1503,7 @@ func (c *compositionNameCollector) root(part packagePart, local string) (*xmlEle
 		return nil, err
 	}
 	nodes := 0
-	tracker := newResourceMarkupScopeTracker(c.format, false, c.budget.context)
+	tracker := newResourceMarkupScopeTracker(c.format, c.format == FormatOpenXPS, c.budget.context)
 	root, err := decodeXMLVisit(part.data, c.budget.limits, func(token xml.Token, node *xmlElement) error {
 		if err := c.budget.step(1); err != nil {
 			return err
@@ -1661,10 +1728,10 @@ func (c *compositionNameCollector) document(part packagePart) (map[string]map[st
 	return result, nil
 }
 
-// newCompositionNavigation 独立保存名称映射并构造输出地址索引，尚未写出的资源仅登记地址身份
-// 入参: plan 输出规划, names 各页面实例的原名称到输出名称映射
+// newCompositionNavigation 独立保存名称映射与跨方言去重表并构造输出地址索引，尚未写出的资源仅登记地址身份
+// 入参: plan 输出规划, names 各页面实例的原名称到输出名称映射, dropped 各页面因跨方言同源去重移除的原LinkTarget集合
 // 返回: *compositionNavigation 地址改写器，失败为nil, error 名称、索引、预算或取消错误
-func newCompositionNavigation(plan *compositionPlan, names []map[string]string) (*compositionNavigation, error) {
+func newCompositionNavigation(plan *compositionPlan, names []map[string]string, dropped []map[string]bool) (*compositionNavigation, error) {
 	if len(names) != len(plan.pages) {
 		return nil, fmt.Errorf("%w: incomplete composition navigation names", ErrInvalid)
 	}
@@ -1693,6 +1760,9 @@ func newCompositionNavigation(plan *compositionPlan, names []map[string]string) 
 		for _, name := range plan.pages[i].reference.LinkTargets {
 			if err := plan.budget.step(1); err != nil {
 				return nil, err
+			}
+			if i < len(dropped) && dropped[i][name] {
+				continue
 			}
 			target, exists := c.pages[i][name]
 			if !exists {
@@ -2048,15 +2118,23 @@ func rewriteCompositionPrintResources(part packagePart, mapping map[string]strin
 		return nil, false, err
 	}
 	text := make(map[*xmlElement][]compositionPrintText)
+	var version uint32
 	root, err := decodeXMLVisitSpan(part.data, budget.limits, func(token xml.Token, node *xmlElement, start, end int64) error {
 		if err := budget.step(1); err != nil {
 			return err
 		}
 		switch token.(type) {
 		case xml.StartElement:
-			return compositionPrintRepresentable(node, capabilities)
+			if version == 0 {
+				if node.Name.Space == printFramework2NS {
+					version = 2
+				} else if node.Name.Space == printFrameworkNS {
+					version = 1
+				}
+			}
+			return compositionPrintRepresentable(node, version, capabilities)
 		case xml.CharData:
-			if node != nil && node.Name == (xml.Name{Space: printFrameworkNS, Local: "Value"}) {
+			if node != nil && compositionPrintValueNode(node, version) {
 				text[node] = append(text[node], compositionPrintText{start: int(start), end: int(end)})
 			}
 		}
@@ -2108,15 +2186,12 @@ func rewriteCompositionPrintResources(part packagePart, mapping map[string]strin
 		if canonical != target {
 			return nil, false, fmt.Errorf("%w: noncanonical print resource target", ErrInvalid)
 		}
-		node := root
-		for _, index := range reference.path {
-			if index < 0 || index >= len(node.Children) {
-				return nil, false, fmt.Errorf("%w: print resource rewrite path", ErrInvalid)
-			}
-			node = node.Children[index]
+		node, err := resolveCompositionPrintValueNode(root, reference.path, version, capabilities)
+		if err != nil {
+			return nil, false, err
 		}
 		originalURI, originalError := opcPartName(node.Text)
-		if node.Name != (xml.Name{Space: printFrameworkNS, Local: "Value"}) || originalError != nil || originalURI != reference.uri {
+		if !compositionPrintValueNode(node, version) || originalError != nil || originalURI != reference.uri {
 			return nil, false, fmt.Errorf("%w: print resource rewrite value", ErrInvalid)
 		}
 		if previous, exists := targets[node]; exists {
@@ -2162,25 +2237,119 @@ func rewriteCompositionPrintResources(part packagePart, mapping map[string]strin
 	return compositionPrintReplace(part.data, changes, maximum, intermediate, budget)
 }
 
-// compositionPrintRepresentable 校验打印文档节点是否可由标准模型表示，拒绝未知XML扩展与属性
-// 入参: node 已展开名称的节点, capabilities 是否为能力文档
-// 返回: error 未支持的元素或属性错误
-func compositionPrintRepresentable(node *xmlElement, capabilities bool) error {
-	if node.Name.Space != printFrameworkNS || printSettingKind(node.Name) == PrintSettingUnknown && node.Name.Local != "PrintTicket" && node.Name.Local != "PrintCapabilities" {
+// compositionPrintValueNode 判断XML节点是否为标准v1显式Value或v2可承载内联文本值的属性与参数节点
+// 入参: node 已展开名称的节点, version 框架版本号
+// 返回: bool 是否可承载标准打印资源URI文本
+func compositionPrintValueNode(node *xmlElement, version uint32) bool {
+	if version != 2 {
+		return printSettingKind(node.Name) == PrintSettingValue
+	}
+	kind, psf2, err := printSettingKindForVersion(node, version)
+	return err == nil && psf2 && (kind == PrintSettingProperty || kind == PrintSettingScoredProperty || kind == PrintSettingParameterInit)
+}
+
+// resolveCompositionPrintValueNode 将模型路径映射回原始打印XML节点，补偿PSF2的selectiontype与内联文本合成子节点偏移
+// 入参: root 原始打印XML根, path 模型子元素索引路径, version 框架版本号, capabilities 是否为能力文档
+// 返回: *xmlElement 原始XML值节点, error 路径越界或结构不匹配错误
+func resolveCompositionPrintValueNode(root *xmlElement, path []int, version uint32, capabilities bool) (*xmlElement, error) {
+	node := root
+	for step, idx := range path {
+		if step == 0 {
+			if idx < 0 || idx >= len(node.Children) {
+				return nil, fmt.Errorf("%w: print resource rewrite path", ErrInvalid)
+			}
+			node = node.Children[idx]
+			continue
+		}
+		kind, psf2, err := printSettingKindForVersion(node, version)
+		if err != nil {
+			return nil, err
+		}
+		synthetic := 0
+		if psf2 {
+			if capabilities && kind == PrintSettingFeature {
+				if _, hasSel := node.attributeNS(printFramework2NS, "selectiontype"); hasSel {
+					if idx == 0 {
+						return nil, fmt.Errorf("%w: print resource rewrite path", ErrInvalid)
+					}
+					synthetic++
+				}
+			}
+			inlineCapable := kind == PrintSettingProperty || kind == PrintSettingScoredProperty || kind == PrintSettingParameterInit
+			_, hasXSIType := node.attributeNS(xsiNamespace, "type")
+			if inlineCapable && (len(node.Children) == 0 || hasXSIType || !xmlWhitespace(node.Text)) {
+				if idx == synthetic {
+					if step == len(path)-1 {
+						return node, nil
+					}
+					return nil, fmt.Errorf("%w: print resource rewrite path", ErrInvalid)
+				}
+				synthetic++
+			}
+		}
+		xmlIdx := idx - synthetic
+		if xmlIdx < 0 || xmlIdx >= len(node.Children) {
+			return nil, fmt.Errorf("%w: print resource rewrite path", ErrInvalid)
+		}
+		node = node.Children[xmlIdx]
+	}
+	return node, nil
+}
+
+// compositionPrintRepresentable 校验打印文档节点是否可由标准Print Schema v1或v2模型表示，拒绝未知XML扩展与属性
+// 入参: node 已展开名称的节点, version 框架版本号, capabilities 是否为能力文档
+// 返回: error 未支持的元素、属性或非法psftype错误
+func compositionPrintRepresentable(node *xmlElement, version uint32, capabilities bool) error {
+	expectedRootNS := printFrameworkNS
+	if version == 2 {
+		expectedRootNS = printFramework2NS
+	}
+	if node.Name.Space == expectedRootNS && (node.Name.Local == "PrintTicket" || node.Name.Local == "PrintCapabilities") {
+		for _, attribute := range node.Attr {
+			if attribute.Name.Space == xmlnsNamespace || attribute.Name == (xml.Name{Local: "xmlns"}) {
+				continue
+			}
+			if attribute.Name.Space != "" || attribute.Name.Local != "version" {
+				return fmt.Errorf("%w: print resource XML attribute {%s}%s", ErrUnsupported, attribute.Name.Space, attribute.Name.Local)
+			}
+		}
+		return nil
+	}
+	if version == 0 {
 		return fmt.Errorf("%w: print resource XML extension {%s}%s", ErrUnsupported, node.Name.Space, node.Name.Local)
 	}
+	kind, psf2, err := printSettingKindForVersion(node, version)
+	if err != nil {
+		return err
+	}
+	if kind == PrintSettingUnknown {
+		return fmt.Errorf("%w: print resource XML extension {%s}%s", ErrUnsupported, node.Name.Space, node.Name.Local)
+	}
+	inlineCapable := psf2 && (kind == PrintSettingProperty || kind == PrintSettingScoredProperty || kind == PrintSettingParameterInit)
 	for _, attribute := range node.Attr {
 		if attribute.Name.Space == xmlnsNamespace || attribute.Name == (xml.Name{Local: "xmlns"}) {
 			continue
 		}
-		allowed := node.Name.Local == "Value" && attribute.Name == (xml.Name{Space: xsiNamespace, Local: "type"})
-		if attribute.Name.Space == "" {
-			switch node.Name.Local {
-			case "PrintTicket", "PrintCapabilities":
-				allowed = attribute.Name.Local == "version"
-			case "Value":
-			default:
-				allowed = attribute.Name.Local == "name" || capabilities && node.Name.Local == "Option" && attribute.Name.Local == "constrained"
+		allowed := false
+		if psf2 {
+			switch {
+			case attribute.Name == (xml.Name{Space: printFramework2NS, Local: "psftype"}):
+				allowed = true
+			case inlineCapable && attribute.Name == (xml.Name{Space: xsiNamespace, Local: "type"}):
+				allowed = true
+			case kind == PrintSettingOption && attribute.Name == (xml.Name{Space: printFramework2NS, Local: "default"}):
+				allowed = true
+			case capabilities && kind == PrintSettingOption && (attribute.Name == (xml.Name{Local: "constrained"}) || attribute.Name == (xml.Name{Space: printFramework2NS, Local: "constrained"})):
+				allowed = true
+			case capabilities && kind == PrintSettingFeature && attribute.Name == (xml.Name{Space: printFramework2NS, Local: "selectiontype"}):
+				allowed = true
+			}
+		} else {
+			allowed = kind == PrintSettingValue && attribute.Name == (xml.Name{Space: xsiNamespace, Local: "type"})
+			if attribute.Name.Space == "" {
+				if kind != PrintSettingValue {
+					allowed = attribute.Name.Local == "name" || capabilities && kind == PrintSettingOption && attribute.Name.Local == "constrained"
+				}
 			}
 		}
 		if !allowed {
@@ -2367,7 +2536,8 @@ func (g *compositionProtectionGraph) markup(part packagePart) error {
 		}
 	}
 	nodes := 0
-	tracker := newResourceMarkupScopeTracker(g.source.format, false, g.budget.context)
+	var printVersion uint32
+	tracker := newResourceMarkupScopeTracker(g.source.format, g.source.format == FormatOpenXPS, g.budget.context)
 	visit := func(token xml.Token, node *xmlElement) error {
 		if err := g.budget.step(1); err != nil {
 			return err
@@ -2396,7 +2566,14 @@ func (g *compositionProtectionGraph) markup(part packagePart) error {
 				return err
 			}
 			if knownPrint {
-				return compositionPrintRepresentable(node, capabilities)
+				if printVersion == 0 {
+					if node.Name.Space == printFramework2NS {
+						printVersion = 2
+					} else if node.Name.Space == printFrameworkNS {
+						printVersion = 1
+					}
+				}
+				return compositionPrintRepresentable(node, printVersion, capabilities)
 			}
 			if definition {
 				return g.definition(node)

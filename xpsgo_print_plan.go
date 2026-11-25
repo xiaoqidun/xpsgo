@@ -132,6 +132,7 @@ type printPlanPage struct {
 	index     int
 	document  int
 	layout    PrintLayout
+	rotation  Matrix
 	copies    int
 	force     bool
 	poster    int
@@ -150,6 +151,7 @@ type printPlanDocument struct {
 	direction         string
 	duplex            PrintDuplex
 	manual            bool
+	hasDuplex         bool
 	separate          bool
 	separateCopies    bool
 	finishing         PrintFinishing
@@ -337,7 +339,7 @@ func (s PrintSheet) BackFlipTransform() Matrix {
 	case PrintDuplexLongEdge:
 		rotate = s.Back.Width > s.Back.Height
 	case PrintDuplexShortEdge:
-		rotate = s.Back.Height >= s.Back.Width
+		rotate = s.Back.Height > s.Back.Width
 	}
 	if !rotate {
 		return IdentityMatrix()
@@ -471,6 +473,8 @@ func (b *printPlanBuilder) build() (*PrintPlan, error) {
 	if err != nil {
 		return nil, err
 	}
+	jobDuplexOpt, _, _ := control.option(job.Elements, "JobDuplexAllDocumentsContiguously")
+	jobHasDuplex := jobDuplexOpt != nil
 	var documents []printPlanDocument
 	var documentFinishing []PrintFinishing
 	first := 0
@@ -489,9 +493,19 @@ func (b *printPlanBuilder) build() (*PrintPlan, error) {
 	plan := &PrintPlan{JobFinishing: jobFinishing, DocumentFinishing: documentFinishing}
 	if jobFinishing.Binding == PrintBindingBooklet {
 		var jobPages []printPlanPage
+		bookletDuplex, bookletManual := duplex, manual
+		seenDocDuplex := false
+		var docDuplexMode PrintDuplex
+		var docManualMode bool
 		for _, document := range documents {
 			if len(document.pages) == 0 {
 				continue
+			}
+			if document.hasDuplex {
+				if seenDocDuplex && (docDuplexMode != document.duplex || docManualMode != document.manual) {
+					return nil, fmt.Errorf("%w: conflicting document duplex in job booklet", ErrUnsupported)
+				}
+				seenDocDuplex, docDuplexMode, docManualMode = true, document.duplex, document.manual
 			}
 			if document.collated {
 				for range document.copies {
@@ -524,9 +538,15 @@ func (b *printPlanBuilder) build() (*PrintPlan, error) {
 				}
 			}
 		}
+		if seenDocDuplex {
+			if jobHasDuplex && (duplex != docDuplexMode || manual != docManualMode) {
+				return nil, fmt.Errorf("%w: job and document duplex conflict in booklet", ErrUnsupported)
+			}
+			bookletDuplex, bookletManual = docDuplexMode, docManualMode
+		}
 		template := &PrintPlan{}
 		packer := printSheetPacker{builder: b, output: template, temporary: true}
-		if err := packer.bookletPages(jobPages, jobFinishing, duplex, manual); err != nil {
+		if err := packer.bookletPages(jobPages, jobFinishing, bookletDuplex, bookletManual); err != nil {
 			return nil, err
 		}
 		if err := b.copyDocument(plan, template.Sheets, copies, collated == "Collated"); err != nil {
@@ -874,13 +894,15 @@ func (b *printPlanBuilder) document(index int, source Document, first int, job *
 	if err != nil {
 		return result, err
 	}
+	docDuplexOpt, _, _ := control.option(model.Elements, "DocumentDuplex")
+	result.hasDuplex = docDuplexOpt != nil
 	if documentDuplex != PrintSimplex {
 		if duplex != PrintSimplex {
 			return result, fmt.Errorf("%w: simultaneous job and document duplex", ErrUnsupported)
 		}
 		result.duplex, result.manual, result.separate, result.separateCopies = documentDuplex, documentManual, true, true
 	} else if duplex != PrintSimplex {
-		if option, _, _ := control.option(model.Elements, "DocumentDuplex"); option != nil {
+		if docDuplexOpt != nil {
 			return result, fmt.Errorf("%w: document simplex conflicts with job duplex", ErrUnsupported)
 		}
 	}
@@ -989,11 +1011,12 @@ func (b *printPlanBuilder) page(index int, source string, document *PrintSetting
 	if err != nil {
 		return result, err
 	}
-	layout, err := layoutSettings.Layout(b.settings.context, page, b.options.Print.Media, &b.settings.PrintSettingsOptions)
+	layout, rotation, err := layoutSettings.layoutWithRotation(b.settings.context, page, b.options.Print.Media, &b.settings.PrintSettingsOptions)
 	if err != nil {
 		return result, err
 	}
 	result.layout = *layout
+	result.rotation = rotation
 	return result, nil
 }
 
@@ -1148,7 +1171,7 @@ func (s *printLayoutSettings) scored(option *PrintSetting, name string) (*PrintV
 		}
 		value, reference := printScoredValue(property.Children)
 		if reference != (xml.Name{}) {
-			value = s.values[reference]
+			value = s.values[printCanonicalKey(reference)]
 			if value == nil {
 				return nil, fmt.Errorf("%w: print plan parameter not initialized", ErrUnsupported)
 			}
@@ -1279,9 +1302,9 @@ func (p *printSheetPacker) document(document printPlanDocument) error {
 	return nil
 }
 
-// bookletPages 按标准骑马订小册子规则将页流补齐至四的倍数并生成双面对折拼版纸张
+// bookletPages 按标准骑马订小册子规则将页流补齐至四的倍数并生成双面对折拼版纸张，结合方向与翻页轴补偿背面槽位和旋转
 // 入参: pages 已展开的逻辑页流, finishing 小册子装订参数, duplex 显式双面方式，单面时默认改用短边双面, manual 是否手动双面
-// 返回: error 几何、容量或取消错误
+// 返回: error 几何、强制正面冲突、容量或取消错误
 func (p *printSheetPacker) bookletPages(pages []printPlanPage, finishing PrintFinishing, duplex PrintDuplex, manual bool) error {
 	if len(pages) == 0 {
 		return nil
@@ -1295,16 +1318,28 @@ func (p *printSheetPacker) bookletPages(pages []printPlanPage, finishing PrintFi
 		if err := p.builder.step(1); err != nil {
 			return err
 		}
-		frontSlots := [2]int{padded - 1 - 2*sheetIndex, 2 * sheetIndex}
-		backSlots := [2]int{2*sheetIndex + 1, padded - 2 - 2*sheetIndex}
-		ref := pages[frontSlots[1]]
-		front, err := p.bookletSide(pages, frontSlots, ref, finishing, duplex, false)
+		backCover, frontCover := padded-1-2*sheetIndex, 2*sheetIndex
+		insideFront, insideBack := 2*sheetIndex+1, padded-2-2*sheetIndex
+		ref := pages[frontCover]
+		frontSlots := [2]int{backCover, frontCover}
+		backSlots := [2]int{insideFront, insideBack}
+		if printBookletSwapVisual(ref) {
+			frontSlots = [2]int{frontCover, backCover}
+			backSlots = [2]int{insideBack, insideFront}
+		}
+		naturalRotate := ref.layout.Height > ref.layout.Width
+		actualRotate := duplex == PrintDuplexLongEdge && ref.layout.Width > ref.layout.Height || duplex == PrintDuplexShortEdge && ref.layout.Height > ref.layout.Width
+		compensateBack := actualRotate != naturalRotate
+		if compensateBack {
+			backSlots[0], backSlots[1] = backSlots[1], backSlots[0]
+		}
+		front, err := p.bookletSide(pages, frontSlots, ref, finishing, duplex, false, false)
 		if err != nil {
 			return err
 		}
 		var back *PrintSide
 		if backSlots[0] < len(pages) || backSlots[1] < len(pages) {
-			side, err := p.bookletSide(pages, backSlots, ref, finishing, duplex, true)
+			side, err := p.bookletSide(pages, backSlots, ref, finishing, duplex, true, compensateBack)
 			if err != nil {
 				return err
 			}
@@ -1318,15 +1353,69 @@ func (p *printSheetPacker) bookletPages(pages []printPlanPage, finishing PrintFi
 	return nil
 }
 
-// bookletSide 将小册子正反面的最多两个书帖槽位映射到折脊两侧的有效可打印区域，避开中心装订留白
-// 入参: pages 逻辑页流, slots 左右或上下槽位逻辑页序号, ref 纸张介质基准页, finishing 装订设置, duplex 双面方式, back 是否为背面
-// 返回: PrintSide 独立纸面, error 变换或范围错误
-func (p *printSheetPacker) bookletSide(pages []printPlanPage, slots [2]int, ref printPlanPage, finishing PrintFinishing, duplex PrintDuplex, back bool) (PrintSide, error) {
-	side := PrintSide{Width: ref.layout.Width, Height: ref.layout.Height, MediaClip: ref.layout.MediaClip, Color: ref.color}
+// printBookletSwapVisual 根据基准页介质折脊方向与纯方向旋转矩阵判断是否需交换物理槽位以保持视觉左封底右封面
+// 入参: ref 当前书帖纸张的基准页
+// 返回: bool 是否交换槽位0与槽位1
+func printBookletSwapVisual(ref printPlanPage) bool {
+	rot := ref.rotation
+	if rot.A == 0 && rot.B == 0 && rot.C == 0 && rot.D == 0 {
+		return false
+	}
+	if ref.layout.Height > ref.layout.Width {
+		return rot.B+rot.D < 0
+	}
+	return rot.A+rot.C < 0
+}
+
+// printColorModeRank 返回输出色彩模式的保真优先级，彩色高于灰度，灰度高于黑白单色
+// 入参: mode 输出色彩模式
+// 返回: int 优先级分值
+func printColorModeRank(mode PrintColorMode) int {
+	switch mode {
+	case PrintColorPreserve:
+		return 4
+	case PrintColorOriginal:
+		return 3
+	case PrintColorGrayscale:
+		return 2
+	case PrintColorMonochrome:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// printMergeBookletColor 合并小册子同面两槽位的输出色彩设置，优先保留更高色彩模式及更高位深
+// 入参: first 第一槽位色彩设置, second 第二槽位色彩设置
+// 返回: PrintColor 合并后的纸面色彩设置
+func printMergeBookletColor(first, second PrintColor) PrintColor {
+	rankFirst, rankSecond := printColorModeRank(first.Mode), printColorModeRank(second.Mode)
+	if rankSecond > rankFirst {
+		return second
+	}
+	if rankFirst > rankSecond {
+		return first
+	}
+	first.DeviceBitsPerPixel = max(first.DeviceBitsPerPixel, second.DeviceBitsPerPixel)
+	first.DriverBitsPerPixel = max(first.DriverBitsPerPixel, second.DriverBitsPerPixel)
+	return first
+}
+
+// bookletSide 将小册子正反面的最多两个书帖槽位映射到折脊两侧的有效可打印区域，避开中心装订留白并按需执行背面180度补偿旋转
+// 入参: pages 逻辑页流, slots 左右或上下槽位逻辑页序号, ref 纸张介质基准页, finishing 装订设置, duplex 双面方式, back 是否为背面, rotateBack 是否对背面槽位施加180度旋转补偿
+// 返回: PrintSide 独立纸面, error 强制正面冲突、变换或范围错误
+func (p *printSheetPacker) bookletSide(pages []printPlanPage, slots [2]int, ref printPlanPage, finishing PrintFinishing, duplex PrintDuplex, back, rotateBack bool) (PrintSide, error) {
+	side := PrintSide{Width: ref.layout.Width, Height: ref.layout.Height, MediaClip: ref.layout.MediaClip}
+	hasColor := false
 	for _, index := range slots {
-		if index < len(pages) {
+		if index >= len(pages) {
+			continue
+		}
+		if !hasColor {
 			side.Color = pages[index].color
-			break
+			hasColor = true
+		} else {
+			side.Color = printMergeBookletColor(side.Color, pages[index].color)
 		}
 	}
 	side.Gutter = printBindingGutter(finishing, side, duplex, back)
@@ -1336,8 +1425,11 @@ func (p *printSheetPacker) bookletSide(pages []printPlanPage, slots [2]int, ref 
 			continue
 		}
 		page := pages[index]
+		if back && page.force {
+			return PrintSide{}, fmt.Errorf("%w: PageForceFrontSide conflicts with booklet back side", ErrUnsupported)
+		}
 		if len(side.Pages) > 0 && !printSideColorTargetEqual(side, page.colorPlan) {
-			p.builder.addDiagnostic(Diagnostic{Element: "PageDestinationColorProfile", Message: "different target declarations start a separate print side"})
+			p.builder.addDiagnostic(Diagnostic{Element: "PageDestinationColorProfile", Message: "different target declarations share a booklet print side"})
 		}
 		target, clipBound := usable[slot], usable[slot]
 		if target.Width <= 0 || target.Height <= 0 {
@@ -1351,11 +1443,21 @@ func (p *printSheetPacker) bookletSide(pages []printPlanPage, slots [2]int, ref 
 			src = Rect{Width: page.layout.Width, Height: page.layout.Height}
 		}
 		factor := min(target.Width/src.Width, target.Height/src.Height)
-		mapping := Matrix{
-			A: factor,
-			D: factor,
-			E: target.X + (target.Width-factor*src.Width)/2 - factor*src.X,
-			F: target.Y + (target.Height-factor*src.Height)/2 - factor*src.Y,
+		var mapping Matrix
+		if rotateBack {
+			mapping = Matrix{
+				A: -factor,
+				D: -factor,
+				E: target.X + (target.Width+factor*src.Width)/2 + factor*src.X,
+				F: target.Y + (target.Height+factor*src.Height)/2 + factor*src.Y,
+			}
+		} else {
+			mapping = Matrix{
+				A: factor,
+				D: factor,
+				E: target.X + (target.Width-factor*src.Width)/2 - factor*src.X,
+				F: target.Y + (target.Height-factor*src.Height)/2 - factor*src.Y,
+			}
 		}
 		placement := PrintPlacement{
 			Page:          page.index,
@@ -1888,7 +1990,21 @@ func printSideGutterClip(media Rect, gutter *Rect) (*Geometry, error) {
 	return clip, nil
 }
 
-// renderNegativeColor 按指定合成空间执行负片反相，scRGB线性路径经非线性sRGB反相后再返回线性空间，sRGB路径保持预乘alpha与扩展范围
+// renderSignedLinearToSRGB 将带符号扩展色域线性分量按对称IEC 61966-2-1曲线编码为sRGB值
+// 入参: value 有限线性分量，允许小于零或大于一
+// 返回: float64 对应sRGB分量
+func renderSignedLinearToSRGB(value float64) float64 {
+	magnitude := math.Abs(value)
+	if magnitude == 1 {
+		return value
+	}
+	if magnitude <= 0.0031308 {
+		return 12.92 * value
+	}
+	return math.Copysign(1.055*math.Pow(magnitude, 1.0/2.4)-0.055, value)
+}
+
+// renderNegativeColor 按指定合成空间执行负片反相，scRGB路径使用对称扩展sRGB曲线无截断反相并返回线性空间，sRGB路径保持预乘alpha与扩展范围
 // 入参: value 当前工作空间预乘颜色, space 工作合成空间
 // 返回: renderColor 反相颜色, error 非法输入或算术范围错误
 func renderNegativeColor(value renderColor, space renderColorSpace) (renderColor, error) {
@@ -1901,7 +2017,7 @@ func renderNegativeColor(value renderColor, space renderColorSpace) (renderColor
 			return renderColor{}, nil
 		}
 		invert := func(channel float64) float64 {
-			return renderSRGBToLinear(1-renderLinearToSRGB(colorClamp(channel/value.a))) * value.a
+			return renderSignedSRGBToLinear(1-renderSignedLinearToSRGB(channel/value.a)) * value.a
 		}
 		result = renderColor{r: invert(value.r), g: invert(value.g), b: invert(value.b), a: value.a}
 	} else {

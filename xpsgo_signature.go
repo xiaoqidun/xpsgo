@@ -2434,11 +2434,11 @@ func signatureRelationshipXML(data []byte, transform SignatureTransform, limits 
 		}
 		return nil, fmt.Errorf("%w: relationship transform algorithm", ErrInvalid)
 	}
-	root, content, err := decodeXMLContent(data, limits, ctx)
+	root, err := decodeXMLVisit(data, limits, func(_ xml.Token, _ *xmlElement) error { return checkContext(ctx) })
 	if err != nil {
 		return nil, err
 	}
-	processor := compatibilityProcessor{understood: map[string]bool{mcNamespace: true, xmlNamespace: true, opcRelsNS: true}, context: ctx}
+	processor := compatibilityProcessor{understood: map[string]bool{mcNamespace: true, xmlNamespace: true, opcRelsNS: true}, ignorePreservation: true, context: ctx}
 	fragment, err := processor.element(root, compatibilityScope{})
 	if err != nil {
 		return nil, err
@@ -2512,21 +2512,16 @@ func signatureRelationshipXML(data []byte, transform SignatureTransform, limits 
 			selected = append(selected, relationship)
 		}
 	}
-	return signatureRelationshipOutput(content, selected, limit, ctx)
+	return signatureRelationshipOutput(selected, limit, ctx)
 }
 
-// signatureRelationshipOutput 按ISO/IEC 29500-2:2008输出仅使用关系默认命名空间的XML，补全TargetMode并清除根内非元素内容
-// 入参: content 根外词元, selected 排序筛选后的关系列表, limit 输出字节上限, ctx 取消Context
+// signatureRelationshipOutput 按ISO/IEC 29500-2:2008输出纯关系根元素与排序筛选后的关系，不保留根内外注释及处理指令
+// 入参: selected 排序筛选后的关系列表, limit 输出字节上限, ctx 取消Context
 // 返回: []byte 独立XML字节, error 序列化、预算或取消错误
-func signatureRelationshipOutput(content *xmlContentReader, selected []signatureRelationship, limit int64, ctx context.Context) ([]byte, error) {
+func signatureRelationshipOutput(selected []signatureRelationship, limit int64, ctx context.Context) ([]byte, error) {
 	var output bytes.Buffer
 	writer := packageOutput{writer: &output, context: ctx, limit: limit}
 	encoder := xml.NewEncoder(&writer)
-	for _, token := range content.before {
-		if err := encoder.EncodeToken(token); err != nil {
-			return nil, err
-		}
-	}
 	root := xml.StartElement{Name: xml.Name{Local: "Relationships"}, Attr: []xml.Attr{{Name: xml.Name{Local: "xmlns"}, Value: opcRelsNS}}}
 	if err := encoder.EncodeToken(root); err != nil {
 		return nil, err
@@ -2545,11 +2540,6 @@ func signatureRelationshipOutput(content *xmlContentReader, selected []signature
 	}
 	if err := encoder.EncodeToken(root.End()); err != nil {
 		return nil, err
-	}
-	for _, token := range content.after {
-		if err := encoder.EncodeToken(token); err != nil {
-			return nil, err
-		}
 	}
 	if err := encoder.Flush(); err != nil {
 		return nil, err

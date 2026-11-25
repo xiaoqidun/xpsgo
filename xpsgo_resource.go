@@ -143,14 +143,26 @@ type resourceMergeBudget struct {
 	context context.Context
 }
 
+// resourceAlternateState 保存单个mc:AlternateContent块在词元遍历期间的分支选择与ProcessContent包装深度
+type resourceAlternateState struct {
+	depth         int
+	selected      bool
+	sawFallback   bool
+	choices       int
+	contentDepths []int
+}
+
 // resourceMarkupScopeTracker 在词元遍历期间维护MCE作用域栈，识别合法可忽略及保留扩展
 type resourceMarkupScopeTracker struct {
-	format         Format
-	models         bool
-	processor      compatibilityProcessor
-	scopes         []compatibilityScope
-	ignoredDepth   int
-	preservedDepth int
+	format          Format
+	models          bool
+	selectAlternate bool
+	ignoreOnly      bool
+	processor       compatibilityProcessor
+	scopes          []compatibilityScope
+	ignoredDepth    int
+	preservedDepth  int
+	alternates      []resourceAlternateState
 }
 
 // ResourceRemoval 记录移除的标准资源及其逻辑字节数，包含一并移除的附属关系标记
@@ -861,7 +873,7 @@ func rewriteResourceAttribute(source string, node *xmlElement, attribute xml.Att
 // 返回: []byte 比较数据, string 需保留的部件身份，空值可跨部件比较, error XML、引用或预算错误
 func resourceDictionaryIdentity(part packagePart, format Format, limits Limits, budget *resourceMergeBudget, aliases map[string]string) ([]byte, string, error) {
 	scope := ""
-	tracker := newResourceMarkupScopeTracker(format, false, budget.context)
+	tracker := newResourceMarkupScopeTracker(format, format == FormatOpenXPS, budget.context)
 	_, err := decodeXMLVisit(part.data, limits, func(token xml.Token, node *xmlElement) error {
 		skip, mceScope, err := tracker.visit(token, node)
 		if err != nil {
@@ -891,7 +903,11 @@ func resourceDictionaryIdentity(part packagePart, format Format, limits Limits, 
 	if err != nil {
 		return nil, "", err
 	}
-	data, _, err := rewriteXMLAttributes(part.data, limits, budget.context, func(node *xmlElement, a xml.Attr) (string, bool, error) {
+	rewriteTracker := newResourceMarkupScopeTracker(format, format == FormatOpenXPS, budget.context)
+	data, _, err := rewriteXMLAttributes(part.data, limits, budget.context, nil, func(token xml.Token, node *xmlElement) (bool, error) {
+		skip, _, err := rewriteTracker.visit(token, node)
+		return skip, err
+	}, func(node *xmlElement, a xml.Attr) (string, bool, error) {
 		if err := budget.charge(1); err != nil {
 			return "", false, err
 		}
@@ -1108,13 +1124,13 @@ func resolveDictionaryNavigations(dictPart string, values, pageHosts []string, a
 // 入参: budget 扫描及遍历预算
 // 返回: *resourceReachability 已校验引用图, error 标记、引用或预算错误
 func (r *Reader) resourceReferenceGraph(budget *resourceMergeBudget) (*resourceReachability, error) {
-	return r.resourceReferenceGraphMode(budget, true)
+	return r.resourceReferenceGraphMode(budget, true, false)
 }
 
-// resourceReferenceGraphMode 构造原始部件引用图，可按需排除超链接导航边以供资源生存期校验使用
-// 入参: budget 扫描及遍历预算, includeNavigation 是否纳入FixedPage.NavigateUri及OutlineTarget导航边
+// resourceReferenceGraphMode 构造原始部件引用图，可按需排除超链接导航边并启用MCE分支选择供资源生存期校验使用
+// 入参: budget 扫描及遍历预算, includeNavigation 是否纳入FixedPage.NavigateUri及OutlineTarget导航边, selectAlternate 是否按标准MCE执行AlternateContent分支选择
 // 返回: *resourceReachability 已校验引用图, error 标记、引用或预算错误
-func (r *Reader) resourceReferenceGraphMode(budget *resourceMergeBudget, includeNavigation bool) (*resourceReachability, error) {
+func (r *Reader) resourceReferenceGraphMode(budget *resourceMergeBudget, includeNavigation, selectAlternate bool) (*resourceReachability, error) {
 	if err := budget.charge(len(r.pkg.parts)); err != nil {
 		return nil, err
 	}
@@ -1224,7 +1240,7 @@ func (r *Reader) resourceReferenceGraphMode(budget *resourceMergeBudget, include
 		}
 		dictionary := strings.EqualFold(media, resourceDictionaryContentType)
 		modelMarkup := false
-		tracker := newResourceMarkupScopeTracker(r.format, true, budget.context)
+		tracker := newResourceMarkupScopeTrackerWithAlternate(r.format, true, selectAlternate, budget.context)
 		root, err := decodeXMLVisit(data, r.limits, func(token xml.Token, node *xmlElement) error {
 			if discard {
 				if _, start := token.(xml.StartElement); !start {
@@ -1684,6 +1700,13 @@ func (r *Reader) hasResourceModels(budget *resourceMergeBudget) (bool, error) {
 // 入参: format 包格式, models 是否识别3D模型画刷, ctx 取消Context
 // 返回: *resourceMarkupScopeTracker 作用域跟踪器
 func newResourceMarkupScopeTracker(format Format, models bool, ctx context.Context) *resourceMarkupScopeTracker {
+	return newResourceMarkupScopeTrackerWithAlternate(format, models, false, ctx)
+}
+
+// newResourceMarkupScopeTrackerWithAlternate 创建可按标准MCE选择AlternateContent分支的词元级作用域跟踪器
+// 入参: format 包格式, models 是否识别3D模型画刷, selectAlternate 是否执行标准MCE分支选择跳过未选子树, ctx 取消Context
+// 返回: *resourceMarkupScopeTracker 作用域跟踪器
+func newResourceMarkupScopeTrackerWithAlternate(format Format, models, selectAlternate bool, ctx context.Context) *resourceMarkupScopeTracker {
 	namespace := formatNamespace(format)
 	understood := map[string]bool{
 		namespace:                             true,
@@ -1695,7 +1718,16 @@ func newResourceMarkupScopeTracker(format Format, models bool, ctx context.Conte
 	if models && format == FormatOpenXPS {
 		understood[openXPS3DNamespace] = true
 	}
-	return &resourceMarkupScopeTracker{format: format, models: models, processor: compatibilityProcessor{understood: understood, context: ctx}}
+	return &resourceMarkupScopeTracker{format: format, models: models, selectAlternate: selectAlternate, processor: compatibilityProcessor{understood: understood, context: ctx}}
+}
+
+// newResourceMarkupIgnoreTracker 创建仅跳过mc:Ignorable与mc:PreserveElements子树的词元级作用域跟踪器，保留全部AlternateContent分支供已校验主索引遍历与重写
+// 入参: format 包格式, models 是否识别3D模型画刷, ctx 取消Context
+// 返回: *resourceMarkupScopeTracker 作用域跟踪器
+func newResourceMarkupIgnoreTracker(format Format, models bool, ctx context.Context) *resourceMarkupScopeTracker {
+	tracker := newResourceMarkupScopeTrackerWithAlternate(format, models, false, ctx)
+	tracker.ignoreOnly = true
+	return tracker
 }
 
 // visit 跟踪词元进出栈的MCE作用域，放行合法可忽略扩展并校验保留元素内部MustUnderstand及属性规则
@@ -1704,13 +1736,38 @@ func newResourceMarkupScopeTracker(format Format, models bool, ctx context.Conte
 func (t *resourceMarkupScopeTracker) visit(token xml.Token, node *xmlElement) (bool, compatibilityScope, error) {
 	if _, end := token.(xml.EndElement); end {
 		if len(t.scopes) != 0 {
-			if t.ignoredDepth == len(t.scopes) {
+			curDepth := len(t.scopes)
+			if t.ignoredDepth == curDepth {
 				t.ignoredDepth = 0
 			}
-			if t.preservedDepth == len(t.scopes) {
+			if t.preservedDepth == curDepth {
 				t.preservedDepth = 0
 			}
-			t.scopes = t.scopes[:len(t.scopes)-1]
+			if t.selectAlternate && len(t.alternates) != 0 {
+				top := &t.alternates[len(t.alternates)-1]
+				if top.depth == curDepth {
+					choices := top.choices
+					t.alternates = t.alternates[:len(t.alternates)-1]
+					t.scopes = t.scopes[:curDepth-1]
+					if choices == 0 {
+						return false, compatibilityScope{}, fmt.Errorf("%w: AlternateContent requires a Choice", ErrInvalid)
+					}
+					return true, compatibilityScope{}, nil
+				}
+				if top.contentDepths[len(top.contentDepths)-1] == curDepth {
+					top.contentDepths = top.contentDepths[:len(top.contentDepths)-1]
+				}
+			}
+			t.scopes = t.scopes[:curDepth-1]
+		}
+		return true, compatibilityScope{}, nil
+	}
+	if data, ok := token.(xml.CharData); ok {
+		if t.selectAlternate && t.ignoredDepth == 0 && len(t.alternates) != 0 {
+			top := &t.alternates[len(t.alternates)-1]
+			if len(t.scopes) == top.contentDepths[len(top.contentDepths)-1] && len(compatibilityWords(string(data))) != 0 {
+				return false, compatibilityScope{}, fmt.Errorf("%w: text directly inside AlternateContent", ErrInvalid)
+			}
 		}
 		return true, compatibilityScope{}, nil
 	}
@@ -1741,6 +1798,100 @@ func (t *resourceMarkupScopeTracker) visit(token xml.Token, node *xmlElement) (b
 		t.scopes = append(t.scopes, scope)
 		return true, scope, nil
 	}
+	if t.selectAlternate && len(t.alternates) != 0 {
+		top := &t.alternates[len(t.alternates)-1]
+		if len(t.scopes) == top.contentDepths[len(top.contentDepths)-1] {
+			isBranch := node.Name.Space == mcNamespace && (node.Name.Local == "Choice" || node.Name.Local == "Fallback")
+			scope, err := t.processor.rulesChecked(node, inherited, !isBranch)
+			if err != nil {
+				return false, scope, err
+			}
+			t.scopes = append(t.scopes, scope)
+			if !t.processor.understood[node.Name.Space] {
+				if !scope.ignorable[node.Name.Space] {
+					return false, scope, fmt.Errorf("%w: AlternateContent child namespace %q", ErrUnsupported, node.Name.Space)
+				}
+				if scope.processes(node.Name) {
+					if err := compatibilityNoXMLContext(node); err != nil {
+						return false, scope, err
+					}
+					if err := t.processor.validateAttributes(node, scope, false); err != nil {
+						return false, scope, err
+					}
+					top.contentDepths = append(top.contentDepths, len(t.scopes))
+					return true, scope, nil
+				}
+				if scope.preservesElement(node.Name) {
+					if err := t.processor.validateAttributes(node, scope, false); err != nil {
+						return false, scope, err
+					}
+					t.preservedDepth = len(t.scopes)
+				}
+				t.ignoredDepth = len(t.scopes)
+				return true, scope, nil
+			}
+			if !isBranch {
+				return false, scope, fmt.Errorf("%w: unexpected AlternateContent child %s", ErrInvalid, node.Name.Local)
+			}
+			if err := t.processor.validateAttributes(node, scope, true); err != nil {
+				return false, scope, err
+			}
+			selectable := true
+			if node.Name.Local == "Choice" {
+				if top.sawFallback {
+					return false, scope, fmt.Errorf("%w: Choice follows Fallback", ErrInvalid)
+				}
+				top.choices++
+				requires, ok := node.attributeNS("", "Requires")
+				if !ok {
+					return false, scope, fmt.Errorf("%w: Choice requires an unqualified Requires attribute", ErrInvalid)
+				}
+				uris, err := compatibilityPrefixes(node, requires)
+				if err != nil {
+					return false, scope, err
+				}
+				if len(uris) == 0 {
+					return false, scope, fmt.Errorf("%w: empty Choice Requires", ErrInvalid)
+				}
+				for _, uri := range uris {
+					if !t.processor.understood[uri] {
+						selectable = false
+					}
+				}
+			} else {
+				if top.sawFallback || top.choices == 0 {
+					return false, scope, fmt.Errorf("%w: Fallback must occur once after all Choices", ErrInvalid)
+				}
+				top.sawFallback = true
+			}
+			if !top.selected && selectable {
+				if value, ok := node.attributeNS(mcNamespace, "MustUnderstand"); ok {
+					if err := t.processor.checkMustUnderstand(node, value); err != nil {
+						return false, scope, err
+					}
+				}
+				top.selected = true
+				return true, scope, nil
+			}
+			t.ignoredDepth = len(t.scopes)
+			return true, scope, nil
+		}
+	}
+	if t.selectAlternate && node.Name.Space == mcNamespace {
+		if node.Name.Local != "AlternateContent" {
+			return false, compatibilityScope{}, fmt.Errorf("%w: unexpected MCE element %s", ErrInvalid, node.Name.Local)
+		}
+		scope, err := t.processor.rulesChecked(node, inherited, true)
+		if err != nil {
+			return false, scope, err
+		}
+		if err := t.processor.validateAttributes(node, scope, true); err != nil {
+			return false, scope, err
+		}
+		t.scopes = append(t.scopes, scope)
+		t.alternates = append(t.alternates, resourceAlternateState{depth: len(t.scopes), contentDepths: []int{len(t.scopes)}})
+		return true, scope, nil
+	}
 	isControl := node.Name.Space == mcNamespace
 	isBranch := isControl && (node.Name.Local == "Choice" || node.Name.Local == "Fallback")
 	scope, err := t.processor.rulesChecked(node, inherited, !isBranch)
@@ -1769,6 +1920,9 @@ func (t *resourceMarkupScopeTracker) visit(token xml.Token, node *xmlElement) (b
 		}
 		t.ignoredDepth = len(t.scopes)
 		return true, scope, nil
+	}
+	if t.ignoreOnly {
+		return false, scope, nil
 	}
 	if err := validateResourceMarkupScope(node, t.format, t.models, scope); err != nil {
 		return false, scope, err
@@ -2102,7 +2256,11 @@ func (p *Package) DeduplicateResources(ctx context.Context, options *Optimizatio
 		if opcRelationshipName(name) {
 			updated, changed, err = resourceRelationshipTargets(relationshipSource(name), data, aliases, p.limits, &budget)
 		} else {
-			updated, changed, err = rewriteXMLAttributes(data, p.limits, ctx, func(node *xmlElement, attribute xml.Attr) (string, bool, error) {
+			rewriteTracker := newResourceMarkupScopeTracker(p.format, p.format == FormatOpenXPS, ctx)
+			updated, changed, err = rewriteXMLAttributes(data, p.limits, ctx, nil, func(token xml.Token, node *xmlElement) (bool, error) {
+				skip, _, err := rewriteTracker.visit(token, node)
+				return skip, err
+			}, func(node *xmlElement, attribute xml.Attr) (string, bool, error) {
 				if err := budget.charge(1); err != nil {
 					return "", false, err
 				}

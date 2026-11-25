@@ -806,23 +806,23 @@ func parseDiscardControl(root *xmlElement, part, namespace string, step func() e
 	return result, nil
 }
 
-// validateDiscardLifetime 校验图形资源在哨兵页及后续页面不再被引用，无法证明安全时返回ErrUnsupported
-// 入参: control 已解析提示, ctx 取消Context
-// 返回: error 过早释放、未知引用语义、预算或取消错误
-func (r *Reader) validateDiscardLifetime(control *DiscardControl, ctx context.Context) error {
-	budget := resourceMergeBudget{bytes: r.limits.MaxPackageBytes, work: r.limits.MaxXMLNodes, seen: make(map[string]bool), context: ctx}
-	graph, err := r.resourceReferenceGraphMode(&budget, false)
+// discardResourceLifetimes 计算包内页面索引、各资源最晚使用页号以及不可追踪X3D模型的最晚活跃页号
+// 入参: budget 共享资源遍历预算
+// 返回: *resourceReachability 资源引用图, map[string]int 页面小写URI到页号映射, map[string]int 资源小写URI到最晚使用页号映射, int 不确定X3D最晚页号, error 解析、预算或取消错误
+func (r *Reader) discardResourceLifetimes(budget *resourceMergeBudget) (*resourceReachability, map[string]int, map[string]int, int, error) {
+	graph, err := r.resourceReferenceGraphMode(budget, false, true)
 	if err != nil {
-		return err
+		return nil, nil, nil, -1, err
 	}
 	last := make(map[string]int)
 	uncertain := -1
-	pages := make(map[string]int)
+	pages := make(map[string]int, len(r.pages))
 	for index, page := range r.pages {
-		pages[strings.ToLower(page.Part)] = index
-		seen, err := graph.reachableFrom(map[string]bool{strings.ToLower(page.Part): true}, false)
+		pageKey := strings.ToLower(page.Part)
+		pages[pageKey] = index
+		seen, err := graph.reachableFrom(map[string]bool{pageKey: true}, false)
 		if err != nil {
-			return err
+			return nil, nil, nil, -1, err
 		}
 		for key := range seen {
 			last[key] = index
@@ -830,6 +830,78 @@ func (r *Reader) validateDiscardLifetime(control *DiscardControl, ctx context.Co
 				uncertain = index
 			}
 		}
+	}
+	recordScope := func(source string, scopeLast int) error {
+		if scopeLast < 0 || source == "" {
+			return nil
+		}
+		sourceKey := strings.ToLower(source)
+		if prev, exists := last[sourceKey]; !exists || scopeLast > prev {
+			last[sourceKey] = scopeLast
+		}
+		relations, err := r.pkg.relationships(source)
+		if err != nil {
+			return err
+		}
+		restrictedType := formatNamespace(r.format) + "/restricted-font"
+		roots := make(map[string]bool)
+		for _, relation := range relations {
+			if relation.Type == restrictedType || relation.TargetMode != "" && relation.TargetMode != TargetModeInternal {
+				continue
+			}
+			target, err := resolvePart(source, relation.Target)
+			if err != nil {
+				return err
+			}
+			roots[strings.ToLower(target)] = true
+		}
+		if len(roots) == 0 {
+			return nil
+		}
+		seen, err := graph.reachableFrom(roots, false)
+		if err != nil {
+			return err
+		}
+		for key := range seen {
+			if prev, exists := last[key]; !exists || scopeLast > prev {
+				last[key] = scopeLast
+			}
+			if graph.models[key] && scopeLast > uncertain {
+				uncertain = scopeLast
+			}
+		}
+		return nil
+	}
+	for _, doc := range r.documents {
+		if len(doc.Pages) == 0 {
+			continue
+		}
+		docLast := -1
+		for _, page := range doc.Pages {
+			if idx, ok := pages[strings.ToLower(page.Part)]; ok && idx > docLast {
+				docLast = idx
+			}
+		}
+		if err := recordScope(doc.Part, docLast); err != nil {
+			return nil, nil, nil, -1, err
+		}
+	}
+	if len(r.pages) != 0 {
+		if err := recordScope(r.sequence, len(r.pages)-1); err != nil {
+			return nil, nil, nil, -1, err
+		}
+	}
+	return graph, pages, last, uncertain, nil
+}
+
+// validateDiscardLifetime 校验图形及页面与文档关联部件在哨兵页及后续页面不再被引用，无法证明安全时返回ErrUnsupported
+// 入参: control 已解析提示, ctx 取消Context
+// 返回: error 过早释放、未知引用语义、预算或取消错误
+func (r *Reader) validateDiscardLifetime(control *DiscardControl, ctx context.Context) error {
+	budget := resourceMergeBudget{bytes: r.limits.MaxPackageBytes, work: r.limits.MaxXMLNodes, seen: make(map[string]bool), context: ctx}
+	graph, pages, last, uncertain, err := r.discardResourceLifetimes(&budget)
+	if err != nil {
+		return err
 	}
 	for _, hint := range control.Hints {
 		if err := budget.charge(1); err != nil {
@@ -839,17 +911,15 @@ func (r *Reader) validateDiscardLifetime(control *DiscardControl, ctx context.Co
 		if err != nil {
 			return err
 		}
-		if !graphicResourceMedia(media) && !graph.models[strings.ToLower(hint.Target)] {
-			continue
-		}
 		sentinel, exists := pages[strings.ToLower(hint.SentinelPage)]
 		if !exists {
 			return fmt.Errorf("%w: discard sentinel is not a fixed page", ErrInvalid)
 		}
-		if index, used := last[strings.ToLower(hint.Target)]; used && index >= sentinel {
+		targetKey := strings.ToLower(hint.Target)
+		if index, used := last[targetKey]; used && index >= sentinel {
 			return &PartError{Part: hint.Target, Err: fmt.Errorf("%w: discard precedes last resource use", ErrInvalid)}
 		}
-		if uncertain >= sentinel {
+		if (graphicResourceMedia(media) || graph.models[targetKey]) && uncertain >= sentinel {
 			return &PartError{Part: hint.Target, Err: fmt.Errorf("%w: resource lifetime depends on opaque X3D content", ErrUnsupported)}
 		}
 	}

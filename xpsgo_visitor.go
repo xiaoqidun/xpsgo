@@ -1308,19 +1308,22 @@ func (w *sceneWalker) bitmapGlyphYMax(ctx context.Context, source *fontSource, g
 		x, y = y, x
 	}
 	x, y = x*glyphs.FontRenderingEmSize, y*glyphs.FontRenderingEmSize
-	px, py := math.Round(x), math.Round(y)
 	var strike *fontBitmapStrike
 	scaleY := 1.0
 	var ppemY uint8
-	if geometryFinite(x, y) && px >= 1 && py >= 1 && px <= 255 && py <= 255 && math.Abs(x-px) <= 1e-9 && math.Abs(y-py) <= 1e-9 {
-		selection, present, err := source.selectBitmapStrikeWithWork(uint16(px), uint16(py), false, charge)
-		if err != nil {
-			return nil, err
-		}
-		if present {
-			strike = &source.bitmaps.strikes[selection.strike]
-			scaleY = selection.scaleY
-			ppemY = selection.ppemY
+	hasTarget := geometryFinite(x, y) && x > 0 && y > 0
+	if hasTarget {
+		px, py := math.Round(x), math.Round(y)
+		if px >= 1 && py >= 1 && px <= 255 && py <= 255 && math.Abs(x-px) <= 1e-9 && math.Abs(y-py) <= 1e-9 {
+			selection, present, err := source.selectBitmapStrikeWithWork(uint16(px), uint16(py), true, charge)
+			if err != nil {
+				return nil, err
+			}
+			if present {
+				strike = &source.bitmaps.strikes[selection.strike]
+				scaleY = selection.scaleY
+				ppemY = selection.ppemY
+			}
 		}
 	}
 	if strike == nil {
@@ -1330,26 +1333,38 @@ func (w *sceneWalker) bitmapGlyphYMax(ctx context.Context, source *fontSource, g
 		if source.bitmaps == nil || len(source.bitmaps.strikes) == 0 {
 			return nil, fmt.Errorf("%w: no matching bitmap strike", ErrUnsupported)
 		}
+		if err := charge(uint64(len(source.bitmaps.strikes))); err != nil {
+			return nil, err
+		}
 		bestDist := math.Inf(1)
-		for i := range source.bitmaps.strikes {
-			candidate := &source.bitmaps.strikes[i]
-			if candidate.ppemY == 0 {
-				continue
+		for _, matchDirection := range []bool{true, false} {
+			for i := range source.bitmaps.strikes {
+				candidate := &source.bitmaps.strikes[i]
+				if candidate.ppemX == 0 || candidate.ppemY == 0 {
+					continue
+				}
+				if matchDirection && candidate.flags&fontBitmapFlagVertical == 0 {
+					continue
+				}
+				dist := 0.0
+				if hasTarget {
+					dist = math.Hypot(float64(candidate.ppemX)-x, float64(candidate.ppemY)-y)
+				}
+				if strike == nil || dist < bestDist {
+					strike = candidate
+					ppemY = candidate.ppemY
+					bestDist = dist
+				}
 			}
-			dist := 0.0
-			if geometryFinite(x, y) {
-				dist = math.Hypot(float64(candidate.ppemX)-x, float64(candidate.ppemY)-y)
-			}
-			if strike == nil || dist < bestDist {
-				strike = candidate
-				ppemY = candidate.ppemY
-				bestDist = dist
+			if strike != nil {
+				break
 			}
 		}
 	}
 	if strike == nil || ppemY == 0 {
 		return nil, fmt.Errorf("%w: no matching bitmap strike", ErrUnsupported)
 	}
+	fallback := float64(source.metrics.hhea.ascender)
 	return func(gid uint16) (float64, error) {
 		if err := checkContext(ctx); err != nil {
 			return 0, err
@@ -1359,17 +1374,23 @@ func (w *sceneWalker) bitmapGlyphYMax(ctx context.Context, source *fontSource, g
 			return 0, fmt.Errorf("%w: selected bitmap glyph %d is absent", ErrUnsupported, gid)
 		}
 		entry := strike.entries[i]
+		if !entry.fixed && entry.start == entry.end {
+			return 0, nil
+		}
 		metrics, _, err := strike.imageMetrics(entry, source.bitmaps.data[entry.start:entry.end])
 		if err != nil {
 			return 0, err
 		}
-		if metrics.hasVertical {
+		if metrics.width == 0 || metrics.height == 0 {
 			return 0, nil
 		}
-		if !metrics.hasHorizontal {
-			return 0, fmt.Errorf("%w: bitmap glyph has no positioning metrics", ErrUnsupported)
+		if metrics.hasHorizontal {
+			return math.Round(float64(metrics.horizontal.bearingY)*scaleY) * float64(source.metrics.unitsPerEm) / float64(ppemY), nil
 		}
-		return math.Round(float64(metrics.horizontal.bearingY)*scaleY) * float64(source.metrics.unitsPerEm) / float64(ppemY), nil
+		if metrics.hasVertical {
+			return fallback - math.Round(float64(metrics.vertical.bearingY)*scaleY)*float64(source.metrics.unitsPerEm)/float64(ppemY), nil
+		}
+		return 0, fmt.Errorf("%w: bitmap glyph has no positioning metrics", ErrUnsupported)
 	}, nil
 }
 

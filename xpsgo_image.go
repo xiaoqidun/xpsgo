@@ -78,6 +78,8 @@ type rasterImage struct {
 	profileCompressed bool
 	cicp              *imageCICP
 	gammaChroma       *imageGammaChroma
+	srgb              bool
+	hdrPeakNits       float64
 	transform         *iccTransform
 	selectedProfile   *iccProfile
 	associatedProfile bool
@@ -126,7 +128,7 @@ type ImageResource struct {
 	source      *rasterImage
 }
 
-// rasterMetadata 保存图像分辨率、原生通道数、内嵌配置文件、CICP及伽马色度元数据
+// rasterMetadata 保存图像分辨率、原生通道数、内嵌配置文件、CICP、sRGB、HDR峰值及伽马色度元数据
 type rasterMetadata struct {
 	dpi                Point
 	channels           int
@@ -134,6 +136,8 @@ type rasterMetadata struct {
 	profileCompressed  bool
 	cicp               *imageCICP
 	gammaChroma        *imageGammaChroma
+	srgb               bool
+	hdrPeakNits        float64
 	jpegProcess        byte
 	jpegJFIF           bool
 	jpegAdobe          bool
@@ -278,7 +282,7 @@ func decodeRasterImageWithMemory(ctx context.Context, data []byte, media string,
 	if decoded.Bounds() != image.Rect(0, 0, config.Width, config.Height) {
 		return nil, fmt.Errorf("%w: inconsistent decoded image dimensions", ErrInvalid)
 	}
-	out := &rasterImage{pixels: decoded, dpi: metadata.dpi, channels: metadata.channels, profile: metadata.profile, profileCompressed: metadata.profileCompressed, cicp: metadata.cicp, gammaChroma: metadata.gammaChroma}
+	out := &rasterImage{pixels: decoded, dpi: metadata.dpi, channels: metadata.channels, profile: metadata.profile, profileCompressed: metadata.profileCompressed, cicp: metadata.cicp, gammaChroma: metadata.gammaChroma, srgb: metadata.srgb, hdrPeakNits: metadata.hdrPeakNits}
 	if metadata.jpegOrientation > 1 {
 		applyTIFFOrientation(out, metadata.jpegOrientation)
 	}
@@ -517,7 +521,7 @@ func (r *ImageResource) Sample(x, y int, components []float64) (float64, error) 
 	return float64(value.A) / 65535, nil
 }
 
-// pngImageMetadata 读取分辨率、CICP色彩编码、内嵌配置文件与gAMA/cHRM，按PNG第三版规则校验块顺序与优先级
+// pngImageMetadata 读取分辨率、CICP色彩编码、sRGB、HDR亮度块、内嵌配置文件与gAMA/cHRM，按PNG第三版规则校验块顺序与优先级
 // 入参: data 完整PNG数据
 // 返回: rasterMetadata 图像元数据, error 数据或资源错误
 func pngImageMetadata(data []byte) (rasterMetadata, error) {
@@ -526,8 +530,9 @@ func pngImageMetadata(data []byte) (rasterMetadata, error) {
 		return rasterMetadata{}, fmt.Errorf("%w: PNG signature", ErrInvalid)
 	}
 	seen := false
-	profileSeen, srgbSeen, cicpSeen, gamaSeen, chrmSeen, paletteSeen, imageSeen := false, false, false, false, false, false, false
+	profileSeen, srgbSeen, cicpSeen, gamaSeen, chrmSeen, mdcvSeen, clliSeen, paletteSeen, imageSeen := false, false, false, false, false, false, false, false, false
 	var gammaChroma imageGammaChroma
+	var mdcvMaxNits, clliMaxNits float64
 	for pos := uint64(8); pos < uint64(len(data)); {
 		if uint64(len(data))-pos < 12 {
 			return rasterMetadata{}, fmt.Errorf("%w: truncated PNG chunk", ErrInvalid)
@@ -559,6 +564,39 @@ func pngImageMetadata(data []byte) (rasterMetadata, error) {
 			}
 			cicpSeen = true
 			metadata.cicp = &imageCICP{primaries: chunk[4], transfer: chunk[5], matrix: chunk[6], fullRange: chunk[7] == 1}
+		case "mDCV":
+			if mdcvSeen || paletteSeen || imageSeen || size != 24 {
+				return rasterMetadata{}, fmt.Errorf("%w: PNG mDCV chunk", ErrInvalid)
+			}
+			for i := range 4 {
+				cx := binary.BigEndian.Uint16(chunk[4+i*4:])
+				cy := binary.BigEndian.Uint16(chunk[6+i*4:])
+				if cx > 50000 || cy > 50000 || uint32(cx)+uint32(cy) > 50000 {
+					return rasterMetadata{}, fmt.Errorf("%w: PNG mDCV chromaticity", ErrInvalid)
+				}
+			}
+			maxLum := binary.BigEndian.Uint32(chunk[20:])
+			minLum := binary.BigEndian.Uint32(chunk[24:])
+			if minLum > maxLum || maxLum > 0 && minLum == maxLum {
+				return rasterMetadata{}, fmt.Errorf("%w: PNG mDCV luminance", ErrInvalid)
+			}
+			mdcvSeen = true
+			if maxLum > 0 {
+				mdcvMaxNits = float64(maxLum) / 10000
+			}
+		case "cLLI":
+			if clliSeen || paletteSeen || imageSeen || size != 8 {
+				return rasterMetadata{}, fmt.Errorf("%w: PNG cLLI chunk", ErrInvalid)
+			}
+			maxCLL := binary.BigEndian.Uint32(chunk[4:])
+			maxFALL := binary.BigEndian.Uint32(chunk[8:])
+			if maxCLL > 0 && maxFALL > maxCLL {
+				return rasterMetadata{}, fmt.Errorf("%w: PNG cLLI luminance", ErrInvalid)
+			}
+			clliSeen = true
+			if maxCLL > 0 {
+				clliMaxNits = float64(maxCLL) / 10000
+			}
 		case "pHYs":
 			if seen || imageSeen || size != 9 || chunk[12] > 1 {
 				return rasterMetadata{}, fmt.Errorf("%w: PNG physical dimensions", ErrInvalid)
@@ -589,6 +627,7 @@ func pngImageMetadata(data []byte) (rasterMetadata, error) {
 				return rasterMetadata{}, fmt.Errorf("%w: PNG sRGB chunk", ErrInvalid)
 			}
 			srgbSeen = true
+			metadata.srgb = true
 		case "gAMA":
 			if gamaSeen || paletteSeen || imageSeen || size != 4 {
 				return rasterMetadata{}, fmt.Errorf("%w: PNG gAMA chunk", ErrInvalid)
@@ -632,6 +671,11 @@ func pngImageMetadata(data []byte) (rasterMetadata, error) {
 			if size != 0 || pos+12 != uint64(len(data)) {
 				return rasterMetadata{}, fmt.Errorf("%w: PNG ending", ErrInvalid)
 			}
+			if clliMaxNits > 0 {
+				metadata.hdrPeakNits = clliMaxNits
+			} else if mdcvMaxNits > 0 {
+				metadata.hdrPeakNits = mdcvMaxNits
+			}
 			if !imageCICPUsable(metadata.cicp) && !profileSeen && !srgbSeen && (gamaSeen || chrmSeen) {
 				gc := gammaChroma
 				metadata.gammaChroma = &gc
@@ -643,7 +687,7 @@ func pngImageMetadata(data []byte) (rasterMetadata, error) {
 	return rasterMetadata{}, fmt.Errorf("%w: missing PNG ending", ErrInvalid)
 }
 
-// jpegImageMetadata 按EXIF优先于JFIF解析分辨率与方向，并按片段序号合并内嵌ICC配置文件
+// jpegImageMetadata 按绝对物理单位EXIF优先于JFIF解析分辨率与方向，并按片段序号合并内嵌ICC配置文件
 // 入参: data 完整JPEG数据, maxProfileBytes 配置文件字节上限
 // 返回: rasterMetadata 图像元数据, error 标记、元数据或资源错误
 func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, error) {
@@ -652,7 +696,7 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 	}
 	metadata := rasterMetadata{dpi: Point{96, 96}}
 	var exif Point
-	hasExif, hasOrient := false, false
+	hasExif, exifAbsolute, jfifAbsolute, hasOrient := false, false, false, false
 	var profiles [256][]byte
 	profileCount, profileSize := 0, int64(0)
 	entropy := false
@@ -677,7 +721,7 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 		}
 		entropy = false
 		if marker == 0xd9 {
-			if hasExif {
+			if hasExif && (exifAbsolute || !jfifAbsolute) {
 				metadata.dpi = exif
 			}
 			if profileCount != 0 {
@@ -723,26 +767,28 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 			}
 			if unit == 0 {
 				metadata.dpi = Point{96, 96 * (float64(y) / float64(x))}
+				jfifAbsolute = false
 			} else {
 				factor := 1.0
 				if unit == 2 {
 					factor = 2.54
 				}
 				metadata.dpi = Point{float64(x) * factor, float64(y) * factor}
+				jfifAbsolute = true
 			}
 		case marker == 0xee && len(payload) >= 12 && bytes.HasPrefix(payload, []byte("Adobe")):
 			metadata.jpegAdobe = true
 			metadata.jpegAdobeTransform = payload[11]
 		case marker == 0xe1 && bytes.HasPrefix(payload, []byte("Exif\x00\x00")):
-			value, present, orientation, hasOrientation, err := exifImageMetadata(payload[6:])
+			value, present, absolute, orientation, hasOrientation, err := exifImageMetadata(payload[6:])
 			if err != nil {
 				return rasterMetadata{}, err
 			}
 			if present {
-				if hasExif && exif != value {
+				if hasExif && (exif != value || exifAbsolute != absolute) {
 					return rasterMetadata{}, fmt.Errorf("%w: conflicting EXIF resolution", ErrInvalid)
 				}
-				exif, hasExif = value, true
+				exif, hasExif, exifAbsolute = value, true, absolute
 			}
 			if hasOrientation {
 				if hasOrient && metadata.jpegOrientation != orientation {
@@ -770,13 +816,13 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 	return rasterMetadata{}, fmt.Errorf("%w: truncated JPEG", ErrInvalid)
 }
 
-// exifImageMetadata 从EXIF首个图像目录读取物理分辨率、无单位纵横比与方向Tag 274
+// exifImageMetadata 从EXIF首个图像目录读取分辨率、绝对物理单位标志与方向Tag 274
 // 入参: data 去除EXIF前缀的TIFF数据
-// 返回: Point 分辨率, bool 是否指定分辨率, uint32 方向编号, bool 是否声明方向, error 目录或数值错误
-func exifImageMetadata(data []byte) (Point, bool, uint32, bool, error) {
+// 返回: Point 分辨率, bool 是否指定分辨率, bool 是否具备绝对物理单位, uint32 方向编号, bool 是否声明方向, error 目录或数值错误
+func exifImageMetadata(data []byte) (Point, bool, bool, uint32, bool, error) {
 	invalid := fmt.Errorf("%w: EXIF resolution metadata", ErrInvalid)
 	if len(data) < 8 {
-		return Point{}, false, 0, false, invalid
+		return Point{}, false, false, 0, false, invalid
 	}
 	var order binary.ByteOrder
 	switch string(data[:2]) {
@@ -785,18 +831,18 @@ func exifImageMetadata(data []byte) (Point, bool, uint32, bool, error) {
 	case "MM":
 		order = binary.BigEndian
 	default:
-		return Point{}, false, 0, false, invalid
+		return Point{}, false, false, 0, false, invalid
 	}
 	if order.Uint16(data[2:]) != 42 {
-		return Point{}, false, 0, false, invalid
+		return Point{}, false, false, 0, false, invalid
 	}
 	pos := uint64(order.Uint32(data[4:]))
 	if pos < 8 || pos > uint64(len(data))-2 {
-		return Point{}, false, 0, false, invalid
+		return Point{}, false, false, 0, false, invalid
 	}
 	count := uint64(order.Uint16(data[pos:]))
 	if count*12+6 > uint64(len(data))-pos {
-		return Point{}, false, 0, false, invalid
+		return Point{}, false, false, 0, false, invalid
 	}
 	dpi := Point{}
 	unit := uint16(2)
@@ -809,26 +855,26 @@ func exifImageMetadata(data []byte) (Point, bool, uint32, bool, error) {
 		tag := order.Uint16(entry)
 		if tag == 274 {
 			if seenOrient || order.Uint16(entry[2:]) != 3 || order.Uint32(entry[4:]) != 1 {
-				return Point{}, false, 0, false, invalid
+				return Point{}, false, false, 0, false, invalid
 			}
 			value := uint32(order.Uint16(entry[8:]))
 			if value < 1 || value > 8 {
-				return Point{}, false, 0, false, invalid
+				return Point{}, false, false, 0, false, invalid
 			}
 			orientation, seenOrient = value, true
 			continue
 		}
 		if tag == 34665 {
 			if hasColor || order.Uint16(entry[2:]) != 4 || order.Uint32(entry[4:]) != 1 {
-				return Point{}, false, 0, false, invalid
+				return Point{}, false, false, 0, false, invalid
 			}
 			hasColor = true
 			offset := uint64(order.Uint32(entry[8:]))
 			if offset == pos {
-				return Point{}, false, 0, false, invalid
+				return Point{}, false, false, 0, false, invalid
 			}
 			if err := exifImageColor(data, order, offset); err != nil {
-				return Point{}, false, 0, false, err
+				return Point{}, false, false, 0, false, err
 			}
 		}
 		if tag != 282 && tag != 283 && tag != 296 {
@@ -839,26 +885,26 @@ func exifImageMetadata(data []byte) (Point, bool, uint32, bool, error) {
 			index = 2
 		}
 		if seen[index] || order.Uint32(entry[4:]) != 1 {
-			return Point{}, false, 0, false, invalid
+			return Point{}, false, false, 0, false, invalid
 		}
 		seen[index] = true
 		if tag == 296 {
 			if order.Uint16(entry[2:]) != 3 {
-				return Point{}, false, 0, false, invalid
+				return Point{}, false, false, 0, false, invalid
 			}
 			unit = order.Uint16(entry[8:])
 			continue
 		}
 		if order.Uint16(entry[2:]) != 5 {
-			return Point{}, false, 0, false, invalid
+			return Point{}, false, false, 0, false, invalid
 		}
 		offset := uint64(order.Uint32(entry[8:]))
 		if offset > uint64(len(data))-8 {
-			return Point{}, false, 0, false, invalid
+			return Point{}, false, false, 0, false, invalid
 		}
 		n, d := order.Uint32(data[offset:]), order.Uint32(data[offset+4:])
 		if n == 0 || d == 0 {
-			return Point{}, false, 0, false, invalid
+			return Point{}, false, false, 0, false, invalid
 		}
 		if tag == 282 {
 			dpi.X = float64(n) / float64(d)
@@ -867,19 +913,19 @@ func exifImageMetadata(data []byte) (Point, bool, uint32, bool, error) {
 		}
 	}
 	if unit < 1 || unit > 3 || seen[0] != seen[1] {
-		return Point{}, false, 0, false, invalid
+		return Point{}, false, false, 0, false, invalid
 	}
 	if !seen[0] {
-		return Point{}, false, orientation, seenOrient, nil
+		return Point{}, false, false, orientation, seenOrient, nil
 	}
 	if unit == 1 {
-		return Point{96, 96 * (dpi.Y / dpi.X)}, true, orientation, seenOrient, nil
+		return Point{96, 96 * (dpi.Y / dpi.X)}, true, false, orientation, seenOrient, nil
 	}
 	if unit == 3 {
 		dpi.X *= 2.54
 		dpi.Y *= 2.54
 	}
-	return dpi, true, orientation, seenOrient, nil
+	return dpi, true, true, orientation, seenOrient, nil
 }
 
 // exifImageColor 校验EXIF颜色空间声明，未校准颜色由ICC或像素格式解释

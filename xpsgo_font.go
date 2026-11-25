@@ -1776,15 +1776,19 @@ func (r *Reader) FontUsage(ctx context.Context, options *OptimizationOptions) ([
 			return nil, err
 		}
 		c.fonts.remaining -= int64(len(data))
-		tracker := newResourceMarkupScopeTracker(r.format, false, ctx)
+		tracker := newResourceMarkupScopeTracker(r.format, r.format == FormatOpenXPS, ctx)
 		root, err := decodeXMLVisit(data, r.limits, func(token xml.Token, node *xmlElement) error {
 			if _, start := token.(xml.StartElement); start {
 				if err := c.charge(1); err != nil {
 					return err
 				}
 			}
-			if _, _, err := tracker.visit(token, node); err != nil {
+			skip, _, err := tracker.visit(token, node)
+			if err != nil {
 				return err
+			}
+			if skip {
+				return nil
 			}
 			if _, start := token.(xml.StartElement); !start {
 				return nil

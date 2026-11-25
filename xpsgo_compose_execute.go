@@ -143,7 +143,7 @@ func executeCompositionPlan(plan *compositionPlan, names *compositionNames, root
 	if err != nil {
 		return nil, err
 	}
-	x.navigation, err = newCompositionNavigation(plan, names.pages)
+	x.navigation, err = newCompositionNavigation(plan, names.pages, names.droppedTargets)
 	if err != nil {
 		return nil, err
 	}
@@ -206,6 +206,10 @@ func executeCompositionPlan(plan *compositionPlan, names *compositionNames, root
 			if source.retained[part] {
 				identity := true
 				for _, page := range document.pages {
+					if len(names.droppedTargets[page]) != 0 {
+						identity = false
+						break
+					}
 					for original, target := range names.pages[page] {
 						if err := plan.budget.step(1); err != nil {
 							return nil, err
@@ -224,6 +228,14 @@ func executeCompositionPlan(plan *compositionPlan, names *compositionNames, root
 					origin := compositionOrigin{document.source, part}
 					x.docParts[origin] = append(x.docParts[origin], index)
 					if err := x.schedule(compositionPartKey{document.source, part, index, -1}, document.part); err != nil {
+						return nil, err
+					}
+				} else if source.sourceFormat == FormatOpenXPS && plan.format == FormatXPS {
+					data, err := normalizeCompositionDocumentLinkTargets(source.parts[part], document, plan, names)
+					if err != nil {
+						return nil, err
+					}
+					if err := x.put(source.parts[part], document.part, data); err != nil {
 						return nil, err
 					}
 				}
@@ -1031,11 +1043,24 @@ func (x *compositionExecution) prepareMarkup(item compositionExecutionPart, valu
 		return err
 	}
 	format := x.plan.sources[item.source].format
+	var tracker *resourceMarkupScopeTracker
+	if compositionIndexRoot(value.media) != "" {
+		tracker = newResourceMarkupIgnoreTracker(format, format == FormatOpenXPS, b.context)
+	} else {
+		tracker = newResourceMarkupScopeTracker(format, format == FormatOpenXPS, b.context)
+	}
 	_, err := decodeXMLVisit(value.data, b.limits, func(token xml.Token, node *xmlElement) error {
 		if err := b.step(1); err != nil {
 			return err
 		}
-		if _, start := token.(xml.StartElement); !start || node.Name.Space != formatNamespace(format) {
+		skip, _, err := tracker.visit(token, node)
+		if err != nil {
+			return err
+		}
+		if _, start := token.(xml.StartElement); !start || skip {
+			return nil
+		}
+		if node.Name.Space != formatNamespace(format) && !(format == FormatOpenXPS && node.Name.Space == openXPS3DNamespace) {
 			return nil
 		}
 		for _, attr := range node.Attr {
@@ -1664,16 +1689,22 @@ func printSettingListsConflict(left, right []PrintSetting, budget *compositionBu
 		kind PrintSettingKind
 		name xml.Name
 	}
+	canonicalName := func(name xml.Name) xml.Name {
+		if printFrameworkSpace(name.Space) {
+			name.Space = printFrameworkNS
+		}
+		return name
+	}
 	byKey := make(map[key][]PrintSetting, len(left))
 	leftFamilies := make(map[printPrefixKey]xml.Name, len(left))
 	for _, item := range left {
 		if err := budget.step(1); err != nil {
 			return false, err
 		}
-		k := key{item.Kind, item.Name}
+		k := key{item.Kind, canonicalName(item.Name)}
 		byKey[k] = append(byKey[k], item)
 		if familyKey, _, ok := printPrefixFamily(item); ok {
-			leftFamilies[familyKey] = item.Name
+			leftFamilies[familyKey] = canonicalName(item.Name)
 		}
 	}
 	rightByKey := make(map[key][]PrintSetting, len(right))
@@ -1682,11 +1713,11 @@ func printSettingListsConflict(left, right []PrintSetting, budget *compositionBu
 			return false, err
 		}
 		if familyKey, _, ok := printPrefixFamily(item); ok {
-			if prevName, exists := leftFamilies[familyKey]; exists && prevName != item.Name {
+			if prevName, exists := leftFamilies[familyKey]; exists && prevName != canonicalName(item.Name) {
 				return true, nil
 			}
 		}
-		k := key{item.Kind, item.Name}
+		k := key{item.Kind, canonicalName(item.Name)}
 		rightByKey[k] = append(rightByKey[k], item)
 	}
 	for k, rightItems := range rightByKey {
@@ -1717,7 +1748,14 @@ func printSettingEqual(a, b PrintSetting, budget *compositionBudget) (bool, erro
 	if err := budget.step(1); err != nil {
 		return false, err
 	}
-	if a.Kind != b.Kind || a.Name != b.Name || a.Constraint != b.Constraint {
+	nameA, nameB := a.Name, b.Name
+	if printFrameworkSpace(nameA.Space) {
+		nameA.Space = printFrameworkNS
+	}
+	if printFrameworkSpace(nameB.Space) {
+		nameB.Space = printFrameworkNS
+	}
+	if a.Kind != b.Kind || nameA != nameB || a.Constraint != b.Constraint || a.HasDefault != b.HasDefault || a.Default != b.Default {
 		return false, nil
 	}
 	if (a.Value == nil) != (b.Value == nil) {
@@ -2187,7 +2225,11 @@ func (x *compositionExecution) finishStories() error {
 		var err error
 		if x.stories.keepDocuments[index] {
 			original := x.plan.sources[key.source].parts[key.part]
-			data, err = rewriteExtractMarkup(original.data, x.plan.budget.limits, x.plan.budget.context, func(node *xmlElement, attr xml.Attr) (string, bool, error) {
+			rewriteTracker := newResourceMarkupScopeTracker(x.plan.format, x.plan.format == FormatOpenXPS, x.plan.budget.context)
+			data, err = rewriteExtractMarkup(original.data, x.plan.budget.limits, x.plan.budget.context, func(token xml.Token, node *xmlElement) (bool, error) {
+				skip, _, err := rewriteTracker.visit(token, node)
+				return skip, err
+			}, func(node *xmlElement, attr xml.Attr) (string, bool, error) {
 				if node.Name == (xml.Name{Space: structureNamespace(x.plan.format), Local: "OutlineEntry"}) && attr.Name == (xml.Name{Local: "OutlineTarget"}) {
 					return x.navigate(x.instance(key), original.name, target, attr.Value)
 				}

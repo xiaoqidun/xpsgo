@@ -487,8 +487,15 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 			bboxGeometry := geometry
 			if font.cid {
 				if fdMatrix := font.fontDict[font.fdSelect[gid]].matrix; fdMatrix != nil {
+					bboxMatrix := *fdMatrix
+					if font.top.matrix == nil {
+						bboxMatrix = (Matrix{A: 1000, D: 1000}).Mul(bboxMatrix)
+					}
+					if !geometryFinite(bboxMatrix.A, bboxMatrix.B, bboxMatrix.C, bboxMatrix.D, bboxMatrix.E, bboxMatrix.F) {
+						return nil, fmt.Errorf("%w: subset CFF FontBBox matrix", ErrLimit)
+					}
 					bboxGeometry = subsetCFFCloneGeometry(geometry)
-					if err := fontTransformOutline(&bboxGeometry, *fdMatrix); err != nil {
+					if err := fontTransformOutline(&bboxGeometry, bboxMatrix); err != nil {
 						return nil, err
 					}
 				}

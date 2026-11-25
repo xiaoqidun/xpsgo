@@ -78,16 +78,13 @@ type xmlContent struct {
 	token   xml.Token
 }
 
-// xmlContentReader 按需保存XML内容顺序及根元素外的词元，不增加普通XML模型的字段
+// xmlContentReader 按需保存XML元素内容顺序，不增加普通XML模型的字段
 type xmlContentReader struct {
 	context context.Context
 	limit   int
 	count   int
 	nodes   map[*xmlElement][]xmlContent
 	stack   []*xmlElement
-	before  []xml.Token
-	after   []xml.Token
-	passed  bool
 }
 
 // xmlAttributeRange 保存已校验起始标签中属性值的UTF-8半开范围，不含引号
@@ -143,11 +140,12 @@ type compatibilityScope struct {
 
 // compatibilityProcessor 保存调用方声明理解的命名空间集合
 type compatibilityProcessor struct {
-	understood       map[string]bool
-	content          map[*xmlElement][]xmlContent
-	includePreserved bool
-	context          context.Context
-	namespaceCopies  map[*xmlElement]map[string]string
+	understood         map[string]bool
+	content            map[*xmlElement][]xmlContent
+	includePreserved   bool
+	ignorePreservation bool
+	context            context.Context
+	namespaceCopies    map[*xmlElement]map[string]string
 }
 
 // compatibilityFragment 保存移除兼容性包装后得到的元素、保留扩展及聚合文本
@@ -1001,9 +999,6 @@ func (r *xmlContentReader) visit(token xml.Token, node *xmlElement) error {
 		r.stack = append(r.stack, node)
 	case xml.EndElement:
 		r.stack = r.stack[:len(r.stack)-1]
-		if len(r.stack) == 0 {
-			r.passed = true
-		}
 	case xml.ProcInst:
 		if token.Target == "xml" {
 			return nil
@@ -1015,29 +1010,18 @@ func (r *xmlContentReader) visit(token xml.Token, node *xmlElement) error {
 	return nil
 }
 
-// append 将非元素词元加入所属内容或文档根前后，不改变词元的相对位置
+// append 将非元素词元加入所属元素的内容列表，忽略根外词元并保持相对位置
 // 入参: node 所属元素，根外词元为nil, token 独立词元
 func (r *xmlContentReader) append(node *xmlElement, token xml.Token) {
 	if node != nil {
 		r.nodes[node] = append(r.nodes[node], xmlContent{token: token})
-	} else if r.passed {
-		r.after = append(r.after, token)
-	} else {
-		r.before = append(r.before, token)
 	}
 }
 
-// rewriteXMLAttributes 按回调定点替换XML属性值，保留其余原文与原编码且禁止改写命名空间声明
-// 入参: original 原始XML, limits 资源上限, ctx 取消Context, rewrite 属性选择及新值
-// 返回: []byte 原编码XML, bool 是否实际修改, error XML、资源、访问或取消错误
-func rewriteXMLAttributes(original []byte, limits Limits, ctx context.Context, rewrite xmlAttributeRewrite) ([]byte, bool, error) {
-	return rewriteXMLMappedAttributes(original, limits, ctx, nil, rewrite)
-}
-
-// rewriteXMLMappedAttributes 按显式命名空间映射改写属性，回调不得改变未登记的绑定
-// 入参: original 原始XML, limits 资源上限, ctx 取消Context, namespaces 允许的原URI到目标URI映射, rewrite 属性改写回调
-// 返回: []byte 原编码XML, bool 是否实际修改, error XML、绑定、资源或取消错误
-func rewriteXMLMappedAttributes(original []byte, limits Limits, ctx context.Context, namespaces map[string]string, rewrite xmlAttributeRewrite) ([]byte, bool, error) {
+// rewriteXMLAttributes 在可选命名空间白名单与词元作用域过滤下定点改写XML属性，跳过被忽略或保留扩展子树并保留原编码
+// 入参: original 原始XML, limits 资源上限, ctx 取消Context, namespaces 允许的原URI到目标URI映射, filter 可选词元级跳过回调, rewrite 属性改写回调
+// 返回: []byte 原编码XML, bool 是否实际修改, error XML、绑定、作用域、资源或取消错误
+func rewriteXMLAttributes(original []byte, limits Limits, ctx context.Context, namespaces map[string]string, filter func(xml.Token, *xmlElement) (bool, error), rewrite xmlAttributeRewrite) ([]byte, bool, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, false, err
 	}
@@ -1066,6 +1050,15 @@ func rewriteXMLMappedAttributes(original []byte, limits Limits, ctx context.Cont
 	_, err = parseXMLTokens(&xmlTokenInput{reader: bytes.NewReader(input), data: input}, encoding, limits, func(token xml.Token, node *xmlElement, start, end int64) error {
 		if err := checkContext(ctx); err != nil {
 			return err
+		}
+		if filter != nil {
+			skip, err := filter(token, node)
+			if err != nil {
+				return err
+			}
+			if skip {
+				return nil
+			}
 		}
 		if _, present := token.(xml.StartElement); !present {
 			return nil
@@ -1480,7 +1473,7 @@ func (p *compatibilityProcessor) element(node *xmlElement, inherited compatibili
 	if node == nil {
 		return compatibilityFragment{}, fmt.Errorf("%w: nil XML element", ErrInvalid)
 	}
-	scope, err := p.rules(node, inherited)
+	scope, err := p.rulesChecked(node, inherited, !p.ignorePreservation)
 	if err != nil {
 		return compatibilityFragment{}, err
 	}
@@ -1489,12 +1482,19 @@ func (p *compatibilityProcessor) element(node *xmlElement, inherited compatibili
 			return compatibilityFragment{}, fmt.Errorf("%w: element namespace %q", ErrUnsupported, node.Name.Space)
 		}
 		if scope.processes(node.Name) {
+			if p.ignorePreservation {
+				if value, ok := node.attributeNS(mcNamespace, "MustUnderstand"); ok {
+					if err := p.checkMustUnderstand(node, value); err != nil {
+						return compatibilityFragment{}, err
+					}
+				}
+			}
 			if err := compatibilityNoXMLContext(node); err != nil {
 				return compatibilityFragment{}, err
 			}
 			return p.contents(node, scope)
 		}
-		if scope.preservesElement(node.Name) {
+		if !p.ignorePreservation && scope.preservesElement(node.Name) {
 			preserved, err := p.preserveElement(node, scope)
 			if err != nil {
 				return compatibilityFragment{}, err
@@ -1506,6 +1506,13 @@ func (p *compatibilityProcessor) element(node *xmlElement, inherited compatibili
 			return result, nil
 		}
 		return compatibilityFragment{}, nil
+	}
+	if p.ignorePreservation {
+		if value, ok := node.attributeNS(mcNamespace, "MustUnderstand"); ok {
+			if err := p.checkMustUnderstand(node, value); err != nil {
+				return compatibilityFragment{}, err
+			}
+		}
 	}
 	if node.Name.Space == mcNamespace {
 		if node.Name.Local != "AlternateContent" {
@@ -1819,6 +1826,9 @@ func (p *compatibilityProcessor) rulesChecked(node *xmlElement, inherited compat
 					}
 					scope.process[name] = true
 				case "PreserveElements":
+					if p.ignorePreservation {
+						continue
+					}
 					if !preserveElemCloned {
 						scope.preserveElements = maps.Clone(scope.preserveElements)
 						if scope.preserveElements == nil {
@@ -1828,6 +1838,9 @@ func (p *compatibilityProcessor) rulesChecked(node *xmlElement, inherited compat
 					}
 					scope.preserveElements[name] = true
 				case "PreserveAttributes":
+					if p.ignorePreservation {
+						continue
+					}
 					if !preserveAttrCloned {
 						scope.preserveAttributes = maps.Clone(scope.preserveAttributes)
 						if scope.preserveAttributes == nil {
@@ -1929,7 +1942,7 @@ func (p *compatibilityProcessor) attributesWithPreserved(node *xmlElement, scope
 		}
 		if attr.Name.Space != "" && !p.understood[attr.Name.Space] {
 			if scope.ignorable[attr.Name.Space] {
-				if scope.preservesAttribute(attr.Name) {
+				if !p.ignorePreservation && scope.preservesAttribute(attr.Name) {
 					preserved = append(preserved, attr)
 				}
 				continue
@@ -2002,7 +2015,7 @@ func (p *compatibilityProcessor) alternative(node *xmlElement, inherited compati
 			return fmt.Errorf("%w: AlternateContent child namespace %q", ErrUnsupported, node.Name.Space)
 		}
 		if !scope.processes(node.Name) {
-			if scope.preservesElement(node.Name) {
+			if !p.ignorePreservation && scope.preservesElement(node.Name) {
 				preserved, err := p.preserveElement(node, scope)
 				if err != nil {
 					return err

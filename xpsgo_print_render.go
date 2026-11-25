@@ -501,8 +501,36 @@ func (r *printWatermarkRenderer) elements(part string, elements []Element, water
 		return nil, err
 	}
 	var run *glyphRun
+	bitmapOnly := fontIsBitmapOnly(source.face)
+	var bitmapSelection fontBitmapSelection
+	var bitmapDecoder fontBitmapDecode
 	if mark.Text != "" || len(glyphs.Indices) != 0 {
-		run, err = resolveGlyphRunWithStep(glyphs, source.metrics, source.glyphIndex, source.glyphYMax, r.glyphs, func() error {
+		yMax := source.glyphYMax
+		if bitmapOnly {
+			bitmapSelection, err = r.bitmapStrike(source, mark.FontSize, glyphs.IsSideways)
+			if err != nil {
+				return nil, &PartError{Part: fontPart, Element: "Glyphs", Err: err}
+			}
+			allowance := int(min(r.work, uint64(^uint(0)>>1)))
+			bitmapDecoder = fontBitmapDecode{font: source.bitmaps, strike: &source.bitmaps.strikes[bitmapSelection.strike], path: make(map[uint16]bool), cache: make(map[uint16]fontBitmapDecoded), components: min(fontBitmapMaxComponents, allowance), pixels: min(fontBitmapMaxPixels, allowance)}
+			yMax = func(gid uint16) (float64, error) {
+				decoded, err := r.decodeBitmapGlyph(&bitmapDecoder, gid)
+				if err != nil {
+					return 0, err
+				}
+				if decoded.mask == nil || decoded.mask.Rect.Empty() || decoded.metrics.width == 0 || decoded.metrics.height == 0 {
+					return 0, nil
+				}
+				if decoded.metrics.hasVertical {
+					return 0, nil
+				}
+				if !decoded.metrics.hasHorizontal {
+					return 0, fmt.Errorf("%w: watermark bitmap has no positioning metrics", ErrUnsupported)
+				}
+				return math.Round(float64(decoded.metrics.horizontal.bearingY)*bitmapSelection.scaleY) * float64(source.metrics.unitsPerEm) / float64(bitmapSelection.ppemY), nil
+			}
+		}
+		run, err = resolveGlyphRunWithStep(glyphs, source.metrics, source.glyphIndex, yMax, r.glyphs, func() error {
 			if err := r.charge(1); err != nil {
 				return err
 			}
@@ -523,8 +551,8 @@ func (r *printWatermarkRenderer) elements(part string, elements []Element, water
 	var ink Point
 	hasInk := false
 	for _, glyph := range run.glyphs {
-		if fontIsBitmapOnly(source.face) {
-			items, left, present, err := r.bitmapPaths(source, glyph, mark.FontSize, part, brush)
+		if bitmapOnly {
+			items, left, present, err := r.bitmapGlyphPaths(source, bitmapSelection, &bitmapDecoder, glyph, run.sideways, part, brush)
 			if err != nil {
 				return nil, &PartError{Part: fontPart, Element: "Glyphs", Err: err}
 			}
@@ -749,50 +777,131 @@ func (r *printWatermarkRenderer) outline(source *fontSource, gid uint16) (Geomet
 	return glyph.geometry, nil
 }
 
-// bitmapPaths 按内容字号解码嵌入式位图字形并转换为像素行程路径元素
-// 入参: source 字体, glyph 已定位字形, size 九十六dpi内容字号, part 源页面部件, brush 不透明颜色
-// 返回: []Element 像素行程路径, Point 实际非零像素左上角, bool 是否有墨迹, error 尺寸、字体或预算错误
-func (r *printWatermarkRenderer) bitmapPaths(source *fontSource, glyph positionedGlyph, size float64, part string, brush *Brush) ([]Element, Point, bool, error) {
+// bitmapStrike 按内容字号与书写方向优先匹配精确EBLC或EBSC代用strike，无匹配时按欧氏距离选取最近strike
+// 入参: source 已加载纯位图字体, size 九十六dpi内容字号, sideways 是否采用竖排方向标志
+// 返回: fontBitmapSelection 选中的strike与比例, error 尺寸、字体或预算错误
+func (r *printWatermarkRenderer) bitmapStrike(source *fontSource, size float64, sideways bool) (fontBitmapSelection, error) {
+	if !geometryFinite(size) || size <= 0 {
+		return fontBitmapSelection{}, fmt.Errorf("%w: bitmap watermark requires positive finite size", ErrUnsupported)
+	}
+	if err := r.charge(uint64(source.face.tables["EBLC"].length) + uint64(source.face.tables["EBSC"].length) + 1); err != nil {
+		return fontBitmapSelection{}, err
+	}
+	rounded := math.Round(size)
+	if rounded >= 1 && rounded <= 255 && math.Abs(size-rounded) <= 1e-9 {
+		selection, present, err := source.selectBitmapStrikeWithWork(uint16(rounded), uint16(rounded), sideways, r.charge)
+		if err != nil {
+			return fontBitmapSelection{}, err
+		}
+		if present {
+			return selection, nil
+		}
+	}
+	if err := source.loadBitmaps(r.charge); err != nil {
+		return fontBitmapSelection{}, err
+	}
+	if source.bitmaps == nil || len(source.bitmaps.strikes) == 0 {
+		return fontBitmapSelection{}, fmt.Errorf("%w: no matching watermark bitmap strike", ErrUnsupported)
+	}
+	if err := r.charge(uint64(len(source.bitmaps.strikes))); err != nil {
+		return fontBitmapSelection{}, err
+	}
+	wantFlag := uint8(fontBitmapFlagHorizontal)
+	if sideways {
+		wantFlag = fontBitmapFlagVertical
+	}
+	best, bestDist := -1, math.Inf(1)
+	for _, matchDirection := range []bool{true, false} {
+		for i, candidate := range source.bitmaps.strikes {
+			if candidate.ppemX == 0 || candidate.ppemY == 0 {
+				continue
+			}
+			if matchDirection && candidate.flags&wantFlag == 0 {
+				continue
+			}
+			dist := math.Hypot(float64(candidate.ppemX)-size, float64(candidate.ppemY)-size)
+			if best < 0 || dist < bestDist {
+				best, bestDist = i, dist
+			}
+		}
+		if best >= 0 {
+			break
+		}
+	}
+	if best < 0 {
+		return fontBitmapSelection{}, fmt.Errorf("%w: no matching watermark bitmap strike", ErrUnsupported)
+	}
+	strike := source.bitmaps.strikes[best]
+	return fontBitmapSelection{strike: best, ppemX: strike.ppemX, ppemY: strike.ppemY, scaleX: 1, scaleY: 1}, nil
+}
+
+// decodeBitmapGlyph 在水印累计工作预算内解码并缓存单个位图字形
+// 入参: decoder 复用位图解码器, gid 字形编号
+// 返回: fontBitmapDecoded 解码后的掩码与度量, error 缺失、解码或预算错误
+func (r *printWatermarkRenderer) decodeBitmapGlyph(decoder *fontBitmapDecode, gid uint16) (fontBitmapDecoded, error) {
+	if err := r.charge(0); err != nil {
+		return fontBitmapDecoded{}, err
+	}
+	allowance := int(min(r.work, uint64(^uint(0)>>1)))
+	decoder.components = min(decoder.components, allowance)
+	decoder.pixels = min(decoder.pixels, allowance)
+	beforeComponents, beforePixels := decoder.components, decoder.pixels
+	decoded, present, err := decoder.decode(gid)
+	if charged := r.charge(uint64(beforeComponents-decoder.components) + uint64(beforePixels-decoder.pixels)); charged != nil {
+		return fontBitmapDecoded{}, charged
+	}
+	if err != nil {
+		return fontBitmapDecoded{}, err
+	}
+	if !present {
+		return fontBitmapDecoded{}, fmt.Errorf("%w: watermark bitmap glyph %d is absent", ErrUnsupported, gid)
+	}
+	return decoded, nil
+}
+
+// bitmapGlyphPaths 使用已选strike与解码器将单个位图字形按横竖排度量转换为缩放后的像素行程路径
+// 入参: source 字体, selection 已选strike与缩放, decoder 复用解码器, glyph 已定位字形, sideways 是否竖排, part 源页面部件, brush 不透明颜色
+// 返回: []Element 像素行程路径, Point 实际非零像素左上角, bool 是否有墨迹, error 度量、数值或预算错误
+func (r *printWatermarkRenderer) bitmapGlyphPaths(source *fontSource, selection fontBitmapSelection, decoder *fontBitmapDecode, glyph positionedGlyph, sideways bool, part string, brush *Brush) ([]Element, Point, bool, error) {
 	if err := r.charge(1); err != nil {
 		return nil, Point{}, false, err
 	}
-	if size < 1 || size > 255 || math.Trunc(size) != size {
-		return nil, Point{}, false, fmt.Errorf("%w: bitmap watermark requires integral content ppem in 1..255", ErrUnsupported)
-	}
-	ppem := uint16(size)
-	selection, present, err := source.selectBitmapStrikeWithWork(ppem, ppem, false, r.charge)
+	decoded, err := r.decodeBitmapGlyph(decoder, glyph.gid)
 	if err != nil {
 		return nil, Point{}, false, err
 	}
-	if !present {
-		return nil, Point{}, false, fmt.Errorf("%w: no matching watermark bitmap strike", ErrUnsupported)
-	}
-	decoder := fontBitmapDecode{font: source.bitmaps, strike: &source.bitmaps.strikes[selection.strike], path: make(map[uint16]bool), cache: make(map[uint16]fontBitmapDecoded), components: min(fontBitmapMaxComponents, int(min(r.work, uint64(^uint(0)>>1)))), pixels: min(fontBitmapMaxPixels, int(min(r.work, uint64(^uint(0)>>1))))}
-	components, pixels := decoder.components, decoder.pixels
-	decoded, present, err := decoder.decode(glyph.gid)
-	if charged := r.charge(uint64(components-decoder.components) + uint64(pixels-decoder.pixels)); charged != nil {
-		return nil, Point{}, false, charged
-	}
-	if err != nil {
-		return nil, Point{}, false, err
-	}
-	if !present {
-		return nil, Point{}, false, fmt.Errorf("%w: watermark bitmap glyph %d is absent", ErrUnsupported, glyph.gid)
-	}
-	if decoded.mask == nil || decoded.mask.Rect.Empty() || decoded.metrics.width == 0 || decoded.metrics.height == 0 {
+	metrics := decoded.metrics
+	if decoded.mask == nil || decoded.mask.Rect.Empty() || metrics.width == 0 || metrics.height == 0 {
 		return nil, Point{}, false, nil
 	}
-	if !decoded.metrics.hasHorizontal {
+	axis := metrics.horizontal
+	local := glyph.matrix
+	vertical := sideways && metrics.hasVertical
+	if vertical {
+		axis = metrics.vertical
+		local.E, local.F = glyph.origin.X, glyph.origin.Y
+	} else if !metrics.hasHorizontal {
 		return nil, Point{}, false, fmt.Errorf("%w: watermark bitmap has no horizontal bearing", ErrUnsupported)
 	}
-	mask := decoded.mask
-	x0 := glyph.origin.X + float64(decoded.metrics.horizontal.bearingX)*selection.scaleX
-	y0 := glyph.origin.Y - float64(decoded.metrics.horizontal.bearingY)*selection.scaleY
-	if !geometryFinite(x0, y0) {
-		return nil, Point{}, false, fmt.Errorf("%w: watermark bitmap bearing overflow", ErrLimit)
+	width := int(math.Round(float64(metrics.width) * selection.scaleX))
+	height := int(math.Round(float64(metrics.height) * selection.scaleY))
+	if width == 0 || height == 0 {
+		return nil, Point{}, false, nil
 	}
+	unitsX := float64(source.metrics.unitsPerEm) / float64(selection.ppemX)
+	unitsY := float64(source.metrics.unitsPerEm) / float64(selection.ppemY)
+	bearingY := math.Round(float64(axis.bearingY) * selection.scaleY)
+	if vertical {
+		bearingY = -bearingY
+	}
+	pixels := Matrix{A: unitsX, D: -unitsY, E: math.Round(float64(axis.bearingX)*selection.scaleX) * unitsX, F: bearingY * unitsY}
+	pixelTransform := strokePathCompose(local, strokePathCompose(pixels, Matrix{A: selection.scaleX, D: selection.scaleY}))
+	if !geometryFillMatrixFinite(pixelTransform) {
+		return nil, Point{}, false, fmt.Errorf("%w: watermark bitmap transform range", ErrLimit)
+	}
+	mask := decoded.mask
 	var coverage [256]Geometry
-	var ink Point
+	var minX, minY, maxX, maxY int
 	hasInk := false
 	for y := mask.Rect.Min.Y; y < mask.Rect.Max.Y; y++ {
 		if err := r.charge(uint64(mask.Rect.Dx())); err != nil {
@@ -812,20 +921,37 @@ func (r *printWatermarkRenderer) bitmapPaths(source *fontSource, glyph positione
 					return nil, Point{}, false, err
 				}
 				r.edges -= 3
-				box := Rect{X: x0 + float64(x)*selection.scaleX, Y: y0 + float64(y)*selection.scaleY, Width: float64(end-x) * selection.scaleX, Height: selection.scaleY}
-				if !geometryFinite(box.X, box.Y, box.X+box.Width, box.Y+box.Height) {
-					return nil, Point{}, false, fmt.Errorf("%w: watermark bitmap pixel overflow", ErrLimit)
-				}
+				box := Rect{X: float64(x), Y: float64(y), Width: float64(end - x), Height: 1}
 				geometry := &coverage[alpha]
 				geometry.FillRule = GeometryNonZero
 				geometry.Figures = append(geometry.Figures, renderBoxGeometry(box).Figures[0])
 				if !hasInk {
-					ink, hasInk = Point{X: box.X, Y: box.Y}, true
+					minX, minY, maxX, maxY, hasInk = x, y, end, y+1, true
 				} else {
-					ink.X, ink.Y = min(ink.X, box.X), min(ink.Y, box.Y)
+					minX, minY = min(minX, x), min(minY, y)
+					maxX, maxY = max(maxX, end), max(maxY, y+1)
 				}
 			}
 			x = end
+		}
+	}
+	var ink Point
+	if hasInk {
+		corners := [4]Point{
+			pixelTransform.Transform(Point{X: float64(minX), Y: float64(minY)}),
+			pixelTransform.Transform(Point{X: float64(maxX), Y: float64(minY)}),
+			pixelTransform.Transform(Point{X: float64(minX), Y: float64(maxY)}),
+			pixelTransform.Transform(Point{X: float64(maxX), Y: float64(maxY)}),
+		}
+		for i, corner := range corners {
+			if !geometryFinite(corner.X, corner.Y) {
+				return nil, Point{}, false, fmt.Errorf("%w: watermark bitmap pixel overflow", ErrLimit)
+			}
+			if i == 0 {
+				ink = corner
+			} else {
+				ink.X, ink.Y = min(ink.X, corner.X), min(ink.Y, corner.Y)
+			}
 		}
 	}
 	var paths []Element
@@ -836,7 +962,8 @@ func (r *printWatermarkRenderer) bitmapPaths(source *fontSource, glyph positione
 		if err := r.resource(); err != nil {
 			return nil, Point{}, false, err
 		}
-		paths = append(paths, &Path{ElementProperties: ElementProperties{Part: part, Opacity: float64(alpha) / 255}, Data: &coverage[alpha], Fill: brush})
+		matrix := pixelTransform
+		paths = append(paths, &Path{ElementProperties: ElementProperties{Part: part, Opacity: float64(alpha) / 255, RenderTransform: &matrix}, Data: &coverage[alpha], Fill: brush})
 	}
 	return paths, ink, hasInk, nil
 }

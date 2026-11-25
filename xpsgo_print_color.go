@@ -256,7 +256,7 @@ func (s *printLayoutSettings) printColors() (bool, PrintColor, error) {
 		return false, PrintColor{}, err
 	}
 	result := PrintColor{}
-	if option.Name.Space != printKeywordsNS {
+	if !printPublicKeywordSpace(option.Name.Space) {
 		return false, result, fmt.Errorf("%w: private print output color", ErrUnsupported)
 	}
 	switch option.Name.Local {
@@ -303,7 +303,7 @@ func printColorSettings(settings *PrintSettings, options printSettingsConfig) (*
 	}
 	present := false
 	for _, setting := range settings.Elements {
-		if setting.Kind == PrintSettingFeature && setting.Name.Space == printKeywordsNS && (setting.Name.Local == "PageOutputColor" || setting.Name.Local == "PageNegativeImage") {
+		if setting.Kind == PrintSettingFeature && printPublicKeywordSpace(setting.Name.Space) && (setting.Name.Local == "PageOutputColor" || setting.Name.Local == "PageNegativeImage") {
 			present = true
 			break
 		}
@@ -321,7 +321,7 @@ func printColorSettings(settings *PrintSettings, options printSettingsConfig) (*
 	}
 	result := &PrintSettings{Version: settings.Version}
 	for _, setting := range settings.Elements {
-		if setting.Kind != PrintSettingFeature || setting.Name != (xml.Name{Space: printKeywordsNS, Local: "PageOutputColor"}) && setting.Name != (xml.Name{Space: printKeywordsNS, Local: "PageNegativeImage"}) {
+		if setting.Kind != PrintSettingFeature || !printPublicKeywordSpace(setting.Name.Space) || setting.Name.Local != "PageOutputColor" && setting.Name.Local != "PageNegativeImage" {
 			result.Elements = append(result.Elements, setting)
 		}
 	}
@@ -405,7 +405,7 @@ func (c *printColorRuntime) brush(brush *Brush, transform Matrix, aliased bool, 
 		return c.image(brush, transform, alphaOnly)
 	case BrushVisual:
 		r.nativeSample = nil
-		_, err := r.visualBrush(brush, transform, aliased, depth)
+		_, err := r.visualBrush(brush, transform, aliased, depth, alphaOnly)
 		if err != nil {
 			return nil, err
 		}
@@ -530,7 +530,7 @@ func (c *printColorRuntime) image(brush *Brush, transform Matrix, alphaOnly bool
 		return nil, err
 	}
 	if alphaOnly {
-		sampler, err := newImageSampler(brush, source, transform, renderScRGB, true, IntentDefault, c.renderer.options.hdrPeakNits, false)
+		sampler, err := newImageSampler(brush, source, transform, renderScRGB, true, IntentDefault, c.renderer.options.hdrPeakNits)
 		if err != nil {
 			return nil, err
 		}
@@ -558,7 +558,8 @@ func (c *printColorRuntime) image(brush *Brush, transform Matrix, alphaOnly bool
 	if source.transform != nil {
 		profile = source.transform.profile
 	}
-	if profile == nil && c.source != nil && (c.plan.SourceSpace == PrintColorSourceSpaceRGB && !source.linear && imageColorChannels(source) == 3 || c.plan.SourceSpace == PrintColorSourceSpaceCMYK && imageColorChannels(source) == 4) {
+	tagged := imageCICPUsable(source.cicp) || source.gammaChroma != nil || source.srgb || source.jxr != nil && source.jxr.info.ColorEncoding != nil
+	if profile == nil && !tagged && c.source != nil && (c.plan.SourceSpace == PrintColorSourceSpaceRGB && !source.linear && imageColorChannels(source) == 3 || c.plan.SourceSpace == PrintColorSourceSpaceCMYK && imageColorChannels(source) == 4) {
 		profile = c.source
 		copySource := *source
 		copySource.selectedProfile = profile
@@ -612,7 +613,7 @@ func (c *printColorRuntime) image(brush *Brush, transform Matrix, alphaOnly bool
 		working = c.device
 	}
 	jxrIntent := c.sourceIntent(profile, true)
-	sampler, err := newImageSampler(brush, source, transform, renderScRGB, false, jxrIntent, c.renderer.options.hdrPeakNits, false)
+	sampler, err := newImageSampler(brush, source, transform, renderScRGB, false, jxrIntent, c.renderer.options.hdrPeakNits)
 	if err != nil {
 		return nil, err
 	}
@@ -623,6 +624,7 @@ func (c *printColorRuntime) image(brush *Brush, transform Matrix, alphaOnly bool
 	c.renderer.registerCleanup(sampler.releaseFilter)
 	intent := c.destinationIntent(profile, true)
 	useExtendedTRC := imageUseExtendedTRC(source, sampler.jxrMode)
+	defaultCMYK := profile == nil && imageColorChannels(source) == 4 && !source.multiChannel && sampler.jxrMode != jxrSampleLinear && sampler.cicp == nil && sampler.gammaChroma == nil
 	if working.channels <= 3 {
 		sampler.convert = func(components [iccMaxChannels]float64, alpha float64, linear bool) (renderColor, error) {
 			alpha = colorClamp(alpha)
@@ -630,7 +632,10 @@ func (c *printColorRuntime) image(brush *Brush, transform Matrix, alphaOnly bool
 				return renderColor{}, nil
 			}
 			space := ColorSRGB
-			if linear {
+			if defaultCMYK {
+				cv, mv, yv, kv := colorClamp(components[0]), colorClamp(components[1]), colorClamp(components[2]), colorClamp(components[3])
+				components = [iccMaxChannels]float64{(1 - cv) * (1 - kv), (1 - mv) * (1 - kv), (1 - yv) * (1 - kv)}
+			} else if linear {
 				space = ColorScRGB
 			}
 			value, err := c.colorWith(profile, components, alpha, space, true, source, useExtendedTRC)
@@ -700,7 +705,10 @@ func (p *printImageSampler) pixelColor(x, y int, jxrCache *jxrRowCache) (printNa
 		return printNativePixel{}, fmt.Errorf("%w: image source channels", ErrUnsupported)
 	}
 	space := ColorSRGB
-	if linear {
+	if p.profile == nil && channels == 4 && !p.base.image.multiChannel {
+		cv, mv, yv, kv := colorClamp(components[0]), colorClamp(components[1]), colorClamp(components[2]), colorClamp(components[3])
+		components = [iccMaxChannels]float64{(1 - cv) * (1 - kv), (1 - mv) * (1 - kv), (1 - yv) * (1 - kv)}
+	} else if linear {
 		space = ColorScRGB
 	}
 	value, err := p.runtime.colorWith(p.profile, components, alpha, space, true, p.base.image, p.useExtendedTRC)
@@ -1076,7 +1084,7 @@ func printColorPlanSettings(ctx context.Context, model *PrintSettings, options *
 		if option == nil {
 			continue
 		}
-		if option.Name.Space != printKeywordsNS {
+		if !printPublicKeywordSpace(option.Name.Space) {
 			return nil, nil, fmt.Errorf("%w: private print color option", ErrUnsupported)
 		}
 		found := false
@@ -1116,7 +1124,7 @@ func printColorPlanSettings(ctx context.Context, model *PrintSettings, options *
 		if err := printOptionProperties(intent); err != nil {
 			return nil, nil, err
 		}
-		if intent.Name.Space != printKeywordsNS {
+		if !printPublicKeywordSpace(intent.Name.Space) {
 			return nil, nil, fmt.Errorf("%w: private print rendering intent", ErrUnsupported)
 		}
 		switch intent.Name.Local {
@@ -1133,7 +1141,7 @@ func printColorPlanSettings(ctx context.Context, model *PrintSettings, options *
 		}
 	}
 	remaining := min(configuration.Limits.MaxPartBytes, configuration.Limits.MaxMetadataBytes, configuration.Limits.MaxPackageBytes)
-	if value := s.values[xml.Name{Space: printKeywordsNS, Local: "PageDeviceColorSpaceProfileURI"}]; value != nil {
+	if value := printParamValue(s.values, "PageDeviceColorSpaceProfileURI"); value != nil {
 		p.Device, err = printColorProfileValue(value, false, &remaining)
 		if err != nil {
 			return nil, nil, err
@@ -1216,7 +1224,7 @@ func printColorPlanSettings(ctx context.Context, model *PrintSettings, options *
 // 入参: name 展开关键字
 // 返回: bool 是否属于本组
 func printColorPlanName(name xml.Name) bool {
-	if name.Space != printKeywordsNS {
+	if !printPublicKeywordSpace(name.Space) {
 		return false
 	}
 	switch name.Local {

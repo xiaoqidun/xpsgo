@@ -101,6 +101,20 @@ func (p *Package) SetPage(ctx context.Context, docIndex, pageIndex int, page *Pa
 	if p.hasStoryRelationship(part, "storyfragments") {
 		return p.setStoryPage(docIndex, pageIndex, &value, ctx)
 	}
+	if p.hasDiscardControl() {
+		q := p.storyCopy()
+		targets, err := q.storePage(&value, ctx)
+		if err != nil {
+			return err
+		}
+		q.documents[docIndex].Pages[pageIndex] = PageReference{Part: part, LinkTargets: targets}
+		q.dirty[strings.ToLower(q.documents[docIndex].Part)] = true
+		if err := q.syncDiscardControl(); err != nil {
+			return err
+		}
+		p.commitStory(q)
+		return nil
+	}
 	targets, err := p.storePage(&value, ctx)
 	if err != nil {
 		return err
@@ -1567,25 +1581,20 @@ func (p *Package) syncDiscardControl() error {
 		}
 		defer view.Close()
 		budget := resourceMergeBudget{bytes: p.limits.MaxPackageBytes, work: p.limits.MaxXMLNodes, seen: make(map[string]bool)}
-		graph, err := view.resourceReferenceGraphMode(&budget, false)
+		graph, pageIndex, last, uncertain, err := view.discardResourceLifetimes(&budget)
 		if err != nil {
 			return err
 		}
-		last := make(map[string]int)
-		uncertain := -1
-		pageIndex := make(map[string]int, len(view.pages))
-		for index, page := range view.pages {
-			pageKey := strings.ToLower(page.Part)
-			pageIndex[pageKey] = index
-			seen, err := graph.reachableFrom(map[string]bool{pageKey: true}, false)
-			if err != nil {
-				return err
-			}
-			for resKey := range seen {
-				last[resKey] = index
-				if graph.models[resKey] {
-					uncertain = index
-				}
+		type discardKey struct {
+			target   string
+			sentinel string
+		}
+		seenHint := make(map[discardKey]bool, len(control.Hints))
+		appendHint := func(hint DiscardHint) {
+			pair := discardKey{target: strings.ToLower(hint.Target), sentinel: strings.ToLower(hint.SentinelPage)}
+			if !seenHint[pair] {
+				seenHint[pair] = true
+				updated = append(updated, hint)
 			}
 		}
 		for _, hint := range control.Hints {
@@ -1599,27 +1608,27 @@ func (p *Package) syncDiscardControl() error {
 			}
 			sentinelKey := strings.ToLower(hint.SentinelPage)
 			curSentinel, sentinelExists := pageIndex[sentinelKey]
-			if !graphicResourceMedia(media) && !graph.models[targetKey] {
-				if sentinelExists {
-					updated = append(updated, hint)
+			isGraphic := graphicResourceMedia(media) || graph.models[targetKey]
+			lastUse, used := last[targetKey]
+			if !used {
+				knownPrint, _ := printResourceMedia(media)
+				standardScoped := isGraphic || knownPrint || strings.EqualFold(media, fixedContentType("storyfragments")) || strings.EqualFold(media, fixedContentType("documentstructure")) || compositionLayoutMedia(media)
+				if !standardScoped && sentinelExists {
+					appendHint(hint)
 				}
 				continue
 			}
-			lastUse, used := last[targetKey]
-			if !used {
-				continue
-			}
 			minSentinel := lastUse + 1
-			if uncertain >= 0 && uncertain+1 > minSentinel {
+			if isGraphic && uncertain >= 0 && uncertain+1 > minSentinel {
 				minSentinel = uncertain + 1
 			}
 			if sentinelExists && curSentinel >= minSentinel {
-				updated = append(updated, hint)
+				appendHint(hint)
 				continue
 			}
 			if minSentinel < len(view.pages) {
 				hint.SentinelPage = view.pages[minSentinel].Part
-				updated = append(updated, hint)
+				appendHint(hint)
 			}
 		}
 	}
@@ -1854,6 +1863,7 @@ func (p *Package) editStoryReader(ctx context.Context) (*Reader, error) {
 		createdPut(pkg, p.sequence, fixedContentType("fixeddocumentsequence"), []byte(`<FixedDocumentSequence xmlns="`+ns+`"/>`))
 	}
 	r := &Reader{pkg: pkg, format: p.format, limits: p.limits, sequence: p.sequence, documents: p.documents}
+	pageSet := make(map[string]bool)
 	for _, document := range p.documents {
 		if err := checkContext(ctx); err != nil {
 			return nil, err
@@ -1861,17 +1871,41 @@ func (p *Package) editStoryReader(ctx context.Context) (*Reader, error) {
 		if _, present := pkg.parts[strings.ToLower(document.Part)]; !present {
 			createdPut(pkg, document.Part, fixedContentType("fixeddocument"), []byte(`<FixedDocument xmlns="`+ns+`"/>`))
 		}
+		for _, page := range document.Pages {
+			pageSet[strings.ToLower(page.Part)] = true
+		}
 		r.pages = append(r.pages, document.Pages...)
 	}
-	for _, source := range slices.Sorted(maps.Keys(p.relations)) {
+	sources := make(map[string]bool, len(p.relations)+len(r.pages))
+	for source := range p.relations {
+		sources[source] = true
+	}
+	for source := range p.dirtyRels {
+		if !p.dirtyRels[source] {
+			continue
+		}
+		if _, exists := pkg.parts[source]; exists || source == "/" {
+			sources[source] = true
+		}
+	}
+	for pageKey := range pageSet {
+		if p.dirty[pageKey] {
+			sources[pageKey] = true
+		}
+	}
+	for _, source := range slices.Sorted(maps.Keys(sources)) {
 		if err := checkContext(ctx); err != nil {
 			return nil, err
 		}
 		var wanted []Relationship
 		for _, relation := range p.originalRels[source] {
-			if p.modelRelationship(relation) {
-				wanted = append(wanted, relation)
+			if !p.modelRelationship(relation) {
+				continue
 			}
+			if p.dirty[source] && pageSet[source] && relation.Type == ns+"/required-resource" {
+				continue
+			}
+			wanted = append(wanted, relation)
 		}
 		if err := p.composeRelationships(pkg, p.relationSourceName(pkg, source), wanted, ctx); err != nil {
 			return nil, err
@@ -1929,6 +1963,11 @@ func (p *Package) setStoryPage(document, index int, page *Page, ctx context.Cont
 	q.dirty[strings.ToLower(q.documents[document].Part)] = true
 	if err := q.validateStoryEdit(ctx); err != nil {
 		return err
+	}
+	if q.hasDiscardControl() {
+		if err := q.syncDiscardControl(); err != nil {
+			return err
+		}
 	}
 	p.commitStory(q)
 	return nil
@@ -3260,7 +3299,7 @@ func (s *documentExtraction) part(item extractionPart) error {
 	if !markup {
 		return nil
 	}
-	tracker := newResourceMarkupScopeTracker(s.reader.format, false, s.context)
+	tracker := newResourceMarkupScopeTracker(s.reader.format, s.reader.format == FormatOpenXPS, s.context)
 	if _, err := decodeXMLVisit(value.data, s.output.limits, func(token xml.Token, node *xmlElement) error {
 		if _, start := token.(xml.StartElement); start {
 			if err := s.step(1); err != nil {
@@ -3275,7 +3314,11 @@ func (s *documentExtraction) part(item extractionPart) error {
 	if strings.EqualFold(item.part, s.reader.sequence) {
 		return nil
 	}
-	data, err := rewriteExtractMarkup(value.data, s.output.limits, s.context, func(node *xmlElement, attribute xml.Attr) (string, bool, error) {
+	rewriteTracker := newResourceMarkupScopeTracker(s.reader.format, s.reader.format == FormatOpenXPS, s.context)
+	data, err := rewriteExtractMarkup(value.data, s.output.limits, s.context, func(token xml.Token, node *xmlElement) (bool, error) {
+		skip, _, err := rewriteTracker.visit(token, node)
+		return skip, err
+	}, func(node *xmlElement, attribute xml.Attr) (string, bool, error) {
 		if err := s.step(1); err != nil {
 			return "", false, err
 		}
@@ -3415,10 +3458,10 @@ func (s *documentExtraction) namedTarget(part, name string, scope extractionLink
 	return scope.first, nil
 }
 
-// rewriteExtractMarkup 按属性顺序改写XML逻辑值并保留原编码及其他字节，禁止改写命名空间声明
-// 入参: data 原始XML, limits 资源上限, ctx 取消Context, rewrite 属性改写函数
-// 返回: []byte 独立的原编码结果，失败为nil, error XML、回调、资源或取消错误
-func rewriteExtractMarkup(data []byte, limits Limits, ctx context.Context, rewrite func(*xmlElement, xml.Attr) (string, bool, error)) ([]byte, error) {
+// rewriteExtractMarkup 在词元级MCE作用域过滤下按属性顺序改写XML逻辑值，跳过被忽略或保留扩展子树并保留原编码
+// 入参: data 原始XML, limits 资源上限, ctx 取消Context, filter 可选词元级跳过回调, rewrite 属性改写函数
+// 返回: []byte 独立的原编码结果，失败为nil, error XML、作用域、回调、资源或取消错误
+func rewriteExtractMarkup(data []byte, limits Limits, ctx context.Context, filter func(xml.Token, *xmlElement) (bool, error), rewrite func(*xmlElement, xml.Attr) (string, bool, error)) ([]byte, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
@@ -3431,7 +3474,7 @@ func rewriteExtractMarkup(data []byte, limits Limits, ctx context.Context, rewri
 	}
 	bindings := 0
 	var source, snapshot *xmlElement
-	output, _, err := rewriteXMLAttributes(data, limits, ctx, func(node *xmlElement, attribute xml.Attr) (string, bool, error) {
+	output, _, err := rewriteXMLAttributes(data, limits, ctx, nil, filter, func(node *xmlElement, attribute xml.Attr) (string, bool, error) {
 		if source != node {
 			if len(node.Namespaces) > bindingLimit-bindings {
 				return "", false, fmt.Errorf("%w: extraction markup namespace copy budget", ErrLimit)

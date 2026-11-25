@@ -562,17 +562,25 @@ func (r *Reader) readPrintPageHeader(ctx context.Context, index int, options Pri
 // 入参: ctx 取消Context，nil采用Background, page 页面尺寸及区域, media 已选物理介质, options 资源参数，Scope须为Unknown
 // 返回: *PrintLayout 独立布局, error 页面、设置、未支持组合、资源或取消错误
 func (s *PrintSettings) Layout(ctx context.Context, page *Page, media PrintMedia, options *PrintSettingsOptions) (*PrintLayout, error) {
+	layout, _, err := s.layoutWithRotation(ctx, page, media, options)
+	return layout, err
+}
+
+// layoutWithRotation 计算页面布局并返回不含镜像的纯方向旋转矩阵，供书帖拼版判断视觉页序
+// 入参: ctx 取消Context，nil采用Background, page 页面尺寸及区域, media 已选物理介质, options 资源参数，Scope须为Unknown
+// 返回: *PrintLayout 独立布局, Matrix 方向旋转矩阵, error 页面、设置、未支持组合、资源或取消错误
+func (s *PrintSettings) layoutWithRotation(ctx context.Context, page *Page, media PrintMedia, options *PrintSettingsOptions) (*PrintLayout, Matrix, error) {
 	configuration, err := printSettingsOptions(ctx, options)
 	if err != nil {
-		return nil, err
+		return nil, Matrix{}, err
 	}
 	if configuration.Scope != PrintScopeUnknown || page == nil || !geometryFinite(page.Width, page.Height, media.Width, media.Height) || page.Width < 1 || page.Height < 1 || media.Width < 0 || media.Height < 0 || (media.Width == 0) != (media.Height == 0) {
-		return nil, fmt.Errorf("%w: print layout page or media", ErrInvalid)
+		return nil, Matrix{}, fmt.Errorf("%w: print layout page or media", ErrInvalid)
 	}
 	if media.ImageableArea != nil {
 		area := *media.ImageableArea
 		if !geometryFinite(area.X, area.Y, area.Width, area.Height, area.X+area.Width, area.Y+area.Height) || area.Width <= 0 || area.Height <= 0 {
-			return nil, fmt.Errorf("%w: print imageable area", ErrInvalid)
+			return nil, Matrix{}, fmt.Errorf("%w: print imageable area", ErrInvalid)
 		}
 	}
 	if s == nil {
@@ -580,13 +588,13 @@ func (s *PrintSettings) Layout(ctx context.Context, page *Page, media PrintMedia
 	}
 	root, err := printSettingsRoot(s, configuration)
 	if err != nil {
-		return nil, err
+		return nil, Matrix{}, err
 	}
 	model, err := parsePrintSettings(root, configuration)
 	if err != nil {
-		return nil, err
+		return nil, Matrix{}, err
 	}
-	return newPrintLayoutSettings(model, configuration).layout(page, media)
+	return newPrintLayoutSettings(model, configuration).layoutWithRotation(page, media)
 }
 
 // option 读取指定层级的唯一选择，仅匹配Print Schema公共关键字命名空间
@@ -654,7 +662,7 @@ func (s *printLayoutSettings) number(option *PrintSetting, name string) (float64
 		}
 		value, reference := printScoredValue(child.Children)
 		if reference != (xml.Name{}) {
-			value = s.values[reference]
+			value = s.values[printCanonicalKey(reference)]
 			if value == nil {
 				return 0, true, fmt.Errorf("%w: print layout parameter {%s}%s not initialized", ErrUnsupported, reference.Space, reference.Local)
 			}
@@ -675,29 +683,29 @@ func (s *printLayoutSettings) number(option *PrintSetting, name string) (float64
 	return 0, false, nil
 }
 
-// layout 组合内容缩放、物理介质方向及物理介质轴向镜像，保持两个坐标空间的裁剪独立
+// layoutWithRotation 组合无边距区域、内容缩放、物理介质方向及轴向镜像，保持两个坐标空间裁剪独立并返回纯方向旋转矩阵
 // 入参: page 页面, media 物理介质
-// 返回: *PrintLayout 布局, error 设置、区域或变换错误
-func (s *printLayoutSettings) layout(page *Page, media PrintMedia) (*PrintLayout, error) {
+// 返回: *PrintLayout 布局, Matrix 纯方向旋转矩阵, error 设置、区域或变换错误
+func (s *printLayoutSettings) layoutWithRotation(page *Page, media PrintMedia) (*PrintLayout, Matrix, error) {
 	if err := checkContext(s.options.context); err != nil {
-		return nil, err
+		return nil, Matrix{}, err
 	}
 	for _, value := range s.model.Elements {
 		if value.Kind == PrintSettingFeature && printPublicKeywordSpace(value.Name.Space) && value.Name.Local == "ScaleOffsetAlignment" {
-			return nil, fmt.Errorf("%w: ScaleOffsetAlignment must be a child of PageScaling", ErrInvalid)
+			return nil, Matrix{}, fmt.Errorf("%w: ScaleOffsetAlignment must be a child of PageScaling", ErrInvalid)
 		}
 	}
 	orientationOption, _, err := s.option(s.model.Elements, "PageOrientation")
 	if err != nil {
-		return nil, err
+		return nil, Matrix{}, err
 	}
 	orientation, err := s.keyword(orientationOption, "Portrait")
 	if err != nil {
-		return nil, err
+		return nil, Matrix{}, err
 	}
 	placement, err := s.mediaSize(&media)
 	if err != nil {
-		return nil, err
+		return nil, Matrix{}, err
 	}
 	if media.Width == 0 {
 		media.Width, media.Height = page.Width, page.Height
@@ -711,7 +719,7 @@ func (s *printLayoutSettings) layout(page *Page, media PrintMedia) (*PrintLayout
 	}
 	rotation, err := printOrientation(orientation, orientedMedia)
 	if err != nil {
-		return nil, err
+		return nil, Matrix{}, err
 	}
 	rotation = placement.rotation.Mul(rotation)
 	physical := Rect{Width: media.Width, Height: media.Height}
@@ -719,7 +727,7 @@ func (s *printLayoutSettings) layout(page *Page, media PrintMedia) (*PrintLayout
 	if media.ImageableArea != nil {
 		area = *media.ImageableArea
 		if !printBoxWithin(area, physical) || area.Width <= 0 || area.Height <= 0 {
-			return nil, fmt.Errorf("%w: print imageable area", ErrInvalid)
+			return nil, Matrix{}, fmt.Errorf("%w: print imageable area", ErrInvalid)
 		}
 	}
 	pageBox := Rect{Width: page.Width, Height: page.Height}
@@ -727,22 +735,22 @@ func (s *printLayoutSettings) layout(page *Page, media PrintMedia) (*PrintLayout
 	if page.HasContentBox {
 		content = page.ContentBox
 		if !printBoxWithin(content, pageBox) {
-			return nil, fmt.Errorf("%w: print content box", ErrInvalid)
+			return nil, Matrix{}, fmt.Errorf("%w: print content box", ErrInvalid)
 		}
 	}
 	if page.HasBleedBox {
 		bleed = page.BleedBox
 		if !printBoxWithin(pageBox, bleed) {
-			return nil, fmt.Errorf("%w: print bleed box", ErrInvalid)
+			return nil, Matrix{}, fmt.Errorf("%w: print bleed box", ErrInvalid)
 		}
 	}
 	mirrorOption, _, err := s.option(s.model.Elements, "PageMirrorImage")
 	if err != nil {
-		return nil, err
+		return nil, Matrix{}, err
 	}
 	mirrorName, err := s.keyword(mirrorOption, "None")
 	if err != nil {
-		return nil, err
+		return nil, Matrix{}, err
 	}
 	mirror := IdentityMatrix()
 	switch mirrorName {
@@ -752,28 +760,20 @@ func (s *printLayoutSettings) layout(page *Page, media PrintMedia) (*PrintLayout
 	case "MirrorImageHeight":
 		mirror.D, mirror.F = -1, media.Height
 	default:
-		return nil, fmt.Errorf("%w: print mirror option %s", ErrUnsupported, mirrorName)
+		return nil, Matrix{}, fmt.Errorf("%w: print mirror option %s", ErrUnsupported, mirrorName)
 	}
 	oriented := mirror.Mul(rotation)
 	inverse, err := oriented.Inverse()
 	if err != nil {
-		return nil, err
-	}
-	scaling, feature, err := s.option(s.model.Elements, "PageScaling")
-	if err != nil {
-		return nil, err
-	}
-	scale, err := s.scale(scaling, feature, content, bleed, pageBox, printTransformBox(area, inverse), printTransformBox(physical, inverse))
-	if err != nil {
-		return nil, err
+		return nil, Matrix{}, err
 	}
 	borderOption, _, err := s.option(s.model.Elements, "PageBorderless")
 	if err != nil {
-		return nil, err
+		return nil, Matrix{}, err
 	}
 	border, err := s.keyword(borderOption, "None")
 	if err != nil {
-		return nil, err
+		return nil, Matrix{}, err
 	}
 	pageClip := pageBox
 	switch border {
@@ -784,16 +784,24 @@ func (s *printLayoutSettings) layout(page *Page, media PrintMedia) (*PrintLayout
 			pageClip = page.BleedBox
 		}
 	default:
-		return nil, fmt.Errorf("%w: print border option %s", ErrUnsupported, border)
+		return nil, Matrix{}, fmt.Errorf("%w: print border option %s", ErrUnsupported, border)
+	}
+	scaling, feature, err := s.option(s.model.Elements, "PageScaling")
+	if err != nil {
+		return nil, Matrix{}, err
+	}
+	scale, err := s.scale(scaling, feature, content, bleed, pageBox, printTransformBox(area, inverse), printTransformBox(physical, inverse))
+	if err != nil {
+		return nil, Matrix{}, err
 	}
 	transform := oriented.Mul(scale)
 	transform.E += placement.offset.X
 	transform.F += placement.offset.Y
 	outputBox := printTransformBox(pageClip, transform)
 	if media.Width <= 0 || media.Height <= 0 || !geometryFillMatrixFinite(transform) || !geometryFinite(media.Width, media.Height, area.X+area.Width, area.Y+area.Height, outputBox.X, outputBox.Y, outputBox.Width, outputBox.Height, outputBox.X+outputBox.Width, outputBox.Y+outputBox.Height) {
-		return nil, fmt.Errorf("%w: print layout transform range", ErrLimit)
+		return nil, Matrix{}, fmt.Errorf("%w: print layout transform range", ErrLimit)
 	}
-	return &PrintLayout{Width: media.Width, Height: media.Height, Transform: transform, PageClip: pageClip, MediaClip: area}, nil
+	return &PrintLayout{Width: media.Width, Height: media.Height, Transform: transform, PageClip: pageClip, MediaClip: area}, rotation, nil
 }
 
 // printOrientation 将内容坐标空间映射到物理介质坐标空间，旋转角采用Print Schema的逆时针约定
@@ -850,7 +858,7 @@ func newPrintLayoutSettings(model *PrintSettings, options printSettingsConfig) *
 	settings := &printLayoutSettings{model: model, values: make(map[xml.Name]*PrintValue), options: options}
 	for _, element := range model.Elements {
 		if element.Kind == PrintSettingParameterInit {
-			settings.values[element.Name] = element.Children[0].Value
+			settings.values[printCanonicalKey(element.Name)] = element.Children[0].Value
 		}
 	}
 	return settings

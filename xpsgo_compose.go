@@ -917,7 +917,7 @@ func convertCompositionSourceWithReport(source *compositionSource, format Format
 		result.documents[i] = doc
 	}
 	if source.rootRelationships.name != "" {
-		part, _, _, err := convertCompositionPartMarkupTargets(source.rootRelationships, source.format, format, source.parts, budget)
+		part, err := convertCompositionPartMarkup(source.rootRelationships, source.format, format, source.parts, budget)
 		if err != nil {
 			return nil, nil, &PartError{Part: source.rootRelationships.name, Err: err}
 		}
@@ -935,25 +935,9 @@ func convertCompositionSourceWithReport(source *compositionSource, format Format
 				return nil, nil, &PartError{Part: source.parts[key].name, Err: err}
 			}
 		}
-		part, pageTargets, linkModified, err := convertCompositionPartMarkupTargets(part, source.format, format, source.parts, budget)
+		part, err := convertCompositionPartMarkup(part, source.format, format, source.parts, budget)
 		if err != nil {
 			return nil, nil, &PartError{Part: source.parts[key].name, Err: err}
-		}
-		if linkModified {
-			offset := 0
-			for docIdx := range result.documents {
-				if strings.EqualFold(result.documents[docIdx].Part, part.name) {
-					for pageIdx := range result.documents[docIdx].Pages {
-						pageKey := strings.ToLower(result.documents[docIdx].Pages[pageIdx].Part)
-						normalized := slices.Clone(pageTargets[pageKey])
-						result.documents[docIdx].Pages[pageIdx].LinkTargets = normalized
-						if offset+pageIdx < len(result.pages) {
-							result.pages[offset+pageIdx].LinkTargets = slices.Clone(normalized)
-						}
-					}
-				}
-				offset += len(result.documents[docIdx].Pages)
-			}
 		}
 		result.parts[key] = part
 	}
@@ -1001,12 +985,12 @@ func validateCompositionFormatTicket(source string, relation Relationship, from,
 	return nil
 }
 
-// convertCompositionPartMarkupTargets 转换方言绑定并返回OpenXPS转XPS时规范化的页面LinkTargets表与变更状态
+// convertCompositionPartMarkup 转换方言命名空间、关系类型及相对引用绑定，保持原编码并在目标方言下复核校验
 // 入参: part 原部件, source 原格式, target 目标格式, parts 可选原快照部件表, budget 共享预算
-// 返回: packagePart 目标部件, map[string][]string 页面小写URI到规范化LinkTargets的映射, bool 是否发生LinkTarget规范化, error 错误信息
-func convertCompositionPartMarkupTargets(part packagePart, source, target Format, parts map[string]packagePart, budget *compositionBudget) (packagePart, map[string][]string, bool, error) {
+// 返回: packagePart 目标部件, error 转换、预算或校验错误
+func convertCompositionPartMarkup(part packagePart, source, target Format, parts map[string]packagePart, budget *compositionBudget) (packagePart, error) {
 	if err := budget.step(1); err != nil {
-		return packagePart{}, nil, false, err
+		return packagePart{}, err
 	}
 	layout, _ := fontUsageMarkup(part.media)
 	index := compositionIndexRoot(part.media) != ""
@@ -1017,37 +1001,37 @@ func convertCompositionPartMarkupTargets(part packagePart, source, target Format
 		relSource := relationshipSource(part.name)
 		records, err := compositionRelationshipRecords(relSource, part, budget)
 		if err != nil {
-			return packagePart{}, nil, false, err
+			return packagePart{}, err
 		}
 		edited := false
 		for index := range records {
 			if err := budget.step(1); err != nil {
-				return packagePart{}, nil, false, err
+				return packagePart{}, err
 			}
 			if err := validateCompositionFormatTicket(relSource, records[index], source, target, parts); err != nil {
-				return packagePart{}, nil, false, err
+				return packagePart{}, err
 			}
 			kind, err := compositionFormatRelationship(records[index].Type, source, target)
 			if err != nil {
-				return packagePart{}, nil, false, err
+				return packagePart{}, err
 			}
 			edited = edited || kind != records[index].Type
 			records[index].Type = kind
 		}
 		data, err := compositionRelationshipMarkup(part, records, edited, budget)
 		if err != nil {
-			return packagePart{}, nil, false, err
+			return packagePart{}, err
 		}
 		if edited {
 			part.data, part.items = data, nil
 		}
-		return part, nil, false, nil
+		return part, nil
 	}
 	if !layout && !definition && !discard {
-		return part, nil, false, nil
+		return part, nil
 	}
 	if err := validateCompositionFormatMarkup(part, source, budget); err != nil {
-		return packagePart{}, nil, false, err
+		return packagePart{}, err
 	}
 	namespace, destination := formatNamespace(source), formatNamespace(target)
 	namespaces := map[string]string{namespace: destination}
@@ -1056,10 +1040,10 @@ func convertCompositionPartMarkupTargets(part packagePart, source, target Format
 	}
 	for range 2 {
 		if err := budget.scan(int64(len(part.data))); err != nil {
-			return packagePart{}, nil, false, err
+			return packagePart{}, err
 		}
 	}
-	data, changed, err := rewriteXMLMappedAttributes(part.data, budget.limits, budget.context, namespaces, func(node *xmlElement, attribute xml.Attr) (string, bool, error) {
+	data, changed, err := rewriteXMLAttributes(part.data, budget.limits, budget.context, namespaces, nil, func(node *xmlElement, attribute xml.Attr) (string, bool, error) {
 		if err := budget.step(1); err != nil {
 			return "", false, err
 		}
@@ -1116,85 +1100,71 @@ func convertCompositionPartMarkupTargets(part packagePart, source, target Format
 		return attribute.Value, false, nil
 	})
 	if err != nil {
-		return packagePart{}, nil, false, err
+		return packagePart{}, err
 	}
 	result := part
 	result.data = data
 	if changed {
 		result.items = nil
 	}
-	var pageTargets map[string][]string
-	linkModified := false
+	nameFormat := target
 	if source == FormatOpenXPS && target == FormatXPS && strings.EqualFold(result.media, fixedContentType("fixeddocument")) {
-		result, pageTargets, linkModified, err = deduplicateCompositionLinkTargets(result, target, budget)
-		if err != nil {
-			return packagePart{}, nil, false, err
-		}
+		nameFormat = FormatOpenXPS
 	}
-	if err := validateCompositionFormatMarkup(result, target, budget); err != nil {
+	if err := validateCompositionFormatMarkupMode(result, target, nameFormat, budget); err != nil {
 		if errors.Is(err, ErrInvalid) {
-			return packagePart{}, nil, false, fmt.Errorf("%w: target document format: %v", ErrUnsupported, err)
+			return packagePart{}, fmt.Errorf("%w: target document format: %v", ErrUnsupported, err)
 		}
-		return packagePart{}, nil, false, err
+		return packagePart{}, err
 	}
 	if err := budget.step(0); err != nil {
-		return packagePart{}, nil, false, err
+		return packagePart{}, err
 	}
-	return result, pageTargets, linkModified, nil
+	return result, nil
 }
 
-// deduplicateCompositionLinkTargets 将OpenXPS固定文档中合法重复或非NCName的LinkTarget规范化为XPS 1.0唯一标识，保留MCE扩展与原相对顺序
-// 入参: part 已切换命名空间的固定文档部件, target 目标方言, budget 共享预算
-// 返回: packagePart 规范化后的文档部件, map[string][]string 各页面规范化LinkTargets, bool 是否发生改写或去重, error 解析、编码、预算或取消错误
-func deduplicateCompositionLinkTargets(part packagePart, target Format, budget *compositionBudget) (packagePart, map[string][]string, bool, error) {
+// normalizeCompositionDocumentLinkTargets 在跨方言整文档保留路径中按实际页面名称映射与去重表规范化LinkTarget，空容器的保留扩展提升至PageContent
+// 入参: part 已切换命名空间的原固定文档部件, document 目标文档实例, plan 组合规划, names 已确定的页面名称映射与去重集合
+// 返回: []byte 规范化后的文档XML, error 解析、编码、预算或取消错误
+func normalizeCompositionDocumentLinkTargets(part packagePart, document compositionDocumentInstance, plan *compositionPlan, names *compositionNames) ([]byte, error) {
+	budget := plan.budget
 	if err := budget.scan(int64(len(part.data))); err != nil {
-		return packagePart{}, nil, false, err
+		return nil, err
 	}
-	namespace := formatNamespace(target)
+	namespace := formatNamespace(plan.format)
 	active, ordered, err := preprocessXMLContentContext(part.data, []string{namespace, namespace + "/resourcedictionary-key"}, budget.limits, budget.context)
 	if err != nil {
-		return packagePart{}, nil, false, err
+		return nil, err
 	}
-	reserved := make(map[string]bool)
+	pageCursor := 0
 	for _, pageNode := range active.Children {
 		if err := budget.step(1); err != nil {
-			return packagePart{}, nil, false, err
+			return nil, err
 		}
 		if pageNode.Name != (xml.Name{Space: namespace, Local: "PageContent"}) {
 			continue
 		}
-		for _, child := range pageNode.Children {
-			if child.Name != (xml.Name{Space: namespace, Local: "PageContent.LinkTargets"}) {
-				continue
-			}
-			for _, link := range child.Children {
-				if link.Name == (xml.Name{Space: namespace, Local: "LinkTarget"}) {
-					if val, ok := link.attribute("Name"); ok && xmlNCName(val) {
-						reserved[val] = true
-					}
-				}
-			}
+		if pageCursor >= len(document.pages) {
+			return nil, fmt.Errorf("%w: composition document page count mismatch", ErrInvalid)
 		}
-	}
-	seen := make(map[string]bool)
-	pageTargets := make(map[string][]string)
-	counter := 0
-	modified := false
-	for _, pageNode := range active.Children {
-		if err := budget.step(1); err != nil {
-			return packagePart{}, nil, false, err
+		pageInst := document.pages[pageCursor]
+		pageCursor++
+		outputPagePart := plan.pages[pageInst].reference.Part
+		relSource, err := relativePart(document.part, outputPagePart)
+		if err != nil {
+			return nil, err
 		}
-		if pageNode.Name != (xml.Name{Space: namespace, Local: "PageContent"}) {
-			continue
-		}
-		pageKey := ""
-		if src, ok := pageNode.attribute("Source"); ok {
-			if resolved, resolveErr := resolvePart(part.name, src); resolveErr == nil {
-				pageKey = strings.ToLower(resolved)
+		for i := range pageNode.Attr {
+			if pageNode.Attr[i].Name.Space == "" && pageNode.Attr[i].Name.Local == "Source" {
+				pageNode.Attr[i].Value = relSource
+				break
 			}
 		}
-		var pageLinks []string
+		mapping := names.pages[pageInst]
+		dropped := names.droppedTargets[pageInst]
+		seenInPage := make(map[string]bool)
 		keptPageChildren := make([]*xmlElement, 0, len(pageNode.Children))
+		promoted := make(map[*xmlElement][]*xmlElement)
 		for _, child := range pageNode.Children {
 			if child.Name != (xml.Name{Space: namespace, Local: "PageContent.LinkTargets"}) {
 				keptPageChildren = append(keptPageChildren, child)
@@ -1203,7 +1173,7 @@ func deduplicateCompositionLinkTargets(part packagePart, target Format, budget *
 			keptLinks := make([]*xmlElement, 0, len(child.Children))
 			for _, link := range child.Children {
 				if err := budget.step(1); err != nil {
-					return packagePart{}, nil, false, err
+					return nil, err
 				}
 				if link.Name != (xml.Name{Space: namespace, Local: "LinkTarget"}) {
 					keptLinks = append(keptLinks, link)
@@ -1214,47 +1184,56 @@ func deduplicateCompositionLinkTargets(part packagePart, target Format, budget *
 					keptLinks = append(keptLinks, link)
 					continue
 				}
-				if seen[val] {
-					modified = true
+				if dropped[val] {
 					continue
 				}
-				seen[val] = true
-				finalName := val
-				if !xmlNCName(val) {
-					for {
-						counter++
-						candidate := "Name_" + strconv.Itoa(counter)
-						if !reserved[candidate] && !seen[candidate] {
-							reserved[candidate], seen[candidate] = true, true
-							finalName = candidate
-							for i := range link.Attr {
-								if link.Attr[i].Name.Space == "" && link.Attr[i].Name.Local == "Name" {
-									link.Attr[i].Value = candidate
-									break
-								}
-							}
-							modified = true
-							break
-						}
+				targetName, exists := mapping[val]
+				if !exists {
+					return nil, fmt.Errorf("%w: missing composition LinkTarget mapping %q", ErrInvalid, val)
+				}
+				if seenInPage[targetName] {
+					continue
+				}
+				seenInPage[targetName] = true
+				for i := range link.Attr {
+					if link.Attr[i].Name.Space == "" && link.Attr[i].Name.Local == "Name" {
+						link.Attr[i].Value = targetName
+						break
 					}
 				}
-				pageLinks = append(pageLinks, finalName)
 				keptLinks = append(keptLinks, link)
 			}
-			if len(keptLinks) == 0 && len(child.PreservedElements) == 0 {
-				modified = true
+			if len(keptLinks) == 0 {
+				if len(child.PreservedElements) != 0 {
+					pageNode.PreservedElements = append(pageNode.PreservedElements, child.PreservedElements...)
+					promoted[child] = child.PreservedElements
+				}
+				if len(child.PreservedAttributes) != 0 {
+					pageNode.PreservedAttributes = append(pageNode.PreservedAttributes, child.PreservedAttributes...)
+				}
 				continue
 			}
 			child.Children = keptLinks
 			keptPageChildren = append(keptPageChildren, child)
 		}
 		pageNode.Children = keptPageChildren
-		if pageKey != "" {
-			pageTargets[pageKey] = pageLinks
+		if len(promoted) != 0 && ordered != nil {
+			if items, ok := ordered[pageNode]; ok {
+				replaced := make([]xmlContent, 0, len(items))
+				for _, item := range items {
+					if item.element != nil {
+						if lifted, hit := promoted[item.element]; hit {
+							for _, elem := range lifted {
+								replaced = append(replaced, xmlContent{element: elem})
+							}
+							continue
+						}
+					}
+					replaced = append(replaced, item)
+				}
+				ordered[pageNode] = replaced
+			}
 		}
-	}
-	if !modified {
-		return part, pageTargets, false, nil
 	}
 	var stripNS func(*xmlElement)
 	stripNS = func(node *xmlElement) {
@@ -1274,21 +1253,56 @@ func deduplicateCompositionLinkTargets(part packagePart, target Format, budget *
 	limits.MaxMetadataBytes = min(limits.MaxMetadataBytes, limits.MaxPackageBytes)
 	data, err := createdMarkupContent(active, ordered, limits, budget.context)
 	if err != nil {
-		return packagePart{}, nil, false, err
+		return nil, err
 	}
 	if err := budget.scan(int64(len(data))); err != nil {
-		return packagePart{}, nil, false, err
+		return nil, err
 	}
-	part.data, part.items = data, nil
-	return part, pageTargets, true, nil
+	if err := validateCompositionFormatMarkup(packagePart{name: document.part, media: part.media, data: data}, plan.format, budget); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// validateCompositionFixedDocumentNames 按OpenXPS规则校验已切换XPS命名空间的固定文档LinkTarget名称，允许跨页重复与非NCName等待规划阶段规范化
+// 入参: root 预处理后的固定文档根节点, namespace 当前文档元素命名空间
+// 返回: error 空或非法字符模式名称错误
+func validateCompositionFixedDocumentNames(root *xmlElement, namespace string) error {
+	var visit func(*xmlElement) error
+	visit = func(node *xmlElement) error {
+		if node.Name.Space != namespace {
+			return nil
+		}
+		if node.Name.Local == "LinkTarget" {
+			for _, attr := range node.Attr {
+				if attr.Name.Space == "" && attr.Name.Local == "Name" && !fixedNamePattern(attr.Value) {
+					return fmt.Errorf("%w: invalid Name %q on LinkTarget", ErrInvalid, attr.Value)
+				}
+			}
+		}
+		for _, child := range node.Children {
+			if err := visit(child); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return visit(root)
 }
 
 // validateCompositionFormatMarkup 校验方言差异及关系、签署请求等结构，不用目标规则替代源规则
 // 入参: part 待校验部件, format 当前格式, budget 共享预算
 // 返回: error XML、名称、文字、颜色、关系、预算或取消错误
 func validateCompositionFormatMarkup(part packagePart, format Format, budget *compositionBudget) error {
+	return validateCompositionFormatMarkupMode(part, format, format, budget)
+}
+
+// validateCompositionFormatMarkupMode 校验方言结构并按指定名称规则校验LinkTarget，支持跨方言延后规范化
+// 入参: part 待校验部件, format 当前XML结构方言, nameFormat 名称校验采用的方言, budget 共享预算
+// 返回: error XML、名称、文字、颜色、关系、预算或取消错误
+func validateCompositionFormatMarkupMode(part packagePart, format, nameFormat Format, budget *compositionBudget) error {
 	if compositionIndexRoot(part.media) != "" {
-		view, err := newCompositionIndex(part, format, budget)
+		view, err := newCompositionIndexWithNameFormat(part, format, nameFormat, budget)
 		if err != nil {
 			return err
 		}
@@ -1303,7 +1317,7 @@ func validateCompositionFormatMarkup(part packagePart, format Format, budget *co
 	discard := strings.EqualFold(part.media, fixedContentType("discard-control"))
 	namespace := formatNamespace(format)
 	graph := compositionProtectionGraph{source: &compositionSource{format: format}, budget: budget}
-	tracker := newResourceMarkupScopeTracker(format, false, budget.context)
+	tracker := newResourceMarkupScopeTracker(format, format == FormatOpenXPS, budget.context)
 	root, err := decodeXMLVisit(part.data, budget.limits, func(token xml.Token, node *xmlElement) error {
 		if err := budget.step(1); err != nil {
 			return err
@@ -1437,6 +1451,13 @@ func compositionIndexRoot(media string) string {
 // 入参: value 原索引部件, format 原方言, budget 共享预算
 // 返回: *compositionIndex 独立索引视图, error 结构、预算或取消错误
 func newCompositionIndex(value packagePart, format Format, budget *compositionBudget) (*compositionIndex, error) {
+	return newCompositionIndexWithNameFormat(value, format, format, budget)
+}
+
+// newCompositionIndexWithNameFormat 复用标准兼容性选择器读取主索引，支持跨方言延后校验XPS 1.0唯一LinkTarget
+// 入参: value 原索引部件, format 当前XML命名空间方言, nameFormat 名称校验采用的方言, budget 共享预算
+// 返回: *compositionIndex 独立索引视图, error 结构、预算或取消错误
+func newCompositionIndexWithNameFormat(value packagePart, format, nameFormat Format, budget *compositionBudget) (*compositionIndex, error) {
 	local, namespace := compositionIndexRoot(value.media), formatNamespace(format)
 	if local == "" || namespace == "" {
 		return nil, fmt.Errorf("%w: composition index input", ErrInvalid)
@@ -1483,7 +1504,11 @@ func newCompositionIndex(value packagePart, format Format, budget *compositionBu
 	if err := validateFixedStructure(active, format); err != nil {
 		return nil, err
 	}
-	if err := validateFixedNames(active, format); err != nil {
+	if nameFormat == FormatOpenXPS && format == FormatXPS && local == "FixedDocument" {
+		if err := validateCompositionFixedDocumentNames(active, namespace); err != nil {
+			return nil, err
+		}
+	} else if err := validateFixedNames(active, format); err != nil {
 		return nil, err
 	}
 	if err := budget.step(0); err != nil {
@@ -1517,7 +1542,11 @@ func (s *compositionSource) indexPart(value packagePart, budget *compositionBudg
 			return &copy, nil
 		}
 	}
-	index, err := newCompositionIndex(value, s.format, budget)
+	nameFormat := s.format
+	if s.sourceFormat == FormatOpenXPS && s.format == FormatXPS {
+		nameFormat = FormatOpenXPS
+	}
+	index, err := newCompositionIndexWithNameFormat(value, s.format, nameFormat, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -2072,7 +2101,7 @@ func (s *compositionCapture) markup(part packagePart, owner string) error {
 			return err
 		}
 	}
-	tracker := newResourceMarkupScopeTracker(s.source.format, false, s.budget.context)
+	tracker := newResourceMarkupScopeTracker(s.source.format, s.source.format == FormatOpenXPS, s.budget.context)
 	visit := func(token xml.Token, node *xmlElement) error {
 		if err := s.budget.step(1); err != nil {
 			return err

@@ -132,12 +132,15 @@ type PrintSettings struct {
 
 // PrintSetting 保存展开后的关键字名称、子元素或值，不依赖输入XML的前缀拼写
 // Option允许省略Name，只有Value元素使用Value，Constraint仅适用于能力文档的Option
+// Default与HasDefault保存Print Schema v2选项的psf2:default声明
 type PrintSetting struct {
 	Kind       PrintSettingKind
 	Name       xml.Name
 	Children   []PrintSetting
 	Value      *PrintValue
 	Constraint PrintConstraint
+	Default    bool
+	HasDefault bool
 }
 
 // PrintValue 保存值类型和字符数据，QName保存QName值或QName参数字符串默认值中的展开名称
@@ -283,6 +286,19 @@ func printFrameworkSpace(space string) bool {
 // 返回: bool 是否为公共关键字命名空间
 func printPublicKeywordSpace(space string) bool {
 	return space == printKeywordsNS || space == printKeywordsV11NS || space == printKeywordsV12NS || space == printKeywords2NS
+}
+
+// printCanonicalKey 将公共关键字与框架命名空间分别归并到规范命名空间用于合并与查重，私有命名空间保持原样
+// 入参: name 展开关键字名称
+// 返回: xml.Name 规范化后的展开名称
+func printCanonicalKey(name xml.Name) xml.Name {
+	if printPublicKeywordSpace(name.Space) {
+		return xml.Name{Space: printKeywordsNS, Local: name.Local}
+	}
+	if printFrameworkSpace(name.Space) {
+		return xml.Name{Space: printFrameworkNS, Local: name.Local}
+	}
+	return name
 }
 
 // Selection 返回Feature的选择方式，能力文档省略声明时默认为PickOne
@@ -739,7 +755,7 @@ func parsePrintDocument(root *xmlElement, options printSettingsConfig, capabilit
 		if err := checkContext(options.context); err != nil {
 			return nil, err
 		}
-		kind, psf2, err := printSettingKindNode(child)
+		kind, psf2, err := printSettingKindForVersion(child, parsedVersion)
 		if err != nil {
 			return nil, err
 		}
@@ -763,11 +779,12 @@ func parsePrintDocument(root *xmlElement, options printSettingsConfig, capabilit
 		if !capabilities && options.Scope != PrintScopeUnknown && scope != PrintScopeUnknown && scope < options.Scope {
 			continue
 		}
-		if seen[name] {
+		key := printCanonicalKey(name)
+		if seen[key] {
 			return nil, fmt.Errorf("%w: duplicate print setting {%s}%s", ErrInvalid, name.Space, name.Local)
 		}
-		seen[name] = true
-		setting, err := parsePrintSetting(child, [len(printSettingNames)]uint8{}, options.context, capabilities)
+		seen[key] = true
+		setting, err := parsePrintSetting(child, parsedVersion, [len(printSettingNames)]uint8{}, options.context, capabilities)
 		if err != nil {
 			return nil, err
 		}
@@ -810,7 +827,8 @@ func printPrefixFamily(value PrintSetting) (printPrefixKey, PrintScope, bool) {
 	if suffix == "" {
 		return printPrefixKey{}, PrintScopeUnknown, false
 	}
-	return printPrefixKey{kind: value.Kind, space: value.Name.Space, local: suffix}, scope, true
+	canonical := printCanonicalKey(value.Name)
+	return printPrefixKey{kind: value.Kind, space: canonical.Space, local: suffix}, scope, true
 }
 
 // printSettingsPrefixConflicts 检查同一父级作用域内同类元素中仅作用域前缀不同的关键字冲突
@@ -820,10 +838,11 @@ func printSettingsPrefixConflicts(settings []PrintSetting) error {
 	seen := make(map[printPrefixKey]xml.Name)
 	for _, value := range settings {
 		if key, _, ok := printPrefixFamily(value); ok {
-			if previous, exists := seen[key]; exists && previous != value.Name {
+			canonical := printCanonicalKey(value.Name)
+			if previous, exists := seen[key]; exists && previous != canonical {
 				return fmt.Errorf("%w: print settings scope prefix conflict {%s}%s and %s", ErrInvalid, value.Name.Space, previous.Local, value.Name.Local)
 			}
-			seen[key] = value.Name
+			seen[key] = canonical
 		}
 		if err := printSettingsPrefixConflicts(value.Children); err != nil {
 			return err
@@ -832,11 +851,11 @@ func printSettingsPrefixConflicts(settings []PrintSetting) error {
 	return nil
 }
 
-// parsePrintSetting 校验单个Framework元素及其子结构，支持PSF1与PSF2节点语法，能力文档同类型元素及票据Feature不得嵌套超过十层
-// 入参: node XML元素, nesting 各类型已包含的层数, ctx 取消Context, capabilities 是否为设备能力文档
+// parsePrintSetting 校验单个Framework元素及其子结构，按根版本严格区分PSF1与PSF2节点语法，能力文档同类型元素及票据Feature不得嵌套超过十层
+// 入参: node XML元素, version 框架版本号, nesting 各类型已包含的层数, ctx 取消Context, capabilities 是否为设备能力文档
 // 返回: PrintSetting 独立设置元素, error 结构、值或取消错误
-func parsePrintSetting(node *xmlElement, nesting [len(printSettingNames)]uint8, ctx context.Context, capabilities bool) (PrintSetting, error) {
-	kind, psf2, err := printSettingKindNode(node)
+func parsePrintSetting(node *xmlElement, version uint32, nesting [len(printSettingNames)]uint8, ctx context.Context, capabilities bool) (PrintSetting, error) {
+	kind, psf2, err := printSettingKindForVersion(node, version)
 	if err != nil {
 		return PrintSetting{}, err
 	}
@@ -857,13 +876,13 @@ func parsePrintSetting(node *xmlElement, nesting [len(printSettingNames)]uint8, 
 	}
 	inlineCapable := psf2 && (value.Kind == PrintSettingProperty || value.Kind == PrintSettingScoredProperty || value.Kind == PrintSettingParameterInit)
 	_, hasXSIType := node.attributeNS(xsiNamespace, "type")
-	inlineValue := inlineCapable && (len(node.Children) == 0 || hasXSIType)
+	inlineValue := inlineCapable && (len(node.Children) == 0 || hasXSIType || !xmlWhitespace(node.Text))
 	if !inlineValue && !xmlWhitespace(node.Text) {
 		return value, fmt.Errorf("%w: text in print settings %s", ErrInvalid, node.Name.Local)
 	}
 	var selectionProp *PrintSetting
 	if psf2 {
-		if err := printSettingsPSF2Attributes(node, value.Kind, capabilities, inlineCapable, &value.Constraint, &selectionProp); err != nil {
+		if err := printSettingsPSF2Attributes(node, value.Kind, capabilities, inlineCapable, &value.Constraint, &value.HasDefault, &value.Default, &selectionProp); err != nil {
 			return value, err
 		}
 		value.Name = node.Name
@@ -889,7 +908,7 @@ func parsePrintSetting(node *xmlElement, nesting [len(printSettingNames)]uint8, 
 	seen := make(map[xml.Name]bool)
 	values, choices := 0, 0
 	if selectionProp != nil {
-		seen[selectionProp.Name] = true
+		seen[printCanonicalKey(selectionProp.Name)] = true
 		value.Children = append(value.Children, *selectionProp)
 	}
 	if inlineValue {
@@ -901,7 +920,7 @@ func parsePrintSetting(node *xmlElement, nesting [len(printSettingNames)]uint8, 
 		value.Children = append(value.Children, PrintSetting{Kind: PrintSettingValue, Value: parsedVal})
 	}
 	for _, child := range node.Children {
-		childKind, _, err := printSettingKindNode(child)
+		childKind, _, err := printSettingKindForVersion(child, version)
 		if err != nil {
 			return value, err
 		}
@@ -923,15 +942,16 @@ func parsePrintSetting(node *xmlElement, nesting [len(printSettingNames)]uint8, 
 		if !allowed {
 			return value, fmt.Errorf("%w: %s child in print settings %s", ErrInvalid, child.Name.Local, node.Name.Local)
 		}
-		parsed, err := parsePrintSetting(child, nesting, ctx, capabilities)
+		parsed, err := parsePrintSetting(child, version, nesting, ctx, capabilities)
 		if err != nil {
 			return value, err
 		}
 		if childKind != PrintSettingOption && parsed.Name != (xml.Name{}) {
-			if seen[parsed.Name] {
+			key := printCanonicalKey(parsed.Name)
+			if seen[key] {
 				return value, fmt.Errorf("%w: duplicate print setting child {%s}%s", ErrInvalid, parsed.Name.Space, parsed.Name.Local)
 			}
-			seen[parsed.Name] = true
+			seen[key] = true
 		}
 		if childKind == PrintSettingValue || childKind == PrintSettingParameterRef {
 			values++
@@ -958,18 +978,18 @@ func parsePrintSetting(node *xmlElement, nesting [len(printSettingNames)]uint8, 
 		return value, fmt.Errorf("%w: print settings %s child count", ErrInvalid, node.Name.Local)
 	}
 	if value.Kind == PrintSettingParameterDef {
-		if err := printParameterDefaultQName(node, &value); err != nil {
+		if err := printParameterDefaultQName(node, &value, psf2); err != nil {
 			return value, err
 		}
 	}
 	return value, nil
 }
 
-// printSettingKind 根据展开名称识别允许的Framework v1或v2显式元素
+// printSettingKind 根据展开名称识别允许的Framework v1显式元素
 // 入参: name 元素展开名称
-// 返回: PrintSettingKind 元素类型，非Framework或未知元素返回Unknown
+// 返回: PrintSettingKind 元素类型，非Framework v1或未知元素返回Unknown
 func printSettingKind(name xml.Name) PrintSettingKind {
-	if printFrameworkSpace(name.Space) {
+	if name.Space == printFrameworkNS {
 		for kind, local := range printSettingNames {
 			if kind != 0 && name.Local == local {
 				return PrintSettingKind(kind)
@@ -979,12 +999,15 @@ func printSettingKind(name xml.Name) PrintSettingKind {
 	return PrintSettingUnknown
 }
 
-// printSettingKindNode 识别显式Framework元素或携带psf2:psftype属性的Print Schema v2元素
-// 入参: node XML元素
-// 返回: PrintSettingKind 元素类型, bool 是否为psf2:psftype直接元素, error 非法psftype属性错误
-func printSettingKindNode(node *xmlElement) (PrintSettingKind, bool, error) {
-	if kind := printSettingKind(node.Name); kind != PrintSettingUnknown {
-		return kind, false, nil
+// printSettingKindForVersion 按框架版本严格识别v1显式包装元素或v2携带psf2:psftype属性的直接关键字元素
+// 入参: node XML元素, version 框架版本号
+// 返回: PrintSettingKind 元素类型, bool 是否为psf2:psftype直接元素, error 非法psftype或伪造包装元素错误
+func printSettingKindForVersion(node *xmlElement, version uint32) (PrintSettingKind, bool, error) {
+	if version != 2 {
+		if kind := printSettingKind(node.Name); kind != PrintSettingUnknown {
+			return kind, false, nil
+		}
+		return PrintSettingUnknown, false, nil
 	}
 	text, present := node.attributeNS(printFramework2NS, "psftype")
 	if !present {
@@ -992,6 +1015,9 @@ func printSettingKindNode(node *xmlElement) (PrintSettingKind, bool, error) {
 	}
 	if node.Name.Space == "" {
 		return PrintSettingUnknown, false, fmt.Errorf("%w: print settings v2 element without namespace", ErrInvalid)
+	}
+	if printFrameworkSpace(node.Name.Space) && (printSettingKind(xml.Name{Space: printFrameworkNS, Local: node.Name.Local}) != PrintSettingUnknown || node.Name.Local == "PrintTicket" || node.Name.Local == "PrintCapabilities") {
+		return PrintSettingUnknown, false, fmt.Errorf("%w: print settings v2 wrapper element {%s}%s", ErrInvalid, node.Name.Space, node.Name.Local)
 	}
 	text = strings.Trim(text, " \t\r\n")
 	for kind, local := range printSettingNames {
@@ -1002,10 +1028,10 @@ func printSettingKindNode(node *xmlElement) (PrintSettingKind, bool, error) {
 	return PrintSettingUnknown, false, fmt.Errorf("%w: print settings psf2:psftype %q", ErrInvalid, text)
 }
 
-// printSettingsPSF2Attributes 校验Print Schema v2直接元素的框架属性并提取约束与选择类型
-// 入参: node XML元素, kind 已识别元素类型, capabilities 是否为能力文档, allowType 是否允许xsi:type, constraint 约束输出, selection 选择属性输出
+// printSettingsPSF2Attributes 校验Print Schema v2直接元素的框架属性并提取约束、默认标记与选择类型
+// 入参: node XML元素, kind 已识别元素类型, capabilities 是否为能力文档, allowType 是否允许xsi:type, constraint 约束输出, hasDefault 默认声明标志输出, isDefault 默认选项值输出, selection 选择属性输出
 // 返回: error 属性或取值错误
-func printSettingsPSF2Attributes(node *xmlElement, kind PrintSettingKind, capabilities, allowType bool, constraint *PrintConstraint, selection **PrintSetting) error {
+func printSettingsPSF2Attributes(node *xmlElement, kind PrintSettingKind, capabilities, allowType bool, constraint *PrintConstraint, hasDefault, isDefault *bool, selection **PrintSetting) error {
 	for _, attribute := range node.Attr {
 		if attribute.Name.Space == xmlnsNamespace || attribute.Name == (xml.Name{Local: "xmlns"}) {
 			continue
@@ -1021,6 +1047,8 @@ func printSettingsPSF2Attributes(node *xmlElement, kind PrintSettingKind, capabi
 			if value != "true" && value != "false" {
 				return fmt.Errorf("%w: print settings psf2:default value", ErrInvalid)
 			}
+			*hasDefault = true
+			*isDefault = value == "true"
 			continue
 		}
 		if capabilities && kind == PrintSettingOption && (attribute.Name == (xml.Name{Local: "constrained"}) || attribute.Name == (xml.Name{Space: printFramework2NS, Local: "constrained"})) {
@@ -1274,7 +1302,7 @@ func MergePrintSettings(ctx context.Context, baseline, delta *PrintSettings, opt
 	indices := make(map[xml.Name]int, len(elements))
 	families := make(map[printPrefixKey]int, len(elements))
 	for index, value := range elements {
-		indices[value.Name] = index
+		indices[printCanonicalKey(value.Name)] = index
 		if key, _, ok := printPrefixFamily(value); ok {
 			families[key] = index
 		}
@@ -1283,20 +1311,21 @@ func MergePrintSettings(ctx context.Context, baseline, delta *PrintSettings, opt
 		if err := checkContext(configuration.context); err != nil {
 			return nil, err
 		}
+		valueKey := printCanonicalKey(value.Name)
 		familyKey, scope, hasFamily := printPrefixFamily(value)
 		replacedIndex := -1
 		if hasFamily {
-			if existing, exists := families[familyKey]; exists && elements[existing].Name != value.Name {
+			if existing, exists := families[familyKey]; exists && printCanonicalKey(elements[existing].Name) != valueKey {
 				if scope < printKeywordScope(elements[existing].Name) {
 					continue
 				}
-				delete(indices, elements[existing].Name)
+				delete(indices, printCanonicalKey(elements[existing].Name))
 				delete(families, familyKey)
 				removed[existing] = true
 				replacedIndex = existing
 			}
 		}
-		if index, exists := indices[value.Name]; exists {
+		if index, exists := indices[valueKey]; exists {
 			if elements[index].Kind == PrintSettingFeature && value.Kind == PrintSettingFeature {
 				mergedFeature, err := mergePrintFeature(elements[index], value, configuration.context)
 				if err != nil {
@@ -1315,13 +1344,13 @@ func MergePrintSettings(ctx context.Context, baseline, delta *PrintSettings, opt
 		} else if replacedIndex >= 0 {
 			removed[replacedIndex] = false
 			elements[replacedIndex] = value
-			indices[value.Name] = replacedIndex
+			indices[valueKey] = replacedIndex
 			families[familyKey] = replacedIndex
 		} else {
 			index := len(elements)
 			elements = append(elements, value)
 			removed = append(removed, false)
-			indices[value.Name] = index
+			indices[valueKey] = index
 			if hasFamily {
 				families[familyKey] = index
 			}
@@ -1373,7 +1402,7 @@ func mergePrintFeature(baseline, delta PrintSetting, ctx context.Context) (Print
 		}
 	}
 	watermark := printPublicKeywordSpace(baseline.Name.Space) && baseline.Name.Local == "PageWatermark"
-	dropBaseSubfeatures := watermark && deltaHasOption && (!baselineHasOption || deltaOption != baselineOption)
+	dropBaseSubfeatures := watermark && deltaHasOption && (!baselineHasOption || printCanonicalKey(deltaOption) != printCanonicalKey(baselineOption))
 	dropDeltaLayering := watermark && !deltaHasOption && baselineHasOption && printPublicKeywordSpace(baselineOption.Space) && baselineOption.Local == "None"
 	elements := make([]PrintSetting, 0, len(baseline.Children)+len(delta.Children))
 	removed := make([]bool, 0, len(baseline.Children)+len(delta.Children))
@@ -1390,7 +1419,7 @@ func mergePrintFeature(baseline, delta PrintSetting, ctx context.Context) (Print
 		elements = append(elements, child)
 		removed = append(removed, false)
 		if child.Kind != PrintSettingOption && child.Name != (xml.Name{}) {
-			indices[child.Name] = index
+			indices[printCanonicalKey(child.Name)] = index
 			if key, _, ok := printPrefixFamily(child); ok {
 				families[key] = index
 			}
@@ -1408,20 +1437,21 @@ func mergePrintFeature(baseline, delta PrintSetting, ctx context.Context) (Print
 			removed = append(removed, false)
 			continue
 		}
+		childKey := printCanonicalKey(child.Name)
 		familyKey, scope, hasFamily := printPrefixFamily(child)
 		replacedIndex := -1
 		if hasFamily {
-			if existing, exists := families[familyKey]; exists && elements[existing].Name != child.Name {
+			if existing, exists := families[familyKey]; exists && printCanonicalKey(elements[existing].Name) != childKey {
 				if scope < printKeywordScope(elements[existing].Name) {
 					continue
 				}
-				delete(indices, elements[existing].Name)
+				delete(indices, printCanonicalKey(elements[existing].Name))
 				delete(families, familyKey)
 				removed[existing] = true
 				replacedIndex = existing
 			}
 		}
-		if index, exists := indices[child.Name]; exists {
+		if index, exists := indices[childKey]; exists {
 			if elements[index].Kind == PrintSettingFeature && child.Kind == PrintSettingFeature {
 				mergedChild, err := mergePrintFeature(elements[index], child, ctx)
 				if err != nil {
@@ -1440,13 +1470,13 @@ func mergePrintFeature(baseline, delta PrintSetting, ctx context.Context) (Print
 		} else if replacedIndex >= 0 {
 			removed[replacedIndex] = false
 			elements[replacedIndex] = child
-			indices[child.Name] = replacedIndex
+			indices[childKey] = replacedIndex
 			families[familyKey] = replacedIndex
 		} else {
 			index := len(elements)
 			elements = append(elements, child)
 			removed = append(removed, false)
-			indices[child.Name] = index
+			indices[childKey] = index
 			if hasFamily {
 				families[familyKey] = index
 			}
@@ -1459,6 +1489,9 @@ func mergePrintFeature(baseline, delta PrintSetting, ctx context.Context) (Print
 		}
 	}
 	result := baseline
+	if deltaHasOption {
+		result.Name = delta.Name
+	}
 	result.Children = merged
 	return result, nil
 }
@@ -1502,7 +1535,7 @@ func printSettingsRoot(settings *PrintSettings, options printSettingsConfig) (*x
 	return printDocumentRoot(settings.Version, settings.Elements, options, false)
 }
 
-// printDocumentRoot 生成票据或能力文档的独立XML结构，共用名称绑定及资源预算
+// printDocumentRoot 生成票据或能力文档的独立XML结构，共用名称绑定及资源预算，按版本输出标准PSF1或PSF2结构
 // 入参: version Framework版本, elements 根内容, options 已校验参数, capabilities 是否为设备能力文档
 // 返回: *xmlElement 独立根节点, error 结构、预算或取消错误
 func printDocumentRoot(version uint32, elements []PrintSetting, options printSettingsConfig, capabilities bool) (*xmlElement, error) {
@@ -1511,6 +1544,9 @@ func printDocumentRoot(version uint32, elements []PrintSetting, options printSet
 	}
 	if version == 0 {
 		version = 1
+	}
+	if version != 1 && version != 2 {
+		return nil, fmt.Errorf("%w: print settings framework version", ErrUnsupported)
 	}
 	framework, prefix := printFrameworkNS, "psf"
 	if version == 2 {
@@ -1546,10 +1582,13 @@ func printDocumentRoot(version uint32, elements []PrintSetting, options printSet
 	return root, nil
 }
 
-// element 将一个设置转换为XML节点，在递归或分配子结构前检查资源限制
+// element 将一个设置转换为XML节点，按框架版本分派标准PSF1或原生PSF2编码并在递归前检查资源限制
 // 入参: value 设置元素, depth XML层级
 // 返回: *xmlElement 独立节点, error 结构、预算或取消错误
 func (b *printSettingsBuilder) element(value PrintSetting, depth int) (*xmlElement, error) {
+	if b.framework == printFramework2NS {
+		return b.elementV2(value, depth)
+	}
 	if err := checkContext(b.options.context); err != nil {
 		return nil, err
 	}
@@ -1559,6 +1598,9 @@ func (b *printSettingsBuilder) element(value PrintSetting, depth int) (*xmlEleme
 	}
 	if value.Kind == PrintSettingUnknown || int(value.Kind) >= len(printSettingNames) {
 		return nil, fmt.Errorf("%w: print settings element kind", ErrInvalid)
+	}
+	if value.HasDefault || value.Default {
+		return nil, fmt.Errorf("%w: print settings Option default requires version 2", ErrInvalid)
 	}
 	local := printSettingNames[value.Kind]
 	node := &xmlElement{Name: xml.Name{Space: b.framework, Local: local}, Namespaces: b.scope}
@@ -1640,6 +1682,148 @@ func (b *printSettingsBuilder) element(value PrintSetting, depth int) (*xmlEleme
 			return nil, err
 		}
 		node.Children = append(node.Children, parsed)
+	}
+	return node, nil
+}
+
+// elementV2 将设置按Microsoft Print Schema v2规范转换为直接关键字XML节点，支持内联值、默认标记、约束与选择类型属性
+// 入参: value 设置元素, depth XML层级
+// 返回: *xmlElement 独立PSF2节点, error 结构、预算或取消错误
+func (b *printSettingsBuilder) elementV2(value PrintSetting, depth int) (*xmlElement, error) {
+	if err := checkContext(b.options.context); err != nil {
+		return nil, err
+	}
+	b.nodes++
+	if b.nodes > b.options.Limits.MaxXMLNodes || depth > b.options.Limits.MaxXMLDepth {
+		return nil, fmt.Errorf("%w: print settings XML complexity", ErrLimit)
+	}
+	if value.Kind == PrintSettingUnknown || int(value.Kind) >= len(printSettingNames) || value.Kind == PrintSettingValue {
+		return nil, fmt.Errorf("%w: print settings v2 element kind", ErrInvalid)
+	}
+	if value.Value != nil {
+		return nil, fmt.Errorf("%w: value on print settings container", ErrInvalid)
+	}
+	if (value.HasDefault || value.Default) && value.Kind != PrintSettingOption {
+		return nil, fmt.Errorf("%w: print settings default on non-Option", ErrInvalid)
+	}
+	if value.Constraint != PrintConstraintUnknown && (!b.capabilities || value.Kind != PrintSettingOption || int(value.Constraint) >= len(printConstraintNames)) {
+		return nil, fmt.Errorf("%w: print settings Option constraint", ErrInvalid)
+	}
+	if value.Name.Space == "" {
+		return nil, fmt.Errorf("%w: missing print settings v2 keyword name", ErrInvalid)
+	}
+	if printFrameworkSpace(value.Name.Space) && (printSettingKind(xml.Name{Space: printFrameworkNS, Local: value.Name.Local}) != PrintSettingUnknown || value.Name.Local == "PrintTicket" || value.Name.Local == "PrintCapabilities") {
+		return nil, fmt.Errorf("%w: print settings v2 framework wrapper element", ErrInvalid)
+	}
+	nameText, err := b.qname(value.Name)
+	if err != nil {
+		return nil, err
+	}
+	local := printSettingNames[value.Kind]
+	node := &xmlElement{
+		Name:       value.Name,
+		Attr:       []xml.Attr{{Name: xml.Name{Space: printFramework2NS, Local: "psftype"}, Value: local}},
+		Namespaces: b.scope,
+	}
+	cost := int64(2*len(nameText) + len(local) + 22)
+	if value.Kind == PrintSettingOption {
+		if value.HasDefault || value.Default {
+			flag := strconv.FormatBool(value.Default)
+			node.Attr = append(node.Attr, xml.Attr{Name: xml.Name{Space: printFramework2NS, Local: "default"}, Value: flag})
+			cost += int64(len(flag)) + 16
+		}
+		if value.Constraint != PrintConstraintUnknown {
+			text, err := b.qname(xml.Name{Space: printKeywordsNS, Local: printConstraintNames[value.Constraint]})
+			if err != nil {
+				return nil, err
+			}
+			node.Attr = append(node.Attr, xml.Attr{Name: xml.Name{Space: printFramework2NS, Local: "constrained"}, Value: text})
+			cost += int64(len(text)) + 20
+		}
+	}
+	selectionIndex, valueIndex := -1, -1
+	for index, child := range value.Children {
+		if b.capabilities && value.Kind == PrintSettingFeature && child.Kind == PrintSettingProperty && printFrameworkSpace(child.Name.Space) && child.Name.Local == "SelectionType" {
+			if selectionIndex >= 0 {
+				return nil, fmt.Errorf("%w: duplicate print settings SelectionType", ErrInvalid)
+			}
+			selVal, err := printCommonValue(child)
+			if err != nil || selVal.Type != (xml.Name{Space: printValueNS, Local: "QName"}) || !printPublicKeywordSpace(selVal.QName.Space) || (selVal.QName.Local != "PickOne" && selVal.QName.Local != "PickMany") {
+				return nil, fmt.Errorf("%w: print settings SelectionType value", ErrInvalid)
+			}
+			selText, err := b.qname(selVal.QName)
+			if err != nil {
+				return nil, err
+			}
+			node.Attr = append(node.Attr, xml.Attr{Name: xml.Name{Space: printFramework2NS, Local: "selectiontype"}, Value: selText})
+			cost += int64(len(selText)) + 22
+			selectionIndex = index
+			continue
+		}
+		if child.Kind == PrintSettingValue {
+			if value.Kind != PrintSettingProperty && value.Kind != PrintSettingScoredProperty && value.Kind != PrintSettingParameterInit {
+				return nil, fmt.Errorf("%w: print settings v2 Value child", ErrInvalid)
+			}
+			if valueIndex >= 0 {
+				return nil, fmt.Errorf("%w: multiple print settings values", ErrInvalid)
+			}
+			valueIndex = index
+		}
+	}
+	if err := b.reserve(cost); err != nil {
+		return nil, err
+	}
+	for index, child := range value.Children {
+		if index == selectionIndex || index == valueIndex {
+			continue
+		}
+		parsed, err := b.elementV2(child, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		node.Children = append(node.Children, parsed)
+	}
+	if valueIndex >= 0 {
+		valChild := value.Children[valueIndex]
+		if valChild.Value == nil || valChild.Name != (xml.Name{}) || len(valChild.Children) != 0 || valChild.Constraint != PrintConstraintUnknown || valChild.HasDefault || valChild.Default {
+			return nil, fmt.Errorf("%w: print settings Value structure", ErrInvalid)
+		}
+		if int64(len(valChild.Value.Text)) > min(b.options.Limits.MaxMetadataBytes, b.options.Limits.MaxPartBytes, b.options.Limits.MaxPackageBytes) {
+			return nil, fmt.Errorf("%w: print settings value byte budget", ErrLimit)
+		}
+		kind := valChild.Value.Type
+		if kind == (xml.Name{}) {
+			kind = xml.Name{Space: printValueNS, Local: "string"}
+		}
+		typeText, err := b.qname(kind)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := b.qname(xml.Name{Space: xsiNamespace, Local: "type"}); err != nil {
+			return nil, err
+		}
+		node.Attr = append(node.Attr, xml.Attr{Name: xml.Name{Space: xsiNamespace, Local: "type"}, Value: typeText})
+		node.Text = valChild.Value.Text
+		if kind == (xml.Name{Space: printValueNS, Local: "QName"}) || kind == (xml.Name{Space: printValueNS, Local: "string"}) && valChild.Value.QName != (xml.Name{}) {
+			if valChild.Value.QName != (xml.Name{}) {
+				normalized := *valChild.Value
+				normalized.Type = kind
+				node.Text, err = b.valueQName(normalized, node)
+				if err != nil {
+					return nil, err
+				}
+			} else if !xmlWhitespace(node.Text) {
+				return nil, fmt.Errorf("%w: unresolved print settings QName value", ErrInvalid)
+			}
+		} else if valChild.Value.QName != (xml.Name{}) {
+			return nil, fmt.Errorf("%w: QName on non-QName print settings value", ErrInvalid)
+		}
+		if !xmlTextValid(node.Text) {
+			return nil, fmt.Errorf("%w: print settings value XML text", ErrInvalid)
+		}
+		if err := b.reserve(int64(len(node.Text)) + int64(len(typeText)) + 12); err != nil {
+			return nil, err
+		}
 	}
 	return node, nil
 }
@@ -1729,6 +1913,9 @@ func (b *printSettingsBuilder) valueQName(value PrintValue, node *xmlElement) (s
 			}
 			return text, nil
 		}
+		if len(node.Children) > 0 && value.Type == (xml.Name{Space: printValueNS, Local: "QName"}) {
+			return b.qname(value.QName)
+		}
 		if err := b.localNamespace(node, prefix, value.QName.Space, value.Type); err != nil {
 			return "", err
 		}
@@ -1737,14 +1924,14 @@ func (b *printSettingsBuilder) valueQName(value PrintValue, node *xmlElement) (s
 	return b.qname(value.QName)
 }
 
-// localNamespace 在值节点局部绑定名称，必要时为Framework元素、类型属性及值类型分配无冲突前缀
+// localNamespace 在值节点局部绑定名称，必要时为Framework元素、当前节点元素、类型属性及值类型分配无冲突前缀
 // 入参: node 值节点, prefix 需绑定前缀或空默认前缀, uri 命名空间, kind 值类型
 // 返回: error 命名空间或资源错误
 func (b *printSettingsBuilder) localNamespace(node *xmlElement, prefix, uri string, kind xml.Name) error {
 	if !xmlTextValid(uri) || uri == xmlnsNamespace || (prefix == "xml") != (uri == xmlNamespace) {
 		return fmt.Errorf("%w: print value namespace", ErrInvalid)
 	}
-	scope := make(map[string]string, len(node.Namespaces)+4)
+	scope := make(map[string]string, len(node.Namespaces)+5)
 	for name, value := range node.Namespaces {
 		scope[name] = value
 	}
@@ -1764,7 +1951,11 @@ func (b *printSettingsBuilder) localNamespace(node *xmlElement, prefix, uri stri
 	if err := add(prefix, uri); err != nil {
 		return err
 	}
-	for _, namespace := range []string{b.framework, xsiNamespace, printValueNS} {
+	required := []string{b.framework, xsiNamespace, printValueNS}
+	if node.Name.Space != "" && node.Name.Space != b.framework && node.Name.Space != xsiNamespace && node.Name.Space != printValueNS {
+		required = append(required, node.Name.Space)
+	}
+	for _, namespace := range required {
 		if printSettingsPrefix(scope, namespace) != "" {
 			continue
 		}
@@ -1796,6 +1987,14 @@ func printSettingsPrefix(scope map[string]string, uri string) string {
 		preferred = "psf"
 	case printFramework2NS:
 		preferred = "psf2"
+	case printKeywordsNS:
+		preferred = "psk"
+	case printKeywordsV11NS:
+		preferred = "psk11"
+	case printKeywordsV12NS:
+		preferred = "psk12"
+	case printKeywords2NS:
+		preferred = "psk2"
 	case printValueNS:
 		preferred = "xs"
 	case xsiNamespace:
@@ -1831,7 +2030,7 @@ func (b *printSettingsBuilder) reserve(size int64) error {
 func writePrintSettingsMarkup(output io.Writer, root *xmlElement, options printSettingsConfig) (int64, error) {
 	counted := packageOutput{writer: output, context: options.context, limit: min(options.Limits.MaxMetadataBytes, options.Limits.MaxPartBytes, options.Limits.MaxPackageBytes)}
 	encoder := xml.NewEncoder(&counted)
-	if err := encodePrintSettingsNode(encoder, root, options); err != nil {
+	if err := encodePrintSettingsNode(encoder, root, options, true); err != nil {
 		return counted.count, err
 	}
 	if err := encoder.Flush(); err != nil {
@@ -1841,14 +2040,14 @@ func writePrintSettingsMarkup(output io.Writer, root *xmlElement, options printS
 }
 
 // encodePrintSettingsNode 编码已校验的Framework结构，根声明绑定共享前缀，冲突值前缀保留节点局部声明
-// 入参: encoder XML编码器, node 已校验节点, options 已校验参数
+// 入参: encoder XML编码器, node 已校验节点, options 已校验参数, isRoot 是否为文档根节点
 // 返回: error 取消或编码错误
-func encodePrintSettingsNode(encoder *xml.Encoder, node *xmlElement, options printSettingsConfig) error {
+func encodePrintSettingsNode(encoder *xml.Encoder, node *xmlElement, options printSettingsConfig, isRoot bool) error {
 	if err := checkContext(options.context); err != nil {
 		return err
 	}
 	start := xml.StartElement{Name: xml.Name{Local: printSettingsPrefix(node.Namespaces, node.Name.Space) + ":" + node.Name.Local}}
-	if node.Name.Local == "PrintTicket" || node.Name.Local == "PrintCapabilities" {
+	if isRoot {
 		prefixes := make([]string, 0, len(node.Namespaces))
 		for prefix := range node.Namespaces {
 			prefixes = append(prefixes, prefix)
@@ -1889,7 +2088,7 @@ func encodePrintSettingsNode(encoder *xml.Encoder, node *xmlElement, options pri
 		}
 	}
 	for _, child := range node.Children {
-		if err := encodePrintSettingsNode(encoder, child, options); err != nil {
+		if err := encodePrintSettingsNode(encoder, child, options, false); err != nil {
 			return err
 		}
 	}
@@ -1970,9 +2169,9 @@ func printConstraint(node *xmlElement, text string) (PrintConstraint, error) {
 }
 
 // printParameterDefaultQName 解析QName参数的字符串默认值，保留其声明位置的名称绑定
-// 入参: node ParameterDef原节点, value 已解析参数定义
+// 入参: node ParameterDef原节点, value 已解析参数定义, psf2 是否为Print Schema v2直接元素
 // 返回: error 默认值QName错误
-func printParameterDefaultQName(node *xmlElement, value *PrintSetting) error {
+func printParameterDefaultQName(node *xmlElement, value *PrintSetting, psf2 bool) error {
 	kind := xml.Name{}
 	defaultIndex := -1
 	for index, child := range value.Children {
@@ -1993,7 +2192,7 @@ func printParameterDefaultQName(node *xmlElement, value *PrintSetting) error {
 		return fmt.Errorf("%w: QName parameter default value type", ErrInvalid)
 	}
 	scopeNode := node.Children[defaultIndex]
-	if len(scopeNode.Children) > 0 {
+	if !psf2 && len(scopeNode.Children) > 0 {
 		scopeNode = scopeNode.Children[0]
 	}
 	name, err := printSettingsQName(scopeNode, item.Text)
@@ -2027,8 +2226,9 @@ func (p *PrintCapabilities) ParameterValue(ctx context.Context, name xml.Name, i
 	if err != nil {
 		return nil, err
 	}
+	target := printCanonicalKey(name)
 	for _, parameter := range model.Elements {
-		if parameter.Kind != PrintSettingParameterDef || parameter.Name != name {
+		if parameter.Kind != PrintSettingParameterDef || printCanonicalKey(parameter.Name) != target {
 			continue
 		}
 		domain, err := printParameterDefinition(parameter, configuration)
@@ -2286,7 +2486,7 @@ func ResolvePrintParameters(ctx context.Context, settings *PrintSettings, capabi
 		if err != nil {
 			return nil, err
 		}
-		domains[parameter.Name] = domain
+		domains[printCanonicalKey(parameter.Name)] = domain
 	}
 	if err := resolvePrintParameterModel(model, domains, configuration); err != nil {
 		return nil, err
@@ -2315,13 +2515,14 @@ func resolvePrintParameterModel(model *PrintSettings, domains map[xml.Name]*prin
 		if parameter.Kind != PrintSettingParameterInit {
 			continue
 		}
-		if domain := domains[parameter.Name]; domain != nil {
+		key := printCanonicalKey(parameter.Name)
+		if domain := domains[key]; domain != nil {
 			value, err := domain.value(parameter.Children[0].Value, configuration)
 			if err != nil {
 				return err
 			}
 			parameter.Children[0].Value = value
-			values[parameter.Name] = value
+			values[key] = value
 		}
 	}
 	for name, domain := range domains {
@@ -2351,11 +2552,12 @@ func resolvePrintParameterRefs(settings []PrintSetting, domains map[xml.Name]*pr
 			}
 			continue
 		}
-		domain := domains[setting.Name]
+		key := printCanonicalKey(setting.Name)
+		domain := domains[key]
 		if domain == nil {
 			return fmt.Errorf("%w: referenced print parameter definition not available", ErrUnsupported)
 		}
-		value := values[setting.Name]
+		value := values[key]
 		if value == nil {
 			if domain.mandatory != "Optional" {
 				return fmt.Errorf("%w: referenced print parameter requires initialization", ErrInvalid)
@@ -2365,7 +2567,7 @@ func resolvePrintParameterRefs(settings []PrintSetting, domains map[xml.Name]*pr
 			if err != nil {
 				return err
 			}
-			values[setting.Name] = value
+			values[key] = value
 		}
 		copy := *value
 		*setting = PrintSetting{Kind: PrintSettingValue, Value: &copy}
@@ -2409,7 +2611,7 @@ func ValidatePrintSelection(ctx context.Context, settings *PrintSettings, capabi
 			if err != nil {
 				return nil, err
 			}
-			checker.domains[setting.Name] = domain
+			checker.domains[printCanonicalKey(setting.Name)] = domain
 		}
 	}
 	model.Elements = checker.filter(model.Elements)
@@ -2425,7 +2627,7 @@ func ValidatePrintSelection(ctx context.Context, settings *PrintSettings, capabi
 func (c *printSelectionChecker) collectNamespaces(settings []PrintSetting) {
 	for _, setting := range settings {
 		if setting.Name.Space != "" {
-			c.namespaces[setting.Name.Space] = true
+			c.namespaces[printCanonicalKey(setting.Name).Space] = true
 		}
 		c.collectNamespaces(setting.Children)
 	}
@@ -2437,7 +2639,7 @@ func (c *printSelectionChecker) collectNamespaces(settings []PrintSetting) {
 func (c *printSelectionChecker) filter(settings []PrintSetting) []PrintSetting {
 	result := settings[:0]
 	for _, setting := range settings {
-		if setting.Kind != PrintSettingOption && setting.Kind != PrintSettingParameterRef && setting.Name.Space != "" && !c.namespaces[setting.Name.Space] {
+		if setting.Kind != PrintSettingOption && setting.Kind != PrintSettingParameterRef && setting.Name.Space != "" && !c.namespaces[printCanonicalKey(setting.Name).Space] {
 			c.ignored(setting)
 			continue
 		}
@@ -2473,7 +2675,7 @@ func (c *printSelectionChecker) features(requested, supported []PrintSetting) er
 	index := make(map[xml.Name]PrintSetting)
 	for _, setting := range supported {
 		if setting.Kind == PrintSettingFeature {
-			index[setting.Name] = setting
+			index[printCanonicalKey(setting.Name)] = setting
 		}
 	}
 	for _, setting := range requested {
@@ -2483,7 +2685,7 @@ func (c *printSelectionChecker) features(requested, supported []PrintSetting) er
 		if err := c.step(); err != nil {
 			return err
 		}
-		capability, exists := index[setting.Name]
+		capability, exists := index[printCanonicalKey(setting.Name)]
 		if !exists {
 			return fmt.Errorf("%w: print Feature not declared by capabilities", ErrUnsupported)
 		}
@@ -2507,7 +2709,8 @@ func (c *printSelectionChecker) feature(requested, supported PrintSetting) error
 	for _, setting := range supported.Children {
 		if setting.Kind == PrintSettingOption {
 			options = append(options, setting)
-			byName[setting.Name] = append(byName[setting.Name], setting)
+			key := printCanonicalKey(setting.Name)
+			byName[key] = append(byName[key], setting)
 		}
 	}
 	count, identities := 0, 0
@@ -2518,8 +2721,9 @@ func (c *printSelectionChecker) feature(requested, supported PrintSetting) error
 		count++
 		candidates := options
 		named := false
-		if requestedOption.Name != (xml.Name{}) && len(byName[requestedOption.Name]) > 0 {
-			candidates, named = byName[requestedOption.Name], true
+		reqKey := printCanonicalKey(requestedOption.Name)
+		if requestedOption.Name != (xml.Name{}) && len(byName[reqKey]) > 0 {
+			candidates, named = byName[reqKey], true
 		}
 		matched := false
 		for _, candidate := range candidates {
@@ -2529,7 +2733,7 @@ func (c *printSelectionChecker) feature(requested, supported PrintSetting) error
 			if candidate.Constraint != PrintConstraintUnknown && candidate.Constraint != PrintConstraintNone {
 				continue
 			}
-			if !named && requestedOption.Name != candidate.Name && printScoredCount(requestedOption.Children) == 0 {
+			if !named && reqKey != printCanonicalKey(candidate.Name) && printScoredCount(requestedOption.Children) == 0 {
 				continue
 			}
 			same, err := c.scored(requestedOption.Children, candidate.Children, named)
@@ -2585,7 +2789,7 @@ func (c *printSelectionChecker) scored(requested, supported []PrintSetting, subs
 	index := make(map[xml.Name]PrintSetting)
 	for _, setting := range supported {
 		if setting.Kind == PrintSettingScoredProperty {
-			index[setting.Name] = setting
+			index[printCanonicalKey(setting.Name)] = setting
 		}
 	}
 	for _, setting := range requested {
@@ -2595,14 +2799,14 @@ func (c *printSelectionChecker) scored(requested, supported []PrintSetting, subs
 		if err := c.step(); err != nil {
 			return false, err
 		}
-		capability, exists := index[setting.Name]
+		capability, exists := index[printCanonicalKey(setting.Name)]
 		if !exists {
 			return false, nil
 		}
 		requestValue, _ := printScoredValue(setting.Children)
 		capValue, reference := printScoredValue(capability.Children)
 		if reference != (xml.Name{}) {
-			domain := c.domains[reference]
+			domain := c.domains[printCanonicalKey(reference)]
 			if domain == nil {
 				return false, fmt.Errorf("%w: print Option parameter definition not available", ErrUnsupported)
 			}

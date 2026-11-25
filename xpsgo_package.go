@@ -1084,7 +1084,7 @@ func readPackageZIPLocal(input io.ReaderAt, boundary, offset int64, file *zip.Fi
 		return packageZIPLocal{}, fmt.Errorf("%w: ZIP local record signature", ErrInvalid)
 	}
 	version := binary.LittleEndian.Uint16(fixed[4:])
-	extendedSize := file.Flags&8 != 0 && (file.CompressedSize64 >= 0xffffffff || file.UncompressedSize64 >= 0xffffffff)
+	extendedSize := file.Flags&8 != 0 && (cdSizeZIP64 || file.CompressedSize64 >= 0xffffffff || file.UncompressedSize64 >= 0xffffffff)
 	versionMatch := version == file.ReaderVersion || (extendedOffset || extendedSize) && file.ReaderVersion == 45 && (version == 10 && file.Method == zip.Store || version == 20)
 	if !versionMatch || binary.LittleEndian.Uint16(fixed[6:]) != file.Flags || binary.LittleEndian.Uint16(fixed[8:]) != file.Method || binary.LittleEndian.Uint16(fixed[10:]) != file.ModifiedTime || binary.LittleEndian.Uint16(fixed[12:]) != file.ModifiedDate {
 		return packageZIPLocal{}, fmt.Errorf("%w: ZIP local/central common fields", ErrInvalid)
@@ -1417,18 +1417,48 @@ func readPackageZIPEnd(input io.ReaderAt, size int64, limits Limits) (packageZIP
 			return packageZIPLayout{}, fmt.Errorf("%w: ZIP central directory bounds", ErrInvalid)
 		}
 		dirSize, dirOff := int64(directorySize), int64(directoryOffset)
-		hasCentral := func(pos int64) (bool, error) {
+		validCentralChain := func(start int64) (bool, error) {
 			if dirSize == 0 {
-				return true, nil
+				return layout.count == 0 && start >= 0 && start <= boundary, nil
 			}
-			if pos < 0 || pos > boundary-4 {
+			if start < 0 || dirSize > boundary-start {
 				return false, nil
 			}
-			var signature [4]byte
-			if err := readPackageZIPAt(input, boundary, pos, signature[:]); err != nil {
+			pos, limit := start, start+dirSize
+			for range layout.count {
+				if limit-pos < 46 {
+					return false, nil
+				}
+				var fixed [46]byte
+				if err := readPackageZIPAt(input, limit, pos, fixed[:]); err != nil {
+					return false, err
+				}
+				if binary.LittleEndian.Uint32(fixed[:]) != packageZIPCentralSignature {
+					return false, nil
+				}
+				nameBytes := int(binary.LittleEndian.Uint16(fixed[28:]))
+				extraBytes := int(binary.LittleEndian.Uint16(fixed[30:]))
+				commentBytes := int(binary.LittleEndian.Uint16(fixed[32:]))
+				if validateZIPMetadata(nameBytes, extraBytes, commentBytes) != nil {
+					return false, nil
+				}
+				entryLen := 46 + int64(nameBytes) + int64(extraBytes) + int64(commentBytes)
+				if entryLen > limit-pos {
+					return false, nil
+				}
+				pos += entryLen
+			}
+			if pos == limit {
+				return true, nil
+			}
+			if limit-pos < 6 {
+				return false, nil
+			}
+			var digital [6]byte
+			if err := readPackageZIPAt(input, limit, pos, digital[:]); err != nil {
 				return false, err
 			}
-			return binary.LittleEndian.Uint32(signature[:]) == packageZIPCentralSignature, nil
+			return binary.LittleEndian.Uint32(digital[:]) == packageZIPDigitalSignature && pos+6+int64(binary.LittleEndian.Uint16(digital[4:])) == limit, nil
 		}
 		hasDigitalSig := func(pos int64) (bool, error) {
 			if pos == boundary {
@@ -1447,7 +1477,7 @@ func readPackageZIPEnd(input io.ReaderAt, size int64, limits Limits) (packageZIP
 		if dirOff+dirSize == boundary {
 			layout.base, resolved = 0, true
 		} else {
-			okCentral, err := hasCentral(dirOff)
+			okCentral, err := validCentralChain(dirOff)
 			if err != nil {
 				return packageZIPLayout{}, err
 			}
@@ -1463,7 +1493,7 @@ func readPackageZIPEnd(input io.ReaderAt, size int64, limits Limits) (packageZIP
 		}
 		if !resolved && dirSize > 0 {
 			candBase := boundary - dirSize - dirOff
-			okCentral, err := hasCentral(candBase + dirOff)
+			okCentral, err := validCentralChain(candBase + dirOff)
 			if err != nil {
 				return packageZIPLayout{}, err
 			}
@@ -1485,7 +1515,7 @@ func readPackageZIPEnd(input io.ReaderAt, size int64, limits Limits) (packageZIP
 						continue
 					}
 					candBase := sigPos - dirSize - dirOff
-					okCentral, err := hasCentral(candBase + dirOff)
+					okCentral, err := validCentralChain(candBase + dirOff)
 					if err != nil {
 						return packageZIPLayout{}, err
 					}

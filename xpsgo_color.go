@@ -565,8 +565,11 @@ func parseICCNamedColor(profile *iccProfile) ([]iccNamedColor, error) {
 		return nil, fmt.Errorf("%w: ICC named device coordinates", ErrInvalid)
 	}
 	stride := uint64(38) + 2*device
+	if count == 0 || count > (uint64(len(data))-84)/stride {
+		return nil, fmt.Errorf("%w: ICC named color size", ErrInvalid)
+	}
 	end := uint64(84) + count*stride
-	if count == 0 || end > uint64(len(data)) || uint64(len(data))-end > 3 {
+	if uint64(len(data))-end > 3 {
 		return nil, fmt.Errorf("%w: ICC named color size", ErrInvalid)
 	}
 	for _, value := range data[end:] {
@@ -2198,80 +2201,121 @@ func cicpHDRInverseTransfer(value float64, transfer uint8) float64 {
 	return (math.Exp((value-cicpHLGC)/cicpHLGA) + cicpHLGB) / 12
 }
 
-// cicpHLGDisplayLight 按BT.2100-2参考峰值亮度及表5注5f系统伽马公式将HLG场景光转换为归一化显示光
+// cicpHLGDisplayLight 按BT.2100-2参考峰值亮度及表5注5f系统伽马公式将HLG场景光转换为归一化显示光，防护极小峰值与极小亮度溢出
 // 入参: rgb 线性场景RGB, weights 场景亮度权重, peakNits 参考显示峰值亮度
 // 返回: [3]float64 相对peakNits归一化的显示光RGB
 func cicpHLGDisplayLight(rgb, weights [3]float64, peakNits float64) [3]float64 {
 	luma := weights[0]*rgb[0] + weights[1]*rgb[1] + weights[2]*rgb[2]
-	if !(luma > 0) {
+	if !(luma > 0) || !geometryFinite(luma) {
 		return [3]float64{}
+	}
+	if !(peakNits > 0) || !geometryFinite(peakNits) {
+		peakNits = 1000
 	}
 	gamma := 1.2
 	if peakNits != 1000 {
 		if peakNits >= 400 && peakNits <= 2000 {
 			gamma = 1.2 + 0.42*math.Log10(peakNits/1000)
 		} else {
-			gamma = 1.2 * math.Pow(1.111, math.Log2(peakNits/1000))
+			gamma = 1.2 * math.Pow(1.111, math.Log2(peakNits)-math.Log2(1000))
 		}
 	}
 	gain := math.Pow(luma, gamma-1)
+	lumaGamma := 0.0
+	lumaLog := 0.0
+	hasFallback := false
 	for i := range rgb {
-		if rgb[i] != 0 {
-			rgb[i] *= gain
+		if rgb[i] == 0 {
+			continue
 		}
+		if geometryFinite(gain) {
+			if value := rgb[i] * gain; geometryFinite(value) {
+				rgb[i] = value
+				continue
+			}
+		}
+		if !hasFallback {
+			lumaGamma, lumaLog, hasFallback = math.Pow(luma, gamma), math.Log(luma), true
+		}
+		if value := (rgb[i] / luma) * lumaGamma; geometryFinite(value) {
+			rgb[i] = value
+			continue
+		}
+		value := math.Copysign(math.Exp(math.Log(math.Abs(rgb[i]))+(gamma-1)*lumaLog), rgb[i])
+		if !geometryFinite(value) {
+			value = math.Copysign(math.MaxFloat64, rgb[i])
+		}
+		rgb[i] = value
 	}
 	return rgb
 }
 
-// renderBT2446MethodA 按ITU-R BT.2446方法A将相对100 cd/m²的线性scRGB映射至100 cd/m²线性sRGB，峰值不高于100 cd/m²时裁剪恒等输出
+// renderBT2446MethodA 按ITU-R BT.2446方法A将相对100 cd/m²的线性scRGB映射至100 cd/m²线性sRGB，低于100 cd/m²恒等裁剪并在100至200 cd/m²按对数权重平滑过渡
 // 入参: linearSRGB 相对100 cd/m²归一化的线性scRGB, peakNits HDR标称峰值亮度（cd/m²）
 // 返回: [3]float64 映射后的100 cd/m²线性sRGB
 func renderBT2446MethodA(linearSRGB [3]float64, peakNits float64) [3]float64 {
-	if !(peakNits > 0) {
+	if !(peakNits > 0) || !geometryFinite(peakNits) {
 		return linearSRGB
 	}
-	if peakNits <= 100 {
+	var clamped [3]float64
+	if peakNits < 200 {
 		for i, v := range linearSRGB {
-			if !(v > 0) {
-				linearSRGB[i] = 0
-			} else if v > 1 {
-				linearSRGB[i] = 1
+			if v > 1 {
+				clamped[i] = 1
+			} else if v > 0 {
+				clamped[i] = v
 			}
 		}
-		return linearSRGB
+		if peakNits <= 100 {
+			return clamped
+		}
 	}
 	bt2020 := iccMatrixColor(cicpSRGBToBT2020, linearSRGB)
 	invPeak := 100.0 / peakNits
 	var rgb [3]float64
 	for i, v := range bt2020 {
-		rgb[i] = math.Pow(colorClamp(v*invPeak), 1/2.4)
+		scaled := v * invPeak
+		if !(scaled > 0) {
+			rgb[i] = 0
+		} else if scaled >= 1 {
+			rgb[i] = 1
+		} else {
+			rgb[i] = math.Pow(scaled, 1/2.4)
+		}
 	}
 	luma := cicpBT2100Red*rgb[0] + cicpBT2100Green*rgb[1] + cicpBT2100Blue*rgb[2]
-	if !(luma > 0) {
-		return [3]float64{}
+	var mapped [3]float64
+	if luma > 0 {
+		hdrRho := 32 * math.Pow(peakNits/10000, 1/2.4)
+		perceptual := math.Log1p(hdrRho*luma) / math.Log1p(hdrRho)
+		var compressed float64
+		switch {
+		case perceptual <= 0.7399:
+			compressed = 1.0770 * perceptual
+		case perceptual < 0.9909:
+			compressed = (-1.1510*perceptual+2.7811)*perceptual - 0.6302
+		default:
+			compressed = 0.5*perceptual + 0.5
+		}
+		sdr := math.Expm1(cicpBT2446SDRLog*compressed) / cicpBT2446SDRRho
+		gain := sdr / (1.1 * luma)
+		cb, cr := gain*(rgb[2]-luma)/1.8814, gain*(rgb[0]-luma)/1.4746
+		yPrime := sdr - max(0.1*cr, 0)
+		red := yPrime + 2*(1-cicpBT2100Red)*cr
+		blue := yPrime + 2*(1-cicpBT2100Blue)*cb
+		green := (yPrime - cicpBT2100Red*red - cicpBT2100Blue*blue) / cicpBT2100Green
+		sdrBT2020 := [3]float64{
+			math.Pow(max(0, red), 2.4),
+			math.Pow(max(0, green), 2.4),
+			math.Pow(max(0, blue), 2.4),
+		}
+		mapped = iccMatrixColor(cicpBT2020ToSRGB, sdrBT2020)
 	}
-	hdrRho := 32 * math.Pow(peakNits/10000, 1/2.4)
-	perceptual := math.Log1p(hdrRho*luma) / math.Log1p(hdrRho)
-	var compressed float64
-	switch {
-	case perceptual <= 0.7399:
-		compressed = 1.0770 * perceptual
-	case perceptual < 0.9909:
-		compressed = (-1.1510*perceptual+2.7811)*perceptual - 0.6302
-	default:
-		compressed = 0.5*perceptual + 0.5
+	if peakNits < 200 {
+		t := math.Log2(peakNits / 100)
+		for i := range mapped {
+			mapped[i] = clamped[i]*(1-t) + mapped[i]*t
+		}
 	}
-	sdr := math.Expm1(cicpBT2446SDRLog*compressed) / cicpBT2446SDRRho
-	gain := sdr / (1.1 * luma)
-	cb, cr := gain*(rgb[2]-luma)/1.8814, gain*(rgb[0]-luma)/1.4746
-	yPrime := sdr - max(0.1*cr, 0)
-	red := yPrime + 2*(1-cicpBT2100Red)*cr
-	blue := yPrime + 2*(1-cicpBT2100Blue)*cb
-	green := (yPrime - cicpBT2100Red*red - cicpBT2100Blue*blue) / cicpBT2100Green
-	sdrBT2020 := [3]float64{
-		math.Pow(max(0, red), 2.4),
-		math.Pow(max(0, green), 2.4),
-		math.Pow(max(0, blue), 2.4),
-	}
-	return iccMatrixColor(cicpBT2020ToSRGB, sdrBT2020)
+	return mapped
 }

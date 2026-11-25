@@ -26,8 +26,8 @@ import (
 	"github.com/xiaoqidun/jxrgo"
 )
 
-// jxrRowCacheMaxWidth 定义JPEG XR扫描行缓存支持的最大宽度
-const jxrRowCacheMaxWidth = 4096
+// jxrRowCacheMaxBytes 定义单个JPEG XR两行滑动缓存允许占用的最大内存字节数
+const jxrRowCacheMaxBytes = 32 << 20
 
 // jxrSampleNative 等常量表示JPEG XR渲染采样阶段选择的数据通道视图
 const (
@@ -566,7 +566,7 @@ func (source *jxrImage) sampleRGB(x, y int, components []float64) (float64, erro
 	return source.sampleRow4(reader.ReadRow, x, y, components)
 }
 
-// readRow4 经四分量行读取器批量读取整行颜色与透明度并校验有限性
+// readRow4 经四分量行读取器批量读取整行颜色与透明度并原地校验有限性及钳位透明度
 // 入参: read 行读取回调, y 图像行坐标, buf 可复用行缓冲
 // 返回: error 行读取或非有限数值错误
 func (source *jxrImage) readRow4(read func(context.Context, int, []float64) error, y int, buf *jxrRowBuffer) error {
@@ -580,19 +580,6 @@ func (source *jxrImage) readRow4(read func(context.Context, int, []float64) erro
 	if err := read(context.Background(), y, buf.rgba); err != nil {
 		return jxrImageError(err)
 	}
-	for channel := range 3 {
-		if cap(buf.channels[channel]) < width {
-			buf.channels[channel] = make([]float64, width)
-		} else {
-			buf.channels[channel] = buf.channels[channel][:width]
-		}
-	}
-	if cap(buf.alpha) < width {
-		buf.alpha = make([]float64, width)
-	} else {
-		buf.alpha = buf.alpha[:width]
-	}
-	rRow, gRow, bRow, aRow := buf.channels[0], buf.channels[1], buf.channels[2], buf.alpha
 	for x := range width {
 		at := x * 4
 		r, g, b, alpha := buf.rgba[at], buf.rgba[at+1], buf.rgba[at+2], buf.rgba[at+3]
@@ -602,7 +589,7 @@ func (source *jxrImage) readRow4(read func(context.Context, int, []float64) erro
 		if !geometryFinite(r, g, b) {
 			return fmt.Errorf("%w: JPEG XR non-finite color", ErrUnsupported)
 		}
-		rRow[x], gRow[x], bRow[x], aRow[x] = r, g, b, colorClamp(alpha)
+		buf.rgba[at+3] = colorClamp(alpha)
 	}
 	return nil
 }
@@ -805,12 +792,34 @@ func (source *jxrImage) readRow(y int, buf *jxrRowBuffer) error {
 	return nil
 }
 
+// jxrRowCacheBytes 计算单个JPEG XR两行滑动缓存所需字节数，供受控内存预算判定使用
+// 入参: source 只读JPEG XR视图, mode 采样模式
+// 返回: uint64 两行滑动缓存估算字节数
+func jxrRowCacheBytes(source *jxrImage, mode jxrSampleMode) uint64 {
+	width := source.bounds.Dx()
+	if width <= 0 {
+		return 0
+	}
+	if mode != jxrSampleNative {
+		return uint64(width) * 4 * 8 * 2
+	}
+	planes := uint64(source.channels)
+	if source.alpha {
+		planes++
+	}
+	return uint64(width) * (planes*8 + 4) * 2
+}
+
 // sample 优先从两行滑动缓存返回整行批量读取的结果，支持原生、设备域RGB及线性scRGB三种模式
 // 入参: source 只读JPEG XR视图, x, y 像素坐标, components 输出颜色分量缓冲区, mode 采样模式, key 线性读取配置键
 // 返回: float64 有限且归一化的透明度, error 取样或数值错误
 func (cache *jxrRowCache) sample(source *jxrImage, x, y int, components []float64, mode jxrSampleMode, key jxrLinearKey) (float64, error) {
-	width := source.bounds.Dx()
-	if cache == nil || width <= 0 || width > jxrRowCacheMaxWidth || x < source.bounds.Min.X || x >= source.bounds.Max.X || y < source.bounds.Min.Y || y >= source.bounds.Max.Y {
+	needBytes := jxrRowCacheBytes(source, mode)
+	limit := uint64(jxrRowCacheMaxBytes)
+	if source.limits.MaxMemoryBytes > 0 && source.limits.MaxMemoryBytes < limit {
+		limit = source.limits.MaxMemoryBytes
+	}
+	if cache == nil || needBytes == 0 || needBytes > limit || x < source.bounds.Min.X || x >= source.bounds.Max.X || y < source.bounds.Min.Y || y >= source.bounds.Max.Y {
 		switch mode {
 		case jxrSampleLinear:
 			return source.sampleLinear(x, y, components, key)
@@ -864,8 +873,9 @@ func (cache *jxrRowCache) sample(source *jxrImage, x, y int, components []float6
 	col := x - source.bounds.Min.X
 	row := &cache.rows[slot]
 	if mode != jxrSampleNative {
-		components[0], components[1], components[2] = row.channels[0][col], row.channels[1][col], row.channels[2][col]
-		return row.alpha[col], nil
+		at := col * 4
+		components[0], components[1], components[2] = row.rgba[at], row.rgba[at+1], row.rgba[at+2]
+		return row.rgba[at+3], nil
 	}
 	for channel := range source.channels {
 		components[channel] = row.channels[channel][col]

@@ -142,7 +142,6 @@ type sceneColorCache struct {
 	bytes           int64
 	maxProfiles     int
 	sourceIntent    RenderingIntent
-	deviceOutput    bool
 }
 
 // String 返回ICC渲染意图的名称
@@ -1176,7 +1175,7 @@ func (c *sceneColorCache) vector(part string, value Color) (Color, error) {
 		}
 		input = scaled[:len(input)]
 	}
-	rgb, err := transform.linearRGB(input, false, c.deviceOutput)
+	rgb, err := transform.linearRGB(input, false)
 	if err != nil {
 		return Color{}, err
 	}

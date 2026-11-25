@@ -168,6 +168,7 @@ type sceneRenderer struct {
 	brushMeta        sceneBrushMeta
 	visualCount      int
 	hasFiltered      bool
+	maskOnly         bool
 	concurrent       bool
 	cancelled        atomic.Bool
 	sceneHDRPeakNits atomic.Uint64
@@ -1098,7 +1099,6 @@ func (r *Reader) renderLoadedElementsFonts(elements []Element, transform Matrix,
 	colors := sceneColorCache{pkg: r.pkg, profiles: make(map[string]*iccProfile), transforms: make(map[string][4]*iccTransform), bytes: options.profileBytes, maxProfiles: options.profiles}
 	if options.device != nil {
 		colors.sourceIntent = options.device.sourceIntent
-		colors.deviceOutput = true
 	}
 	options.color = colors.vector
 	images := sceneImageCache{pkg: r.pkg, images: make(map[string]*rasterImage), bytes: options.imageBytes, pixels: options.imagePixels, maxImages: options.images, colors: &colors, context: withJXRDecodeWorkers(options.context, options.workers), format: r.format}
@@ -1581,18 +1581,17 @@ func (r *sceneRenderer) brush(brush *Brush, transform Matrix, aliased bool, dept
 func (r *sceneRenderer) brushMode(brush *Brush, transform Matrix, aliased bool, depth int, maskOnly bool) (sceneSample, error) {
 	r.nativeSample = nil
 	r.brushMeta = sceneBrushMeta{}
+	effectiveMask := maskOnly || r.maskOnly
 	if r.printRuntime != nil {
-		native, err := r.printRuntime.brush(brush, transform, aliased, depth, maskOnly)
+		native, err := r.printRuntime.brush(brush, transform, aliased, depth, effectiveMask)
 		if err != nil {
 			return nil, err
 		}
 		r.nativeSample = native
-		if brush != nil && brush.Kind != BrushSolidColor && brush.Kind != BrushLinearGradient && brush.Kind != BrushRadialGradient {
+		if brush != nil && brush.Kind == BrushVisual {
 			r.brushMeta = sceneBrushMeta{visual: true}
 			r.hasFiltered = true
-			if brush.Kind == BrushImage || brush.Kind == BrushVisual {
-				r.visualCount++
-			}
+			r.visualCount++
 		}
 		return r.printRuntime.previewSample(native), nil
 	}
@@ -1644,11 +1643,11 @@ func (r *sceneRenderer) brushMode(brush *Brush, transform Matrix, aliased bool, 
 		if r.options.device != nil {
 			sourceIntent = r.options.device.sourceIntent
 		}
-		sampler, err := newImageSampler(brush, data, transform, space, maskOnly, sourceIntent, r.options.hdrPeakNits, r.options.device != nil)
+		sampler, err := newImageSampler(brush, data, transform, space, effectiveMask, sourceIntent, r.options.hdrPeakNits)
 		if err != nil {
 			return nil, err
 		}
-		if !maskOnly && sampler.hdrNominalPeak > 0 {
+		if !effectiveMask && sampler.hdrNominalPeak > 0 {
 			r.recordHDRPeakNits(sampler.hdrNominalPeak)
 		}
 		sampler.charge = r.charge
@@ -1669,7 +1668,7 @@ func (r *sceneRenderer) brushMode(brush *Brush, transform Matrix, aliased bool, 
 			return sampler.sampleAtPooled(point, center)
 		}, nil
 	case BrushVisual:
-		sample, err := r.visualBrush(brush, transform, aliased, depth)
+		sample, err := r.visualBrush(brush, transform, aliased, depth, effectiveMask)
 		if err != nil {
 			return nil, err
 		}

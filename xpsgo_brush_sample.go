@@ -79,7 +79,6 @@ type imageSampler struct {
 	gammaChroma    *imageGammaChromaTransform
 	toneMapPeak    float64
 	hdrNominalPeak float64
-	deviceOutput   bool
 	cachePool      sync.Pool
 	convert        func([iccMaxChannels]float64, float64, bool) (renderColor, error)
 	mu             sync.Mutex
@@ -152,10 +151,10 @@ func makeImageByteToUnit() [256]float64 {
 	return table
 }
 
-// newImageSampler 按渲染意图、HDR峰值亮度与是否面向设备目标ICC构建图像画刷采样器，统一处理JXR三模式、PNG CICP、gAMA/cHRM与色调映射
-// 入参: brush 图像画刷, source 图像资源, transform 所属元素的设备变换, space 合成空间, alphaOnly 是否仅读取透明度, jxrIntent 显式源渲染意图, hdrPeakNits 可选HDR参考峰值亮度, deviceOutput 是否输出至目标ICC设备管线
+// newImageSampler 按渲染意图与HDR峰值亮度构建图像画刷采样器，统一处理JXR三模式、PNG CICP、gAMA/cHRM与色调映射
+// 入参: brush 图像画刷, source 图像资源, transform 所属元素的设备变换, space 合成空间, alphaOnly 是否仅读取透明度, jxrIntent 显式源渲染意图, hdrPeakNits 可选HDR参考峰值亮度
 // 返回: *imageSampler 本次绘制独占的采样器, error 属性、能力或数值错误
-func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space renderColorSpace, alphaOnly bool, jxrIntent RenderingIntent, hdrPeakNits float64, deviceOutput bool) (*imageSampler, error) {
+func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space renderColorSpace, alphaOnly bool, jxrIntent RenderingIntent, hdrPeakNits float64) (*imageSampler, error) {
 	if brush == nil || brush.Kind != BrushImage || source == nil || source.bounds().Empty() || !geometryFinite(source.dpi.X, source.dpi.Y) || source.dpi.X <= 0 || source.dpi.Y <= 0 {
 		return nil, fmt.Errorf("%w: image brush source", ErrInvalid)
 	}
@@ -178,8 +177,12 @@ func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space 
 			view.transform = nil
 			source = &view
 		}
+		effectivePeak := hdrPeakNits
+		if effectivePeak == 0 && source.cicp.transfer == 16 && geometryFinite(source.hdrPeakNits) && source.hdrPeakNits > 0 {
+			effectivePeak = source.hdrPeakNits
+		}
 		var err error
-		cicpTransform, err = prepareImageCICP(source.cicp, channels, imageSourceBitDepth(source), hdrPeakNits)
+		cicpTransform, err = prepareImageCICP(source.cicp, channels, imageSourceBitDepth(source), effectivePeak)
 		if err != nil {
 			return nil, err
 		}
@@ -188,7 +191,11 @@ func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space 
 				toneMapPeak = cicpTransform.peakNits
 				if !alphaOnly {
 					if cicpTransform.transfer == 16 {
-						hdrNominalPeak = 10000
+						if hdrPeakNits == 0 && geometryFinite(source.hdrPeakNits) && source.hdrPeakNits > 0 {
+							hdrNominalPeak = source.hdrPeakNits
+						} else {
+							hdrNominalPeak = 10000
+						}
 					} else {
 						hdrNominalPeak = 1000
 					}
@@ -218,7 +225,7 @@ func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space 
 				} else {
 					jxrMode = jxrSampleNative
 				}
-			} else if effectiveProfile != nil && (isExternal || source.selectedProfile != nil || effectiveProfile.class == "nmcl" || deviceOutput && jxrIntent == IntentAbsoluteColorimetric && effectiveProfile.version>>24 == 2 && effectiveProfile.class == "mntr" && !effectiveProfile.hasChad) {
+			} else if effectiveProfile != nil && (isExternal || source.selectedProfile != nil || effectiveProfile.class == "nmcl") {
 				if effectiveProfile.space == "YCbr" {
 					jxrMode = jxrSampleNative
 				} else {
@@ -316,7 +323,6 @@ func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space 
 		gammaChroma:    gammaChroma,
 		toneMapPeak:    toneMapPeak,
 		hdrNominalPeak: hdrNominalPeak,
-		deviceOutput:   deviceOutput,
 	}
 	if collapsed {
 		sampler.filterX, sampler.filterY = true, true
@@ -688,7 +694,7 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 		if s.image.transform.pipeline != nil && !s.image.transform.pipeline.floating && imageRejectClampedLUT(s.image, input) {
 			return renderColor{}, fmt.Errorf("%w: extended-range image requires floating-point ICC DToB or matrix-TRC transform", ErrUnsupported)
 		}
-		rgb, err := s.image.transform.linearRGB(input, imageUseExtendedTRC(s.image, s.jxrMode), s.deviceOutput)
+		rgb, err := s.image.transform.linearRGB(input, imageUseExtendedTRC(s.image, s.jxrMode))
 		if err != nil {
 			return renderColor{}, err
 		}
@@ -1121,10 +1127,13 @@ func scenePixelCenter(point Point) Point {
 	return Point{math.Floor(point.X) + 0.5, math.Floor(point.Y) + 0.5}
 }
 
-// visualBrush 在使用位置准备视觉内容，图块映射先于视觉自身的变换
-// 入参: brush 视觉画刷, transform 所属元素的设备变换, aliased 继承的边缘模式, depth 当前元素深度
+// visualBrush 在使用位置准备视觉内容并向子树透传透明度掩模状态，图块映射先于视觉自身的变换
+// 入参: brush 视觉画刷, transform 所属元素的设备变换, aliased 继承的边缘模式, depth 当前元素深度, maskOnly 是否仅用作透明度掩模
 // 返回: sceneSample 视觉采样器, error 结构、数值或资源错误
-func (r *sceneRenderer) visualBrush(brush *Brush, transform Matrix, aliased bool, depth int) (sceneSample, error) {
+func (r *sceneRenderer) visualBrush(brush *Brush, transform Matrix, aliased bool, depth int, maskOnly bool) (sceneSample, error) {
+	previousMask := r.maskOnly
+	r.maskOnly = previousMask || maskOnly
+	defer func() { r.maskOnly = previousMask }()
 	if brush.Visual == nil || brush.TileMode > TileFlipXY {
 		return nil, fmt.Errorf("%w: visual brush source or attributes", ErrInvalid)
 	}

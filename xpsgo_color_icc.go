@@ -43,9 +43,6 @@ var iccPCSFromLinearRGB, _ = iccInverseMatrix(iccPCSDisplayMatrix)
 // iccPCSWhite 保存ICC标准D50连接空间白点XYZ坐标
 var iccPCSWhite = [3]float64{0.9642, 1, 0.8249}
 
-// iccD65White 保存标准D65显示参考白点XYZ坐标
-var iccD65White = [3]float64{0.3127 / 0.3290, 1, (1 - 0.3127 - 0.3290) / 0.3290}
-
 // iccXYZD65ToLinearRGB 保存D65参考白XYZ到线性sRGB的直接显示矩阵
 var iccXYZD65ToLinearRGB = iccDisplayD65Matrix()
 
@@ -68,7 +65,6 @@ type iccProfile struct {
 	pcs      string
 	intent   uint32
 	channels int
-	hasChad  bool
 }
 
 // iccMetadataValidator 限制元数据检查的累计工作量，不复制配置文件或改写私有标签
@@ -96,7 +92,6 @@ type iccTransform struct {
 	curves      [3]iccCurve
 	matrix      [9]float64
 	white       [3]float64
-	hasChad     bool
 	absolutePCS bool
 	gray        bool
 	intent      uint32
@@ -170,7 +165,6 @@ func parseICCProfile(data []byte) (*iccProfile, error) {
 			return nil, fmt.Errorf("%w: overlapping ICC tag data", ErrInvalid)
 		}
 	}
-	p.hasChad = iccParseAdaptationMatrix(p.tag("chad"))
 	return p, nil
 }
 
@@ -307,25 +301,24 @@ func iccReadDisplayWhite(p *iccProfile, white [3]float64) bool {
 	return iccD50White(p.version, white)
 }
 
-// iccParseAdaptationMatrix 校验sf32色度适应矩阵格式及其可逆性
-// 入参: data chad标签字节
-// 返回: bool 是否存在可逆适应矩阵
-func iccParseAdaptationMatrix(data []byte) bool {
-	if len(data) != 44 || string(data[:4]) != "sf32" || binary.BigEndian.Uint32(data[4:]) != 0 {
-		return false
-	}
-	var matrix [9]float64
-	for i := range matrix {
-		matrix[i] = iccFixed(data[8+4*i:])
-	}
-	_, err := iccInverseMatrix(matrix)
-	return err == nil
-}
-
-// iccSelectTransformTag 按ICC.1:2010优先级选择源或目标转换标签，v4优先采用浮点管线
+// iccSelectTransformTag 按ICC.1:2010优先级选择源或目标转换标签，v4优先采用浮点管线并排除抽象配置的D2B3路由
 // 入参: profile 已解析配置文件, intent ICC渲染意图, forward 是否为设备到PCS方向
 // 返回: string 选中标签名, []byte 标签字节，未找到为空
 func iccSelectTransformTag(profile *iccProfile, intent uint32, forward bool) (string, []byte) {
+	if profile.class == "abst" {
+		if !forward {
+			return "", nil
+		}
+		if profile.version>>24 == 4 {
+			if data := profile.tag("D2B0"); data != nil {
+				return "D2B0", data
+			}
+		}
+		if data := profile.tag("A2B0"); data != nil {
+			return "A2B0", data
+		}
+		return "", nil
+	}
 	var candidates []string
 	if profile.version>>24 == 4 {
 		if forward {
@@ -1144,7 +1137,7 @@ func validateCreatedICCLUT(p *iccProfile, name string, forward bool, inputs, out
 // 返回: error 记录、通道、字符串或取消错误
 func validateCreatedICCNamed(p *iccProfile, ctx context.Context) error {
 	data := p.tag("ncl2")
-	if len(data) < 84 || string(data[:4]) != "ncl2" {
+	if len(data) < 84 || string(data[:4]) != "ncl2" || binary.BigEndian.Uint32(data[4:]) != 0 {
 		return fmt.Errorf("%w: ICC named color header", ErrInvalid)
 	}
 	count, device := uint64(binary.BigEndian.Uint32(data[12:])), uint64(binary.BigEndian.Uint32(data[16:]))
@@ -1152,8 +1145,17 @@ func validateCreatedICCNamed(p *iccProfile, ctx context.Context) error {
 		return fmt.Errorf("%w: ICC named color device coordinates", ErrInvalid)
 	}
 	stride := uint64(38) + 2*device
-	if uint64(84)+count*stride != uint64(len(data)) {
+	if count > (uint64(len(data))-84)/stride {
 		return fmt.Errorf("%w: ICC named color length", ErrInvalid)
+	}
+	expected := uint64(84) + count*stride
+	if uint64(len(data))-expected > 3 {
+		return fmt.Errorf("%w: ICC named color length", ErrInvalid)
+	}
+	for _, value := range data[expected:] {
+		if value != 0 {
+			return fmt.Errorf("%w: ICC named color padding", ErrInvalid)
+		}
 	}
 	for _, text := range [][]byte{data[20:52], data[52:84]} {
 		if err := iccNamedASCII(text); err != nil {
@@ -1212,7 +1214,7 @@ func newICCTarget(profile *iccProfile, intent uint32) (*iccTargetTransform, erro
 	if !iccReadDisplayWhite(profile, white) {
 		return nil, fmt.Errorf("%w: ICC target display white", ErrInvalid)
 	}
-	if profile.version>>24 == 4 && profile.class == "mntr" && (profile.hasChad || iccDisplayWhite(profile, white)) {
+	if profile.class == "mntr" {
 		white = iccPCSWhite
 	}
 	return &iccTargetTransform{profile: profile, white: white, intent: intent}, nil
@@ -1408,10 +1410,10 @@ func prepareICCTransform(profile *iccProfile, intent uint32) (*iccTransform, err
 	if !iccReadDisplayWhite(profile, white) {
 		return nil, fmt.Errorf("%w: ICC display media white point", ErrInvalid)
 	}
-	if profile.version>>24 == 4 && profile.class == "mntr" && (profile.hasChad || iccDisplayWhite(profile, white)) {
+	if profile.class == "mntr" || profile.class == "abst" {
 		white = iccPCSWhite
 	}
-	t := &iccTransform{profile: profile, white: white, hasChad: profile.hasChad, intent: intent}
+	t := &iccTransform{profile: profile, white: white, intent: intent}
 	if profile.class == "nmcl" {
 		t.named, err = parseICCNamedColor(profile)
 		if err != nil {
@@ -1561,18 +1563,13 @@ func (t *iccTransform) toXYZ(input []float64, extended bool) ([3]float64, error)
 	return xyz, nil
 }
 
-// linearRGB 转换为线性sRGB，支持TRC扩展外推及面向设备ICC连接空间的绝对白点保真传输
-// 入参: input 源设备颜色分量, extended 是否对TRC启用扩展范围外推, devicePCS 是否面向目标ICC连接空间保留源绝对白点
+// linearRGB 将源设备颜色经PCS转换为线性sRGB，支持TRC扩展外推
+// 入参: input 源设备颜色分量, extended 是否对TRC启用扩展范围外推
 // 返回: [3]float64 线性sRGB分量, error 源转换错误
-func (t *iccTransform) linearRGB(input []float64, extended, devicePCS bool) ([3]float64, error) {
+func (t *iccTransform) linearRGB(input []float64, extended bool) ([3]float64, error) {
 	xyz, err := t.toXYZ(input, extended)
 	if err != nil {
 		return [3]float64{}, err
-	}
-	if !devicePCS && t.intent == 3 && !t.absolutePCS && t.profile.version>>24 == 2 && t.profile.class == "mntr" && !t.hasChad {
-		for i := range 3 {
-			xyz[i] *= iccPCSWhite[i] / iccD65White[i]
-		}
 	}
 	return iccMatrixColor(iccPCSDisplayMatrix, xyz), nil
 }
