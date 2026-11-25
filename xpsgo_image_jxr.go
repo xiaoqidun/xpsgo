@@ -177,6 +177,65 @@ func jxrImageCICP(encoding *jxrgo.ColorEncoding) *imageCICP {
 	}
 }
 
+// jxrImageColorSpace 将JXRGo颜色空间枚举映射为公开图像源色彩空间类别
+// 入参: space JXRGo颜色空间标识
+// 返回: ImageColorSpace 公开图像源色彩空间
+func jxrImageColorSpace(space jxrgo.ColorSpace) ImageColorSpace {
+	switch space {
+	case jxrgo.ColorGray:
+		return ImageColorGray
+	case jxrgo.ColorRGB:
+		return ImageColorRGB
+	case jxrgo.ColorYCC:
+		return ImageColorYCC
+	case jxrgo.ColorCMYK, jxrgo.ColorCMYKDirect:
+		return ImageColorCMYK
+	case jxrgo.ColorMultiChannel:
+		return ImageColorMultiChannel
+	default:
+		return ImageColorUnknown
+	}
+}
+
+// jxrEXIFOrientation 将JPEG XR的0至7方向枚举转换为EXIF/TIFF Tag 274的1至8方向编码
+// 入参: orientation JXRGo声明方向
+// 返回: uint32 标准EXIF/TIFF方向值（1至8）
+func jxrEXIFOrientation(orientation jxrgo.Orientation) uint32 {
+	switch orientation {
+	case jxrgo.OrientationNone:
+		return 1
+	case jxrgo.OrientationFlipY:
+		return 4
+	case jxrgo.OrientationFlipX:
+		return 2
+	case jxrgo.OrientationFlipXY:
+		return 3
+	case jxrgo.OrientationRotate90:
+		return 6
+	case jxrgo.OrientationRotate90FlipY:
+		return 7
+	case jxrgo.OrientationRotate90FlipX:
+		return 5
+	case jxrgo.OrientationRotate90FlipXY:
+		return 8
+	default:
+		return 1
+	}
+}
+
+// jxrIsFloating 判断JPEG XR颜色通道是否采用IEEE半精度或单精度浮点样本编码
+// 入参: info JPEG XR图像元数据
+// 返回: bool 是否为浮点样本
+func jxrIsFloating(info jxrgo.Info) bool {
+	count := min(info.Channels, len(info.Components))
+	for i := range count {
+		if info.Components[i].Format == jxrgo.SampleFloat {
+			return true
+		}
+	}
+	return false
+}
+
 // jxrIntentFromICC 将ICC头部标准意图编码映射为JXRGo渲染意图枚举
 // 入参: intent ICC意图编号，0感知、1相对、2饱和度、3绝对
 // 返回: jxrgo.RenderingIntent 对应的JXRGo渲染意图
@@ -319,8 +378,14 @@ func decodeJXRImage(ctx context.Context, data []byte, maxPixels, maxBytes uint64
 		channels:     info.Channels,
 		profile:      info.ICCProfile,
 		cicp:         jxrImageCICP(info.ColorEncoding),
+		srgb:         info.ColorHint == jxrgo.ColorHintSRGB,
 		linear:       info.Linear,
 		multiChannel: info.ColorSpace == jxrgo.ColorMultiChannel,
+		colorSpace:   jxrImageColorSpace(info.ColorSpace),
+		hasAlpha:     info.Alpha,
+		bitDepth:     int(info.Components[0].Precision),
+		floating:     jxrIsFloating(info),
+		orientation:  jxrEXIFOrientation(info.Orientation),
 	}, nil
 }
 

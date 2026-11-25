@@ -16,6 +16,7 @@ package xpsgo
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image"
 	"image/color"
@@ -1656,5 +1657,158 @@ func (s *visualBrushFilter) releaseFilter() {
 		count := s.reserved
 		s.reserved = 0
 		s.renderer.releaseLive(count)
+	}
+}
+
+// RenderBrushTile 隔离光栅化VisualBrush、ImageBrush或渐变画刷的单个Viewport瓦片到透明背景画布
+// 按options.DPI（默认96）将物理Viewport换算为整数像素尺寸，返回瓦片图像与对应物理Viewport矩形
+// 入参: ctx 取消Context，nil采用Background, brush 待光栅化画刷, options 绘制参数，nil采用96DPI透明默认配置
+// 返回: *image.NRGBA 透明背景单瓦片图像, Rect 瓦片在画刷局部坐标系中的物理Viewport矩形, error 参数、画刷、资源、预算或取消错误
+func (r *Reader) RenderBrushTile(ctx context.Context, brush *Brush, options *RenderOptions) (*image.NRGBA, Rect, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, Rect{}, err
+	}
+	if err := r.readLock(); err != nil {
+		return nil, Rect{}, err
+	}
+	defer r.mu.RUnlock()
+	if brush == nil || !geometryFinite(brush.Opacity) || brush.Opacity < 0 || brush.Opacity > 1 {
+		return nil, Rect{}, fmt.Errorf("%w: brush tile source", ErrInvalid)
+	}
+	configuration := RenderOptions{}
+	if options != nil {
+		configuration = *options
+	}
+	configuration.Background = color.Transparent
+	settings, _, err := configuration.settings(ctx)
+	if err != nil {
+		return nil, Rect{}, err
+	}
+	viewport, err := brushTileViewport(brush)
+	if err != nil {
+		return nil, Rect{}, err
+	}
+	if viewport.Width == 0 || viewport.Height == 0 || brush.Opacity == 0 {
+		return image.NewNRGBA(image.Rectangle{}), viewport, nil
+	}
+	dpi := configuration.DPI
+	if dpi == 0 {
+		dpi = 96
+	}
+	scale := dpi / 96
+	rawW, rawH := viewport.Width*scale, viewport.Height*scale
+	if !geometryFinite(rawW, rawH) || rawW > float64(rasterMaxDimension) || rawH > float64(rasterMaxDimension) {
+		return nil, Rect{}, fmt.Errorf("%w: brush tile pixel dimensions", ErrLimit)
+	}
+	pixelW := max(1, int(math.Ceil(rawW)))
+	pixelH := max(1, int(math.Ceil(rawH)))
+	sx := float64(pixelW) / viewport.Width
+	sy := float64(pixelH) / viewport.Height
+	tileTransform := Matrix{A: sx, D: sy, E: -viewport.X * sx, F: -viewport.Y * sy}
+	if !geometryFillMatrixFinite(tileTransform) || geometryMatrixSingular(tileTransform) {
+		return nil, Rect{}, fmt.Errorf("%w: brush tile mapping range", ErrLimit)
+	}
+	tileBrush := *brush
+	tileBrush.Transform = nil
+	tileBrush.TileMode = TileNone
+	tilePath := &Path{
+		ElementProperties: ElementProperties{Part: brush.Part, Opacity: 1},
+		Data:              renderBoxGeometry(viewport),
+		Fill:              &tileBrush,
+	}
+	output, err := r.renderLoadedElements([]Element{tilePath}, tileTransform, image.Rect(0, 0, pixelW, pixelH), settings)
+	if err != nil {
+		return nil, Rect{}, err
+	}
+	if err := checkContext(ctx); err != nil {
+		return nil, Rect{}, err
+	}
+	return output, viewport, nil
+}
+
+// brushTileViewport 校验画刷属性并确定单瓦片在画刷局部坐标系下的物理Viewport范围
+// 入参: brush 源画刷
+// 返回: Rect 物理Viewport矩形, error 画刷参数或不支持种类错误
+func brushTileViewport(brush *Brush) (Rect, error) {
+	switch brush.Kind {
+	case BrushVisual:
+		if brush.Visual == nil || brush.TileMode > TileFlipXY {
+			return Rect{}, fmt.Errorf("%w: visual brush tile source", ErrInvalid)
+		}
+		for _, box := range []Rect{brush.Viewbox, brush.Viewport} {
+			if !geometryFinite(box.X, box.Y, box.Width, box.Height, box.X+box.Width, box.Y+box.Height) || box.Width < 0 || box.Height < 0 {
+				return Rect{}, fmt.Errorf("%w: visual brush tile rectangle", ErrInvalid)
+			}
+		}
+		return brush.Viewport, nil
+	case BrushImage:
+		if brush.ImageSource == "" || brush.TileMode > TileFlipXY {
+			return Rect{}, fmt.Errorf("%w: image brush tile source", ErrInvalid)
+		}
+		for _, box := range []Rect{brush.Viewbox, brush.Viewport} {
+			if !geometryFinite(box.X, box.Y, box.Width, box.Height, box.X+box.Width, box.Y+box.Height) || box.Width < 0 || box.Height < 0 {
+				return Rect{}, fmt.Errorf("%w: image brush tile rectangle", ErrInvalid)
+			}
+		}
+		return brush.Viewport, nil
+	case BrushLinearGradient:
+		if !geometryFinite(brush.StartPoint.X, brush.StartPoint.Y, brush.EndPoint.X, brush.EndPoint.Y) {
+			return Rect{}, fmt.Errorf("%w: linear gradient brush points", ErrInvalid)
+		}
+		if brush.Viewport != (Rect{}) {
+			if !geometryFinite(brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height, brush.Viewport.X+brush.Viewport.Width, brush.Viewport.Y+brush.Viewport.Height) || brush.Viewport.Width < 0 || brush.Viewport.Height < 0 {
+				return Rect{}, fmt.Errorf("%w: gradient brush viewport", ErrInvalid)
+			}
+			return brush.Viewport, nil
+		}
+		minX, maxX := min(brush.StartPoint.X, brush.EndPoint.X), max(brush.StartPoint.X, brush.EndPoint.X)
+		minY, maxY := min(brush.StartPoint.Y, brush.EndPoint.Y), max(brush.StartPoint.Y, brush.EndPoint.Y)
+		w, h := maxX-minX, maxY-minY
+		if !geometryFinite(w, h) {
+			return Rect{}, fmt.Errorf("%w: linear gradient viewport range", ErrLimit)
+		}
+		if w == 0 {
+			w = 1
+		}
+		if h == 0 {
+			h = 1
+		}
+		return Rect{X: minX, Y: minY, Width: w, Height: h}, nil
+	case BrushRadialGradient:
+		if !geometryFinite(brush.Center.X, brush.Center.Y, brush.GradientOrigin.X, brush.GradientOrigin.Y, brush.RadiusX, brush.RadiusY) || brush.RadiusX < 0 || brush.RadiusY < 0 {
+			return Rect{}, fmt.Errorf("%w: radial gradient brush geometry", ErrInvalid)
+		}
+		if brush.Viewport != (Rect{}) {
+			if !geometryFinite(brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height, brush.Viewport.X+brush.Viewport.Width, brush.Viewport.Y+brush.Viewport.Height) || brush.Viewport.Width < 0 || brush.Viewport.Height < 0 {
+				return Rect{}, fmt.Errorf("%w: gradient brush viewport", ErrInvalid)
+			}
+			return brush.Viewport, nil
+		}
+		minX := min(brush.Center.X-brush.RadiusX, brush.GradientOrigin.X)
+		maxX := max(brush.Center.X+brush.RadiusX, brush.GradientOrigin.X)
+		minY := min(brush.Center.Y-brush.RadiusY, brush.GradientOrigin.Y)
+		maxY := max(brush.Center.Y+brush.RadiusY, brush.GradientOrigin.Y)
+		w, h := maxX-minX, maxY-minY
+		if !geometryFinite(w, h) {
+			return Rect{}, fmt.Errorf("%w: radial gradient viewport range", ErrLimit)
+		}
+		if w == 0 {
+			w = 1
+		}
+		if h == 0 {
+			h = 1
+		}
+		return Rect{X: minX, Y: minY, Width: w, Height: h}, nil
+	case BrushSolidColor:
+		if brush.Viewport != (Rect{}) {
+			if !geometryFinite(brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height, brush.Viewport.X+brush.Viewport.Width, brush.Viewport.Y+brush.Viewport.Height) || brush.Viewport.Width < 0 || brush.Viewport.Height < 0 {
+				return Rect{}, fmt.Errorf("%w: solid brush viewport", ErrInvalid)
+			}
+			return brush.Viewport, nil
+		}
+		return Rect{Width: 1, Height: 1}, nil
+	default:
+		return Rect{}, fmt.Errorf("%w: unsupported brush tile kind %d", ErrUnsupported, brush.Kind)
 	}
 }

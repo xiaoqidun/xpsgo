@@ -677,7 +677,7 @@ func (r *Reader) DiscardControl(ctx context.Context) (*DiscardControl, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !strings.EqualFold(media, fixedContentType("discard-control")) {
+	if !strings.EqualFold(opcMediaTypeBase(media), fixedContentType("discard-control")) {
 		return nil, &PartError{Part: part, Err: fmt.Errorf("%w: discard control content type", ErrInvalid)}
 	}
 	data, err := r.pkg.readItemsContext(ctx, strings.ToLower(part), min(r.limits.MaxMetadataBytes, r.limits.MaxPartBytes, r.limits.MaxPackageBytes))

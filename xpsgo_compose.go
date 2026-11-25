@@ -1171,6 +1171,8 @@ func normalizeCompositionDocumentLinkTargets(part packagePart, document composit
 				continue
 			}
 			keptLinks := make([]*xmlElement, 0, len(child.Children))
+			liftedLinks := make(map[*xmlElement][]*xmlElement)
+			var liftedAttrs []xml.Attr
 			for _, link := range child.Children {
 				if err := budget.step(1); err != nil {
 					return nil, err
@@ -1184,14 +1186,26 @@ func normalizeCompositionDocumentLinkTargets(part packagePart, document composit
 					keptLinks = append(keptLinks, link)
 					continue
 				}
-				if dropped[val] {
-					continue
+				removeLink := dropped[val]
+				targetName := ""
+				if !removeLink {
+					var exists bool
+					targetName, exists = mapping[val]
+					if !exists {
+						return nil, fmt.Errorf("%w: missing composition LinkTarget mapping %q", ErrInvalid, val)
+					}
+					if seenInPage[targetName] {
+						removeLink = true
+					}
 				}
-				targetName, exists := mapping[val]
-				if !exists {
-					return nil, fmt.Errorf("%w: missing composition LinkTarget mapping %q", ErrInvalid, val)
-				}
-				if seenInPage[targetName] {
+				if removeLink {
+					if len(link.PreservedElements) != 0 {
+						child.PreservedElements = append(child.PreservedElements, link.PreservedElements...)
+						liftedLinks[link] = link.PreservedElements
+					}
+					if len(link.PreservedAttributes) != 0 {
+						liftedAttrs = append(liftedAttrs, link.PreservedAttributes...)
+					}
 					continue
 				}
 				seenInPage[targetName] = true
@@ -1203,15 +1217,61 @@ func normalizeCompositionDocumentLinkTargets(part packagePart, document composit
 				}
 				keptLinks = append(keptLinks, link)
 			}
+			if len(liftedLinks) != 0 && ordered != nil {
+				if items, ok := ordered[child]; ok {
+					replaced := make([]xmlContent, 0, len(items))
+					for _, item := range items {
+						if item.element != nil {
+							if lifted, hit := liftedLinks[item.element]; hit {
+								for _, elem := range lifted {
+									replaced = append(replaced, xmlContent{element: elem})
+								}
+								continue
+							}
+						}
+						replaced = append(replaced, item)
+					}
+					ordered[child] = replaced
+				}
+			}
 			if len(keptLinks) == 0 {
 				if len(child.PreservedElements) != 0 {
-					pageNode.PreservedElements = append(pageNode.PreservedElements, child.PreservedElements...)
-					promoted[child] = child.PreservedElements
+					elems := child.PreservedElements
+					if ordered != nil {
+						if items, ok := ordered[child]; ok {
+							allowed := make(map[*xmlElement]bool, len(child.PreservedElements))
+							for _, elem := range child.PreservedElements {
+								allowed[elem] = true
+							}
+							seenElem := make(map[*xmlElement]bool, len(child.PreservedElements))
+							sortedElems := make([]*xmlElement, 0, len(child.PreservedElements))
+							for _, item := range items {
+								if item.element != nil && allowed[item.element] && !seenElem[item.element] {
+									seenElem[item.element] = true
+									sortedElems = append(sortedElems, item.element)
+								}
+							}
+							for _, elem := range child.PreservedElements {
+								if !seenElem[elem] {
+									sortedElems = append(sortedElems, elem)
+								}
+							}
+							elems = sortedElems
+						}
+					}
+					pageNode.PreservedElements = append(pageNode.PreservedElements, elems...)
+					promoted[child] = elems
 				}
-				if len(child.PreservedAttributes) != 0 {
-					pageNode.PreservedAttributes = append(pageNode.PreservedAttributes, child.PreservedAttributes...)
+				if err := mergeCompositionPreservedAttributes(pageNode, child.PreservedAttributes, "PageContent"); err != nil {
+					return nil, err
+				}
+				if err := mergeCompositionPreservedAttributes(pageNode, liftedAttrs, "PageContent"); err != nil {
+					return nil, err
 				}
 				continue
+			}
+			if err := mergeCompositionPreservedAttributes(child, liftedAttrs, "PageContent.LinkTargets"); err != nil {
+				return nil, err
 			}
 			child.Children = keptLinks
 			keptPageChildren = append(keptPageChildren, child)
@@ -1262,6 +1322,46 @@ func normalizeCompositionDocumentLinkTargets(part packagePart, document composit
 		return nil, err
 	}
 	return data, nil
+}
+
+// mergeCompositionPreservedAttributes 将提升的保留属性合入目标节点，同名同值去重，同名异值返回不支持错误
+// 入参: target 目标容器元素, incoming 待合入保留属性列表, container 目标容器错误标识名称
+// 返回: error 同展开名异值冲突错误
+func mergeCompositionPreservedAttributes(target *xmlElement, incoming []xml.Attr, container string) error {
+	for _, attr := range incoming {
+		if attr.Name.Space == xmlnsNamespace || attr.Name == (xml.Name{Local: "xmlns"}) {
+			continue
+		}
+		matched := false
+		for _, existing := range target.Attr {
+			if existing.Name.Space == xmlnsNamespace || existing.Name == (xml.Name{Local: "xmlns"}) {
+				continue
+			}
+			if existing.Name == attr.Name {
+				if existing.Value != attr.Value {
+					return fmt.Errorf("%w: preserved attribute conflict on %s", ErrUnsupported, container)
+				}
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+		for _, existing := range target.PreservedAttributes {
+			if existing.Name == attr.Name {
+				if existing.Value != attr.Value {
+					return fmt.Errorf("%w: preserved attribute conflict on %s", ErrUnsupported, container)
+				}
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			target.PreservedAttributes = append(target.PreservedAttributes, attr)
+		}
+	}
+	return nil
 }
 
 // validateCompositionFixedDocumentNames 按OpenXPS规则校验已切换XPS命名空间的固定文档LinkTarget名称，允许跨页重复与非NCName等待规划阶段规范化

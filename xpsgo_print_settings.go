@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"math/big"
 	"slices"
 	"strconv"
@@ -94,6 +95,15 @@ const (
 	PrintConstraintAdministrator
 	// PrintConstraintDevice 表示选项受打印设备硬件配置约束
 	PrintConstraintDevice
+)
+
+const (
+	// printDocumentTicket 表示打印票据文档类别
+	printDocumentTicket printDocumentMode = iota
+	// printDocumentCapabilities 表示PrintCapabilities能力文档类别
+	printDocumentCapabilities
+	// printDocumentDeviceCapabilities 表示PrintDeviceCapabilities设备能力文档类别
+	printDocumentDeviceCapabilities
 )
 
 // printSettingNames 保存Framework元素名称，索引对应公开元素类型
@@ -186,7 +196,7 @@ type PrintCapabilities struct {
 	Elements []PrintSetting
 }
 
-// printParameterDomain 保存一个参数的基础域及默认值，不解释私有单位或设备间约束
+// printParameterDomain 保存一个参数的基础域、步进及默认值，不解释私有单位或设备间约束
 type printParameterDomain struct {
 	kind         xml.Name
 	defaultValue PrintValue
@@ -194,6 +204,23 @@ type printParameterDomain struct {
 	unit         string
 	minimum      *big.Rat
 	maximum      *big.Rat
+	multiple     *big.Rat
+}
+
+// printDocumentMode 表示内部校验与编码的Print Schema文档类别
+type printDocumentMode uint8
+
+// PrintNormalizeOptions 设置PrintTicket规范化合并与设备能力补全的作用域及资源预算
+type PrintNormalizeOptions struct {
+	Settings PrintSettingsOptions
+}
+
+// printNormalizer 在单次规范化调用中保存能力索引、参数域、比较预算及诊断列表
+type printNormalizer struct {
+	options     printSettingsConfig
+	domains     map[xml.Name]*printParameterDomain
+	diagnostics []Diagnostic
+	remaining   int
 }
 
 // printSelectionChecker 校验能力快照中的选择声明并约束Option及标量比较工作量
@@ -625,10 +652,11 @@ func (r *Reader) validatePrintTicketLinks(ctx context.Context) error {
 		if err != nil {
 			return &PartError{Part: part, Err: err}
 		}
-		if r.format == FormatXPS && !strings.EqualFold(typeName, printTicketType) {
+		baseType := opcMediaTypeBase(typeName)
+		if r.format == FormatXPS && !strings.EqualFold(baseType, printTicketType) {
 			return &PartError{Part: part, Err: fmt.Errorf("%w: XPS print ticket content type", ErrInvalid)}
 		}
-		known, capabilities := printResourceMedia(typeName)
+		known, capabilities := printResourceMedia(baseType)
 		profile := known && !capabilities
 		partKey := strings.ToLower(part)
 		if !profile || checked[partKey][scope] {
@@ -718,36 +746,58 @@ func parsePrintSettings(root *xmlElement, options printSettingsConfig) (*PrintSe
 // 入参: root 已解析XML根, options 已校验参数, capabilities 是否为设备能力文档
 // 返回: *PrintSettings 独立Framework结构, error 结构、资源或取消错误
 func parsePrintDocument(root *xmlElement, options printSettingsConfig, capabilities bool) (*PrintSettings, error) {
-	rootName := "PrintTicket"
+	mode := printDocumentTicket
 	if capabilities {
-		rootName = "PrintCapabilities"
+		mode = printDocumentCapabilities
 	}
-	if !printFrameworkSpace(root.Name.Space) || root.Name.Local != rootName || !xmlWhitespace(root.Text) {
+	return parsePrintDocumentMode(root, options, mode)
+}
+
+// parsePrintDocumentMode 按票据、PrintCapabilities或PrintDeviceCapabilities模式校验根结构与子元素
+// 入参: root 已解析XML根, options 已校验参数, mode 文档类别模式
+// 返回: *PrintSettings 独立Framework结构, error 结构、资源或取消错误
+func parsePrintDocumentMode(root *xmlElement, options printSettingsConfig, mode printDocumentMode) (*PrintSettings, error) {
+	capabilities := mode != printDocumentTicket
+	rootName := "PrintTicket"
+	if mode == printDocumentCapabilities {
+		rootName = "PrintCapabilities"
+	} else if mode == printDocumentDeviceCapabilities {
+		rootName = "PrintDeviceCapabilities"
+	}
+	validSpace := printFrameworkSpace(root.Name.Space)
+	if mode == printDocumentDeviceCapabilities {
+		validSpace = root.Name.Space == printFramework2NS
+	}
+	if !validSpace || root.Name.Local != rootName || !xmlWhitespace(root.Text) {
 		return nil, fmt.Errorf("%w: print settings root", ErrInvalid)
 	}
-	if err := printSettingsAttributes(root, "version"); err != nil {
+	if err := printSettingsElementAttributes(root, true, "version"); err != nil {
 		return nil, err
 	}
 	version, exists := root.attribute("version")
 	version = strings.Trim(version, " \t\r\n")
-	if !exists || !printInteger(version) || strings.HasPrefix(version, "-") {
-		return nil, fmt.Errorf("%w: print settings version", ErrInvalid)
-	}
-	version = strings.TrimLeft(strings.TrimPrefix(version, "+"), "0")
-	if version == "" {
-		return nil, fmt.Errorf("%w: print settings version", ErrInvalid)
-	}
 	var parsedVersion uint32
-	if root.Name.Space == printFrameworkNS {
-		if version != "1" {
-			return nil, fmt.Errorf("%w: print settings framework version", ErrUnsupported)
-		}
-		parsedVersion = 1
-	} else {
-		if version != "2" {
-			return nil, fmt.Errorf("%w: print settings framework version", ErrUnsupported)
-		}
+	if mode == printDocumentDeviceCapabilities && !exists {
 		parsedVersion = 2
+	} else {
+		if !exists || !printInteger(version) || strings.HasPrefix(version, "-") {
+			return nil, fmt.Errorf("%w: print settings version", ErrInvalid)
+		}
+		version = strings.TrimLeft(strings.TrimPrefix(version, "+"), "0")
+		if version == "" {
+			return nil, fmt.Errorf("%w: print settings version", ErrInvalid)
+		}
+		if root.Name.Space == printFrameworkNS {
+			if version != "1" {
+				return nil, fmt.Errorf("%w: print settings framework version", ErrUnsupported)
+			}
+			parsedVersion = 1
+		} else {
+			if version != "2" {
+				return nil, fmt.Errorf("%w: print settings framework version", ErrUnsupported)
+			}
+			parsedVersion = 2
+		}
 	}
 	value := &PrintSettings{Version: parsedVersion}
 	seen := make(map[xml.Name]bool)
@@ -1016,7 +1066,7 @@ func printSettingKindForVersion(node *xmlElement, version uint32) (PrintSettingK
 	if node.Name.Space == "" {
 		return PrintSettingUnknown, false, fmt.Errorf("%w: print settings v2 element without namespace", ErrInvalid)
 	}
-	if printFrameworkSpace(node.Name.Space) && (printSettingKind(xml.Name{Space: printFrameworkNS, Local: node.Name.Local}) != PrintSettingUnknown || node.Name.Local == "PrintTicket" || node.Name.Local == "PrintCapabilities") {
+	if printFrameworkSpace(node.Name.Space) && (printSettingKind(xml.Name{Space: printFrameworkNS, Local: node.Name.Local}) != PrintSettingUnknown || node.Name.Local == "PrintTicket" || node.Name.Local == "PrintCapabilities" || node.Name.Local == "PrintDeviceCapabilities") {
 		return PrintSettingUnknown, false, fmt.Errorf("%w: print settings v2 wrapper element {%s}%s", ErrInvalid, node.Name.Space, node.Name.Local)
 	}
 	text = strings.Trim(text, " \t\r\n")
@@ -1028,12 +1078,39 @@ func printSettingKindForVersion(node *xmlElement, version uint32) (PrintSettingK
 	return PrintSettingUnknown, false, fmt.Errorf("%w: print settings psf2:psftype %q", ErrInvalid, text)
 }
 
+// printSettingsXMLAttribute 校验标准XML 1.0及根元素XSD全局属性
+// 入参: attribute XML属性, isRoot 是否位于文档根元素
+// 返回: bool 是否已由标准全局属性规则处理, error 属性取值错误
+func printSettingsXMLAttribute(attribute xml.Attr, isRoot bool) (bool, error) {
+	if attribute.Name.Space == xmlNamespace {
+		switch attribute.Name.Local {
+		case "lang":
+			return true, nil
+		case "space":
+			if attribute.Value != "default" && attribute.Value != "preserve" {
+				return true, fmt.Errorf("%w: print settings xml:space value", ErrInvalid)
+			}
+			return true, nil
+		}
+	}
+	if isRoot && attribute.Name.Space == xsiNamespace && (attribute.Name.Local == "schemaLocation" || attribute.Name.Local == "noNamespaceSchemaLocation") {
+		return true, nil
+	}
+	return false, nil
+}
+
 // printSettingsPSF2Attributes 校验Print Schema v2直接元素的框架属性并提取约束、默认标记与选择类型
 // 入参: node XML元素, kind 已识别元素类型, capabilities 是否为能力文档, allowType 是否允许xsi:type, constraint 约束输出, hasDefault 默认声明标志输出, isDefault 默认选项值输出, selection 选择属性输出
 // 返回: error 属性或取值错误
 func printSettingsPSF2Attributes(node *xmlElement, kind PrintSettingKind, capabilities, allowType bool, constraint *PrintConstraint, hasDefault, isDefault *bool, selection **PrintSetting) error {
 	for _, attribute := range node.Attr {
 		if attribute.Name.Space == xmlnsNamespace || attribute.Name == (xml.Name{Local: "xmlns"}) {
+			continue
+		}
+		if handled, err := printSettingsXMLAttribute(attribute, false); handled {
+			if err != nil {
+				return err
+			}
 			continue
 		}
 		if attribute.Name == (xml.Name{Space: printFramework2NS, Local: "psftype"}) {
@@ -1080,12 +1157,25 @@ func printSettingsPSF2Attributes(node *xmlElement, kind PrintSettingKind, capabi
 	return nil
 }
 
-// printSettingsAttributes 检查允许的无命名空间属性及Value的xsi:type，不接受私有XML属性
+// printSettingsAttributes 检查允许的无命名空间属性、标准XML属性及Value的xsi:type，不接受私有XML属性
 // 入参: node 元素, allowed 允许的无命名空间属性
 // 返回: error 非法属性错误
 func printSettingsAttributes(node *xmlElement, allowed ...string) error {
+	return printSettingsElementAttributes(node, false, allowed...)
+}
+
+// printSettingsElementAttributes 校验元素属性，允许标准XML 1.0全局属性及根元素XSD架构位置属性
+// 入参: node 元素, isRoot 是否为文档根元素, allowed 允许的无命名空间属性
+// 返回: error 非法属性错误
+func printSettingsElementAttributes(node *xmlElement, isRoot bool, allowed ...string) error {
 	for _, attribute := range node.Attr {
 		if attribute.Name.Space == xmlnsNamespace || attribute.Name == (xml.Name{Local: "xmlns"}) {
+			continue
+		}
+		if handled, err := printSettingsXMLAttribute(attribute, isRoot); handled {
+			if err != nil {
+				return err
+			}
 			continue
 		}
 		valid := false
@@ -1095,7 +1185,7 @@ func printSettingsAttributes(node *xmlElement, allowed ...string) error {
 		if valid {
 			continue
 		}
-		if node.Name.Local == "Value" && attribute.Name == (xml.Name{Space: xsiNamespace, Local: "type"}) {
+		if !isRoot && node.Name.Local == "Value" && attribute.Name == (xml.Name{Space: xsiNamespace, Local: "type"}) {
 			continue
 		}
 		return fmt.Errorf("%w: print settings attribute {%s}%s", ErrInvalid, attribute.Name.Space, attribute.Name.Local)
@@ -1366,6 +1456,10 @@ func MergePrintSettings(ctx context.Context, baseline, delta *PrintSettings, opt
 	if change.Version > base.Version {
 		base.Version = change.Version
 	}
+	if base.Version > 1 && printSettingsHasAnonymousOption(base.Elements) {
+		base.Version = 1
+		printStripOptionDefaults(base.Elements)
+	}
 	root, err := printSettingsRoot(base, configuration)
 	if err != nil {
 		return nil, err
@@ -1539,14 +1633,35 @@ func printSettingsRoot(settings *PrintSettings, options printSettingsConfig) (*x
 // 入参: version Framework版本, elements 根内容, options 已校验参数, capabilities 是否为设备能力文档
 // 返回: *xmlElement 独立根节点, error 结构、预算或取消错误
 func printDocumentRoot(version uint32, elements []PrintSetting, options printSettingsConfig, capabilities bool) (*xmlElement, error) {
+	mode := printDocumentTicket
+	if capabilities {
+		mode = printDocumentCapabilities
+	}
+	return printDocumentRootMode(version, elements, options, mode)
+}
+
+// printDocumentRootMode 按指定文档模式生成PrintTicket、PrintCapabilities或PrintDeviceCapabilities根节点
+// 入参: version Framework版本, elements 根内容, options 已校验参数, mode 文档类别模式
+// 返回: *xmlElement 独立根节点, error 结构、预算或取消错误
+func printDocumentRootMode(version uint32, elements []PrintSetting, options printSettingsConfig, mode printDocumentMode) (*xmlElement, error) {
 	if err := checkContext(options.context); err != nil {
 		return nil, err
 	}
-	if version == 0 {
-		version = 1
-	}
-	if version != 1 && version != 2 {
-		return nil, fmt.Errorf("%w: print settings framework version", ErrUnsupported)
+	capabilities := mode != printDocumentTicket
+	if mode == printDocumentDeviceCapabilities {
+		if version == 0 {
+			version = 2
+		}
+		if version != 2 {
+			return nil, fmt.Errorf("%w: print device capabilities requires framework version 2", ErrUnsupported)
+		}
+	} else {
+		if version == 0 {
+			version = 1
+		}
+		if version != 1 && version != 2 {
+			return nil, fmt.Errorf("%w: print settings framework version", ErrUnsupported)
+		}
 	}
 	framework, prefix := printFrameworkNS, "psf"
 	if version == 2 {
@@ -1555,8 +1670,10 @@ func printDocumentRoot(version uint32, elements []PrintSetting, options printSet
 	builder := printSettingsBuilder{options: options, framework: framework, prefixes: map[string]string{framework: prefix}, scope: map[string]string{prefix: framework}, nodes: 1, capabilities: capabilities}
 	limit := min(options.Limits.MaxMetadataBytes, options.Limits.MaxPartBytes, options.Limits.MaxPackageBytes)
 	rootName, parameterKind := "PrintTicket", PrintSettingParameterInit
-	if capabilities {
+	if mode == printDocumentCapabilities {
 		rootName, parameterKind = "PrintCapabilities", PrintSettingParameterDef
+	} else if mode == printDocumentDeviceCapabilities {
+		rootName, parameterKind = "PrintDeviceCapabilities", PrintSettingParameterDef
 	}
 	root := &xmlElement{Name: xml.Name{Space: framework, Local: rootName}, Attr: []xml.Attr{{Name: xml.Name{Local: "version"}, Value: strconv.FormatUint(uint64(version), 10)}}, Namespaces: builder.scope}
 	for _, setting := range elements {
@@ -1712,7 +1829,7 @@ func (b *printSettingsBuilder) elementV2(value PrintSetting, depth int) (*xmlEle
 	if value.Name.Space == "" {
 		return nil, fmt.Errorf("%w: missing print settings v2 keyword name", ErrInvalid)
 	}
-	if printFrameworkSpace(value.Name.Space) && (printSettingKind(xml.Name{Space: printFrameworkNS, Local: value.Name.Local}) != PrintSettingUnknown || value.Name.Local == "PrintTicket" || value.Name.Local == "PrintCapabilities") {
+	if printFrameworkSpace(value.Name.Space) && (printSettingKind(xml.Name{Space: printFrameworkNS, Local: value.Name.Local}) != PrintSettingUnknown || value.Name.Local == "PrintTicket" || value.Name.Local == "PrintCapabilities" || value.Name.Local == "PrintDeviceCapabilities") {
 		return nil, fmt.Errorf("%w: print settings v2 framework wrapper element", ErrInvalid)
 	}
 	nameText, err := b.qname(value.Name)
@@ -1894,6 +2011,9 @@ func (b *printSettingsBuilder) valueQName(value PrintValue, node *xmlElement) (s
 	prefix, local, qualified := strings.Cut(text, ":")
 	if !qualified && text == value.QName.Local && xmlNCName(text) {
 		if value.QName.Space != "" {
+			if len(node.Children) > 0 {
+				return b.qname(value.QName)
+			}
 			if err := b.localNamespace(node, "", value.QName.Space, value.Type); err != nil {
 				return "", err
 			}
@@ -1913,7 +2033,7 @@ func (b *printSettingsBuilder) valueQName(value PrintValue, node *xmlElement) (s
 			}
 			return text, nil
 		}
-		if len(node.Children) > 0 && value.Type == (xml.Name{Space: printValueNS, Local: "QName"}) {
+		if len(node.Children) > 0 {
 			return b.qname(value.QName)
 		}
 		if err := b.localNamespace(node, prefix, value.QName.Space, value.Type); err != nil {
@@ -2274,19 +2394,8 @@ func printParameterDefinition(parameter PrintSetting, options printSettingsConfi
 	if domain.mandatory != "Optional" && domain.mandatory != "Conditional" && domain.mandatory != "Unconditional" {
 		return nil, fmt.Errorf("%w: print parameter Mandatory", ErrInvalid)
 	}
-	if printPublicKeywordSpace(parameter.Name.Space) {
-		units := []string{"characters", "numeric", "sRGB", "base64"}
-		switch domain.kind.Local {
-		case "QName":
-			units = []string{"characters"}
-		case "integer":
-			units = []string{"copies", "microns", "percent", "points", "degrees", "dpi", "pixels", "sheets"}
-		case "decimal":
-			units = []string{"microns", "percent", "points", "degrees"}
-		}
-		if !slices.Contains(units, domain.unit) {
-			return nil, fmt.Errorf("%w: public print parameter unit", ErrInvalid)
-		}
+	if strings.TrimSpace(domain.unit) == "" {
+		return nil, fmt.Errorf("%w: empty print parameter unit", ErrInvalid)
 	}
 	var minimum, maximum *PrintValue
 	switch domain.kind.Local {
@@ -2316,6 +2425,7 @@ func printParameterDefinition(parameter PrintSetting, options printSettingsConfi
 		if step.Sign() <= 0 {
 			return nil, fmt.Errorf("%w: print parameter multiple must be positive", ErrInvalid)
 		}
+		domain.multiple = step
 	default:
 		return nil, fmt.Errorf("%w: print parameter data type", ErrInvalid)
 	}
@@ -2415,6 +2525,12 @@ func (p *printParameterDomain) value(value *PrintValue, options printSettingsCon
 	}
 	if measure.Cmp(p.minimum) < 0 || measure.Cmp(p.maximum) > 0 {
 		return nil, fmt.Errorf("%w: print parameter value outside range", ErrInvalid)
+	}
+	if p.multiple != nil {
+		diff := new(big.Rat).Sub(measure, p.minimum)
+		if !new(big.Rat).Quo(diff, p.multiple).IsInt() {
+			return nil, fmt.Errorf("%w: print parameter value multiple step", ErrInvalid)
+		}
 	}
 	return value, nil
 }
@@ -2844,29 +2960,29 @@ func printScoredValue(settings []PrintSetting) (*PrintValue, xml.Name) {
 	return nil, xml.Name{}
 }
 
-// value 按基本类型比较值，数值采用精确比较，QName按展开名称比较
-// 入参: requested 请求值, supported 能力值
-// 返回: bool 是否等值, error 资源或取消错误
-func (c *printSelectionChecker) value(requested, supported *PrintValue) (bool, error) {
-	if err := c.step(); err != nil {
-		return false, err
-	}
+// printValuesEqual 按基本类型精确比较两个PrintValue是否等价，数值使用精确有理数比较
+// 入参: requested 请求值, supported 能力值, options 解析与数值预算选项, canonicalQName 是否按规范命名空间键比较QName
+// 返回: bool 是否等值, error 预算或取消错误
+func printValuesEqual(requested, supported *PrintValue, options printSettingsConfig, canonicalQName bool) (bool, error) {
 	if requested == nil || supported == nil || requested.Type != supported.Type {
 		return false, nil
 	}
 	switch requested.Type.Local {
 	case "QName":
+		if canonicalQName {
+			return printCanonicalKey(requested.QName) == printCanonicalKey(supported.QName), nil
+		}
 		return requested.QName == supported.QName, nil
 	case "integer", "decimal":
 		left, right := strings.Trim(requested.Text, " \t\r\n"), strings.Trim(supported.Text, " \t\r\n")
 		if left == "" || right == "" {
 			return left == right, nil
 		}
-		a, err := printParameterNumber(left, c.options)
+		a, err := printParameterNumber(left, options)
 		if err != nil {
 			return false, err
 		}
-		b, err := printParameterNumber(right, c.options)
+		b, err := printParameterNumber(right, options)
 		if err != nil {
 			return false, err
 		}
@@ -2874,4 +2990,930 @@ func (c *printSelectionChecker) value(requested, supported *PrintValue) (bool, e
 	default:
 		return requested.Text == supported.Text, nil
 	}
+}
+
+// value 按基本类型比较值，数值采用精确比较，QName按展开名称比较
+// 入参: requested 请求值, supported 能力值
+// 返回: bool 是否等值, error 资源或取消错误
+func (c *printSelectionChecker) value(requested, supported *PrintValue) (bool, error) {
+	if err := c.step(); err != nil {
+		return false, err
+	}
+	return printValuesEqual(requested, supported, c.options, false)
+}
+
+// printSettingsHasAnonymousOption 递归检查设置树中是否存在无名称的Option节点
+// 入参: elements 待检查设置元素切片
+// 返回: bool 是否存在匿名Option
+func printSettingsHasAnonymousOption(elements []PrintSetting) bool {
+	for _, element := range elements {
+		if element.Kind == PrintSettingOption && element.Name == (xml.Name{}) {
+			return true
+		}
+		if printSettingsHasAnonymousOption(element.Children) {
+			return true
+		}
+	}
+	return false
+}
+
+// printStripOptionDefaults 递归清除所有设置节点的Print Schema v2默认选项标记，供降级至v1序列化使用
+// 入参: elements 待清理设置元素切片
+func printStripOptionDefaults(elements []PrintSetting) {
+	for index := range elements {
+		elements[index].HasDefault = false
+		elements[index].Default = false
+		printStripOptionDefaults(elements[index].Children)
+	}
+}
+
+// ParsePrintDeviceCapabilities 解析Windows V4驱动PrintDeviceCapabilities文档并校验PSF2结构与参数域
+// 支持标准psf2:PrintDeviceCapabilities根元素并允许省略或显式声明version="2"，Scope须为Unknown
+// 入参: ctx 取消Context，nil采用Background, data UTF-8或UTF-16设备能力XML, options 解析参数，nil采用默认值
+// 返回: *PrintSettings 独立设备能力结构, error XML、Framework、资源或取消错误
+func ParsePrintDeviceCapabilities(ctx context.Context, data []byte, options *PrintSettingsOptions) (*PrintSettings, error) {
+	configuration, err := printSettingsOptions(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	if configuration.Scope != PrintScopeUnknown {
+		return nil, fmt.Errorf("%w: scope on print device capabilities", ErrInvalid)
+	}
+	if err := checkContext(configuration.context); err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > min(configuration.Limits.MaxPartBytes, configuration.Limits.MaxMetadataBytes, configuration.Limits.MaxPackageBytes) {
+		return nil, fmt.Errorf("%w: print device capabilities byte budget", ErrLimit)
+	}
+	root, err := decodeXML(data, configuration.Limits)
+	if err != nil {
+		return nil, err
+	}
+	return parsePrintDocumentMode(root, configuration, printDocumentDeviceCapabilities)
+}
+
+// EncodePrintDeviceCapabilities 校验并按原生PSF2语法编码Windows V4驱动PrintDeviceCapabilities文档
+// 省略的版本采用2，不修改调用方模型，结构、预算或取消错误不会提前写入输出流
+// 入参: ctx 取消Context，nil采用Background, output 输出流, settings 设备能力结构, options 编码参数，Scope须为Unknown
+// 返回: int64 实际写入字节数, error 结构、预算、取消或输出错误
+func EncodePrintDeviceCapabilities(ctx context.Context, output io.Writer, settings *PrintSettings, options *PrintSettingsOptions) (int64, error) {
+	configuration, err := printSettingsOptions(ctx, options)
+	if err != nil {
+		return 0, err
+	}
+	if output == nil || settings == nil || configuration.Scope != PrintScopeUnknown {
+		return 0, fmt.Errorf("%w: print device capabilities encode parameters", ErrInvalid)
+	}
+	root, err := printDocumentRootMode(settings.Version, settings.Elements, configuration, printDocumentDeviceCapabilities)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := parsePrintDocumentMode(root, configuration, printDocumentDeviceCapabilities); err != nil {
+		return 0, err
+	}
+	var buffer bytes.Buffer
+	if _, err := writePrintSettingsMarkup(&buffer, root, configuration); err != nil {
+		return 0, err
+	}
+	counted := packageOutput{writer: output, context: configuration.context, limit: min(configuration.Limits.MaxMetadataBytes, configuration.Limits.MaxPartBytes, configuration.Limits.MaxPackageBytes)}
+	_, err = counted.Write(buffer.Bytes())
+	return counted.count, err
+}
+
+// NormalizePrintSettings 按Microsoft Print Schema规范对基础票据与增量票据执行合并、设备能力校验、约束消解、默认补全与参数量化
+// capabilities支持PrintCapabilities或PrintDeviceCapabilities模型，输出完全合法且独立的PrintSettings
+// 入参: ctx 取消Context，nil采用Background, base 基础票据，允许为nil, delta 优先增量票据，允许为nil, capabilities 设备能力文档, options 规范化参数，nil采用默认值
+// 返回: *PrintSettings 规范化后的独立打印设置, []Diagnostic 规范化过程产生的诊断记录, error 结构、能力、预算或取消错误
+func NormalizePrintSettings(ctx context.Context, base, delta, capabilities *PrintSettings, options *PrintNormalizeOptions) (*PrintSettings, []Diagnostic, error) {
+	var settingsOpts *PrintSettingsOptions
+	if options != nil {
+		optsCopy := options.Settings
+		settingsOpts = &optsCopy
+	}
+	configuration, err := printSettingsOptions(ctx, settingsOpts)
+	if err != nil {
+		return nil, nil, err
+	}
+	if capabilities == nil {
+		return nil, nil, fmt.Errorf("%w: nil print capabilities", ErrInvalid)
+	}
+	capConfig := configuration
+	capConfig.Scope = PrintScopeUnknown
+	capRoot, err := printDocumentRoot(capabilities.Version, capabilities.Elements, capConfig, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	capModel, err := parsePrintDocument(capRoot, capConfig, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	var ticket *PrintSettings
+	if base != nil && delta != nil {
+		ticket, err = MergePrintSettings(ctx, base, delta, &configuration.PrintSettingsOptions)
+	} else if base != nil {
+		ticket, err = MergePrintSettings(ctx, base, &PrintSettings{Version: base.Version}, &configuration.PrintSettingsOptions)
+	} else if delta != nil {
+		ticket, err = MergePrintSettings(ctx, &PrintSettings{Version: delta.Version}, delta, &configuration.PrintSettingsOptions)
+	} else {
+		ticket = &PrintSettings{Version: capModel.Version}
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	normalizer := printNormalizer{
+		options:   configuration,
+		domains:   make(map[xml.Name]*printParameterDomain),
+		remaining: configuration.MaxOptionComparisons,
+	}
+	for _, element := range capModel.Elements {
+		if element.Kind != PrintSettingParameterDef {
+			continue
+		}
+		if err := checkContext(configuration.context); err != nil {
+			return nil, nil, err
+		}
+		domain, err := printParameterDefinition(element, capConfig)
+		if err != nil {
+			return nil, nil, err
+		}
+		key := printCanonicalKey(element.Name)
+		normalizer.domains[key] = domain
+	}
+	paramInits := make(map[xml.Name]PrintSetting)
+	paramValues := make(map[xml.Name]*PrintValue)
+	var rootProperties []PrintSetting
+	for _, element := range ticket.Elements {
+		if err := checkContext(configuration.context); err != nil {
+			return nil, nil, err
+		}
+		switch element.Kind {
+		case PrintSettingParameterInit:
+			key := printCanonicalKey(element.Name)
+			if normalizer.domains[key] == nil {
+				normalizer.addDiagnostic("ParameterInit", "name", fmt.Sprintf("unsupported print ParameterInit %s removed", element.Name.Local))
+				continue
+			}
+			paramInits[key] = element
+			if len(element.Children) == 1 && element.Children[0].Value != nil {
+				paramValues[key] = element.Children[0].Value
+			}
+		case PrintSettingProperty:
+			rootProperties = append(rootProperties, element)
+		}
+	}
+	normalizedFeatures, err := normalizer.normalizeFeatureList(ticket.Elements, capModel.Elements, paramValues, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	referenced := make(map[xml.Name]bool)
+	printCollectParameterRefs(normalizedFeatures, referenced)
+	normalizedParams, err := normalizer.normalizeParameters(capModel.Elements, paramInits, referenced)
+	if err != nil {
+		return nil, nil, err
+	}
+	resultElements := make([]PrintSetting, 0, len(normalizedFeatures)+len(rootProperties)+len(normalizedParams))
+	usedKeys := make(map[xml.Name]bool, len(normalizedFeatures)+len(normalizedParams))
+	for _, feature := range normalizedFeatures {
+		resultElements = append(resultElements, feature)
+		usedKeys[printCanonicalKey(feature.Name)] = true
+	}
+	for _, param := range normalizedParams {
+		usedKeys[printCanonicalKey(param.Name)] = true
+	}
+	for _, prop := range rootProperties {
+		if !usedKeys[printCanonicalKey(prop.Name)] {
+			resultElements = append(resultElements, prop)
+			usedKeys[printCanonicalKey(prop.Name)] = true
+		}
+	}
+	resultElements = append(resultElements, normalizedParams...)
+	version := ticket.Version
+	if version == 0 {
+		version = 1
+	}
+	if version > 1 && printSettingsHasAnonymousOption(resultElements) {
+		version = 1
+	}
+	if version == 1 {
+		printStripOptionDefaults(resultElements)
+	}
+	candidate := &PrintSettings{Version: version, Elements: resultElements}
+	root, err := printSettingsRoot(candidate, configuration)
+	if err != nil {
+		return nil, nil, err
+	}
+	result, err := parsePrintSettings(root, configuration)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := writePrintSettingsMarkup(io.Discard, root, configuration); err != nil {
+		return nil, nil, err
+	}
+	return result, normalizer.diagnostics, nil
+}
+
+// addDiagnostic 记录一条规范化过程中的非致命修正诊断
+// 入参: element 元素名称, attribute 属性名称, message 诊断消息
+func (n *printNormalizer) addDiagnostic(element, attribute, message string) {
+	n.diagnostics = append(n.diagnostics, Diagnostic{Element: element, Attribute: attribute, Message: message})
+}
+
+// step 在选项比较前检查取消状态与比较预算
+// 返回: error 取消或预算超限错误
+func (n *printNormalizer) step() error {
+	if err := checkContext(n.options.context); err != nil {
+		return err
+	}
+	if n.remaining == 0 {
+		return fmt.Errorf("%w: print Option comparison budget", ErrLimit)
+	}
+	n.remaining--
+	return nil
+}
+
+// normalizeFeatureList 在同一父级层级规范化Feature集合，移除未声明项并对缺失项执行Defaulting
+// 入参: requestedElements 票据当前层级元素, capElements 能力当前层级元素, paramValues 票据参数初值映射, isRoot 是否位于文档根层级
+// 返回: []PrintSetting 规范化后的Feature列表, error 预算或取消错误
+func (n *printNormalizer) normalizeFeatureList(requestedElements, capElements []PrintSetting, paramValues map[xml.Name]*PrintValue, isRoot bool) ([]PrintSetting, error) {
+	capByKey := make(map[xml.Name]PrintSetting)
+	for _, element := range capElements {
+		if element.Kind == PrintSettingFeature {
+			capByKey[printCanonicalKey(element.Name)] = element
+		}
+	}
+	reqByKey := make(map[xml.Name]PrintSetting)
+	for _, element := range requestedElements {
+		if element.Kind != PrintSettingFeature {
+			continue
+		}
+		key := printCanonicalKey(element.Name)
+		if _, exists := capByKey[key]; !exists {
+			n.addDiagnostic("Feature", "name", fmt.Sprintf("unsupported print Feature %s removed", element.Name.Local))
+			continue
+		}
+		reqByKey[key] = element
+	}
+	var result []PrintSetting
+	for _, capFeat := range capElements {
+		if capFeat.Kind != PrintSettingFeature {
+			continue
+		}
+		if err := checkContext(n.options.context); err != nil {
+			return nil, err
+		}
+		if isRoot && n.options.Scope != PrintScopeUnknown {
+			scope := printKeywordScope(capFeat.Name)
+			if scope != PrintScopeUnknown && scope < n.options.Scope {
+				continue
+			}
+		}
+		key := printCanonicalKey(capFeat.Name)
+		reqFeat, present := reqByKey[key]
+		var reqPtr *PrintSetting
+		if present {
+			reqPtr = &reqFeat
+		}
+		normalized, ok, err := n.normalizeFeature(reqPtr, capFeat, paramValues)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			result = append(result, normalized)
+		}
+	}
+	return result, nil
+}
+
+// normalizeFeature 规范化单个Feature及其直接Option和子Feature
+// 入参: requested 票据中的Feature指针，缺失时为nil, capability 设备能力中的Feature, paramValues 票据参数初值映射
+// 返回: PrintSetting 规范化Feature, bool 是否生成有效Feature, error 预算或取消错误
+func (n *printNormalizer) normalizeFeature(requested *PrintSetting, capability PrintSetting, paramValues map[xml.Name]*PrintValue) (PrintSetting, bool, error) {
+	selection, err := capability.Selection()
+	if err != nil {
+		return PrintSetting{}, false, err
+	}
+	var allOptions []PrintSetting
+	var unconstrained []PrintSetting
+	for _, child := range capability.Children {
+		if child.Kind != PrintSettingOption {
+			continue
+		}
+		allOptions = append(allOptions, child)
+		if child.Constraint == PrintConstraintUnknown || child.Constraint == PrintConstraintNone {
+			unconstrained = append(unconstrained, child)
+		}
+	}
+	defaultIndex := -1
+	for index := range unconstrained {
+		if unconstrained[index].Default {
+			defaultIndex = index
+			break
+		}
+	}
+	if defaultIndex < 0 && len(unconstrained) > 0 {
+		defaultIndex = 0
+	}
+	var children []PrintSetting
+	if requested == nil {
+		if len(allOptions) > 0 {
+			if defaultIndex < 0 {
+				return PrintSetting{}, false, nil
+			}
+			children = append(children, printTicketOptionFromCapability(unconstrained[defaultIndex]))
+		}
+		subFeatures, err := n.normalizeFeatureList(nil, capability.Children, paramValues, false)
+		if err != nil {
+			return PrintSetting{}, false, err
+		}
+		children = append(children, subFeatures...)
+		if len(children) == 0 {
+			return PrintSetting{}, false, nil
+		}
+		return PrintSetting{Kind: PrintSettingFeature, Name: capability.Name, Children: children}, true, nil
+	}
+	var reqOptions []PrintSetting
+	var reqProps []PrintSetting
+	for _, child := range requested.Children {
+		if child.Kind == PrintSettingOption {
+			reqOptions = append(reqOptions, child)
+		} else if child.Kind == PrintSettingProperty {
+			reqProps = append(reqProps, child)
+		}
+	}
+	if len(allOptions) > 0 {
+		if defaultIndex < 0 {
+			n.addDiagnostic("Feature", "name", fmt.Sprintf("all options for print Feature %s are constrained", capability.Name.Local))
+			return PrintSetting{}, false, nil
+		}
+		if len(reqOptions) == 0 {
+			children = append(children, printTicketOptionFromCapability(unconstrained[defaultIndex]))
+		} else {
+			if selection == PrintSelectionOne && len(reqOptions) > 1 {
+				n.addDiagnostic("Feature", "name", fmt.Sprintf("multiple options on PickOne print Feature %s trimmed", capability.Name.Local))
+				reqOptions = reqOptions[:1]
+			}
+			selectedIndices := make(map[int]bool)
+			for _, reqOpt := range reqOptions {
+				matchedIndex, err := n.matchExactOption(reqOpt, unconstrained, paramValues)
+				if err != nil {
+					return PrintSetting{}, false, err
+				}
+				if matchedIndex >= 0 {
+					if selectedIndices[matchedIndex] {
+						continue
+					}
+					selectedIndices[matchedIndex] = true
+					kept := printTicketOptionFromCapability(reqOpt)
+					if kept.Name == (xml.Name{}) && unconstrained[matchedIndex].Name != (xml.Name{}) {
+						kept.Name = unconstrained[matchedIndex].Name
+					}
+					children = append(children, kept)
+					continue
+				}
+				bestIndex, err := n.bestOption(reqOpt, unconstrained, paramValues)
+				if err != nil {
+					return PrintSetting{}, false, err
+				}
+				chosenIndex := defaultIndex
+				if bestIndex >= 0 {
+					chosenIndex = bestIndex
+				}
+				chosen := unconstrained[chosenIndex]
+				n.addDiagnostic("Option", "name", fmt.Sprintf("print Option %s on Feature %s replaced by %s", reqOpt.Name.Local, capability.Name.Local, chosen.Name.Local))
+				if selectedIndices[chosenIndex] {
+					continue
+				}
+				selectedIndices[chosenIndex] = true
+				children = append(children, printTicketOptionFromCapability(chosen))
+			}
+		}
+	} else if len(reqOptions) > 0 {
+		n.addDiagnostic("Option", "name", fmt.Sprintf("unsupported options on container print Feature %s removed", capability.Name.Local))
+	}
+	subFeatures, err := n.normalizeFeatureList(requested.Children, capability.Children, paramValues, false)
+	if err != nil {
+		return PrintSetting{}, false, err
+	}
+	children = append(children, subFeatures...)
+	if len(children) == 0 {
+		return PrintSetting{}, false, nil
+	}
+	usedPropKeys := make(map[xml.Name]bool, len(subFeatures))
+	for _, sub := range subFeatures {
+		usedPropKeys[printCanonicalKey(sub.Name)] = true
+	}
+	for _, prop := range reqProps {
+		if !usedPropKeys[printCanonicalKey(prop.Name)] {
+			children = append(children, printCloneSetting(prop))
+		}
+	}
+	return PrintSetting{Kind: PrintSettingFeature, Name: requested.Name, Children: children}, true, nil
+}
+
+// matchExactOption 在未受约束候选中查找与请求Option精确匹配的下标，未命中返回负一
+// 入参: reqOpt 请求Option, candidates 未受约束候选列表, paramValues 票据参数初值映射
+// 返回: int 命中候选下标，未命中为负一, error 预算或取消错误
+func (n *printNormalizer) matchExactOption(reqOpt PrintSetting, candidates []PrintSetting, paramValues map[xml.Name]*PrintValue) (int, error) {
+	reqKey := printCanonicalKey(reqOpt.Name)
+	hasNamedCandidate := false
+	if reqOpt.Name != (xml.Name{}) {
+		for _, cand := range candidates {
+			if printCanonicalKey(cand.Name) == reqKey {
+				hasNamedCandidate = true
+				break
+			}
+		}
+	}
+	for index, cand := range candidates {
+		if err := n.step(); err != nil {
+			return -1, err
+		}
+		sameName := reqOpt.Name != (xml.Name{}) && printCanonicalKey(cand.Name) == reqKey
+		if hasNamedCandidate && !sameName {
+			continue
+		}
+		if !sameName && printScoredCount(reqOpt.Children) == 0 {
+			continue
+		}
+		matched, err := n.matchScoredExact(reqOpt.Children, cand.Children, sameName, paramValues)
+		if err != nil {
+			return -1, err
+		}
+		if matched {
+			return index, nil
+		}
+	}
+	return -1, nil
+}
+
+// matchScoredExact 检查请求Option与候选Option的ScoredProperty是否精确匹配
+// 入参: requested 请求子元素, supported 候选子元素, subset 是否允许省略候选已知描述, paramValues 票据参数初值映射
+// 返回: bool 是否精确匹配, error 预算或取消错误
+func (n *printNormalizer) matchScoredExact(requested, supported []PrintSetting, subset bool, paramValues map[xml.Name]*PrintValue) (bool, error) {
+	if !subset && printScoredCount(requested) != printScoredCount(supported) {
+		return false, nil
+	}
+	index := make(map[xml.Name]PrintSetting)
+	for _, setting := range supported {
+		if setting.Kind == PrintSettingScoredProperty {
+			index[printCanonicalKey(setting.Name)] = setting
+		}
+	}
+	for _, setting := range requested {
+		if setting.Kind != PrintSettingScoredProperty {
+			continue
+		}
+		if err := n.step(); err != nil {
+			return false, err
+		}
+		cand, exists := index[printCanonicalKey(setting.Name)]
+		if !exists {
+			return false, nil
+		}
+		reqVal, reqRef := printScoredValue(setting.Children)
+		capVal, capRef := printScoredValue(cand.Children)
+		if capRef != (xml.Name{}) {
+			if reqRef != (xml.Name{}) {
+				if printCanonicalKey(reqRef) != printCanonicalKey(capRef) {
+					return false, nil
+				}
+			} else {
+				domain := n.domains[printCanonicalKey(capRef)]
+				if domain == nil {
+					return false, nil
+				}
+				if _, err := domain.value(reqVal, n.options); err != nil {
+					if errors.Is(err, ErrInvalid) {
+						return false, nil
+					}
+					return false, err
+				}
+			}
+		} else {
+			if reqRef != (xml.Name{}) {
+				reqVal = paramValues[printCanonicalKey(reqRef)]
+				if reqVal == nil {
+					if domain := n.domains[printCanonicalKey(reqRef)]; domain != nil {
+						reqVal = &domain.defaultValue
+					}
+				}
+			}
+			same, err := n.valuesEqual(reqVal, capVal)
+			if err != nil || !same {
+				return same, err
+			}
+		}
+		if same, err := n.matchScoredExact(setting.Children, cand.Children, subset, paramValues); err != nil || !same {
+			return same, err
+		}
+	}
+	return true, nil
+}
+
+// bestOption 按ScoredProperty匹配度评分查找最接近的未受约束候选下标，无匹配时返回负一
+// 入参: reqOpt 请求Option, candidates 未受约束候选列表, paramValues 票据参数初值映射
+// 返回: int 最佳候选下标，无匹配为负一, error 预算或取消错误
+func (n *printNormalizer) bestOption(reqOpt PrintSetting, candidates []PrintSetting, paramValues map[xml.Name]*PrintValue) (int, error) {
+	if printScoredCount(reqOpt.Children) == 0 {
+		return -1, nil
+	}
+	bestIndex := -1
+	bestScore := 0.0
+	for index, cand := range candidates {
+		if err := n.step(); err != nil {
+			return -1, err
+		}
+		score, err := n.scoreScored(reqOpt.Children, cand.Children, paramValues)
+		if err != nil {
+			return -1, err
+		}
+		if score > 0 && reqOpt.Name != (xml.Name{}) && printCanonicalKey(reqOpt.Name) == printCanonicalKey(cand.Name) {
+			score += 0.5
+		}
+		if score > bestScore || score > 0 && score == bestScore && cand.Default && bestIndex >= 0 && !candidates[bestIndex].Default {
+			bestScore = score
+			bestIndex = index
+		}
+	}
+	return bestIndex, nil
+}
+
+// scoreScored 递归计算两组ScoredProperty的相似度评分，精确值、数值接近度与参数域匹配分别计分
+// 入参: requested 请求子元素, supported 候选子元素, paramValues 票据参数初值映射
+// 返回: float64 相似度总分, error 预算或取消错误
+func (n *printNormalizer) scoreScored(requested, supported []PrintSetting, paramValues map[xml.Name]*PrintValue) (float64, error) {
+	index := make(map[xml.Name]PrintSetting)
+	for _, setting := range supported {
+		if setting.Kind == PrintSettingScoredProperty {
+			index[printCanonicalKey(setting.Name)] = setting
+		}
+	}
+	total := 0.0
+	for _, setting := range requested {
+		if setting.Kind != PrintSettingScoredProperty {
+			continue
+		}
+		if err := n.step(); err != nil {
+			return 0, err
+		}
+		cand, exists := index[printCanonicalKey(setting.Name)]
+		if !exists {
+			continue
+		}
+		total += 1.0
+		reqVal, reqRef := printScoredValue(setting.Children)
+		capVal, capRef := printScoredValue(cand.Children)
+		if reqRef != (xml.Name{}) {
+			if capRef != (xml.Name{}) && printCanonicalKey(reqRef) == printCanonicalKey(capRef) {
+				total += 100.0
+			} else if v := paramValues[printCanonicalKey(reqRef)]; v != nil {
+				reqVal = v
+			} else if domain := n.domains[printCanonicalKey(reqRef)]; domain != nil {
+				reqVal = &domain.defaultValue
+			}
+		}
+		if capRef != (xml.Name{}) {
+			if reqVal != nil {
+				if domain := n.domains[printCanonicalKey(capRef)]; domain != nil {
+					if _, err := domain.value(reqVal, n.options); err == nil {
+						total += 100.0
+					} else if !errors.Is(err, ErrInvalid) {
+						return 0, err
+					} else {
+						capVal = &domain.defaultValue
+					}
+				}
+			}
+		}
+		if reqVal != nil && capVal != nil {
+			same, err := n.valuesEqual(reqVal, capVal)
+			if err != nil {
+				return 0, err
+			}
+			if same {
+				total += 100.0
+			} else if proximity, ok, err := n.numericProximity(reqVal, capVal); err != nil {
+				return 0, err
+			} else if ok {
+				total += proximity
+			}
+		}
+		nested, err := n.scoreScored(setting.Children, cand.Children, paramValues)
+		if err != nil {
+			return 0, err
+		}
+		total += nested
+	}
+	return total, nil
+}
+
+// valuesEqual 按基本类型精确比较两个PrintValue是否等价
+// 入参: requested 请求值, supported 候选值
+// 返回: bool 是否等值, error 预算或取消错误
+func (n *printNormalizer) valuesEqual(requested, supported *PrintValue) (bool, error) {
+	if err := n.step(); err != nil {
+		return false, err
+	}
+	return printValuesEqual(requested, supported, n.options, true)
+}
+
+// numericProximity 计算两个数值PrintValue的接近度加分，越接近分值越高
+// 入参: requested 请求值, supported 候选值
+// 返回: float64 接近度分值, bool 是否为可比较数值, error 算术预算或取消错误
+func (n *printNormalizer) numericProximity(requested, supported *PrintValue) (float64, bool, error) {
+	if requested == nil || supported == nil {
+		return 0, false, nil
+	}
+	if (requested.Type.Local != "integer" && requested.Type.Local != "decimal") || (supported.Type.Local != "integer" && supported.Type.Local != "decimal") {
+		return 0, false, nil
+	}
+	left, right := strings.Trim(requested.Text, " \t\r\n"), strings.Trim(supported.Text, " \t\r\n")
+	if left == "" || right == "" {
+		return 0, false, nil
+	}
+	a, err := printParameterNumber(left, n.options)
+	if err != nil {
+		if errors.Is(err, ErrInvalid) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	b, err := printParameterNumber(right, n.options)
+	if err != nil {
+		if errors.Is(err, ErrInvalid) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	fa, _ := a.Float64()
+	fb, _ := b.Float64()
+	if math.IsNaN(fa) || math.IsInf(fa, 0) || math.IsNaN(fb) || math.IsInf(fb, 0) {
+		return 0, false, nil
+	}
+	diff := math.Abs(fa - fb)
+	scale := max(math.Abs(fa), math.Abs(fb), 1.0)
+	return 50.0 / (1.0 + diff/scale), true, nil
+}
+
+// normalizeParameters 按设备ParameterDef校验、补全、裁剪与量化票据中的ParameterInit集合
+// 入参: capElements 能力根元素列表, paramInits 票据已有ParameterInit索引, referenced 选定Option引用的参数集合
+// 返回: []PrintSetting 规范化后的ParameterInit列表, error 预算或取消错误
+func (n *printNormalizer) normalizeParameters(capElements []PrintSetting, paramInits map[xml.Name]PrintSetting, referenced map[xml.Name]bool) ([]PrintSetting, error) {
+	var result []PrintSetting
+	for _, element := range capElements {
+		if element.Kind != PrintSettingParameterDef {
+			continue
+		}
+		if err := checkContext(n.options.context); err != nil {
+			return nil, err
+		}
+		if n.options.Scope != PrintScopeUnknown {
+			scope := printKeywordScope(element.Name)
+			if scope != PrintScopeUnknown && scope < n.options.Scope {
+				continue
+			}
+		}
+		key := printCanonicalKey(element.Name)
+		domain := n.domains[key]
+		if domain == nil {
+			continue
+		}
+		existing, present := paramInits[key]
+		if !present {
+			if domain.mandatory == "Unconditional" || referenced[key] {
+				defaultCopy := domain.defaultValue
+				result = append(result, PrintSetting{
+					Kind:     PrintSettingParameterInit,
+					Name:     element.Name,
+					Children: []PrintSetting{{Kind: PrintSettingValue, Value: &defaultCopy}},
+				})
+				n.addDiagnostic("ParameterInit", "name", fmt.Sprintf("missing print ParameterInit %s defaulted", element.Name.Local))
+			}
+			continue
+		}
+		normalized, err := n.normalizeParameterInit(existing, domain)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, normalized)
+	}
+	return result, nil
+}
+
+// normalizeParameterInit 校验单个ParameterInit，对越界数值裁剪量化、对越界字符串截断或回退默认值
+// 入参: existing 票据已有ParameterInit, domain 对应参数域定义
+// 返回: PrintSetting 规范化后的ParameterInit, error 算术预算或取消错误
+func (n *printNormalizer) normalizeParameterInit(existing PrintSetting, domain *printParameterDomain) (PrintSetting, error) {
+	fallback := func(reason string) PrintSetting {
+		defaultCopy := domain.defaultValue
+		n.addDiagnostic("ParameterInit", "name", fmt.Sprintf("print ParameterInit %s %s", existing.Name.Local, reason))
+		return PrintSetting{
+			Kind:     PrintSettingParameterInit,
+			Name:     existing.Name,
+			Children: []PrintSetting{{Kind: PrintSettingValue, Value: &defaultCopy}},
+		}
+	}
+	if len(existing.Children) != 1 || existing.Children[0].Value == nil {
+		return fallback("reset to default"), nil
+	}
+	val := *existing.Children[0].Value
+	if val.Type == (xml.Name{}) {
+		val.Type = xml.Name{Space: printValueNS, Local: "string"}
+	}
+	if val.Type != domain.kind {
+		return fallback("type mismatch reset to default"), nil
+	}
+	switch domain.kind.Local {
+	case "integer", "decimal":
+		text := strings.Trim(val.Text, " \t\r\n")
+		if text == "" || domain.kind.Local == "integer" && !printInteger(text) || domain.kind.Local == "decimal" && !printDecimal(text) {
+			return fallback("invalid numeric value reset to default"), nil
+		}
+		num, err := printParameterNumber(text, n.options)
+		if err != nil {
+			if errors.Is(err, ErrInvalid) {
+				return fallback("invalid numeric value reset to default"), nil
+			}
+			return PrintSetting{}, err
+		}
+		adjusted := false
+		if num.Cmp(domain.minimum) < 0 {
+			num = new(big.Rat).Set(domain.minimum)
+			adjusted = true
+		} else if num.Cmp(domain.maximum) > 0 {
+			num = new(big.Rat).Set(domain.maximum)
+			adjusted = true
+		}
+		if domain.multiple != nil {
+			diff := new(big.Rat).Sub(num, domain.minimum)
+			quot := new(big.Rat).Quo(diff, domain.multiple)
+			if !quot.IsInt() {
+				qInt := new(big.Int).Quo(quot.Num(), quot.Denom())
+				rem := new(big.Int).Rem(quot.Num(), quot.Denom())
+				twiceRem := new(big.Int).Lsh(rem, 1)
+				chosen := new(big.Int).Set(qInt)
+				if twiceRem.Cmp(quot.Denom()) >= 0 {
+					ceilQ := new(big.Int).Add(qInt, big.NewInt(1))
+					ceilVal := new(big.Rat).Add(domain.minimum, new(big.Rat).Mul(new(big.Rat).SetInt(ceilQ), domain.multiple))
+					if ceilVal.Cmp(domain.maximum) <= 0 {
+						chosen = ceilQ
+					}
+				}
+				num = new(big.Rat).Add(domain.minimum, new(big.Rat).Mul(new(big.Rat).SetInt(chosen), domain.multiple))
+				adjusted = true
+			}
+		}
+		if adjusted {
+			if domain.kind.Local == "integer" {
+				val.Text = num.Num().String()
+			} else {
+				val.Text = printFormatDecimalRat(num, n.options.MaxNumericDigits)
+			}
+			n.addDiagnostic("ParameterInit", "name", fmt.Sprintf("print ParameterInit %s clamped or quantized to %s", existing.Name.Local, val.Text))
+		}
+		return PrintSetting{Kind: PrintSettingParameterInit, Name: existing.Name, Children: []PrintSetting{{Kind: PrintSettingValue, Value: &val}}}, nil
+	case "string":
+		if _, err := domain.value(&val, n.options); err == nil {
+			return PrintSetting{Kind: PrintSettingParameterInit, Name: existing.Name, Children: []PrintSetting{{Kind: PrintSettingValue, Value: &val}}}, nil
+		} else if !errors.Is(err, ErrInvalid) {
+			return PrintSetting{}, err
+		}
+		if domain.unit == "sRGB" {
+			return fallback("invalid sRGB string reset to default"), nil
+		}
+		if domain.unit == "numeric" {
+			for _, character := range val.Text {
+				if character < '0' || character > '9' {
+					return fallback("invalid numeric string reset to default"), nil
+				}
+			}
+		}
+		count := big.NewRat(int64(utf8.RuneCountInString(val.Text)), 1)
+		if count.Cmp(domain.maximum) > 0 {
+			if !domain.maximum.IsInt() || !domain.maximum.Num().IsInt64() {
+				return fallback("string length exceeded reset to default"), nil
+			}
+			val.Text = printTruncateRunes(val.Text, int(domain.maximum.Num().Int64()))
+			if _, err := domain.value(&val, n.options); err != nil {
+				if errors.Is(err, ErrInvalid) {
+					return fallback("truncated string invalid reset to default"), nil
+				}
+				return PrintSetting{}, err
+			}
+			n.addDiagnostic("ParameterInit", "name", fmt.Sprintf("print ParameterInit %s truncated to MaxLength", existing.Name.Local))
+			return PrintSetting{Kind: PrintSettingParameterInit, Name: existing.Name, Children: []PrintSetting{{Kind: PrintSettingValue, Value: &val}}}, nil
+		}
+		return fallback("string shorter than MinLength reset to default"), nil
+	default:
+		if validated, err := domain.value(&val, n.options); err == nil {
+			return PrintSetting{Kind: PrintSettingParameterInit, Name: existing.Name, Children: []PrintSetting{{Kind: PrintSettingValue, Value: validated}}}, nil
+		} else if !errors.Is(err, ErrInvalid) {
+			return PrintSetting{}, err
+		}
+		return fallback("invalid QName value reset to default"), nil
+	}
+}
+
+// printFormatDecimalRat 将有限十进制有理数精确格式化为XML Schema十进制词法字符串
+// 入参: value 精确有理数, maxDigits 最大允许小数位数上限
+// 返回: string 无多余尾随零的十进制字符串
+func printFormatDecimalRat(value *big.Rat, maxDigits int) string {
+	if value.IsInt() {
+		return value.Num().String()
+	}
+	denom := new(big.Int).Set(value.Denom())
+	two, five, zero := big.NewInt(2), big.NewInt(5), big.NewInt(0)
+	rem := new(big.Int)
+	c2, c5 := 0, 0
+	for {
+		q, _ := new(big.Int).QuoRem(denom, two, rem)
+		if rem.Cmp(zero) != 0 {
+			break
+		}
+		denom = q
+		c2++
+	}
+	for {
+		q, _ := new(big.Int).QuoRem(denom, five, rem)
+		if rem.Cmp(zero) != 0 {
+			break
+		}
+		denom = q
+		c5++
+	}
+	prec := max(c2, c5)
+	if denom.Cmp(big.NewInt(1)) != 0 || prec > maxDigits {
+		prec = min(maxDigits, 32)
+	}
+	text := value.FloatString(prec)
+	if strings.Contains(text, ".") {
+		text = strings.TrimRight(text, "0")
+		text = strings.TrimRight(text, ".")
+	}
+	return text
+}
+
+// printTruncateRunes 按Unicode码点数量截断字符串至指定上限
+// 入参: text 原字符串, limit 最大Unicode码点数
+// 返回: string 截断后的字符串
+func printTruncateRunes(text string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	count := 0
+	for index := range text {
+		if count == limit {
+			return text[:index]
+		}
+		count++
+	}
+	return text
+}
+
+// printCollectParameterRefs 递归收集设置树中全部ParameterRef的规范化名称
+// 入参: settings 设置树元素列表, target 输出引用集合
+func printCollectParameterRefs(settings []PrintSetting, target map[xml.Name]bool) {
+	for _, setting := range settings {
+		if setting.Kind == PrintSettingParameterRef {
+			target[printCanonicalKey(setting.Name)] = true
+			continue
+		}
+		printCollectParameterRefs(setting.Children, target)
+	}
+}
+
+// printTicketOptionFromCapability 将能力或候选Option深拷贝为不含能力专属元数据的票据Option
+// 入参: option 源Option节点
+// 返回: PrintSetting 独立票据Option节点
+func printTicketOptionFromCapability(option PrintSetting) PrintSetting {
+	result := PrintSetting{Kind: option.Kind, Name: option.Name}
+	if option.Value != nil {
+		val := *option.Value
+		result.Value = &val
+	}
+	for _, child := range option.Children {
+		if child.Kind == PrintSettingProperty && (printFrameworkSpace(child.Name.Space) && (child.Name.Local == "SelectionType" || child.Name.Local == "IdentityOption") || printPublicKeywordSpace(child.Name.Space) && (child.Name.Local == "DisplayName" || child.Name.Local == "DisplayUI")) {
+			continue
+		}
+		result.Children = append(result.Children, printTicketOptionFromCapability(child))
+	}
+	return result
+}
+
+// printCloneSetting 深拷贝单个PrintSetting及其全部子元素和值指针
+// 入参: setting 源设置节点
+// 返回: PrintSetting 独立副本
+func printCloneSetting(setting PrintSetting) PrintSetting {
+	result := setting
+	if setting.Value != nil {
+		val := *setting.Value
+		result.Value = &val
+	}
+	if len(setting.Children) > 0 {
+		result.Children = make([]PrintSetting, len(setting.Children))
+		for index, child := range setting.Children {
+			result.Children[index] = printCloneSetting(child)
+		}
+	}
+	return result
 }

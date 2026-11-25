@@ -21,6 +21,7 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"fmt"
+	"image/color"
 	"maps"
 	"math"
 	"math/big"
@@ -48,6 +49,27 @@ var iccXYZD65ToLinearRGB = iccDisplayD65Matrix()
 
 // iccPCSDisplayMatrix 保存D50连接空间到线性sRGB显示空间的转换矩阵
 var iccPCSDisplayMatrix = iccDisplayMatrix()
+
+// ICCNamedColor 保存ICC命名色条目的名称、前后缀、连接空间坐标、显示近似sRGB及可选设备坐标
+type ICCNamedColor struct {
+	Name   string
+	Prefix string
+	Suffix string
+	PCS    [3]float64
+	SRGB   color.NRGBA
+	Device []float64
+}
+
+// ICCProfileInfo 保存ICC配置文件的头部属性、默认渲染意图及可选命名色表信息
+type ICCProfileInfo struct {
+	Version       uint32
+	Class         string
+	ColorSpace    string
+	PCS           string
+	Channels      int
+	DefaultIntent RenderingIntent
+	NamedColors   []ICCNamedColor
+}
 
 // iccTag 保存标签的数据范围，多个标签可以共享完全相同的数据
 type iccTag struct {
@@ -96,6 +118,48 @@ type iccTransform struct {
 	gray        bool
 	intent      uint32
 	named       []iccNamedColor
+}
+
+// InspectICCProfile 探测ICC配置文件头部、空间通道、默认渲染意图及可选ncl2命名专色表与sRGB近似值
+// 入参: data ICC配置文件完整字节
+// 返回: *ICCProfileInfo 只读配置元数据, error 头部、标签、版本或命名色错误
+func InspectICCProfile(data []byte) (*ICCProfileInfo, error) {
+	profile, err := parseICCProfile(data)
+	if err != nil {
+		return nil, err
+	}
+	info := &ICCProfileInfo{
+		Version:       profile.version,
+		Class:         profile.class,
+		ColorSpace:    profile.space,
+		PCS:           profile.pcs,
+		Channels:      profile.channels,
+		DefaultIntent: RenderingIntent(profile.intent + 1),
+	}
+	if profile.class == "nmcl" || profile.tag("ncl2") != nil && (profile.pcs == "XYZ " || profile.pcs == "Lab ") {
+		named, err := parseICCNamedColor(profile)
+		if err != nil {
+			return nil, err
+		}
+		info.NamedColors = make([]ICCNamedColor, len(named))
+		for i, entry := range named {
+			linear := iccMatrixColor(iccPCSDisplayMatrix, entry.xyz)
+			info.NamedColors[i] = ICCNamedColor{
+				Name:   entry.name,
+				Prefix: entry.prefix,
+				Suffix: entry.suffix,
+				PCS:    entry.pcs,
+				SRGB: color.NRGBA{
+					R: colorQuantize8(renderLinearToSRGB(colorClamp(linear[0]))),
+					G: colorQuantize8(renderLinearToSRGB(colorClamp(linear[1]))),
+					B: colorQuantize8(renderLinearToSRGB(colorClamp(linear[2]))),
+					A: 255,
+				},
+				Device: slices.Clone(entry.device),
+			}
+		}
+	}
+	return info, nil
 }
 
 // parseICCProfile 校验ICC封装和标签范围，输入在配置文件使用期间不得修改

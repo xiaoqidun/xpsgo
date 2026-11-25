@@ -37,25 +37,56 @@ const (
 const (
 	// WalkGroupCanvas 表示由Canvas节点开启的隔离渲染组
 	WalkGroupCanvas WalkGroupKind = iota
-	// WalkGroupVisualBrush 表示展开VisualBrush内容时开启的隔离渲染组
+	// WalkGroupVisualBrush 表示展开非平铺VisualBrush内容时开启的隔离渲染组
 	WalkGroupVisualBrush
+	// WalkGroupVisualBrushTile 表示展开平铺VisualBrush单瓦片内容时开启的隔离渲染组
+	WalkGroupVisualBrushTile
+)
+
+const (
+	// FallbackNone 表示无光栅化回退或特殊合成标记
+	FallbackNone FallbackReason = 0
+	// FallbackOpacityMask 表示元素或祖先存在OpacityMask透明度蒙版
+	FallbackOpacityMask FallbackReason = 1 << (iota - 1)
+	// FallbackVisualBrush 表示存在未矢量展开的VisualBrush
+	FallbackVisualBrush
+	// FallbackVisualBrushTile 表示存在平铺模式的VisualBrush
+	FallbackVisualBrushTile
+	// FallbackImageTile 表示ImageBrush启用了平铺模式
+	FallbackImageTile
+	// FallbackImageViewbox 表示ImageBrush仅裁剪源图像局部Viewbox区域或物理尺寸不可用
+	FallbackImageViewbox
+	// FallbackBitmapFont 表示字形使用了纯位图字体或字体轮廓不可用
+	FallbackBitmapFont
+	// FallbackMissingWatermarkFont 表示拼版水印缺少可用字体配置或物化失败
+	FallbackMissingWatermarkFont
+	// FallbackPrintGrayscale 表示打印纸面使用灰度或黑白单色输出模式
+	FallbackPrintGrayscale
+	// FallbackPrintNegative 表示打印放置使用反相负片输出
+	FallbackPrintNegative
+	// FallbackTranslucentFillStroke 表示路径同时含填充与描边且局部不透明度小于一
+	FallbackTranslucentFillStroke
 )
 
 // WalkGroupKind 表示场景遍历器进入或离开的隔离组类别
 type WalkGroupKind uint8
 
-// WalkOptions 设置场景遍历器的画刷展开深度、字形轮廓解析、根变换、水印、签名验证、回退分辨率及资源上限
+// FallbackReason 表示场景遍历事件触发光栅化回退或特殊矢量合成的位掩码原因
+type FallbackReason uint32
+
+// WalkOptions 设置场景遍历器的画刷展开深度、平铺瓦片展开、字形轮廓解析、根变换、水印、签名验证、回退分辨率及资源上限
 // MaxBrushDepth默认8、RenderFallbackDPI默认96（负值返回ErrInvalid），Limits零值字段沿用阅读器上限
-// Transform可左乘PrintSheet.BackFlipTransform()用于背面遍历；Watermark省略时含水印放置标记NeedsRasterFallback
+// Transform可左乘PrintSheet.BackFlipTransform()用于背面遍历；Watermark省略时含水印放置标记FallbackMissingWatermarkFont与NeedsRasterFallback
 type WalkOptions struct {
-	MaxBrushDepth        int
-	ExpandVisualBrush    bool
-	ResolveGlyphOutlines bool
-	RenderFallbackDPI    float64
-	Transform            *Matrix
-	Watermark            *PrintWatermarkOptions
-	Signatures           *PrintSignatureOptions
-	Limits               Limits
+	MaxBrushDepth          int
+	ExpandVisualBrush      bool
+	ExpandTiledVisualBrush bool
+	ResolveGlyphOutlines   bool
+	RenderFallbackDPI      float64
+	Transform              *Matrix
+	Watermark              *PrintWatermarkOptions
+	Signatures             *PrintSignatureOptions
+	Limits                 Limits
 }
 
 // WalkClip 保存单层裁切路径几何及其生效时的累计仿射变换矩阵
@@ -65,14 +96,16 @@ type WalkClip struct {
 }
 
 // WalkState 保存当前遍历节点累计的规范化图形与文档状态，Index、DocumentIndex与PageIndex为零基页号（辅助页均为-1）
+// PlacementIndex在WalkPrintSide中为零基放置序号，普通单页遍历固定为-1；IsWatermark标记当前节点属于物化水印子树
 // Opacity为扁平累计不透明度，EdgeMode自祖先Canvas向下继承，按EnterGroup/LeaveGroup构建隔离组应使用LocalOpacity避免双重乘算
-// PrintColor与SignaturePolicy在WalkPrintSide中透传自当前纸面，普通单页遍历保持零值
-// Clip内Geometry指针与OpacityMask指针均为只读零拷贝视图，回调期间及返回后不得修改
+// PrintColor、PrintColorPlan、Negative与SignaturePolicy在WalkPrintSide中透传自当前纸面与放置，普通单页遍历保持零值
+// Clip内Geometry指针、OpacityMask指针与PrintColorPlan指针均为只读零拷贝视图，回调期间及返回后不得修改
 type WalkState struct {
 	PagePart        string
 	Index           int
 	DocumentIndex   int
 	PageIndex       int
+	PlacementIndex  int
 	Matrix          Matrix
 	Clip            []WalkClip
 	Opacity         float64
@@ -82,10 +115,20 @@ type WalkState struct {
 	NavigateURI     string
 	Name            string
 	PrintColor      PrintColor
+	PrintColorPlan  *PrintColorPlan
+	Negative        bool
+	IsWatermark     bool
 	SignaturePolicy PrintSignaturePolicy
 }
 
-// WalkPathEvent 保存规范化后的路径绘制事件及可选光栅化回退建议
+// WalkPlacementEvent 保存拼版纸面进入或离开单个源页放置时的序号、放置描述及初始状态
+type WalkPlacementEvent struct {
+	PlacementIndex int
+	Placement      PrintPlacement
+	State          WalkState
+}
+
+// WalkPathEvent 保存规范化后的路径绘制事件及精细化回退原因位掩码
 // State.Opacity为扁平累计不透明度，LocalOpacity为当前路径自身不透明度，供配合隔离组回调使用
 // Data、Fill、Stroke及State内指针字段均为只读零拷贝视图，回调期间及返回后不得修改所指向内容
 type WalkPathEvent struct {
@@ -106,6 +149,7 @@ type WalkPathEvent struct {
 	AutomationName      string
 	AutomationHelpText  string
 	NeedsRasterFallback bool
+	FallbackReasons     FallbackReason
 	FallbackDPI         float64
 }
 
@@ -132,23 +176,29 @@ type WalkGlyphsEvent struct {
 	Glyphs              []GlyphPosition
 	Outlines            []*Geometry
 	NeedsRasterFallback bool
+	FallbackReasons     FallbackReason
 	FallbackDPI         float64
+	ascender            float64
+	descender           float64
+	unitsPerEm          float64
 }
 
 // WalkImageEvent 保存ImageBrush驱动的图像绘制事件，State.Opacity已计入Brush.Opacity，LocalOpacity为宿主路径与Brush.Opacity局部乘积
-// ImageTransform已包含State.Matrix并将96DPI源图像映射至页面或纸面坐标，Bounds与ClipPath保持元素局部坐标
+// ImageTransform已包含State.Matrix并将96DPI源图像映射至页面或纸面坐标，ImageExtent为源图像96DPI物理尺寸，Bounds与ClipPath保持元素局部坐标
 // Brush、ClipPath及State内指针字段均为只读零拷贝视图，回调期间及返回后不得修改
 type WalkImageEvent struct {
 	State               WalkState
 	LocalOpacity        float64
 	ImagePart           string
 	ImageProfilePart    string
+	ImageExtent         Point
 	Brush               *Brush
 	ImageTransform      Matrix
 	Bounds              Rect
 	ClipPath            *Geometry
 	TileMode            TileMode
 	NeedsRasterFallback bool
+	FallbackReasons     FallbackReason
 	FallbackDPI         float64
 }
 
@@ -161,30 +211,36 @@ type WalkGroupEvent struct {
 	Brush               *Brush
 	LocalOpacity        float64
 	EdgeMode            EdgeMode
+	AutomationName      string
+	AutomationHelpText  string
 	NeedsRasterFallback bool
+	FallbackReasons     FallbackReason
 	FallbackDPI         float64
 }
 
 // SceneVisitor 定义按绘制顺序接收页面与拼版场景事件的可选回调集合
 type SceneVisitor struct {
-	EnterGroup func(ctx context.Context, event WalkGroupEvent) error
-	LeaveGroup func(ctx context.Context, event WalkGroupEvent) error
-	Path       func(ctx context.Context, event WalkPathEvent) error
-	Glyphs     func(ctx context.Context, event WalkGlyphsEvent) error
-	Image      func(ctx context.Context, event WalkImageEvent) error
-	Diagnostic func(diag Diagnostic)
+	EnterPlacement func(WalkPlacementEvent) error
+	LeavePlacement func(WalkPlacementEvent) error
+	EnterGroup     func(ctx context.Context, event WalkGroupEvent) error
+	LeaveGroup     func(ctx context.Context, event WalkGroupEvent) error
+	Path           func(ctx context.Context, event WalkPathEvent) error
+	Glyphs         func(ctx context.Context, event WalkGlyphsEvent) error
+	Image          func(ctx context.Context, event WalkImageEvent) error
+	Diagnostic     func(diag Diagnostic)
 }
 
 // walkConfiguration 保存归一化后的场景遍历参数
 type walkConfiguration struct {
-	maxBrushDepth        int
-	expandVisualBrush    bool
-	resolveGlyphOutlines bool
-	fallbackDPI          float64
-	rootTransform        Matrix
-	watermark            *PrintWatermarkOptions
-	signatures           *PrintSignatureOptions
-	limits               Limits
+	maxBrushDepth          int
+	expandVisualBrush      bool
+	expandTiledVisualBrush bool
+	resolveGlyphOutlines   bool
+	fallbackDPI            float64
+	rootTransform          Matrix
+	watermark              *PrintWatermarkOptions
+	signatures             *PrintSignatureOptions
+	limits                 Limits
 }
 
 // walkImageExtent 缓存源图像在96DPI物理坐标系下的完整宽高，用于识别局部Viewbox裁剪
@@ -196,23 +252,24 @@ type walkImageExtent struct {
 
 // sceneWalker 保存单次场景遍历的私有缓存、递归保护状态及资源预算
 type sceneWalker struct {
-	reader             *Reader
-	visitor            *SceneVisitor
-	config             walkConfiguration
-	forceFallback      bool
-	remainingElements  int
-	remainingGlyphs    int
-	remainingFontBytes int64
-	remainingBoldEdges int
-	remainingBoldWork  uint64
-	remainingBoldExact int
-	maxFonts           int
-	maxDepth           int
-	activeElements     map[Element]bool
-	activeBrushes      map[*Brush]bool
-	fontData           map[string][]byte
-	fontFaces          map[fontCacheKey]*fontSource
-	imageExtents       map[string]walkImageExtent
+	reader              *Reader
+	visitor             *SceneVisitor
+	config              walkConfiguration
+	forceRasterFallback bool
+	inheritedReasons    FallbackReason
+	remainingElements   int
+	remainingGlyphs     int
+	remainingFontBytes  int64
+	remainingBoldEdges  int
+	remainingBoldWork   uint64
+	remainingBoldExact  int
+	maxFonts            int
+	maxDepth            int
+	activeElements      map[Element]bool
+	activeBrushes       map[*Brush]bool
+	fontData            map[string][]byte
+	fontFaces           map[fontCacheKey]*fontSource
+	imageExtents        map[string]walkImageExtent
 }
 
 // String 返回隔离组类别的可读名称
@@ -223,9 +280,120 @@ func (k WalkGroupKind) String() string {
 		return "canvas"
 	case WalkGroupVisualBrush:
 		return "visual-brush"
+	case WalkGroupVisualBrushTile:
+		return "visual-brush-tile"
 	default:
 		return fmt.Sprintf("WalkGroupKind(%d)", k)
 	}
+}
+
+// String 返回回退原因位掩码的可读名称列表
+// 返回: string 以竖线分隔的原因名称
+func (r FallbackReason) String() string {
+	if r == FallbackNone {
+		return "none"
+	}
+	flags := []struct {
+		bit  FallbackReason
+		name string
+	}{
+		{FallbackOpacityMask, "opacity-mask"},
+		{FallbackVisualBrush, "visual-brush"},
+		{FallbackVisualBrushTile, "visual-brush-tile"},
+		{FallbackImageTile, "image-tile"},
+		{FallbackImageViewbox, "image-viewbox"},
+		{FallbackBitmapFont, "bitmap-font"},
+		{FallbackMissingWatermarkFont, "missing-watermark-font"},
+		{FallbackPrintGrayscale, "print-grayscale"},
+		{FallbackPrintNegative, "print-negative"},
+		{FallbackTranslucentFillStroke, "translucent-fill-stroke"},
+	}
+	var names []string
+	known := FallbackNone
+	for _, flag := range flags {
+		if r&flag.bit != 0 {
+			names = append(names, flag.name)
+			known |= flag.bit
+		}
+	}
+	if unknown := r &^ known; unknown != 0 {
+		names = append(names, fmt.Sprintf("0x%x", uint32(unknown)))
+	}
+	return strings.Join(names, "|")
+}
+
+// Bounds 按字形定位、步进向量与字体升降部计算页面空间轴对齐外包矩形
+// 空字形列表或无效字号返回零矩形
+// 返回: Rect 页面或纸面坐标系中的文字外包矩形
+func (e WalkGlyphsEvent) Bounds() Rect {
+	if len(e.Glyphs) == 0 || !geometryFinite(e.FontSize) || e.FontSize <= 0 {
+		return Rect{}
+	}
+	em := e.unitsPerEm
+	asc, desc := e.ascender, e.descender
+	if !geometryFinite(em, asc, desc) || em <= 0 || (asc == 0 && desc == 0) {
+		em, asc, desc = 1000, 850, -150
+	}
+	fallbackMatrix := e.State.Matrix
+	if !geometryFillMatrixFinite(fallbackMatrix) || geometryMatrixSingular(fallbackMatrix) {
+		fallbackMatrix = IdentityMatrix()
+	}
+	have := false
+	var minX, minY, maxX, maxY float64
+	for _, g := range e.Glyphs {
+		if !geometryFinite(g.Origin.X, g.Origin.Y, g.Advance.X, g.Advance.Y) {
+			continue
+		}
+		base0 := g.Origin
+		base1 := Point{X: g.Origin.X + g.Advance.X, Y: g.Origin.Y + g.Advance.Y}
+		hasTransform := geometryFillMatrixFinite(g.Transform) && !geometryMatrixSingular(g.Transform)
+		var v0, v1 Point
+		if !e.IsSideways {
+			if hasTransform {
+				v0 = Point{X: g.Transform.C * asc, Y: g.Transform.D * asc}
+				v1 = Point{X: g.Transform.C * desc, Y: g.Transform.D * desc}
+			} else {
+				scale := e.FontSize / em
+				v0 = Point{X: -fallbackMatrix.C * asc * scale, Y: -fallbackMatrix.D * asc * scale}
+				v1 = Point{X: -fallbackMatrix.C * desc * scale, Y: -fallbackMatrix.D * desc * scale}
+			}
+		} else {
+			if hasTransform {
+				half := em / 2
+				v0 = Point{X: g.Transform.A * half, Y: g.Transform.B * half}
+				v1 = Point{X: -v0.X, Y: -v0.Y}
+			} else {
+				half := e.FontSize / 2
+				v0 = Point{X: -fallbackMatrix.C * half, Y: -fallbackMatrix.D * half}
+				v1 = Point{X: -v0.X, Y: -v0.Y}
+			}
+		}
+		corners := [4]Point{
+			{X: base0.X + v0.X, Y: base0.Y + v0.Y},
+			{X: base1.X + v0.X, Y: base1.Y + v0.Y},
+			{X: base0.X + v1.X, Y: base0.Y + v1.Y},
+			{X: base1.X + v1.X, Y: base1.Y + v1.Y},
+		}
+		for _, pt := range corners {
+			if !geometryFinite(pt.X, pt.Y) {
+				continue
+			}
+			if !have {
+				minX, minY, maxX, maxY, have = pt.X, pt.Y, pt.X, pt.Y, true
+			} else {
+				minX, minY = min(minX, pt.X), min(minY, pt.Y)
+				maxX, maxY = max(maxX, pt.X), max(maxY, pt.Y)
+			}
+		}
+	}
+	if !have {
+		return Rect{}
+	}
+	width, height := maxX-minX, maxY-minY
+	if !geometryFinite(width, height) {
+		return Rect{}
+	}
+	return Rect{X: minX, Y: minY, Width: width, Height: height}
 }
 
 // DefaultWalkOptions 返回场景遍历器的默认配置，采用八层画刷上限、九十六DPI回退分辨率及默认资源上限
@@ -257,14 +425,15 @@ func (r *Reader) Walk(ctx context.Context, pageIndex int, visitor *SceneVisitor,
 	}
 	walker := newSceneWalker(r, visitor, config)
 	initial := WalkState{
-		PagePart:      page.Part,
-		Index:         pageIndex,
-		DocumentIndex: docIndex,
-		PageIndex:     localIndex,
-		Matrix:        config.rootTransform,
-		Clip:          walkPageRootClips(page, config.rootTransform),
-		Opacity:       1,
-		Language:      page.Language,
+		PagePart:       page.Part,
+		Index:          pageIndex,
+		DocumentIndex:  docIndex,
+		PageIndex:      localIndex,
+		PlacementIndex: -1,
+		Matrix:         config.rootTransform,
+		Clip:           walkPageRootClips(page, config.rootTransform),
+		Opacity:        1,
+		Language:       page.Language,
 	}
 	return walker.walkPageElements(ctx, page.Diagnostics, page.Elements, initial)
 }
@@ -287,14 +456,15 @@ func (r *Reader) WalkPart(ctx context.Context, part string, visitor *SceneVisito
 	}
 	walker := newSceneWalker(r, visitor, config)
 	initial := WalkState{
-		PagePart:      page.Part,
-		Index:         globalIndex,
-		DocumentIndex: docIndex,
-		PageIndex:     localIndex,
-		Matrix:        config.rootTransform,
-		Clip:          walkPageRootClips(page, config.rootTransform),
-		Opacity:       1,
-		Language:      page.Language,
+		PagePart:       page.Part,
+		Index:          globalIndex,
+		DocumentIndex:  docIndex,
+		PageIndex:      localIndex,
+		PlacementIndex: -1,
+		Matrix:         config.rootTransform,
+		Clip:           walkPageRootClips(page, config.rootTransform),
+		Opacity:        1,
+		Language:       page.Language,
 	}
 	return walker.walkPageElements(ctx, page.Diagnostics, page.Elements, initial)
 }
@@ -332,12 +502,13 @@ func (r *Reader) WalkPrintSide(ctx context.Context, side *PrintSide, visitor *Sc
 		return err
 	}
 	walker := newSceneWalker(r, visitor, config)
-	sideFallback := side.Color.Mode == PrintColorGrayscale || side.Color.Mode == PrintColorMonochrome
-	if sideFallback {
-		walker.reportDiagnostic(Diagnostic{Element: "PrintColor", Message: "print side grayscale or monochrome output requires raster fallback"})
+	sideReasons := FallbackNone
+	if side.Color.Mode == PrintColorGrayscale || side.Color.Mode == PrintColorMonochrome {
+		sideReasons |= FallbackPrintGrayscale
+		walker.reportDiagnostic(Diagnostic{Element: "PrintColor", Message: "print side uses grayscale or monochrome output color mode"})
 	}
 	pageCache := make(map[string]*Page)
-	for _, placement := range side.Pages {
+	for placementIndex, placement := range side.Pages {
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
@@ -365,11 +536,13 @@ func (r *Reader) WalkPrintSide(ctx context.Context, side *PrintSide, visitor *Sc
 			}
 			pageCache[key] = page
 		}
-		elements := page.Elements
-		placementFallback := sideFallback
+		placementReasons := sideReasons
+		placementForceRaster := false
+		var watermarkCanvas *Canvas
+		var watermarkLayer PrintWatermarkLayer
 		if placement.Watermark != nil {
-			if config.watermark != nil && config.watermark.FontURI != "" {
-				materialized, err := r.materializeWalkWatermark(ctx, page.Part, page.Elements, placement.Watermark, config.watermark, config.limits)
+			if config.watermark != nil && (config.watermark.FontURI != "" || len(config.watermark.FontData) > 0) {
+				watermarkCanvas, watermarkLayer, err = r.materializeWalkWatermarkCanvas(ctx, page.Part, placement.Watermark, config.watermark, config.limits)
 				if err != nil {
 					if cerr := walkContextError(ctx, err); cerr != nil {
 						return cerr
@@ -378,18 +551,18 @@ func (r *Reader) WalkPrintSide(ctx context.Context, side *PrintSide, visitor *Sc
 						return err
 					}
 					walker.reportDiagnostic(Diagnostic{Part: page.Part, Element: "PrintWatermark", Message: err.Error()})
-					placementFallback = true
-				} else {
-					elements = materialized
+					placementReasons |= FallbackMissingWatermarkFont
+					placementForceRaster = true
 				}
 			} else {
 				walker.reportDiagnostic(Diagnostic{Part: page.Part, Element: "PrintWatermark", Message: "print placement watermark requires raster fallback or explicit WalkOptions.Watermark"})
-				placementFallback = true
+				placementReasons |= FallbackMissingWatermarkFont
+				placementForceRaster = true
 			}
 		}
 		if placement.Negative {
-			walker.reportDiagnostic(Diagnostic{Part: page.Part, Element: "PrintNegative", Message: "negative print placement requires raster fallback"})
-			placementFallback = true
+			walker.reportDiagnostic(Diagnostic{Part: page.Part, Element: "PrintNegative", Message: "print placement uses negative color transform"})
+			placementReasons |= FallbackPrintNegative
 		}
 		clips := walkPrintPlacementClips(sideClip, placement, config.rootTransform, effectiveMatrix)
 		initial := WalkState{
@@ -397,18 +570,49 @@ func (r *Reader) WalkPrintSide(ctx context.Context, side *PrintSide, visitor *Sc
 			Index:           globalIndex,
 			DocumentIndex:   docIndex,
 			PageIndex:       localIndex,
+			PlacementIndex:  placementIndex,
 			Matrix:          effectiveMatrix,
 			Clip:            clips,
 			Opacity:         1,
 			Language:        page.Language,
 			PrintColor:      side.Color,
+			PrintColorPlan:  clonePrintColorPlan(placement.Color),
+			Negative:        placement.Negative,
 			SignaturePolicy: side.SignaturePolicy,
 		}
-		walker.forceFallback = placementFallback
-		err = walker.walkPageElements(ctx, page.Diagnostics, elements, initial)
-		walker.forceFallback = false
+		if walker.visitor.EnterPlacement != nil {
+			if err := walker.visitor.EnterPlacement(WalkPlacementEvent{PlacementIndex: placementIndex, Placement: clonePrintPlacement(placement), State: initial.clone()}); err != nil {
+				return err
+			}
+		}
+		walker.inheritedReasons = placementReasons
+		walker.forceRasterFallback = placementForceRaster
+		for _, diag := range page.Diagnostics {
+			walker.reportDiagnostic(diag)
+		}
+		err = nil
+		if watermarkCanvas != nil && watermarkLayer == PrintWatermarkUnderlay {
+			wmState := initial
+			wmState.IsWatermark = true
+			err = walker.walkElements(ctx, []Element{watermarkCanvas}, wmState, 0, 0)
+		}
+		if err == nil {
+			err = walker.walkElements(ctx, page.Elements, initial, 0, 0)
+		}
+		if err == nil && watermarkCanvas != nil && watermarkLayer == PrintWatermarkOverlay {
+			wmState := initial
+			wmState.IsWatermark = true
+			err = walker.walkElements(ctx, []Element{watermarkCanvas}, wmState, 0, 0)
+		}
+		walker.inheritedReasons = FallbackNone
+		walker.forceRasterFallback = false
 		if err != nil {
 			return err
+		}
+		if walker.visitor.LeavePlacement != nil {
+			if err := walker.visitor.LeavePlacement(WalkPlacementEvent{PlacementIndex: placementIndex, Placement: clonePrintPlacement(placement), State: initial.clone()}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -448,6 +652,7 @@ func (r *Reader) walkConfig(options *WalkOptions) (walkConfiguration, error) {
 			config.maxBrushDepth = options.MaxBrushDepth
 		}
 		config.expandVisualBrush = options.ExpandVisualBrush
+		config.expandTiledVisualBrush = options.ExpandTiledVisualBrush
 		config.resolveGlyphOutlines = options.ResolveGlyphOutlines
 		if options.RenderFallbackDPI != 0 {
 			if !geometryFinite(options.RenderFallbackDPI) || options.RenderFallbackDPI < 0 {
@@ -463,6 +668,9 @@ func (r *Reader) walkConfig(options *WalkOptions) (walkConfiguration, error) {
 		}
 		if options.Watermark != nil {
 			copied := *options.Watermark
+			if options.Watermark.FontData != nil {
+				copied.FontData = slices.Clone(options.Watermark.FontData)
+			}
 			config.watermark = &copied
 		}
 		if options.Signatures != nil {
@@ -517,12 +725,12 @@ func (r *Reader) loadScenePageByPart(ctx context.Context, part string, limits Li
 	return page, globalIndex, docIndex, localIndex, nil
 }
 
-// materializeWalkWatermark 短暂持读锁将拼版放置水印物化为独立矢量场景元素后立即释放锁
-// 入参: ctx 取消Context, part 页面部件URI, elements 原页面元素, watermark 水印描述, options 水印字体配置, limits 资源上限
-// 返回: []Element 组合水印后的独立元素切片, error 水印、字体、预算、关闭或取消错误
-func (r *Reader) materializeWalkWatermark(ctx context.Context, part string, elements []Element, watermark *PrintWatermark, options *PrintWatermarkOptions, limits Limits) ([]Element, error) {
+// materializeWalkWatermarkCanvas 短暂持读锁将拼版放置水印物化为独立Canvas后立即释放锁
+// 入参: ctx 取消Context, part 页面部件URI, watermark 水印描述, options 水印字体配置, limits 资源上限
+// 返回: *Canvas 独立水印画布, PrintWatermarkLayer 叠放层级, error 水印、字体、预算、关闭或取消错误
+func (r *Reader) materializeWalkWatermarkCanvas(ctx context.Context, part string, watermark *PrintWatermark, options *PrintWatermarkOptions, limits Limits) (*Canvas, PrintWatermarkLayer, error) {
 	if err := r.readLock(); err != nil {
-		return nil, err
+		return nil, PrintWatermarkLayerUnknown, err
 	}
 	defer r.mu.RUnlock()
 	settings := defaultSceneRenderOptions()
@@ -533,7 +741,7 @@ func (r *Reader) materializeWalkWatermark(ctx context.Context, part string, elem
 	settings.fontBytes = min(int64(defaultWalkMaxFontBytes), limits.MaxPackageBytes)
 	scoped := r.scopedWalkReader(limits)
 	renderer := newPrintWatermarkRenderer(scoped, options, settings)
-	return renderer.elements(part, elements, watermark)
+	return renderer.watermarkCanvas(part, watermark)
 }
 
 // resolveWalkPlacement 在读锁保护下解析纸面放置指向的页面部件及全局、文档、局部页码索引
@@ -728,12 +936,21 @@ func (w *sceneWalker) walkElement(ctx context.Context, element Element, parent W
 // 入参: ctx 取消Context, canvas 画布元素, state 当前有效状态, depth 当前深度, brushDepth 画刷深度
 // 返回: error 遍历或回调错误
 func (w *sceneWalker) walkCanvas(ctx context.Context, canvas *Canvas, state WalkState, depth, brushDepth int) error {
+	reasons := w.inheritedReasons
+	needsRaster := w.forceRasterFallback
+	if state.OpacityMask != nil {
+		reasons |= FallbackOpacityMask
+		needsRaster = true
+	}
 	groupEvent := WalkGroupEvent{
 		State:               state.clone(),
 		Kind:                WalkGroupCanvas,
 		LocalOpacity:        canvas.Opacity,
 		EdgeMode:            state.EdgeMode,
-		NeedsRasterFallback: w.forceFallback || state.OpacityMask != nil,
+		AutomationName:      canvas.AutomationName,
+		AutomationHelpText:  canvas.AutomationHelpText,
+		NeedsRasterFallback: needsRaster,
+		FallbackReasons:     reasons,
 		FallbackDPI:         w.config.fallbackDPI,
 	}
 	if w.visitor.EnterGroup != nil {
@@ -741,15 +958,16 @@ func (w *sceneWalker) walkCanvas(ctx context.Context, canvas *Canvas, state Walk
 			return err
 		}
 	}
-	prevFallback := w.forceFallback
+	prevReasons, prevForce := w.inheritedReasons, w.forceRasterFallback
 	if state.OpacityMask != nil {
-		w.forceFallback = true
+		w.inheritedReasons |= FallbackOpacityMask
+		w.forceRasterFallback = true
 	}
 	childState := state
 	childState.OpacityMask = nil
 	childState.Name = ""
 	err := w.walkElements(ctx, canvas.Elements, childState, depth+1, brushDepth)
-	w.forceFallback = prevFallback
+	w.inheritedReasons, w.forceRasterFallback = prevReasons, prevForce
 	if err != nil {
 		return err
 	}
@@ -762,7 +980,46 @@ func (w *sceneWalker) walkCanvas(ctx context.Context, canvas *Canvas, state Walk
 	return nil
 }
 
-// walkPath 分发Path关联的图像、可展开VisualBrush以及常规矢量路径事件
+// walkBrushFallbackReasons 计算画刷自身引入的回退原因位掩码
+// 入参: brush 待分析画刷
+// 返回: FallbackReason 画刷对应的回退位掩码
+func walkBrushFallbackReasons(brush *Brush) FallbackReason {
+	if brush == nil {
+		return FallbackNone
+	}
+	switch brush.Kind {
+	case BrushVisual:
+		if brush.TileMode != TileNone {
+			return FallbackVisualBrushTile
+		}
+		return FallbackVisualBrush
+	case BrushImage:
+		if brush.TileMode != TileNone {
+			return FallbackImageTile
+		}
+		return FallbackNone
+	default:
+		return FallbackNone
+	}
+}
+
+// pathFallbackReasons 汇总路径节点在当前状态与有效填充描边下的完整回退原因位掩码
+// 入参: path 路径元素, state 当前有效状态, fill 生效填充画刷, stroke 生效描边画刷
+// 返回: FallbackReason 合并后的回退位掩码
+func (w *sceneWalker) pathFallbackReasons(path *Path, state WalkState, fill, stroke *Brush) FallbackReason {
+	reasons := w.inheritedReasons
+	if state.OpacityMask != nil {
+		reasons |= FallbackOpacityMask
+	}
+	if path.Fill != nil && path.Stroke != nil && path.Opacity < 1 {
+		reasons |= FallbackTranslucentFillStroke
+	}
+	reasons |= walkBrushFallbackReasons(fill)
+	reasons |= walkBrushFallbackReasons(stroke)
+	return reasons
+}
+
+// walkPath 分发Path关联的图像、可展开VisualBrush、平铺VisualBrush单瓦片以及常规矢量路径事件
 // 入参: ctx 取消Context, path 路径元素, state 当前有效状态, depth 元素深度, brushDepth 画刷深度
 // 返回: error 遍历或回调错误
 func (w *sceneWalker) walkPath(ctx context.Context, path *Path, state WalkState, depth, brushDepth int) error {
@@ -777,21 +1034,24 @@ func (w *sceneWalker) walkPath(ctx context.Context, path *Path, state WalkState,
 	}
 	if path.Fill != nil && path.Fill.Kind == BrushImage && w.visitor.Image != nil {
 		if path.Stroke != nil && (path.Opacity < 1 || state.OpacityMask != nil) {
+			reasons := w.pathFallbackReasons(path, state, path.Fill, path.Stroke)
 			if w.visitor.Path != nil {
-				return w.emitPathEvent(ctx, path, state, path.Fill, path.Stroke, true)
+				return w.emitPathEvent(ctx, path, state, path.Fill, path.Stroke, true, reasons)
 			}
-			return w.emitImageBrush(ctx, path, state, true)
+			return w.emitImageBrush(ctx, path, state, true, reasons)
 		}
-		if err := w.emitImageBrush(ctx, path, state, false); err != nil {
+		if err := w.emitImageBrush(ctx, path, state, false, FallbackNone); err != nil {
 			return err
 		}
 		if path.Stroke == nil {
 			return nil
 		}
-		return w.emitPathEvent(ctx, path, state, nil, path.Stroke, path.Stroke.Kind == BrushVisual || path.Stroke.Kind == BrushImage)
+		strokeNeeds := state.OpacityMask != nil || path.Stroke.Kind == BrushVisual || path.Stroke.Kind == BrushImage
+		strokeReasons := w.pathFallbackReasons(path, state, nil, path.Stroke)
+		return w.emitPathEvent(ctx, path, state, nil, path.Stroke, strokeNeeds, strokeReasons)
 	}
-	if path.Fill != nil && path.Fill.Kind == BrushVisual && w.config.expandVisualBrush {
-		expanded, err := w.expandVisualBrush(ctx, path, path.Fill, state, depth, brushDepth)
+	if path.Fill != nil && path.Fill.Kind == BrushVisual && path.Fill.TileMode == TileNone && w.config.expandVisualBrush {
+		expanded, extraReasons, err := w.expandVisualBrush(ctx, path, path.Fill, state, depth, brushDepth)
 		if err != nil {
 			return err
 		}
@@ -799,18 +1059,35 @@ func (w *sceneWalker) walkPath(ctx context.Context, path *Path, state WalkState,
 			if path.Stroke == nil {
 				return nil
 			}
-			return w.emitPathEvent(ctx, path, state, nil, path.Stroke, path.Stroke.Kind == BrushVisual || path.Stroke.Kind == BrushImage)
+			strokeNeeds := path.Stroke.Kind == BrushVisual || path.Stroke.Kind == BrushImage
+			strokeReasons := w.pathFallbackReasons(path, state, nil, path.Stroke)
+			return w.emitPathEvent(ctx, path, state, nil, path.Stroke, strokeNeeds, strokeReasons)
 		}
-		return w.emitPathEvent(ctx, path, state, path.Fill, path.Stroke, true)
+		reasons := w.pathFallbackReasons(path, state, path.Fill, path.Stroke) | extraReasons
+		return w.emitPathEvent(ctx, path, state, path.Fill, path.Stroke, true, reasons)
 	}
+	if path.Fill != nil && path.Fill.Kind == BrushVisual && path.Fill.TileMode != TileNone && w.config.expandTiledVisualBrush {
+		expanded, extraReasons, err := w.expandTiledVisualBrush(ctx, path, path.Fill, state, depth, brushDepth)
+		if err != nil {
+			return err
+		}
+		if expanded {
+			hostNeeds := state.OpacityMask != nil || (path.Stroke != nil && (path.Stroke.Kind == BrushVisual || path.Stroke.Kind == BrushImage))
+			hostReasons := w.pathFallbackReasons(path, state, nil, path.Stroke)
+			return w.emitPathEvent(ctx, path, state, path.Fill, path.Stroke, hostNeeds, hostReasons)
+		}
+		reasons := w.pathFallbackReasons(path, state, path.Fill, path.Stroke) | extraReasons
+		return w.emitPathEvent(ctx, path, state, path.Fill, path.Stroke, true, reasons)
+	}
+	reasons := w.pathFallbackReasons(path, state, path.Fill, path.Stroke)
 	needsFallback := state.OpacityMask != nil || (path.Fill != nil && (path.Fill.Kind == BrushVisual || path.Fill.Kind == BrushImage)) || (path.Stroke != nil && (path.Stroke.Kind == BrushVisual || path.Stroke.Kind == BrushImage))
-	return w.emitPathEvent(ctx, path, state, path.Fill, path.Stroke, needsFallback)
+	return w.emitPathEvent(ctx, path, state, path.Fill, path.Stroke, needsFallback, reasons)
 }
 
-// emitImageBrush 解析ImageBrush部件引用、放置变换与宿主几何外包矩形并触发Image回调
-// 入参: ctx 取消Context, path 宿主路径, state 当前有效状态, forceFallback 是否强制标记光栅回退
+// emitImageBrush 解析ImageBrush部件引用、放置变换、源物理尺寸与宿主几何外包矩形并附带回退原因触发Image回调
+// 入参: ctx 取消Context, path 宿主路径, state 当前有效状态, forceFallback 是否强制标记光栅回退, extraReasons 额外回退原因位掩码
 // 返回: error 回调或边界错误
-func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state WalkState, forceFallback bool) error {
+func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state WalkState, forceFallback bool, extraReasons FallbackReason) error {
 	brush := path.Fill
 	basePart := brush.Part
 	if basePart == "" {
@@ -819,12 +1096,18 @@ func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state Walk
 	if basePart == "" {
 		basePart = "/"
 	}
+	reasons := w.inheritedReasons | extraReasons
+	if state.OpacityMask != nil {
+		reasons |= FallbackOpacityMask
+	}
 	brushFallback := false
+	resolvedImage := true
 	imagePart, err := resolvePart(basePart, brush.ImageSource)
 	if err != nil {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "ImageBrush", Attribute: "ImageSource", Message: err.Error()})
 		imagePart = brush.ImageSource
 		brushFallback = true
+		resolvedImage = false
 	}
 	profilePart := ""
 	if brush.ImageProfileURI != "" {
@@ -849,6 +1132,17 @@ func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state Walk
 	} else {
 		brushOpacity = brush.Opacity
 	}
+	var extent walkImageExtent
+	if resolvedImage && imagePart != "" {
+		extent, err = w.imagePhysicalExtent(ctx, imagePart)
+		if err != nil {
+			return err
+		}
+	}
+	var imageExtent Point
+	if extent.ok {
+		imageExtent = Point{X: extent.width, Y: extent.height}
+	}
 	imageTransform := state.Matrix
 	brushMatrix := state.Matrix
 	viewportClip := false
@@ -858,6 +1152,7 @@ func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state Walk
 	} else {
 		if brush.TileMode != TileNone {
 			brushFallback = true
+			reasons |= FallbackImageTile
 		}
 		transformOK := true
 		if brush.Transform != nil {
@@ -885,30 +1180,24 @@ func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state Walk
 		if !geometryFinite(brush.Viewbox.X, brush.Viewbox.Y, brush.Viewbox.Width, brush.Viewbox.Height, brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height) || brush.Viewbox.Width <= 0 || brush.Viewbox.Height <= 0 || brush.Viewport.Width <= 0 || brush.Viewport.Height <= 0 {
 			w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "ImageBrush", Attribute: "Viewbox", Message: "degenerate image brush viewbox or viewport"})
 			brushFallback = true
-		} else if transformOK {
-			sx := brush.Viewport.Width / brush.Viewbox.Width
-			sy := brush.Viewport.Height / brush.Viewbox.Height
-			mapping := Matrix{A: sx, D: sy, E: brush.Viewport.X - brush.Viewbox.X*sx, F: brush.Viewport.Y - brush.Viewbox.Y*sy}
-			composed := strokePathCompose(brushMatrix, mapping)
-			if !geometryFillMatrixFinite(composed) || geometryMatrixSingular(composed) {
-				w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "ImageBrush", Attribute: "Transform", Message: "image brush transform overflow"})
-				brushFallback = true
-			} else {
-				imageTransform = composed
-				viewportClip = brush.TileMode == TileNone
-			}
-			if !brushFallback {
-				if brush.Viewbox.X != 0 || brush.Viewbox.Y != 0 {
+			reasons |= FallbackImageViewbox
+		} else {
+			if transformOK {
+				sx := brush.Viewport.Width / brush.Viewbox.Width
+				sy := brush.Viewport.Height / brush.Viewbox.Height
+				mapping := Matrix{A: sx, D: sy, E: brush.Viewport.X - brush.Viewbox.X*sx, F: brush.Viewport.Y - brush.Viewbox.Y*sy}
+				composed := strokePathCompose(brushMatrix, mapping)
+				if !geometryFillMatrixFinite(composed) || geometryMatrixSingular(composed) {
+					w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "ImageBrush", Attribute: "Transform", Message: "image brush transform overflow"})
 					brushFallback = true
 				} else {
-					extent, extErr := w.imagePhysicalExtent(ctx, imagePart)
-					if extErr != nil {
-						return extErr
-					}
-					if !extent.ok || math.Abs(brush.Viewbox.Width-extent.width) > 1e-6*max(1, extent.width) || math.Abs(brush.Viewbox.Height-extent.height) > 1e-6*max(1, extent.height) {
-						brushFallback = true
-					}
+					imageTransform = composed
+					viewportClip = brush.TileMode == TileNone
 				}
+			}
+			if brush.Viewbox.X != 0 || brush.Viewbox.Y != 0 || !extent.ok || math.Abs(brush.Viewbox.Width-extent.width) > 1e-6*max(1, extent.width) || math.Abs(brush.Viewbox.Height-extent.height) > 1e-6*max(1, extent.height) {
+				brushFallback = true
+				reasons |= FallbackImageViewbox
 			}
 		}
 	}
@@ -922,12 +1211,14 @@ func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state Walk
 		LocalOpacity:        colorClamp(path.Opacity * brushOpacity),
 		ImagePart:           imagePart,
 		ImageProfilePart:    profilePart,
+		ImageExtent:         imageExtent,
 		Brush:               brush,
 		ImageTransform:      imageTransform,
 		Bounds:              bounds,
 		ClipPath:            path.Data,
 		TileMode:            brush.TileMode,
-		NeedsRasterFallback: w.forceFallback || forceFallback || brushFallback || state.OpacityMask != nil,
+		NeedsRasterFallback: w.forceRasterFallback || forceFallback || brushFallback || state.OpacityMask != nil,
+		FallbackReasons:     reasons,
 		FallbackDPI:         w.config.fallbackDPI,
 	}
 	return w.visitor.Image(ctx, event)
@@ -967,9 +1258,9 @@ func (w *sceneWalker) imagePhysicalExtent(ctx context.Context, imagePart string)
 }
 
 // emitPathEvent 构造WalkPathEvent并调用Path回调，Data、Fill与Stroke作为只读零拷贝视图透传
-// 入参: ctx 取消Context, path 路径元素, state 当前有效状态, fill 生效填充画刷, stroke 生效描边画刷, needsFallback 是否建议局部光栅化回退
+// 入参: ctx 取消Context, path 路径元素, state 当前有效状态, fill 生效填充画刷, stroke 生效描边画刷, needsFallback 是否建议局部光栅化回退, reasons 精细化回退原因位掩码
 // 返回: error 回调错误
-func (w *sceneWalker) emitPathEvent(ctx context.Context, path *Path, state WalkState, fill, stroke *Brush, needsFallback bool) error {
+func (w *sceneWalker) emitPathEvent(ctx context.Context, path *Path, state WalkState, fill, stroke *Brush, needsFallback bool, reasons FallbackReason) error {
 	if w.visitor.Path == nil {
 		return nil
 	}
@@ -990,62 +1281,63 @@ func (w *sceneWalker) emitPathEvent(ctx context.Context, path *Path, state WalkS
 		SnapsToDevicePixels: cloneBoolPtr(path.SnapsToDevicePixels),
 		AutomationName:      path.AutomationName,
 		AutomationHelpText:  path.AutomationHelpText,
-		NeedsRasterFallback: w.forceFallback || needsFallback,
+		NeedsRasterFallback: w.forceRasterFallback || needsFallback,
+		FallbackReasons:     reasons,
 		FallbackDPI:         w.config.fallbackDPI,
 	}
 	return w.visitor.Path(ctx, event)
 }
 
-// expandVisualBrush 校验深度上限、环引用、平铺模式、蒙版及坐标映射，满足条件时展开VisualBrush内部矢量子树
+// expandVisualBrush 校验深度上限、环引用、平铺模式、蒙版及坐标映射，满足条件时展开非平铺VisualBrush内部矢量子树
 // 入参: ctx 取消Context, path 宿主路径, brush 视觉画刷, state 宿主状态, depth 元素深度, brushDepth 画刷深度
-// 返回: bool 是否成功完成矢量展开, error 取消、资源上限或回调错误
-func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *Brush, state WalkState, depth, brushDepth int) (bool, error) {
+// 返回: bool 是否成功完成矢量展开, FallbackReason 失败时的附加回退原因, error 取消、资源上限或回调错误
+func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *Brush, state WalkState, depth, brushDepth int) (bool, FallbackReason, error) {
 	if brush == nil || brush.Visual == nil {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Visual", Message: "visual brush has no visual content"})
-		return false, nil
+		return false, FallbackVisualBrush, nil
 	}
 	if brush.TileMode > TileFlipXY {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: "invalid visual brush tile mode"})
-		return false, nil
+		return false, FallbackVisualBrush, nil
 	}
 	if brush.TileMode != TileNone {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "TileMode", Message: "tiled visual brush requires raster fallback"})
-		return false, nil
+		return false, FallbackVisualBrushTile, nil
 	}
 	if state.OpacityMask != nil {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "OpacityMask", Message: "visual brush host opacity mask requires raster fallback"})
-		return false, nil
+		return false, FallbackOpacityMask | FallbackVisualBrush, nil
 	}
 	if path.Stroke != nil && path.Opacity < 1 {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Opacity", Message: "translucent stroked visual brush host requires raster fallback"})
-		return false, nil
+		return false, FallbackTranslucentFillStroke | FallbackVisualBrush, nil
 	}
 	if brushDepth >= w.config.maxBrushDepth {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: fmt.Sprintf("visual brush recursion depth exceeds limit %d", w.config.maxBrushDepth)})
-		return false, nil
+		return false, FallbackVisualBrush, nil
 	}
 	if w.activeBrushes[brush] || w.activeElements[brush.Visual] {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: "cyclic visual brush reference detected"})
-		return false, nil
+		return false, FallbackVisualBrush, nil
 	}
 	brushMatrix := state.Matrix
 	if brush.Transform != nil {
 		if !geometryFillMatrixFinite(*brush.Transform) {
 			w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Transform", Message: "non-finite visual brush transform"})
-			return false, nil
+			return false, FallbackVisualBrush, nil
 		}
 		brushMatrix = strokePathCompose(brushMatrix, *brush.Transform)
 	}
 	if !geometryFillMatrixFinite(brushMatrix) {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Transform", Message: "visual brush transform overflow"})
-		return false, nil
+		return false, FallbackVisualBrush, nil
 	}
 	if geometryMatrixSingular(brushMatrix) {
-		return true, nil
+		return true, FallbackNone, nil
 	}
 	if !geometryFinite(brush.Viewbox.X, brush.Viewbox.Y, brush.Viewbox.Width, brush.Viewbox.Height, brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height) || brush.Viewbox.Width <= 0 || brush.Viewbox.Height <= 0 || brush.Viewport.Width <= 0 || brush.Viewport.Height <= 0 {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Viewbox", Message: "degenerate visual brush viewbox or viewport"})
-		return false, nil
+		return false, FallbackVisualBrush, nil
 	}
 	sx := brush.Viewport.Width / brush.Viewbox.Width
 	sy := brush.Viewport.Height / brush.Viewbox.Height
@@ -1053,53 +1345,134 @@ func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *
 	visualMatrix := strokePathCompose(brushMatrix, mapping)
 	if !geometryFillMatrixFinite(visualMatrix) || geometryMatrixSingular(visualMatrix) || !geometryFinite(brush.Opacity) || brush.Opacity < 0 || brush.Opacity > 1 {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: "visual brush mapping or opacity out of range"})
-		return false, nil
+		return false, FallbackVisualBrush, nil
 	}
 	groupClips := slices.Clone(state.Clip)
 	if path.Data != nil {
 		groupClips = append(groupClips, WalkClip{Geometry: path.Data, Matrix: state.Matrix})
 	}
 	groupClips = append(groupClips, WalkClip{Geometry: renderBoxGeometry(brush.Viewport), Matrix: brushMatrix})
-	groupState := WalkState{
-		PagePart:        state.PagePart,
-		Index:           state.Index,
-		DocumentIndex:   state.DocumentIndex,
-		PageIndex:       state.PageIndex,
-		Matrix:          visualMatrix,
-		Clip:            groupClips,
-		Opacity:         colorClamp(state.Opacity * brush.Opacity),
-		EdgeMode:        state.EdgeMode,
-		Language:        state.Language,
-		NavigateURI:     state.NavigateURI,
-		PrintColor:      state.PrintColor,
-		SignaturePolicy: state.SignaturePolicy,
-	}
+	groupState := state
+	groupState.Matrix = visualMatrix
+	groupState.Clip = groupClips
+	groupState.Opacity = colorClamp(state.Opacity * brush.Opacity)
+	groupState.OpacityMask = nil
+	groupState.Name = ""
 	groupEvent := WalkGroupEvent{
 		State:               groupState.clone(),
 		Kind:                WalkGroupVisualBrush,
 		Brush:               brush,
 		LocalOpacity:        colorClamp(path.Opacity * brush.Opacity),
 		EdgeMode:            state.EdgeMode,
-		NeedsRasterFallback: w.forceFallback,
+		NeedsRasterFallback: w.forceRasterFallback,
+		FallbackReasons:     w.inheritedReasons,
 		FallbackDPI:         w.config.fallbackDPI,
 	}
 	w.activeBrushes[brush] = true
 	defer delete(w.activeBrushes, brush)
 	if w.visitor.EnterGroup != nil {
 		if err := w.visitor.EnterGroup(ctx, groupEvent); err != nil {
-			return false, err
+			return false, FallbackNone, err
 		}
 	}
 	if err := w.walkElement(ctx, brush.Visual, groupState, depth+1, brushDepth+1); err != nil {
-		return false, err
+		return false, FallbackNone, err
 	}
 	if w.visitor.LeaveGroup != nil {
 		groupEvent.State = groupState.clone()
 		if err := w.visitor.LeaveGroup(ctx, groupEvent); err != nil {
-			return false, err
+			return false, FallbackNone, err
 		}
 	}
-	return true, nil
+	return true, FallbackNone, nil
+}
+
+// expandTiledVisualBrush 在无循环与深度预算内将平铺VisualBrush回调为单瓦片局部坐标系矢量子树，便于生成矢量图案底纹
+// 入参: ctx 取消Context, path 宿主路径, brush 平铺视觉画刷, state 宿主状态, depth 元素深度, brushDepth 画刷深度
+// 返回: bool 是否成功完成单瓦片矢量回调, FallbackReason 失败时的附加回退原因, error 取消、资源上限或回调错误
+func (w *sceneWalker) expandTiledVisualBrush(ctx context.Context, path *Path, brush *Brush, state WalkState, depth, brushDepth int) (bool, FallbackReason, error) {
+	if brush == nil || brush.Visual == nil || brush.TileMode == TileNone || brush.TileMode > TileFlipXY {
+		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "TileMode", Message: "invalid tiled visual brush"})
+		return false, FallbackVisualBrushTile, nil
+	}
+	if state.OpacityMask != nil {
+		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "OpacityMask", Message: "tiled visual brush host opacity mask requires raster fallback"})
+		return false, FallbackOpacityMask | FallbackVisualBrushTile, nil
+	}
+	if brushDepth >= w.config.maxBrushDepth {
+		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: fmt.Sprintf("visual brush recursion depth exceeds limit %d", w.config.maxBrushDepth)})
+		return false, FallbackVisualBrush | FallbackVisualBrushTile, nil
+	}
+	if w.activeBrushes[brush] || w.activeElements[brush.Visual] {
+		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: "cyclic visual brush reference detected"})
+		return false, FallbackVisualBrush | FallbackVisualBrushTile, nil
+	}
+	brushMatrix := state.Matrix
+	if brush.Transform != nil {
+		if !geometryFillMatrixFinite(*brush.Transform) {
+			w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Transform", Message: "non-finite visual brush transform"})
+			return false, FallbackVisualBrushTile, nil
+		}
+		brushMatrix = strokePathCompose(brushMatrix, *brush.Transform)
+	}
+	if !geometryFillMatrixFinite(brushMatrix) || geometryMatrixSingular(brushMatrix) {
+		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Transform", Message: "singular or overflow tiled visual brush transform"})
+		return false, FallbackVisualBrushTile, nil
+	}
+	if !geometryFinite(brush.Viewbox.X, brush.Viewbox.Y, brush.Viewbox.Width, brush.Viewbox.Height, brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height) || brush.Viewbox.Width <= 0 || brush.Viewbox.Height <= 0 || brush.Viewport.Width <= 0 || brush.Viewport.Height <= 0 {
+		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Viewbox", Message: "degenerate visual brush viewbox or viewport"})
+		return false, FallbackVisualBrushTile, nil
+	}
+	sx := brush.Viewport.Width / brush.Viewbox.Width
+	sy := brush.Viewport.Height / brush.Viewbox.Height
+	tileMatrix := Matrix{A: sx, D: sy, E: -brush.Viewbox.X * sx, F: -brush.Viewbox.Y * sy}
+	if !geometryFillMatrixFinite(tileMatrix) || geometryMatrixSingular(tileMatrix) || !geometryFinite(brush.Opacity) || brush.Opacity < 0 || brush.Opacity > 1 {
+		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: "tiled visual brush mapping or opacity out of range"})
+		return false, FallbackVisualBrushTile, nil
+	}
+	groupClips := slices.Clone(state.Clip)
+	if path.Data != nil {
+		groupClips = append(groupClips, WalkClip{Geometry: path.Data, Matrix: state.Matrix})
+	}
+	groupState := state
+	groupState.Matrix = brushMatrix
+	groupState.Clip = groupClips
+	groupState.Opacity = colorClamp(state.Opacity * brush.Opacity)
+	groupState.OpacityMask = nil
+	groupState.Name = ""
+	groupEvent := WalkGroupEvent{
+		State:               groupState.clone(),
+		Kind:                WalkGroupVisualBrushTile,
+		Brush:               brush,
+		LocalOpacity:        colorClamp(path.Opacity * brush.Opacity),
+		EdgeMode:            state.EdgeMode,
+		NeedsRasterFallback: w.forceRasterFallback,
+		FallbackReasons:     w.inheritedReasons,
+		FallbackDPI:         w.config.fallbackDPI,
+	}
+	tileState := state
+	tileState.Matrix = tileMatrix
+	tileState.Clip = []WalkClip{{Geometry: renderBoxGeometry(Rect{Width: brush.Viewport.Width, Height: brush.Viewport.Height}), Matrix: IdentityMatrix()}}
+	tileState.Opacity = colorClamp(brush.Opacity)
+	tileState.OpacityMask = nil
+	tileState.Name = ""
+	w.activeBrushes[brush] = true
+	defer delete(w.activeBrushes, brush)
+	if w.visitor.EnterGroup != nil {
+		if err := w.visitor.EnterGroup(ctx, groupEvent); err != nil {
+			return false, FallbackNone, err
+		}
+	}
+	if err := w.walkElement(ctx, brush.Visual, tileState, depth+1, brushDepth+1); err != nil {
+		return false, FallbackNone, err
+	}
+	if w.visitor.LeaveGroup != nil {
+		groupEvent.State = groupState.clone()
+		if err := w.visitor.LeaveGroup(ctx, groupEvent); err != nil {
+			return false, FallbackNone, err
+		}
+	}
+	return true, FallbackNone, nil
 }
 
 // walkGlyphs 解析规范化字体URI、字形定位与按需轮廓几何并触发Glyphs回调
@@ -1148,6 +1521,13 @@ func (w *sceneWalker) walkGlyphs(ctx context.Context, glyphs *Glyphs, state Walk
 	} else if fontURI == "" {
 		fontURI = glyphs.FontURI
 	}
+	reasons := w.inheritedReasons
+	if state.OpacityMask != nil {
+		reasons |= FallbackOpacityMask
+	}
+	if glyphs.Fill != nil {
+		reasons |= walkBrushFallbackReasons(glyphs.Fill)
+	}
 	event := WalkGlyphsEvent{
 		State:               state.clone(),
 		LocalOpacity:        glyphs.Opacity,
@@ -1165,7 +1545,8 @@ func (w *sceneWalker) walkGlyphs(ctx context.Context, glyphs *Glyphs, state Walk
 		CaretStops:          glyphs.CaretStops,
 		DeviceFontName:      glyphs.DeviceFontName,
 		Fill:                glyphs.Fill,
-		NeedsRasterFallback: w.forceFallback || invalidFontURI || state.OpacityMask != nil || (glyphs.Fill != nil && (glyphs.Fill.Kind == BrushVisual || glyphs.Fill.Kind == BrushImage)),
+		NeedsRasterFallback: w.forceRasterFallback || invalidFontURI || state.OpacityMask != nil || (glyphs.Fill != nil && (glyphs.Fill.Kind == BrushVisual || glyphs.Fill.Kind == BrushImage)),
+		FallbackReasons:     reasons,
 		FallbackDPI:         w.config.fallbackDPI,
 	}
 	if fontPart != "" {
@@ -1201,10 +1582,18 @@ func (w *sceneWalker) populateGlyphPositions(ctx context.Context, glyphs *Glyphs
 		event.NeedsRasterFallback = true
 		return nil
 	}
+	event.unitsPerEm = float64(source.metrics.unitsPerEm)
+	event.ascender = float64(source.metrics.hhea.ascender)
+	event.descender = float64(source.metrics.hhea.descender)
+	if event.ascender == 0 && event.descender == 0 && source.metrics.os2 != nil {
+		event.ascender = float64(source.metrics.os2.typoAscender)
+		event.descender = float64(source.metrics.os2.typoDescender)
+	}
 	bitmapOnly := fontIsBitmapOnly(source.face)
 	yMax := source.glyphYMax
 	if bitmapOnly {
 		event.NeedsRasterFallback = true
+		event.FallbackReasons |= FallbackBitmapFont
 		if glyphs.IsSideways {
 			bitmapYMax, bitmapErr := w.bitmapGlyphYMax(ctx, source, glyphs, state.Matrix)
 			if bitmapErr != nil {
@@ -1247,7 +1636,7 @@ func (w *sceneWalker) populateGlyphPositions(ctx context.Context, glyphs *Glyphs
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
-		pos, err := contentGlyphPosition(glyph, state.Matrix, run.rtl)
+		pos, err := contentGlyphPosition(glyph, state.Matrix, run.rtl, run.sideways)
 		if err != nil {
 			return wrapPartError(state.PagePart, "Glyphs", err)
 		}

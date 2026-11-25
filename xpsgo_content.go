@@ -193,7 +193,8 @@ type contentGraph struct {
 }
 
 // GlyphPosition 保存字形编号、UTF-16半开簇范围及页面坐标定位
-// 无Unicode文字时TextStart和TextEnd为-1，Origin为锚点，Nominal为未偏移行进原点
+// 无Unicode文字时TextStart和TextEnd为-1，Origin为页面锚点，Nominal为未偏移行进原点
+// LocalOrigin为Glyphs局部坐标系锚点，VerticalOrigin为IsSideways竖排局部垂直基线偏移
 // Advance为页面步进向量，Transform将字体设计单位映射到页面并含斜体模拟变换
 type GlyphPosition struct {
 	Index           uint16
@@ -204,6 +205,8 @@ type GlyphPosition struct {
 	ExplicitAdvance bool
 	Nominal         Point
 	Origin          Point
+	LocalOrigin     Point
+	VerticalOrigin  float64
 	Advance         Point
 	Transform       Matrix
 }
@@ -526,7 +529,7 @@ func (g *contentGraph) positionGlyphs() error {
 			if err := g.node(); err != nil {
 				return err
 			}
-			position, err := contentGlyphPosition(glyph, item.Transform, run.rtl)
+			position, err := contentGlyphPosition(glyph, item.Transform, run.rtl, run.sideways)
 			if err != nil {
 				return &PartError{Part: item.Part, Element: "Glyphs", Err: err}
 			}
@@ -641,10 +644,10 @@ func (g *contentGraph) bitmapGlyphYMax(font *fontSource, glyphs *Glyphs, transfo
 	}
 }
 
-// contentGlyphPosition 将局部定位结果映射到有效页面坐标，步进向量不通过巨大平移坐标相减求得
-// 入参: glyph 已定位字形, transform 元素到页面的变换, rtl 是否从右向左行进
+// contentGlyphPosition 按书写方向将局部定位结果映射到有效页面坐标，并保留局部原点与竖排垂直基线偏移
+// 入参: glyph 已定位字形, transform 元素到页面的变换, rtl 是否从右向左行进, sideways 是否为竖排侧置字形
 // 返回: GlyphPosition 页面坐标定位, error 数值范围错误
-func contentGlyphPosition(glyph positionedGlyph, transform Matrix, rtl bool) (GlyphPosition, error) {
+func contentGlyphPosition(glyph positionedGlyph, transform Matrix, rtl, sideways bool) (GlyphPosition, error) {
 	advance := glyph.advance
 	if rtl {
 		advance = -advance
@@ -657,8 +660,12 @@ func contentGlyphPosition(glyph positionedGlyph, transform Matrix, rtl bool) (Gl
 	if err != nil {
 		return GlyphPosition{}, err
 	}
-	position := GlyphPosition{Index: glyph.gid, Cluster: glyph.cluster, TextStart: glyph.clusterStart, TextEnd: glyph.clusterEnd, ExplicitIndex: glyph.explicitIndex, ExplicitAdvance: glyph.explicitAdvance, Nominal: nominal, Origin: origin, Advance: Point{X: transform.A * advance, Y: transform.B * advance}, Transform: strokePathCompose(transform, glyph.matrix)}
-	if !geometryFinite(position.Nominal.X, position.Nominal.Y, position.Origin.X, position.Origin.Y, position.Advance.X, position.Advance.Y) || !geometryFillMatrixFinite(position.Transform) {
+	verticalOrigin := 0.0
+	if sideways {
+		verticalOrigin = glyph.matrix.E - glyph.origin.X
+	}
+	position := GlyphPosition{Index: glyph.gid, Cluster: glyph.cluster, TextStart: glyph.clusterStart, TextEnd: glyph.clusterEnd, ExplicitIndex: glyph.explicitIndex, ExplicitAdvance: glyph.explicitAdvance, Nominal: nominal, Origin: origin, LocalOrigin: glyph.origin, VerticalOrigin: verticalOrigin, Advance: Point{X: transform.A * advance, Y: transform.B * advance}, Transform: strokePathCompose(transform, glyph.matrix)}
+	if !geometryFinite(position.Nominal.X, position.Nominal.Y, position.Origin.X, position.Origin.Y, position.LocalOrigin.X, position.LocalOrigin.Y, position.VerticalOrigin, position.Advance.X, position.Advance.Y) || !geometryFillMatrixFinite(position.Transform) {
 		return GlyphPosition{}, fmt.Errorf("%w: content glyph position range", ErrLimit)
 	}
 	return position, nil

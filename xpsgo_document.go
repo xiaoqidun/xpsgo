@@ -658,7 +658,7 @@ func (r *Reader) readFixedPartLoader(part, kind, rootName string, load xmlPartLo
 	if err != nil {
 		return nil, &PartError{Part: part, Err: err}
 	}
-	if !strings.EqualFold(typeName, fixedContentType(kind)) {
+	if !strings.EqualFold(opcMediaTypeBase(typeName), fixedContentType(kind)) {
 		return nil, &PartError{Part: part, Err: fmt.Errorf("%w: unexpected content type %q", ErrInvalid, typeName)}
 	}
 	if !handled {
@@ -1092,7 +1092,7 @@ func (r *Reader) readStructurePartContext(ctx context.Context, source, kind, roo
 	if err != nil {
 		return "", nil, &PartError{Part: part, Err: err}
 	}
-	if !strings.EqualFold(media, fixedContentType(kind)) {
+	if !strings.EqualFold(opcMediaTypeBase(media), fixedContentType(kind)) {
 		return "", nil, &PartError{Part: part, Err: fmt.Errorf("%w: %s content type %q", ErrInvalid, rootName, media)}
 	}
 	data, err := r.pkg.readItemsContext(ctx, strings.ToLower(part), r.limits.MaxPartBytes)
@@ -1513,9 +1513,10 @@ func validateLinkFragment(media, fragment string, indexed bool) error {
 	if fragment == "" {
 		return nil
 	}
-	page := strings.EqualFold(media, fixedContentType("fixedpage"))
-	document := strings.EqualFold(media, fixedContentType("fixeddocument"))
-	sequence := strings.EqualFold(media, fixedContentType("fixeddocumentsequence"))
+	base := opcMediaTypeBase(media)
+	page := strings.EqualFold(base, fixedContentType("fixedpage"))
+	document := strings.EqualFold(base, fixedContentType("fixeddocument"))
+	sequence := strings.EqualFold(base, fixedContentType("fixeddocumentsequence"))
 	if page || document && linkPageNumber(fragment) {
 		return fmt.Errorf("%w: internal fragment address targets the wrong fixed layout type", ErrInvalid)
 	}
@@ -1652,8 +1653,9 @@ func (r *Reader) resolveAuxiliaryLink(ctx context.Context, source string, result
 	if err := validateLinkFragment(media, fragment, true); err != nil {
 		return LinkTarget{}, err
 	}
-	document := strings.EqualFold(media, fixedContentType("fixeddocument"))
-	sequence := strings.EqualFold(media, fixedContentType("fixeddocumentsequence"))
+	base := opcMediaTypeBase(media)
+	document := strings.EqualFold(base, fixedContentType("fixeddocument"))
+	sequence := strings.EqualFold(base, fixedContentType("fixeddocumentsequence"))
 	if !document && !sequence {
 		return result, nil
 	}
@@ -1685,7 +1687,7 @@ func (r *Reader) resolveAuxiliaryLink(ctx context.Context, source string, result
 	if err != nil {
 		return LinkTarget{}, err
 	}
-	if !strings.EqualFold(media, fixedContentType("fixedpage")) {
+	if !strings.EqualFold(opcMediaTypeBase(media), fixedContentType("fixedpage")) {
 		return LinkTarget{}, fmt.Errorf("%w: auxiliary link target is not a fixed page", ErrInvalid)
 	}
 	resolved.Page = -1

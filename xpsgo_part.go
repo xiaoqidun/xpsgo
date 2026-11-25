@@ -284,6 +284,14 @@ func opcMetadataPart(name, media string) bool {
 	return opcRelationshipName(name) || strings.EqualFold(name, opcTypesName) || strings.EqualFold(media, opcCoreType)
 }
 
+// opcMediaTypeBase 按RFC 2045截取媒体类型分号前的主子类型并去除首尾空白
+// 入参: media 原始媒体类型字符串
+// 返回: string 无参数媒体类型
+func opcMediaTypeBase(media string) string {
+	base, _, _ := strings.Cut(media, ";")
+	return strings.TrimSpace(base)
+}
+
 // OpenPart 打开独立逻辑部件读取流并按序拼接分片，使用后须关闭流，读取至EOF后完成全部CRC与尺寸校验
 // 关闭流不影响阅读器，阅读器关闭后流不可读；同一流的Read和Close可并发调用
 // 入参: ctx 取消Context，nil采用Background, name 部件URI, options 读取参数，nil采用默认值
@@ -792,19 +800,20 @@ func requiredColorAttribute(element, attribute string) bool {
 	return (element == "SolidColorBrush" || element == "GradientStop") && attribute == "Color" || (element == "Path" || element == "Glyphs") && attribute == "Fill" || element == "Path" && attribute == "Stroke"
 }
 
-// requiredResourceMedia 按双格式最终规范核对被访问资源的无参数媒体类型
+// requiredResourceMedia 按双格式最终规范核对被访问资源的媒体类型，忽略普通部件的合法MIME参数
 // 入参: kind 资源种类, media 内容类型
 // 返回: bool 类型是否符合用途
 func requiredResourceMedia(kind requiredResourceKind, media string) bool {
+	base := opcMediaTypeBase(media)
 	switch kind {
 	case requiredFont:
-		return strings.EqualFold(media, "application/vnd.ms-opentype") || strings.EqualFold(media, "application/vnd.ms-package.obfuscated-opentype")
+		return strings.EqualFold(base, "application/vnd.ms-opentype") || strings.EqualFold(base, "application/vnd.ms-package.obfuscated-opentype")
 	case requiredImage:
-		return strings.EqualFold(media, "image/jpeg") || strings.EqualFold(media, "image/png") || strings.EqualFold(media, "image/tiff") || strings.EqualFold(media, "image/vnd.ms-photo")
+		return strings.EqualFold(base, "image/jpeg") || strings.EqualFold(base, "image/png") || strings.EqualFold(base, "image/tiff") || strings.EqualFold(base, "image/vnd.ms-photo")
 	case requiredProfile:
-		return strings.EqualFold(media, "application/vnd.ms-color.iccprofile")
+		return strings.EqualFold(base, "application/vnd.ms-color.iccprofile")
 	case requiredDictionary:
-		return strings.EqualFold(media, resourceDictionaryContentType)
+		return strings.EqualFold(base, resourceDictionaryContentType)
 	case requiredModel:
 		model, err := resourceModelMedia(media)
 		return model && err == nil

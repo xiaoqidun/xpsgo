@@ -541,12 +541,28 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 		}
 	}
 	colorChannels := 3
+	colorSpace := ImageColorRGB
 	if photo <= 1 {
 		colorChannels = 1
+		colorSpace = ImageColorGray
 	} else if photo == 5 {
 		colorChannels = 4
+		colorSpace = ImageColorCMYK
 	}
-	result := &rasterImage{dpi: dpi, channels: colorChannels, profile: profile}
+	bitDepth := int(bits)
+	if photo == 3 {
+		bitDepth = 16
+	}
+	result := &rasterImage{
+		dpi:         dpi,
+		channels:    colorChannels,
+		profile:     profile,
+		colorSpace:  colorSpace,
+		hasAlpha:    alpha != 0,
+		bitDepth:    bitDepth,
+		floating:    sampleFormat == 3,
+		orientation: orientation,
+	}
 	bounds := image.Rect(0, 0, int(width), int(height))
 	var out *image.NRGBA64
 	if sampleFormat == 3 {

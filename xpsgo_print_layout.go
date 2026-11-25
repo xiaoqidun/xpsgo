@@ -260,12 +260,13 @@ type PrintLayoutOptions struct {
 }
 
 // PrintMedia 指定物理介质尺寸与可打印区域，单位为九十六分之一英寸；未指定宽高时回退票据或页面尺寸，ImageableArea为nil时采用整张介质
-// LandscapeReverse为true时将Landscape解释为逆时针270度，默认为逆时针90度
+// LandscapeReverse为true时将Landscape解释为逆时针270度，默认为逆时针90度；DefaultOnly为true时仅在票据未声明纸型时生效
 // PSCustomMediaSize采用进纸坐标系（宽为跨进纸方向，高为沿进纸方向，进纸指向负Y），PS偏移在缩放旋转后应用
 type PrintMedia struct {
 	Width, Height    float64
 	ImageableArea    *Rect
 	LandscapeReverse bool
+	DefaultOnly      bool
 }
 
 // PrintLayout 保存页面到物理介质的变换及裁剪区域，PageClip位于页面空间，MediaClip位于介质空间
@@ -371,8 +372,13 @@ func (s *printLayoutSettings) mediaSize(media *PrintMedia) (printMediaPlacement,
 			if media.Width == 0 {
 				return placement, fmt.Errorf("%w: roll media requires an explicit length", ErrUnsupported)
 			}
-			if !printCoordinateEqual(media.Width, width*printMicronUnit) {
-				return placement, fmt.Errorf("%w: physical roll width conflicts with print ticket", ErrInvalid)
+			rollWidth := width * printMicronUnit
+			if !printCoordinateEqual(media.Width, rollWidth) {
+				if !media.DefaultOnly {
+					return placement, fmt.Errorf("%w: physical roll width conflicts with print ticket", ErrInvalid)
+				}
+				media.ImageableArea = nil
+				media.Width = rollWidth
 			}
 			return placement, nil
 		}
@@ -424,7 +430,7 @@ func (s *printLayoutSettings) postScriptMedia(option *PrintSetting, media *Print
 	return placement, nil
 }
 
-// printSetMediaSize 将正微米尺寸换算为布局单位，并要求调用方显式尺寸与票据一致
+// printSetMediaSize 将正微米尺寸换算为布局单位，非DefaultOnly时要求调用方显式尺寸与票据一致
 // 入参: media 待确定的介质, width, height 票据微米尺寸
 // 返回: error 非正尺寸或物理介质冲突错误
 func printSetMediaSize(media *PrintMedia, width, height float64) error {
@@ -433,7 +439,10 @@ func printSetMediaSize(media *PrintMedia, width, height float64) error {
 	}
 	width, height = width*printMicronUnit, height*printMicronUnit
 	if media.Width > 0 && (!printCoordinateEqual(media.Width, width) || !printCoordinateEqual(media.Height, height)) {
-		return fmt.Errorf("%w: physical media conflicts with print ticket", ErrInvalid)
+		if !media.DefaultOnly {
+			return fmt.Errorf("%w: physical media conflicts with print ticket", ErrInvalid)
+		}
+		media.ImageableArea = nil
 	}
 	media.Width, media.Height = width, height
 	return nil
@@ -1085,7 +1094,48 @@ func printLayoutGeometryFeature(name xml.Name) bool {
 	return false
 }
 
-// validatePrintLayoutFeatures 校验有效票据不含单页布局未支持的Feature，开启ignoreUnsupported时跳过设备控制Feature
+// printLayoutNoOpSheetFeature 判断插页类Feature是否仅选定了公共恒等无操作选项（NoCover或None）
+// 入参: feature 待检查的Feature元素
+// 返回: bool 是否为安全可跳过的恒等无操作插页设置
+func printLayoutNoOpSheetFeature(feature PrintSetting) bool {
+	if feature.Kind != PrintSettingFeature || !printPublicKeywordSpace(feature.Name.Space) {
+		return false
+	}
+	want := ""
+	switch feature.Name.Local {
+	case "JobPrimaryCoverFront", "JobPrimaryCoverBack", "DocumentCoverFront", "DocumentCoverBack":
+		want = "NoCover"
+	case "JobPrimaryBannerSheet", "DocumentBannerSheet", "JobErrorSheet":
+		want = "None"
+	default:
+		return false
+	}
+	var selected *PrintSetting
+	for index := range feature.Children {
+		child := &feature.Children[index]
+		if child.Kind == PrintSettingFeature {
+			return false
+		}
+		if child.Kind != PrintSettingOption {
+			continue
+		}
+		if selected != nil {
+			return false
+		}
+		selected = child
+	}
+	if selected == nil || !printPublicKeywordSpace(selected.Name.Space) || selected.Name.Local != want {
+		return false
+	}
+	for _, child := range selected.Children {
+		if child.Kind != PrintSettingProperty {
+			return false
+		}
+	}
+	return true
+}
+
+// validatePrintLayoutFeatures 校验有效票据不含单页布局未支持的Feature，开启ignoreUnsupported时跳过设备控制及恒等无操作插页Feature
 // 入参: settings 有效票据, ignoreUnsupported 是否忽略不影响几何与拼版的设备控制Feature
 // 返回: error 未支持设置错误
 func validatePrintLayoutFeatures(settings *PrintSettings, ignoreUnsupported bool) error {
@@ -1102,7 +1152,7 @@ func validatePrintLayoutFeatures(settings *PrintSettings, ignoreUnsupported bool
 		switch value.Name.Local {
 		case "PageMediaSize", "PageOrientation", "PageScaling", "PageMirrorImage", "PageBorderless":
 		default:
-			if ignoreUnsupported && !printLayoutGeometryFeature(value.Name) {
+			if ignoreUnsupported && (!printLayoutGeometryFeature(value.Name) || printLayoutNoOpSheetFeature(value)) {
 				continue
 			}
 			return fmt.Errorf("%w: print rendering feature %s", ErrUnsupported, value.Name.Local)
@@ -1169,7 +1219,14 @@ func (s *printLayoutSettings) binding(name string) (PrintFinishing, bool, error)
 	return PrintFinishing{Binding: method, Gutter: width * printMicronUnit}, true, nil
 }
 
-// printBindingGutter 计算装订留白与可打印区域的交集，背面按双面翻页方向镜像物理装订边
+// printBackRotates 判断给定双面翻页方向与物理纸面宽高下背面是否需要施加180度旋转
+// 入参: duplex 双面打印模式, width, height 物理纸面宽高
+// 返回: bool 背面是否需旋转180度
+func printBackRotates(duplex PrintDuplex, width, height float64) bool {
+	return duplex == PrintDuplexLongEdge && width > height || duplex == PrintDuplexShortEdge && height > width
+}
+
+// printBindingGutter 计算装订留白与可打印区域的交集，背面按与BackFlipTransform一致的翻页轴镜像物理装订边
 // 入参: finishing 装订设置, side 物理纸面, duplex 双面方向, back 是否为背面
 // 返回: *Rect 实际禁止落墨的纸面区域，未相交或宽度为零时为nil
 func printBindingGutter(finishing PrintFinishing, side PrintSide, duplex PrintDuplex, back bool) *Rect {
@@ -1177,16 +1234,15 @@ func printBindingGutter(finishing PrintFinishing, side PrintSide, duplex PrintDu
 		return nil
 	}
 	method := finishing.Binding
-	if back {
-		landscape := side.Width > side.Height
-		if duplex == PrintDuplexLongEdge && !landscape || duplex == PrintDuplexShortEdge && landscape {
+	if back && duplex != PrintSimplex {
+		if !printBackRotates(duplex, side.Width, side.Height) {
 			switch method {
 			case PrintBindingLeft, PrintBindingStitchLeft:
 				method = PrintBindingRight
 			case PrintBindingRight, PrintBindingStitchRight:
 				method = PrintBindingLeft
 			}
-		} else if duplex == PrintDuplexShortEdge && !landscape || duplex == PrintDuplexLongEdge && landscape {
+		} else {
 			switch method {
 			case PrintBindingTop, PrintBindingStitchTop:
 				method = PrintBindingBottom

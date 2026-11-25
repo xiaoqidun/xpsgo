@@ -81,15 +81,27 @@ type printSideXMLLoader struct {
 	dictionaries  map[string]*xmlElement
 }
 
+// PrintWatermarkLayout 保存水印在源页坐标系中的定位矩阵、真实墨迹包围盒、字号、字形定位与合并矢量轮廓
+type PrintWatermarkLayout struct {
+	Transform Matrix
+	InkBounds Rect
+	FontSize  float64
+	Glyphs    []GlyphPosition
+	Geometry  *Geometry
+}
+
 // printWatermarkRenderer 保存源页水印的字体缓存与累计几何物化预算
 type printWatermarkRenderer struct {
-	fonts     *fontCache
-	options   *PrintWatermarkOptions
-	context   context.Context
-	glyphs    int
-	edges     int
-	resources int
-	work      uint64
+	fonts          *fontCache
+	options        *PrintWatermarkOptions
+	context        context.Context
+	glyphs         int
+	edges          int
+	resources      int
+	work           uint64
+	externalFont   *fontSource
+	externalLoaded bool
+	externalErr    error
 }
 
 // printResourceKind 区分独立ICC配置文件和由打印消费者解释的辅助内容
@@ -427,6 +439,43 @@ func (l *printSideXMLLoader) read(part string, dictionary bool) (*xmlElement, er
 	return root, nil
 }
 
+// LayoutPrintWatermark 按外部字体字节计算水印在源页坐标系中的定位矩阵、墨迹包围盒、字形定位与合并矢量轮廓
+// options须提供FontData字节（可选CollectionIndex、ImageableOrigin及Layout回调），同时设置FontURI返回ErrInvalid
+// 入参: ctx 取消Context，nil采用Background, watermark 水印描述, options 外部字体及水印原点配置
+// 返回: *PrintWatermarkLayout 水印矢量布局结果, error 参数、字体、排版、预算或取消错误
+func LayoutPrintWatermark(ctx context.Context, watermark PrintWatermark, options *PrintWatermarkOptions) (*PrintWatermarkLayout, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := validatePrintWatermarkDescriptor(watermark); err != nil {
+		return nil, err
+	}
+	if options == nil {
+		return nil, fmt.Errorf("%w: LayoutPrintWatermark requires FontData", ErrUnsupported)
+	}
+	if options.FontURI != "" && len(options.FontData) > 0 {
+		return nil, fmt.Errorf("%w: watermark options cannot specify both FontURI and FontData", ErrInvalid)
+	}
+	if len(options.FontData) == 0 {
+		if options.FontURI != "" {
+			return nil, fmt.Errorf("%w: LayoutPrintWatermark requires FontData", ErrUnsupported)
+		}
+		if options.FontData != nil {
+			return nil, fmt.Errorf("%w: empty watermark font data", ErrInvalid)
+		}
+		return nil, fmt.Errorf("%w: LayoutPrintWatermark requires FontData", ErrUnsupported)
+	}
+	settings := defaultSceneRenderOptions()
+	settings.context = ctx
+	renderer := newPrintWatermarkRenderer(nil, options, settings)
+	_, layout, err := renderer.materialize("", watermark, true)
+	if err != nil {
+		return nil, err
+	}
+	return layout, nil
+}
+
 // newPrintWatermarkRenderer 创建单次打印操作的水印物化器，不提前校验未使用的配置
 // 入参: r 持有读锁的阅读器, options 显式字体及内容原点配置, settings 绘制预算和取消Context
 // 返回: *printWatermarkRenderer 串行使用且字体缓存不跨请求共享的物化器
@@ -437,8 +486,11 @@ func newPrintWatermarkRenderer(r *Reader, options *PrintWatermarkOptions, settin
 	}
 	var configuration *PrintWatermarkOptions
 	if options != nil {
-		copy := *options
-		configuration = &copy
+		copied := *options
+		if options.FontData != nil {
+			copied.FontData = slices.Clone(options.FontData)
+		}
+		configuration = &copied
 	}
 	return &printWatermarkRenderer{fonts: fonts, options: configuration, context: settings.context, glyphs: settings.glyphs, edges: settings.edges, resources: settings.elements, work: settings.work}
 }
@@ -459,46 +511,137 @@ func (r *printWatermarkRenderer) elements(part string, elements []Element, water
 		return elements, nil
 	}
 	mark := *watermark
-	if err := validatePrintWatermarkDescriptor(mark); err != nil {
+	canvas, _, err := r.materialize(part, mark, false)
+	if err != nil {
 		return nil, err
+	}
+	if err := r.charge(uint64(len(elements)) + 1); err != nil {
+		return nil, err
+	}
+	result := make([]Element, 0, len(elements)+1)
+	if mark.Layer == PrintWatermarkUnderlay {
+		result = append(result, canvas)
+	}
+	result = append(result, elements...)
+	if mark.Layer == PrintWatermarkOverlay {
+		result = append(result, canvas)
+	}
+	return result, nil
+}
+
+// watermarkCanvas 独立物化源页水印为单层Canvas并返回叠放层级，不合并原页面元素
+// 入参: part 源页面部件, watermark 水印描述
+// 返回: *Canvas 水印独立画布, PrintWatermarkLayer 叠放层级, error 描述、字体、排版、预算或取消错误
+func (r *printWatermarkRenderer) watermarkCanvas(part string, watermark *PrintWatermark) (*Canvas, PrintWatermarkLayer, error) {
+	if watermark == nil {
+		return nil, PrintWatermarkLayerUnknown, nil
+	}
+	mark := *watermark
+	canvas, _, err := r.materialize(part, mark, false)
+	if err != nil {
+		return nil, PrintWatermarkLayerUnknown, err
+	}
+	return canvas, mark.Layer, nil
+}
+
+// loadWatermarkFont 按已经由materialize校验过的FontData或包内FontURI加载并缓存水印字体
+// 入参: part 源页面部件URI，用于解析相对FontURI
+// 返回: *fontSource 只读字体源, string 规范化字体部件URI（外部字体为空）, error 配置、字体或预算错误
+func (r *printWatermarkRenderer) loadWatermarkFont(part string) (*fontSource, string, error) {
+	if len(r.options.FontData) > 0 {
+		if r.externalLoaded {
+			return r.externalFont, "", r.externalErr
+		}
+		if len(r.fonts.faces) >= r.fonts.maxFaces || r.fonts.remaining < 0 || int64(len(r.options.FontData)) > r.fonts.remaining {
+			return nil, "", fmt.Errorf("%w: watermark font budget", ErrLimit)
+		}
+		face, err := parseFontFace(r.options.FontData, r.options.CollectionIndex)
+		if err != nil {
+			r.externalLoaded, r.externalErr = true, err
+			return nil, "", err
+		}
+		source, err := newFontSource(face)
+		if err != nil {
+			r.externalLoaded, r.externalErr = true, err
+			return nil, "", err
+		}
+		r.fonts.remaining -= int64(len(r.options.FontData))
+		r.fonts.maxFaces--
+		r.externalFont, r.externalLoaded = source, true
+		return source, "", nil
+	}
+	uri, index, hasIndex, err := ParseFontURI(r.options.FontURI)
+	if err != nil {
+		return nil, "", fmt.Errorf("watermark font URI: %w", err)
+	}
+	if !hasIndex && r.options.CollectionIndex != 0 {
+		index, hasIndex = r.options.CollectionIndex, true
+	} else if hasIndex && r.options.CollectionIndex != 0 && index != r.options.CollectionIndex {
+		return nil, "", fmt.Errorf("%w: conflicting watermark collection index", ErrInvalid)
+	}
+	fontPart, err := resolvePart(part, uri)
+	if err != nil {
+		return nil, "", fmt.Errorf("watermark font part: %w", err)
+	}
+	if r.fonts.pkg == nil {
+		return nil, "", fmt.Errorf("%w: watermark reader", ErrInvalid)
+	}
+	source, err := r.fonts.load(&Glyphs{ElementProperties: ElementProperties{Part: part, Opacity: 1}, FontURI: r.options.FontURI, FontPart: fontPart, CollectionIndex: index, HasCollectionIndex: hasIndex})
+	if err != nil {
+		return nil, "", err
+	}
+	return source, fontPart, nil
+}
+
+// watermarkFontError 在存在包内字体部件时包装为带位置信息的PartError
+// 入参: fontPart 字体部件URI，外部字体为空, err 原始错误
+// 返回: error 包装后的错误
+func watermarkFontError(fontPart string, err error) error {
+	if err == nil || fontPart == "" {
+		return err
+	}
+	return &PartError{Part: fontPart, Element: "Glyphs", Err: err}
+}
+
+// materialize 完成水印字形布局、墨迹定位与轮廓物化，并按需导出合并几何及源页包围盒
+// 入参: part 源页面部件URI, mark 水印值副本, wantLayout 是否同时构建PrintWatermarkLayout
+// 返回: *Canvas 水印画布, *PrintWatermarkLayout 可选水印矢量布局, error 描述、字体、排版、预算或取消错误
+func (r *printWatermarkRenderer) materialize(part string, mark PrintWatermark, wantLayout bool) (*Canvas, *PrintWatermarkLayout, error) {
+	if err := validatePrintWatermarkDescriptor(mark); err != nil {
+		return nil, nil, err
 	}
 	if err := r.charge(0); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if r.options == nil || r.options.FontURI == "" {
-		return nil, fmt.Errorf("%w: watermark needs an explicit package font and imageable origin", ErrUnsupported)
+	if r.options == nil || (r.options.FontURI == "" && len(r.options.FontData) == 0) {
+		if r.options != nil && r.options.FontData != nil {
+			return nil, nil, fmt.Errorf("%w: empty watermark font data", ErrInvalid)
+		}
+		return nil, nil, fmt.Errorf("%w: watermark needs an explicit package font or FontData and imageable origin", ErrUnsupported)
 	}
-	if !geometryFinite(r.options.ImageableOrigin.X, r.options.ImageableOrigin.Y) || !utf8.ValidString(r.options.FontURI) {
-		return nil, fmt.Errorf("%w: watermark configuration", ErrInvalid)
+	if r.options.FontURI != "" && len(r.options.FontData) > 0 {
+		return nil, nil, fmt.Errorf("%w: watermark options cannot specify both FontURI and FontData", ErrInvalid)
+	}
+	if !geometryFinite(r.options.ImageableOrigin.X, r.options.ImageableOrigin.Y) || (r.options.FontURI != "" && !utf8.ValidString(r.options.FontURI)) {
+		return nil, nil, fmt.Errorf("%w: watermark configuration", ErrInvalid)
 	}
 	if r.options.Layout == nil {
 		count := utf8.RuneCountInString(mark.Text)
 		if count > r.glyphs || uint64(count) > r.work/2 {
-			return nil, fmt.Errorf("%w: watermark nominal layout capacity", ErrLimit)
+			return nil, nil, fmt.Errorf("%w: watermark nominal layout capacity", ErrLimit)
 		}
 	}
-	uri, index, hasIndex, err := ParseFontURI(r.options.FontURI)
+	source, fontPart, err := r.loadWatermarkFont(part)
 	if err != nil {
-		return nil, fmt.Errorf("watermark font URI: %w", err)
-	}
-	fontPart, err := resolvePart(part, uri)
-	if err != nil {
-		return nil, fmt.Errorf("watermark font part: %w", err)
-	}
-	if r.fonts.pkg == nil {
-		return nil, fmt.Errorf("%w: watermark reader", ErrInvalid)
-	}
-	glyphs := &Glyphs{ElementProperties: ElementProperties{Part: part, Opacity: 1}, FontURI: r.options.FontURI, FontPart: fontPart, CollectionIndex: index, HasCollectionIndex: hasIndex, FontRenderingEmSize: mark.FontSize, Text: mark.Text}
-	source, err := r.fonts.load(glyphs)
-	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := r.charge(0); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	glyphs := &Glyphs{ElementProperties: ElementProperties{Part: part, Opacity: 1}, FontURI: r.options.FontURI, FontPart: fontPart, CollectionIndex: r.options.CollectionIndex, FontRenderingEmSize: mark.FontSize, Text: mark.Text}
 	glyphs.Indices, err = r.layout(mark, source)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var run *glyphRun
 	bitmapOnly := fontIsBitmapOnly(source.face)
@@ -509,7 +652,7 @@ func (r *printWatermarkRenderer) elements(part string, elements []Element, water
 		if bitmapOnly {
 			bitmapSelection, err = r.bitmapStrike(source, mark.FontSize, glyphs.IsSideways)
 			if err != nil {
-				return nil, &PartError{Part: fontPart, Element: "Glyphs", Err: err}
+				return nil, nil, watermarkFontError(fontPart, err)
 			}
 			allowance := int(min(r.work, uint64(^uint(0)>>1)))
 			bitmapDecoder = fontBitmapDecode{font: source.bitmaps, strike: &source.bitmaps.strikes[bitmapSelection.strike], path: make(map[uint16]bool), cache: make(map[uint16]fontBitmapDecoded), components: min(fontBitmapMaxComponents, allowance), pixels: min(fontBitmapMaxPixels, allowance)}
@@ -538,13 +681,13 @@ func (r *printWatermarkRenderer) elements(part string, elements []Element, water
 			return nil
 		})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	} else {
 		run = &glyphRun{}
 	}
 	if err := r.resource(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	brush := &Brush{Kind: BrushSolidColor, Part: part, Opacity: 1, Color: Color{Space: ColorSRGB, Alpha: 1, Components: []float64{float64(mark.Color.R) / 255, float64(mark.Color.G) / 255, float64(mark.Color.B) / 255}}}
 	var paths []Element
@@ -554,7 +697,7 @@ func (r *printWatermarkRenderer) elements(part string, elements []Element, water
 		if bitmapOnly {
 			items, left, present, err := r.bitmapGlyphPaths(source, bitmapSelection, &bitmapDecoder, glyph, run.sideways, part, brush)
 			if err != nil {
-				return nil, &PartError{Part: fontPart, Element: "Glyphs", Err: err}
+				return nil, nil, watermarkFontError(fontPart, err)
 			}
 			paths = append(paths, items...)
 			if present {
@@ -568,7 +711,7 @@ func (r *printWatermarkRenderer) elements(part string, elements []Element, water
 		}
 		geometry, err := r.outline(source, glyph.gid)
 		if err != nil {
-			return nil, &PartError{Part: fontPart, Element: "Glyphs", Err: err}
+			return nil, nil, watermarkFontError(fontPart, err)
 		}
 		figures := geometry.Figures[:0]
 		var minX, maxY float64
@@ -576,7 +719,7 @@ func (r *printWatermarkRenderer) elements(part string, elements []Element, water
 			if figure.IsFilled && len(figure.Segments) != 0 {
 				box, err := (&Geometry{Figures: []GeometryFigure{figure}}).Bounds()
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				if box.Width == 0 || box.Height == 0 {
 					continue
@@ -596,7 +739,7 @@ func (r *printWatermarkRenderer) elements(part string, elements []Element, water
 		geometry.Figures = figures
 		left := glyph.matrix.Transform(Point{X: minX, Y: maxY})
 		if !geometryFinite(left.X, left.Y) {
-			return nil, fmt.Errorf("%w: watermark ink position", ErrLimit)
+			return nil, nil, fmt.Errorf("%w: watermark ink position", ErrLimit)
 		}
 		if !hasInk {
 			ink, hasInk = left, true
@@ -604,7 +747,7 @@ func (r *printWatermarkRenderer) elements(part string, elements []Element, water
 			ink.X, ink.Y = min(ink.X, left.X), min(ink.Y, left.Y)
 		}
 		if err := r.resource(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		matrix := glyph.matrix
 		paths = append(paths, &Path{ElementProperties: ElementProperties{Part: part, Opacity: 1, RenderTransform: &matrix}, Data: &geometry, Fill: brush})
@@ -613,28 +756,59 @@ func (r *printWatermarkRenderer) elements(part string, elements []Element, water
 	rotation := Matrix{A: cosine, B: -sine, C: sine, D: cosine, E: r.options.ImageableOrigin.X + mark.Origin.X, F: r.options.ImageableOrigin.Y + mark.Origin.Y}
 	matrix := rotation.Mul(Matrix{A: 1, D: 1, E: -ink.X, F: -ink.Y})
 	if !geometryFillMatrixFinite(matrix) {
-		return nil, fmt.Errorf("%w: watermark positioning transform", ErrLimit)
+		return nil, nil, fmt.Errorf("%w: watermark positioning transform", ErrLimit)
 	}
 	alpha := float64(mark.Color.A) / 255
 	if mark.HasTransparency {
 		alpha *= 1 - mark.Transparency/100
 	}
 	if err := r.resource(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	canvas := &Canvas{ElementProperties: ElementProperties{Part: part, Opacity: alpha, RenderTransform: &matrix}, Elements: paths}
-	if err := r.charge(uint64(len(elements)) + 1); err != nil {
-		return nil, err
+	var layout *PrintWatermarkLayout
+	if wantLayout {
+		positions := make([]GlyphPosition, 0, len(run.glyphs))
+		for _, glyph := range run.glyphs {
+			pos, err := contentGlyphPosition(glyph, matrix, run.rtl, run.sideways)
+			if err != nil {
+				return nil, nil, err
+			}
+			positions = append(positions, pos)
+		}
+		merged := &Geometry{FillRule: GeometryNonZero}
+		for _, item := range paths {
+			p := item.(*Path)
+			copied := Geometry{FillRule: p.Data.FillRule, Figures: make([]GeometryFigure, len(p.Data.Figures))}
+			for i, fig := range p.Data.Figures {
+				fig.Segments = slices.Clone(fig.Segments)
+				copied.Figures[i] = fig
+			}
+			combined := strokePathCompose(matrix, *p.RenderTransform)
+			if !geometryFillMatrixFinite(combined) {
+				return nil, nil, fmt.Errorf("%w: watermark outline transform", ErrLimit)
+			}
+			if err := fontTransformOutline(&copied, combined); err != nil {
+				return nil, nil, err
+			}
+			merged.Figures = append(merged.Figures, copied.Figures...)
+		}
+		var inkBounds Rect
+		if len(merged.Figures) > 0 {
+			inkBounds, err = merged.Bounds()
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		layout = &PrintWatermarkLayout{
+			Transform: matrix,
+			InkBounds: inkBounds,
+			FontSize:  mark.FontSize,
+			Glyphs:    positions,
+			Geometry:  merged,
+		}
 	}
-	result := make([]Element, 0, len(elements)+1)
-	if mark.Layer == PrintWatermarkUnderlay {
-		result = append(result, canvas)
-	}
-	result = append(result, elements...)
-	if mark.Layer == PrintWatermarkOverlay {
-		result = append(result, canvas)
-	}
-	return result, nil
+	return canvas, layout, nil
 }
 
 // validatePrintWatermarkDescriptor 独立校验公开水印值，不假定其一定来自票据解析器
@@ -1172,7 +1346,7 @@ func (c *printResourceCollector) collect() ([]printResourceReference, error) {
 			if err := c.reserve(int64(len(path)) * 8); err != nil {
 				return nil, err
 			}
-			c.parameters[element.Name] = path
+			c.parameters[printCanonicalKey(element.Name)] = path
 		}
 	}
 	for i := range c.document.model.Elements {
@@ -1330,7 +1504,7 @@ func (c *printResourceCollector) inScope(name xml.Name) bool {
 // 入参: name 实际参数名称, kind 标准位置确定的资源用途
 // 返回: error 未初始化参数、定义、资源或预算错误
 func (c *printResourceCollector) parameter(name xml.Name, kind printResourceKind) error {
-	path, exists := c.parameters[name]
+	path, exists := c.parameters[printCanonicalKey(name)]
 	if !exists {
 		return fmt.Errorf("%w: print resource parameter {%s}%s is not initialized", ErrUnsupported, name.Space, name.Local)
 	}

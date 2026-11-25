@@ -1043,7 +1043,7 @@ func (c *sceneColorCache) profileResolved(part string, ctx context.Context) (res
 	if err != nil {
 		return nil, false, err
 	}
-	if !strings.EqualFold(media, "application/vnd.ms-color.iccprofile") {
+	if !requiredResourceMedia(requiredProfile, media) {
 		return nil, false, fmt.Errorf("%w: color profile content type %q", ErrInvalid, media)
 	}
 	data, err := c.pkg.readPart(part)

@@ -768,7 +768,7 @@ func fixedContentType(kind string) string {
 	return "application/vnd.ms-package.xps-" + kind + "+xml"
 }
 
-// xmlNumber 解析XML实数词法，不接受非有限值或Go专用数值语法
+// xmlNumber 解析XML Schema实数词法，支持尾随小数点，不接受无数字小数点、非有限值或Go专用数值语法
 // 入参: text 属性文本
 // 返回: float64 数值, error 错误信息
 func xmlNumber(text string) (float64, error) {
@@ -776,16 +776,45 @@ func xmlNumber(text string) (float64, error) {
 	if text == "" {
 		return 0, fmt.Errorf("%w: empty number", ErrInvalid)
 	}
-	for _, c := range text {
-		if c != '+' && c != '-' && c != '.' && c != 'e' && c != 'E' && (c < '0' || c > '9') {
-			return 0, fmt.Errorf("%w: invalid number %q", ErrInvalid, text)
+	i := 0
+	if text[i] == '+' || text[i] == '-' {
+		i++
+	}
+	intStart := i
+	for i < len(text) && text[i] >= '0' && text[i] <= '9' {
+		i++
+	}
+	intDigits := i - intStart
+	fracDigits := 0
+	if i < len(text) && text[i] == '.' {
+		i++
+		fracStart := i
+		for i < len(text) && text[i] >= '0' && text[i] <= '9' {
+			i++
+		}
+		fracDigits = i - fracStart
+	}
+	if intDigits == 0 && fracDigits == 0 {
+		return 0, fmt.Errorf("%w: invalid number %q", ErrInvalid, text)
+	}
+	if i < len(text) && (text[i] == 'e' || text[i] == 'E') {
+		i++
+		if i < len(text) && (text[i] == '+' || text[i] == '-') {
+			i++
+		}
+		expStart := i
+		for i < len(text) && text[i] >= '0' && text[i] <= '9' {
+			i++
+		}
+		if i == expStart {
+			return 0, fmt.Errorf("%w: invalid exponent in %q", ErrInvalid, text)
 		}
 	}
-	if dot := strings.IndexByte(text, '.'); dot >= 0 && (dot+1 == len(text) || text[dot+1] < '0' || text[dot+1] > '9') {
-		return 0, fmt.Errorf("%w: missing fractional digits in %q", ErrInvalid, text)
+	if i != len(text) {
+		return 0, fmt.Errorf("%w: invalid number %q", ErrInvalid, text)
 	}
 	value, err := strconv.ParseFloat(text, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
 		return 0, fmt.Errorf("%w: invalid number %q", ErrInvalid, text)
 	}
 	return value, nil

@@ -24,13 +24,14 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 )
 
 // StreamPage 表示前向流读取中资源已就绪的临时页面视图，Index为零基全局页号，DocumentPart为所属文档URI
-// Page、Walk、Font、Image、PrintTicketHierarchy、PrintSettings、PrintColorPlan、Render与RenderDevice仅在OnPage回调期间可用
-// 回调结束后视图自动关闭，返回的页面数据、资源及图像独立于视图；Read成功前均为临时结果
+// Page、Walk、Font、Image、ReadPart、ColorProfile、PrintTicketHierarchy、PrintSettings、PrintColorPlan、PrintLayout、CoreProperties、DocumentStructure、Render与RenderDevice仅在OnPage回调期间可用
+// 回调结束后视图自动关闭，返回的页面数据、资源及图像独立于视图；Read或ConsumeStream成功前均为临时结果
 type StreamPage struct {
 	Index        int
 	DocumentPart string
@@ -38,9 +39,11 @@ type StreamPage struct {
 	view         *streamPageView
 }
 
-// streamPageView 保存临时页面视图的只读阅读器、页号、文档位置与流取消Context
+// streamPageView 保存临时页面视图的只读阅读器、方言、页号、文档位置、所属流状态与流取消Context
 type streamPageView struct {
 	reader        *Reader
+	owner         *streamPackage
+	format        Format
 	index         int
 	documentIndex int
 	pageIndex     int
@@ -106,6 +109,15 @@ func (p *StreamPage) Part() string {
 		return ""
 	}
 	return p.Reference.Part
+}
+
+// Format 返回当前文档的XPS或OpenXPS方言，无效或未初始化返回FormatUnknown
+// 返回: Format 文档方言
+func (p *StreamPage) Format() Format {
+	if p == nil || p.view == nil {
+		return FormatUnknown
+	}
+	return p.view.format
 }
 
 // lockReader 校验临时页面视图并获取读锁与合并后的Context，成功时调用方须立即通过Defer执行清理函数
@@ -215,6 +227,51 @@ func (p *StreamPage) Image(ctx context.Context, part string, options *ImageOptio
 	return r.Image(imageCtx, part, options)
 }
 
+// ReadPart 按安全受限方式读取已到达的任意包内部件原始字节，未到达部件返回ErrNotFound，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context, name 部件包根URI
+// 返回: []byte 独立部件字节, error URI、不存在、预算、取消或关闭错误
+func (p *StreamPage) ReadPart(ctx context.Context, name string) ([]byte, error) {
+	r, partCtx, release, err := p.lockReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if err := checkContext(partCtx); err != nil {
+		return nil, err
+	}
+	return r.pkg.readPartContext(partCtx, name)
+}
+
+// ColorProfile 相对当前页部件解析URI并读取已到达ICC配置部件原始字节，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context, uri 相对或包根ICC配置URI
+// 返回: []byte 独立ICC配置字节, error URI、类型、不存在、预算、取消或关闭错误
+func (p *StreamPage) ColorProfile(ctx context.Context, uri string) ([]byte, error) {
+	r, profileCtx, release, err := p.lockReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if err := checkContext(profileCtx); err != nil {
+		return nil, err
+	}
+	part, err := resolvePart(p.Reference.Part, uri)
+	if err != nil {
+		return nil, err
+	}
+	media, err := r.pkg.contentType(part)
+	if err != nil {
+		return nil, &PartError{Part: part, Err: err}
+	}
+	if !requiredResourceMedia(requiredProfile, media) {
+		return nil, &PartError{Part: part, Err: fmt.Errorf("%w: unexpected color profile content type %q", ErrInvalid, media)}
+	}
+	data, err := r.pkg.readPartContext(profileCtx, part)
+	if err != nil {
+		return nil, &PartError{Part: part, Err: err}
+	}
+	return data, nil
+}
+
 // PrintSettings 在回调期间合并基础设置与当前临时页的三级PrintTicket，不修改输入设置
 // 未指定Context时沿用流读取Context并同时响应两者取消信号，回调完成后返回ErrClosed
 // 入参: ctx 取消Context，nil沿用流读取Context, defaults 基础设置，nil为空设置, options 输出作用域及资源参数
@@ -225,7 +282,7 @@ func (p *StreamPage) PrintSettings(ctx context.Context, defaults *PrintSettings,
 		return nil, err
 	}
 	defer release()
-	return r.streamReadPrintSettings(settingsCtx, p.view.index, defaults, options)
+	return r.streamReadPrintSettingsCached(settingsCtx, p.view.index, defaults, options, p.view.owner)
 }
 
 // PrintColorPlan 在回调期间解析当前临时页生效的颜色管理计划，未声明时返回nil
@@ -238,12 +295,93 @@ func (p *StreamPage) PrintColorPlan(ctx context.Context, defaults *PrintSettings
 		return nil, err
 	}
 	defer release()
-	settings, err := r.streamReadPrintSettings(colorCtx, p.view.index, defaults, options)
+	settings, err := r.streamReadPrintSettingsCached(colorCtx, p.view.index, defaults, options, p.view.owner)
 	if err != nil {
 		return nil, err
 	}
 	_, result, err := printColorPlanSettings(colorCtx, settings, options)
 	return result, err
+}
+
+// PrintLayout 基于当前临时页已合并有效票据直接计算物理打印布局，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context, options 基础票据、介质及解析预算，nil采用默认值
+// 返回: *PrintLayout 独立打印布局, error 页面、票据、设置、预算、取消或关闭错误
+func (p *StreamPage) PrintLayout(ctx context.Context, options *PrintLayoutOptions) (*PrintLayout, error) {
+	r, layoutCtx, release, err := p.lockReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if err := checkContext(layoutCtx); err != nil {
+		return nil, err
+	}
+	configuration := DefaultPrintLayoutOptions()
+	if options != nil {
+		configuration = *options
+	}
+	if configuration.Settings.Scope != PrintScopeUnknown {
+		return nil, fmt.Errorf("%w: scope on print page layout", ErrInvalid)
+	}
+	settings, err := r.streamReadPrintSettingsCached(layoutCtx, p.view.index, configuration.Defaults, &configuration.Settings, p.view.owner)
+	if err != nil {
+		return nil, err
+	}
+	page, err := r.readPageHeader(p.view.index, nil, layoutCtx)
+	if err != nil {
+		return nil, err
+	}
+	effective := settings
+	if configuration.IgnoreUnsupportedFeatures {
+		effective = printStripPrivateExtensions(settings)
+	}
+	return effective.Layout(layoutCtx, page, configuration.Media, &configuration.Settings)
+}
+
+// CoreProperties 返回已到达的包级核心属性独立副本，未关联或尚未到达时返回nil，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context
+// 返回: *CoreProperties 独立核心属性或nil, error 关系、格式、预算、取消或关闭错误
+func (p *StreamPage) CoreProperties(ctx context.Context) (*CoreProperties, error) {
+	r, propsCtx, release, err := p.lockReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if err := checkContext(propsCtx); err != nil {
+		return nil, err
+	}
+	if p.view.owner != nil && p.view.owner.corePropsCached != nil {
+		return cloneCoreProperties(p.view.owner.corePropsCached), nil
+	}
+	props, _, err := r.streamReadCorePropertiesIfPresent(propsCtx)
+	return props, err
+}
+
+// DocumentStructure 返回当前页所属文档已到达的文档结构独立副本，未关联或尚未到达时返回nil，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context
+// 返回: *DocumentStructure 独立文档结构或nil, error 关系、格式、预算、取消或关闭错误
+func (p *StreamPage) DocumentStructure(ctx context.Context) (*DocumentStructure, error) {
+	r, structCtx, release, err := p.lockReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if err := checkContext(structCtx); err != nil {
+		return nil, err
+	}
+	docIdx := p.view.documentIndex
+	if p.view.owner != nil && p.view.owner.docStructCached != nil {
+		if cached := p.view.owner.docStructCached[docIdx]; cached != nil {
+			return cloneDocumentStructure(cached), nil
+		}
+	}
+	pageLimit := math.MaxInt32
+	if p.view.owner == nil || docIdx < p.view.owner.document {
+		if docIdx >= 0 && docIdx < len(r.documents) {
+			pageLimit = len(r.documents[docIdx].Pages)
+		}
+	}
+	ds, _, _, err := r.streamReadDocumentStructureIfPresent(structCtx, p.DocumentPart, pageLimit)
+	return ds, err
 }
 
 // Render 使用文档引擎现有渲染器绘制当前页面，不重新封装ZIP或另行解释页面语义
@@ -276,7 +414,7 @@ func (p *StreamPage) RenderDevice(ctx context.Context, device *DeviceColorTarget
 // registerPagePart 将完整部件接入前向读取后端，原始部件保存物理范围并释放已结束页面的增量树
 // 入参: part 完整逻辑部件
 func (p *streamPackage) registerPagePart(part *streamPart) {
-	if p.options.OnPage == nil {
+	if !p.needsIndex() || part.reclaimed {
 		return
 	}
 	p.preparePagePackage()
@@ -293,11 +431,11 @@ func (p *streamPackage) registerPagePart(part *streamPart) {
 
 // preparePagePackage 建立临时完整部件后端，并通过独立关系快照支持未结束的元数据，不伪造完整部件
 func (p *streamPackage) preparePagePackage() {
-	if p.options.OnPage != nil && p.pagePkg == nil {
+	if p.needsIndex() && p.pagePkg == nil {
 		p.pagePkg = &packageReader{limits: p.options.Limits, parts: make(map[string][]*zip.File), names: make(map[string]string), defaults: p.types.defaults, overrides: p.types.overrides, cache: p.cache}
 		p.pagePkg.open = func(key string) (io.ReadCloser, error) {
 			part := p.parts[key]
-			if part == nil || part.last < 0 || len(part.entries) != part.last+1 {
+			if part == nil || part.reclaimed || part.last < 0 || len(part.entries) != part.last+1 {
 				return nil, fmt.Errorf("%w: streamed part %s: %w", ErrNotFound, key, fs.ErrNotExist)
 			}
 			return p.partReader(part), nil
@@ -311,11 +449,11 @@ func (p *streamPackage) preparePagePackage() {
 	}
 }
 
-// emitPages 在元数据或页面依赖到达后按顺序提供可解析页面，未确认的缺失及关系错误留待最终校验
+// emitPages 在元数据或页面依赖到达后按顺序提供元数据回调与可解析页面，未确认的缺失及关系错误留待最终校验
 // 入参: name 到达部件名
 // 返回: error 预算、输入、取消、已确定结构或调用方回调错误
 func (p *streamPackage) emitPages(name string) error {
-	if p.options.OnPage == nil || p.pagePkg == nil {
+	if !p.needsIndex() || p.pagePkg == nil {
 		return nil
 	}
 	if err := checkContext(p.context); err != nil {
@@ -324,24 +462,35 @@ func (p *streamPackage) emitPages(name string) error {
 	if err := p.advanceRelationshipPart("/_rels/.rels"); err != nil {
 		return err
 	}
+	if err := p.emitMetadataCallbacks(); err != nil {
+		return err
+	}
 	if err := p.activateStreamIndex(); err != nil {
 		return err
 	}
 	if p.index == nil {
 		return nil
 	}
-	if err := p.updateDiscard(p.index); err != nil {
-		return err
-	}
-	if p.discard != nil && p.discard.checked && !p.discard.loaded {
-		if part := p.parts[strings.ToLower(p.discard.target)]; part != nil {
-			if err := p.advanceMetadataPart(part.name, "discard-control"); err != nil {
-				return err
+	if p.options.OnPage != nil {
+		if err := p.updateDiscard(p.index); err != nil {
+			return err
+		}
+		if p.discard != nil && p.discard.checked && !p.discard.loaded {
+			if part := p.parts[strings.ToLower(p.discard.target)]; part != nil {
+				if err := p.advanceMetadataPart(part.name, "discard-control"); err != nil {
+					return err
+				}
 			}
 		}
 	}
 	if err := p.advanceLayoutIndex(); err != nil {
 		return err
+	}
+	if err := p.emitMetadataCallbacks(); err != nil {
+		return err
+	}
+	if p.options.OnPage == nil {
+		return nil
 	}
 	if err := p.advancePageMarkup(); err != nil {
 		return err
@@ -349,14 +498,95 @@ func (p *streamPackage) emitPages(name string) error {
 	return p.emitReadyPages(name)
 }
 
-// emitReadyPages 按当前索引交付依赖完整的页面，不在词元回调期间推进其他XML解析状态
+// streamPageMissingResources 从页面已到达关系中收集当前缺失的必需资源部件键，避免每缺失一项重复全解析整页
+// 入参: index 待检查页面序号
+// 返回: []string 尚未到达的必需资源小写键列表
+func (p *streamPackage) streamPageMissingResources(index int) []string {
+	pagePart := p.index.pages[index].Part
+	relsKey := strings.ToLower(createdRelationshipPart(pagePart))
+	var relations []Relationship
+	if _, complete := p.pagePkg.parts[relsKey]; complete {
+		items, err := p.index.pkg.relationshipsContext(p.context, pagePart)
+		if err != nil {
+			return nil
+		}
+		relations = items
+	} else if relsPart := p.parts[relsKey]; relsPart != nil && relsPart.relations != nil && !relsPart.relations.deferred {
+		relations = relsPart.relations.items
+	} else {
+		return nil
+	}
+	requiredType := formatNamespace(p.index.format) + "/required-resource"
+	var missing []string
+	seen := make(map[string]bool)
+	for _, rel := range relations {
+		if rel.Type != requiredType || rel.TargetMode != TargetModeInternal {
+			continue
+		}
+		target, err := resolvePart(pagePart, rel.Target)
+		if err != nil {
+			return nil
+		}
+		key := strings.ToLower(target)
+		if _, exists := p.pagePkg.parts[key]; !exists && !seen[key] {
+			seen[key] = true
+			missing = append(missing, key)
+		}
+	}
+	return missing
+}
+
+// streamCollectResourceKeys 提取单页资源图中全部直接与间接必需资源的去重小写部件键
+// 入参: graph 页面资源图, format 文档方言
+// 返回: []string 规范资源部件键列表
+func streamCollectResourceKeys(graph *resourceGraph, format Format) []string {
+	if graph == nil {
+		return nil
+	}
+	resources, err := collectRequiredResources(graph, format)
+	if err != nil || len(resources) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(resources))
+	keys := make([]string, 0, len(resources))
+	for _, dep := range resources {
+		key := strings.ToLower(dep.Part)
+		if !seen[key] {
+			seen[key] = true
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// emitReadyPages 按当前索引交付依赖完整的页面，缓存缺失必需资源清单与已校验状态以消除重复全解析
 // 入参: name 当前到达或已消费的部件名
 // 返回: error 页面、资源、预算或回调错误
 func (p *streamPackage) emitReadyPages(name string) error {
+	if p.options.OnPage == nil || p.index == nil {
+		return nil
+	}
 	if err := p.releaseProcessed(); err != nil {
 		return err
 	}
-	if p.pageHold || len(p.pageWait) != 0 && !p.pageWait[strings.ToLower(name)] {
+	if p.pageHold {
+		return nil
+	}
+	nameKey := strings.ToLower(name)
+	if len(p.pageMissing) != 0 {
+		if p.pageMissing[nameKey] {
+			_, complete := p.pagePkg.parts[nameKey]
+			part := p.parts[nameKey]
+			relationUpdated := opcRelationshipName(nameKey) && part != nil && part.relations != nil && !part.relations.deferred
+			pageClosed := part != nil && part.page != nil && part.page.closed && !part.page.deferred
+			if complete || relationUpdated || pageClosed {
+				delete(p.pageMissing, nameKey)
+			}
+		}
+		if len(p.pageMissing) != 0 {
+			return nil
+		}
+	} else if len(p.pageWait) != 0 && !p.pageWait[nameKey] {
 		return nil
 	}
 	for p.pages < len(p.index.pages) {
@@ -367,18 +597,40 @@ func (p *streamPackage) emitReadyPages(name string) error {
 		if _, exists := p.pagePkg.parts[key]; !exists {
 			part := p.parts[key]
 			if part == nil || part.page == nil || !part.page.closed || part.page.deferred {
+				p.pageMissing = map[string]bool{key: true}
+				p.pageWait = nil
 				return nil
 			}
 		}
-		p.pageWait = make(map[string]bool)
-		if _, err := p.index.Page(p.context, p.pages); err != nil {
-			if errors.Is(err, ErrInvalid) || errors.Is(err, ErrUnsupported) || errors.Is(err, fs.ErrNotExist) {
-				p.pageHold = len(p.pageWait) == 0
+		if !p.pageValidated {
+			if missing := p.streamPageMissingResources(p.pages); len(missing) != 0 {
+				p.pageMissing = make(map[string]bool, len(missing))
+				for _, item := range missing {
+					p.pageMissing[item] = true
+				}
+				p.pageWait = nil
 				return nil
 			}
-			return err
+			p.pageWait = make(map[string]bool)
+			parsed, err := p.index.Page(p.context, p.pages)
+			if err != nil {
+				if errors.Is(err, ErrInvalid) || errors.Is(err, ErrUnsupported) || errors.Is(err, fs.ErrNotExist) {
+					if len(p.pageWait) == 0 {
+						p.pageHold = true
+					} else {
+						p.pageMissing = p.pageWait
+					}
+					p.pageWait = nil
+					return nil
+				}
+				p.pageWait = nil
+				return err
+			}
+			p.pageWait = nil
+			p.pageMissing = nil
+			p.pageValidated = true
+			p.pageResources = streamCollectResourceKeys(parsed.resources, p.index.format)
 		}
-		p.pageWait = nil
 		waits, hold, err := p.streamPageTicketsReady(p.pages)
 		if err != nil {
 			return err
@@ -398,14 +650,19 @@ func (p *streamPackage) emitReadyPages(name string) error {
 			return err
 		}
 		p.pages++
+		p.pageValidated = false
+		p.pageResources = nil
+		p.pageWait = nil
+		p.pageMissing = nil
 	}
 	return nil
 }
 
-// notifyPage 创建仅供本次回调使用的页面视图，关闭时等待正在进行的读取和渲染
+// notifyPage 创建仅供本次回调使用的页面视图，记录交付状态并在纯前向消费模式下回收已消费页面存储
 // 入参: source 当前文档索引, index 页面序号
 // 返回: error 回调或取消错误
 func (p *streamPackage) notifyPage(source *Reader, index int) error {
+	p.pageWait = nil
 	if err := p.startDiscard(source, index); err != nil {
 		return err
 	}
@@ -421,7 +678,23 @@ func (p *streamPackage) notifyPage(source *Reader, index int) error {
 	if err != nil {
 		return err
 	}
-	page := &StreamPage{Index: index, DocumentPart: docPart, Reference: reference, view: &streamPageView{reader: view, index: index, documentIndex: docIndex, pageIndex: pageIndex, context: p.context}}
+	pageKey := strings.ToLower(reference.Part)
+	_, partComplete := source.pkg.parts[pageKey]
+	relsPart := createdRelationshipPart(reference.Part)
+	_, relsComplete := source.pkg.parts[strings.ToLower(relsPart)]
+	relsCount := 0
+	if rels, relErr := source.pkg.relationshipsContext(p.context, reference.Part); relErr == nil {
+		relsCount = len(rels)
+	}
+	delivered := streamDeliveredPage{
+		partComplete:  partComplete,
+		relsPart:      relsPart,
+		relsComplete:  relsComplete,
+		relsCount:     relsCount,
+		resourceParts: append([]string(nil), p.pageResources...),
+		tickets:       tickets,
+	}
+	page := &StreamPage{Index: index, DocumentPart: docPart, Reference: reference, view: &streamPageView{reader: view, owner: p, format: source.format, index: index, documentIndex: docIndex, pageIndex: pageIndex, context: p.context}}
 	if err := p.options.OnPage(p.context, page); err != nil {
 		return err
 	}
@@ -429,11 +702,39 @@ func (p *streamPackage) notifyPage(source *Reader, index int) error {
 		return err
 	}
 	view.Close()
-	p.pageTickets = append(p.pageTickets, tickets)
+	p.deliveredPages = append(p.deliveredPages, delivered)
+	p.reclaimDeliveredPage(source, reference.Part, docIndex, pageIndex)
 	return p.releaseProcessed()
 }
 
-// finishPages 用最终索引重新校验已发出页面，再提供尚未就绪的页面，不重复回调临时结果
+// pageNeedsFinalValidation 检查已流式交付页面在EOF前是否发生了可能影响校验结果的新增或变更
+// 入参: r 最终阅读器, index 页面序号, delivered 流式交付时记录的状态
+// 返回: bool 是否需要执行最终r.Page全量复检
+func (p *streamPackage) pageNeedsFinalValidation(r *Reader, index int, delivered streamDeliveredPage) bool {
+	if !delivered.partComplete {
+		return true
+	}
+	relsKey := strings.ToLower(delivered.relsPart)
+	_, hasFinalRels := r.pkg.parts[relsKey]
+	if !delivered.relsComplete {
+		if hasFinalRels {
+			return true
+		}
+	} else if !hasFinalRels {
+		return true
+	} else if rels, err := r.pkg.relationshipsContext(p.context, r.pages[index].Part); err != nil || len(rels) != delivered.relsCount {
+		return true
+	}
+	for _, resPart := range delivered.resourceParts {
+		resRelsKey := strings.ToLower(createdRelationshipPart(resPart))
+		if _, hasResRels := r.pkg.parts[resRelsKey]; hasResRels {
+			return true
+		}
+	}
+	return false
+}
+
+// finishPages 用最终索引核对已交付页面并跳过未发生新变更页的重复全解析，再交付尚未就绪页面
 // 入参: r 已完成物理校验的最终阅读器
 // 返回: error 页面、资源、回调、预算或取消错误
 func (p *streamPackage) finishPages(r *Reader) error {
@@ -456,9 +757,6 @@ func (p *streamPackage) finishPages(r *Reader) error {
 		if err := checkContext(p.context); err != nil {
 			return err
 		}
-		if _, err := r.Page(p.context, index); err != nil {
-			return err
-		}
 		tickets, err := r.pageTicketTargets(p.context, index)
 		if err != nil {
 			return err
@@ -467,10 +765,18 @@ func (p *streamPackage) finishPages(r *Reader) error {
 			if p.index == nil || index >= len(p.index.pages) || p.index.pages[index].Part != r.pages[index].Part || p.index.pages[index].Width != r.pages[index].Width || p.index.pages[index].Height != r.pages[index].Height || !slices.Equal(p.index.pages[index].LinkTargets, r.pages[index].LinkTargets) {
 				return fmt.Errorf("%w: streamed page reference conflict", ErrInvalid)
 			}
-			if index >= len(p.pageTickets) || !slices.Equal(p.pageTickets[index], tickets) {
+			if index >= len(p.deliveredPages) || !slices.Equal(p.deliveredPages[index].tickets, tickets) {
 				return fmt.Errorf("%w: streamed page print ticket conflict", ErrInvalid)
 			}
+			if p.pageNeedsFinalValidation(r, index, p.deliveredPages[index]) {
+				if _, err := r.Page(p.context, index); err != nil {
+					return err
+				}
+			}
 			continue
+		}
+		if _, err := r.Page(p.context, index); err != nil {
+			return err
 		}
 		if err := p.notifyPage(r, index); err != nil {
 			return err
@@ -484,16 +790,27 @@ func (p *streamPackage) finishPages(r *Reader) error {
 // 入参: format 文档方言, media 已解析的媒体类型字符串
 // 返回: bool 是否可能用于打印票据
 func streamPotentialPrintTicketMedia(format Format, media string) bool {
-	base, _, _ := strings.Cut(media, ";")
-	base = strings.TrimSpace(base)
+	base := opcMediaTypeBase(media)
 	if base == "" {
 		return false
 	}
 	if strings.EqualFold(base, printTicketType) {
 		return true
 	}
-	if format != FormatOpenXPS || standardResourceMedia(base) != 0 {
+	if format != FormatOpenXPS {
 		return false
+	}
+	if strings.EqualFold(base, printTicket2Type) {
+		return true
+	}
+	if standardResourceMedia(base) != 0 {
+		return false
+	}
+	lower := strings.ToLower(base)
+	for _, prefix := range [...]string{"image/", "font/", "audio/", "video/", "model/", "application/font-", "application/x-font-"} {
+		if strings.HasPrefix(lower, prefix) {
+			return false
+		}
 	}
 	for _, known := range []string{
 		fixedContentType("fixeddocumentsequence"),
@@ -509,8 +826,14 @@ func streamPotentialPrintTicketMedia(format Format, media string) bool {
 		opcSignatureOriginType,
 		opcCertificateType,
 		"application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
-		"model/x3d+xml",
-		"model/x3d+binary",
+		"application/vnd.ms-printing.printcapabilities+xml",
+		"application/vnd.ms-printschemacapabilities+xml",
+		"application/vnd.ms-printdevicecapabilities+xml",
+		"application/vnd.iccprofile",
+		"application/pdf",
+		"application/zip",
+		"application/gzip",
+		"application/x-zip-compressed",
 	} {
 		if strings.EqualFold(base, known) {
 			return false
@@ -583,7 +906,7 @@ func (p *streamPackage) streamRelsPossible(relsKey string) bool {
 	return p.types.defaults["rels"] != ""
 }
 
-// streamPageTicketsReady 检查页面三级关系及打印票据部件是否均已就绪，避免交错未闭合或晚到关系静默丢失票据
+// streamPageTicketsReady 按TicketPolicy检查页面三级关系及打印票据部件是否就绪
 // 入参: index 待交付页面序号
 // 返回: []string 等待到达的部件键列表, bool 是否遇到确定错误需暂缓至最终校验, error 预算或取消错误
 func (p *streamPackage) streamPageTicketsReady(index int) ([]string, bool, error) {
@@ -593,6 +916,7 @@ func (p *streamPackage) streamPageTicketsReady(index int) ([]string, bool, error
 		return nil, false, nil
 	}
 	mayTicket := p.mayHavePrintTicket()
+	strict := p.options.TicketPolicy != StreamTicketsInterleaved
 	var waits []string
 	for _, source := range []string{p.index.sequence, docPart, pagePart} {
 		if err := checkContext(p.context); err != nil {
@@ -619,7 +943,7 @@ func (p *streamPackage) streamPageTicketsReady(index int) ([]string, bool, error
 			}
 			continue
 		}
-		if relsPart := p.parts[relsKey]; relsPart != nil {
+		if relsPart := p.parts[relsKey]; relsPart != nil && !relsPart.reclaimed {
 			if relsPart.relations == nil || relsPart.relations.deferred {
 				if mayTicket {
 					waits = append(waits, relsKey)
@@ -635,12 +959,12 @@ func (p *streamPackage) streamPageTicketsReady(index int) ([]string, bool, error
 				if _, exists := p.pagePkg.parts[targetKey]; !exists {
 					waits = append(waits, targetKey)
 				}
-			} else if !relsPart.relations.closed && mayTicket {
+			} else if !relsPart.relations.closed && mayTicket && strict {
 				waits = append(waits, relsKey)
 			}
 			continue
 		}
-		if mayTicket && p.streamRelsPossible(relsKey) {
+		if strict && mayTicket && p.streamRelsPossible(relsKey) {
 			waits = append(waits, relsKey)
 		}
 	}
@@ -680,7 +1004,7 @@ func (r *Reader) streamPrintTicketHierarchy(ctx context.Context, index int, limi
 		if err != nil {
 			return nil, err
 		}
-		relations, err := r.pkg.relationships(canonical)
+		relations, err := r.pkg.relationshipsContext(ctx, canonical)
 		if err != nil {
 			return nil, err
 		}
@@ -713,16 +1037,24 @@ func (r *Reader) streamPrintTicketHierarchy(ctx context.Context, index int, limi
 	return result, nil
 }
 
-// streamReadPrintSettings 在流式视图读锁内合并基础设置与三级PrintTicket，兼容半完成布局部件
-// 入参: ctx 取消Context, index 页面序号, defaults 基础设置, options 输出过滤及资源参数
+// streamReadPrintSettingsCached 在流式视图读锁内合并基础设置与三级PrintTicket，并复用作业与文档级已解析票据缓存
+// 入参: ctx 取消Context, index 页面序号, defaults 基础设置, options 输出过滤及资源参数, owner 流式包缓存持有者，可为nil
 // 返回: *PrintSettings 独立合并设置, error 状态、读取、合并或取消错误
-func (r *Reader) streamReadPrintSettings(ctx context.Context, index int, defaults *PrintSettings, options *PrintSettingsOptions) (*PrintSettings, error) {
+func (r *Reader) streamReadPrintSettingsCached(ctx context.Context, index int, defaults *PrintSettings, options *PrintSettingsOptions, owner *streamPackage) (*PrintSettings, error) {
 	configuration, err := printSettingsOptions(ctx, options)
 	if err != nil {
 		return nil, err
 	}
 	if err := checkContext(configuration.context); err != nil {
 		return nil, err
+	}
+	if index < 0 || index >= len(r.pages) {
+		return nil, fmt.Errorf("%w: page index out of range: %d", ErrInvalid, index)
+	}
+	pagePart := r.pages[index].Part
+	docPart, _, _ := r.pageLocation(index)
+	if docPart == "" {
+		return nil, fmt.Errorf("%w: streamed page document", ErrInvalid)
 	}
 	outputScope := configuration.Scope
 	configuration.Scope = PrintScopeUnknown
@@ -734,20 +1066,83 @@ func (r *Reader) streamReadPrintSettings(ctx context.Context, index int, default
 	if err != nil {
 		return nil, err
 	}
-	tickets, err := r.streamPrintTicketHierarchy(configuration.context, index, configuration.Limits)
-	if err != nil {
-		return nil, err
+	sources := [3]struct {
+		part  string
+		scope PrintScope
+	}{
+		{r.sequence, PrintScopeJob},
+		{docPart, PrintScopeDocument},
+		{pagePart, PrintScopePage},
 	}
-	for _, ticket := range tickets {
-		local := configuration.PrintSettingsOptions
-		local.Scope = ticket.Scope
-		settings, err := ticket.Settings(configuration.context, &local)
+	remaining := min(r.limits.MaxPackageBytes, r.limits.MaxMetadataBytes, configuration.Limits.MaxPackageBytes, configuration.Limits.MaxMetadataBytes)
+	for _, source := range sources {
+		if err := checkContext(configuration.context); err != nil {
+			return nil, err
+		}
+		canonical, err := opcPartName(source.part)
 		if err != nil {
-			return nil, &PartError{Part: ticket.Part, Err: err}
+			return nil, err
+		}
+		relations, err := r.pkg.relationshipsContext(configuration.context, canonical)
+		if err != nil {
+			return nil, err
+		}
+		part, err := printTicketTarget(canonical, relations, r.format)
+		if err != nil {
+			return nil, err
+		}
+		if part == "" {
+			continue
+		}
+		partName := r.pkg.names[strings.ToLower(part)]
+		if partName == "" {
+			partName = part
+		}
+		local := configuration.PrintSettingsOptions
+		local.Scope = source.scope
+		cacheKey := streamTicketCacheKey{
+			part:                 strings.ToLower(part),
+			scope:                source.scope,
+			limits:               local.Limits,
+			maxNumericDigits:     local.MaxNumericDigits,
+			maxOptionComparisons: local.MaxOptionComparisons,
+		}
+		var settings *PrintSettings
+		if owner != nil && source.scope != PrintScopePage {
+			if cached, hit := owner.getCachedTicket(cacheKey); hit {
+				maxSingle := min(remaining, r.limits.MaxPartBytes, configuration.Limits.MaxPartBytes)
+				if cached.size > maxSingle {
+					return nil, &PartError{Part: partName, Err: fmt.Errorf("%w: print ticket bytes", ErrLimit)}
+				}
+				remaining -= cached.size
+				settings = cached.settings
+			}
+		}
+		if settings == nil {
+			typeName, err := r.pkg.contentType(part)
+			if err != nil {
+				return nil, &PartError{Part: part, Err: err}
+			}
+			sourceName := r.pkg.names[strings.ToLower(canonical)]
+			if sourceName == "" {
+				sourceName = canonical
+			}
+			ticket := PrintTicket{Source: sourceName, Part: partName, Scope: source.scope, ContentType: typeName}
+			if err := r.readPrintTicketData(&ticket, min(remaining, r.limits.MaxPartBytes, configuration.Limits.MaxPartBytes), configuration.context); err != nil {
+				return nil, err
+			}
+			remaining -= int64(len(ticket.Data))
+			settings, err = ticket.Settings(configuration.context, &local)
+			if err != nil {
+				return nil, &PartError{Part: ticket.Part, Err: err}
+			}
+			if owner != nil && source.scope != PrintScopePage {
+				owner.putCachedTicket(cacheKey, settings, int64(len(ticket.Data)))
+			}
 		}
 		result, err = MergePrintSettings(configuration.context, result, settings, &configuration.PrintSettingsOptions)
 		if err != nil {
-			return nil, &PartError{Part: ticket.Part, Err: err}
+			return nil, &PartError{Part: partName, Err: err}
 		}
 	}
 	if outputScope != PrintScopeUnknown {
@@ -757,12 +1152,396 @@ func (r *Reader) streamReadPrintSettings(ctx context.Context, index int, default
 	return result, checkContext(configuration.context)
 }
 
+// getCachedTicket 并发安全读取作业或文档级已解析打印设置缓存
+// 入参: key 票据缓存键
+// 返回: streamCachedTicket 缓存设置与字节数, bool 是否命中
+func (p *streamPackage) getCachedTicket(key streamTicketCacheKey) (streamCachedTicket, bool) {
+	p.ticketMu.RLock()
+	defer p.ticketMu.RUnlock()
+	if p.ticketCache == nil {
+		return streamCachedTicket{}, false
+	}
+	value, ok := p.ticketCache[key]
+	return value, ok
+}
+
+// putCachedTicket 并发安全写入作业或文档级已解析打印设置缓存
+// 入参: key 票据缓存键, settings 已校验只读设置, size 原始票据字节数
+func (p *streamPackage) putCachedTicket(key streamTicketCacheKey, settings *PrintSettings, size int64) {
+	p.ticketMu.Lock()
+	defer p.ticketMu.Unlock()
+	if p.ticketCache == nil {
+		p.ticketCache = make(map[streamTicketCacheKey]streamCachedTicket)
+	}
+	p.ticketCache[key] = streamCachedTicket{settings: settings, size: size}
+}
+
+// evictDocumentTicketCache 清理文档级打印设置缓存条目以在多文档流式作业中控制内存
+func (p *streamPackage) evictDocumentTicketCache() {
+	p.ticketMu.Lock()
+	defer p.ticketMu.Unlock()
+	for key := range p.ticketCache {
+		if key.scope == PrintScopeDocument {
+			delete(p.ticketCache, key)
+		}
+	}
+}
+
+// streamReadCorePropertiesIfPresent 若包级核心属性已关联且目标部件已到达则解析返回，尚未到达时返回nil
+// 入参: ctx 取消Context
+// 返回: *CoreProperties 独立核心属性或nil, bool 是否命中已到达核心属性, error 关系、类型、解析、预算或取消错误
+func (r *Reader) streamReadCorePropertiesIfPresent(ctx context.Context) (*CoreProperties, bool, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, false, err
+	}
+	relations, err := r.pkg.relationshipsContext(ctx, "/")
+	if err != nil {
+		return nil, false, &PartError{Part: "/", Err: err}
+	}
+	part := ""
+	for _, relation := range relations {
+		if relation.Type != opcCoreRel {
+			continue
+		}
+		if part != "" {
+			return nil, false, fmt.Errorf("%w: multiple package core properties relationships", ErrInvalid)
+		}
+		if relation.TargetMode != TargetModeInternal {
+			return nil, false, fmt.Errorf("%w: external package core properties", ErrInvalid)
+		}
+		part, err = resolvePart("/", relation.Target)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	if part == "" {
+		return nil, false, nil
+	}
+	key := strings.ToLower(part)
+	if _, exists := r.pkg.parts[key]; !exists {
+		return nil, false, nil
+	}
+	media, err := r.pkg.contentType(part)
+	if err != nil {
+		return nil, false, &PartError{Part: part, Err: err}
+	}
+	if !strings.EqualFold(media, opcCoreType) {
+		return nil, false, &PartError{Part: part, Err: fmt.Errorf("%w: core properties content type %q", ErrInvalid, media)}
+	}
+	data, err := r.pkg.readItemsContext(ctx, key, min(r.limits.MaxMetadataBytes, r.limits.MaxPartBytes))
+	if err != nil {
+		return nil, false, &PartError{Part: part, Err: err}
+	}
+	root, content, err := decodeXMLContent(data, r.limits, ctx)
+	if err == nil {
+		var result *CoreProperties
+		result, err = parseCorePropertiesContent(root, content)
+		if err == nil {
+			if err := checkContext(ctx); err != nil {
+				return nil, false, err
+			}
+			result.Part = part
+			return result, true, nil
+		}
+	}
+	return nil, false, &PartError{Part: part, Err: err}
+}
+
+// streamReadDocumentStructureIfPresent 若指定固定文档已关联结构部件且目标已到达则解析返回，尚未到达时返回nil
+// 入参: ctx 取消Context, docPart 固定文档部件URI, pageLimit 当前允许校验的故事页码上限
+// 返回: *DocumentStructure 独立文档结构或nil, bool 是否已到达, int 故事引用的最大页码, error 关系、格式、预算或取消错误
+func (r *Reader) streamReadDocumentStructureIfPresent(ctx context.Context, docPart string, pageLimit int) (*DocumentStructure, bool, int, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, false, 0, err
+	}
+	relations, err := r.pkg.relationshipsContext(ctx, docPart)
+	if err != nil {
+		return nil, false, 0, &PartError{Part: docPart, Err: err}
+	}
+	part := ""
+	typeURI := formatNamespace(r.format) + "/documentstructure"
+	for _, relation := range relations {
+		if relation.Type != typeURI {
+			continue
+		}
+		if relation.TargetMode != TargetModeInternal {
+			return nil, false, 0, &PartError{Part: docPart, Err: fmt.Errorf("%w: external DocumentStructure part", ErrInvalid)}
+		}
+		target, err := resolvePart(docPart, relation.Target)
+		if err != nil {
+			return nil, false, 0, &PartError{Part: docPart, Err: err}
+		}
+		if part != "" && !strings.EqualFold(part, target) {
+			return nil, false, 0, &PartError{Part: docPart, Err: fmt.Errorf("%w: multiple distinct DocumentStructure parts", ErrInvalid)}
+		}
+		part = target
+	}
+	if part == "" {
+		return nil, false, 0, nil
+	}
+	key := strings.ToLower(part)
+	if _, exists := r.pkg.parts[key]; !exists {
+		return nil, false, 0, nil
+	}
+	media, err := r.pkg.contentType(part)
+	if err != nil {
+		return nil, false, 0, &PartError{Part: part, Err: err}
+	}
+	if !strings.EqualFold(opcMediaTypeBase(media), fixedContentType("documentstructure")) {
+		return nil, false, 0, &PartError{Part: part, Err: fmt.Errorf("%w: DocumentStructure content type %q", ErrInvalid, media)}
+	}
+	data, err := r.pkg.readItemsContext(ctx, key, r.limits.MaxPartBytes)
+	if err != nil {
+		return nil, false, 0, &PartError{Part: part, Err: err}
+	}
+	root, err := decodeXMLVisit(data, r.limits, func(_ xml.Token, _ *xmlElement) error { return checkContext(ctx) })
+	if err == nil {
+		root, err = preprocessXMLContext(root, []string{structureNamespace(r.format)}, ctx)
+	}
+	if err != nil {
+		return nil, false, 0, &PartError{Part: part, Err: err}
+	}
+	if root.Name.Space != structureNamespace(r.format) || root.Name.Local != "DocumentStructure" {
+		return nil, false, 0, &PartError{Part: part, Element: root.Name.Local, Err: fmt.Errorf("%w: expected DocumentStructure root", ErrInvalid)}
+	}
+	result, err := parseDocumentStructure(root, structureNamespace(r.format), pageLimit)
+	if err != nil {
+		return nil, false, 0, &PartError{Part: part, Element: root.Name.Local, Err: err}
+	}
+	if err := checkContext(ctx); err != nil {
+		return nil, false, 0, err
+	}
+	result.Part = part
+	maxPage := 0
+	for _, story := range result.Stories {
+		for _, frag := range story.Fragments {
+			if frag.PageNumber > maxPage {
+				maxPage = frag.PageNumber
+			}
+		}
+	}
+	return result, true, maxPage, nil
+}
+
+// cloneOptionalString 深拷贝可选字符串指针，确保调用方修改不影响流式缓存
+// 入参: value 原始指针
+// 返回: *string 独立指针副本
+func cloneOptionalString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
+}
+
+// cloneCoreProperties 构造CoreProperties的完整独立深拷贝
+// 入参: src 原始核心属性
+// 返回: *CoreProperties 独立深拷贝
+func cloneCoreProperties(src *CoreProperties) *CoreProperties {
+	if src == nil {
+		return nil
+	}
+	dst := &CoreProperties{
+		Part:           src.Part,
+		Category:       cloneOptionalString(src.Category),
+		ContentStatus:  cloneOptionalString(src.ContentStatus),
+		ContentType:    cloneOptionalString(src.ContentType),
+		Created:        cloneOptionalString(src.Created),
+		Creator:        cloneOptionalString(src.Creator),
+		Description:    cloneOptionalString(src.Description),
+		Identifier:     cloneOptionalString(src.Identifier),
+		Keywords:       cloneOptionalString(src.Keywords),
+		Language:       cloneOptionalString(src.Language),
+		LastModifiedBy: cloneOptionalString(src.LastModifiedBy),
+		LastPrinted:    cloneOptionalString(src.LastPrinted),
+		Modified:       cloneOptionalString(src.Modified),
+		Revision:       cloneOptionalString(src.Revision),
+		Subject:        cloneOptionalString(src.Subject),
+		Title:          cloneOptionalString(src.Title),
+		Version:        cloneOptionalString(src.Version),
+	}
+	if len(src.KeywordValues) != 0 {
+		dst.KeywordValues = make([]CoreKeyword, len(src.KeywordValues))
+		for i, item := range src.KeywordValues {
+			dst.KeywordValues[i] = CoreKeyword{Value: item.Value, Language: cloneOptionalString(item.Language), IsText: item.IsText}
+		}
+	}
+	if len(src.Languages) != 0 {
+		dst.Languages = maps.Clone(src.Languages)
+	}
+	return dst
+}
+
+// cloneDocumentStructure 构造DocumentStructure的完整独立深拷贝
+// 入参: src 原始文档结构
+// 返回: *DocumentStructure 独立深拷贝
+func cloneDocumentStructure(src *DocumentStructure) *DocumentStructure {
+	if src == nil {
+		return nil
+	}
+	dst := &DocumentStructure{Part: src.Part}
+	if src.Outline != nil {
+		outline := &DocumentOutline{Language: src.Outline.Language}
+		if len(src.Outline.Entries) != 0 {
+			outline.Entries = make([]OutlineEntry, len(src.Outline.Entries))
+			for i, entry := range src.Outline.Entries {
+				outline.Entries[i] = OutlineEntry{Level: entry.Level, Target: entry.Target, Description: entry.Description, Language: cloneOptionalString(entry.Language)}
+			}
+		}
+		dst.Outline = outline
+	}
+	if len(src.Stories) != 0 {
+		dst.Stories = make([]Story, len(src.Stories))
+		for i, story := range src.Stories {
+			copied := Story{Name: story.Name}
+			if len(story.Fragments) != 0 {
+				copied.Fragments = make([]StoryFragmentReference, len(story.Fragments))
+				for j, frag := range story.Fragments {
+					copied.Fragments[j] = StoryFragmentReference{PageNumber: frag.PageNumber, FragmentName: cloneOptionalString(frag.FragmentName)}
+				}
+			}
+			dst.Stories[i] = copied
+		}
+	}
+	return dst
+}
+
+// emitMetadataCallbacks 在核心属性或文档结构就绪时立即触发对应流式回调并缓存结果
+// 返回: error 解析、预算、回调或取消错误
+func (p *streamPackage) emitMetadataCallbacks() error {
+	if p.pagePkg == nil {
+		return nil
+	}
+	if p.options.OnCoreProperties != nil && !p.corePropsDelivered {
+		if err := checkContext(p.context); err != nil {
+			return err
+		}
+		probe := &Reader{pkg: p.pagePkg, limits: p.options.Limits}
+		props, arrived, err := probe.streamReadCorePropertiesIfPresent(p.context)
+		if err != nil {
+			return err
+		}
+		if arrived {
+			p.corePropsDelivered = true
+			p.corePropsCached = props
+			if err := p.options.OnCoreProperties(p.context, cloneCoreProperties(props)); err != nil {
+				return err
+			}
+			if err := checkContext(p.context); err != nil {
+				return err
+			}
+			if p.consumeOnly && p.ownedMemory != nil {
+				key := strings.ToLower(props.Part)
+				if part := p.parts[key]; p.canReclaimPart(part) {
+					p.reclaimPart(key)
+				}
+			}
+		}
+	}
+	if p.options.OnDocumentStructure != nil && p.index != nil {
+		if p.docStructDelivered == nil {
+			p.docStructDelivered = make(map[int]bool)
+			p.docStructCached = make(map[int]*DocumentStructure)
+			p.docStructMaxPage = make(map[int]int)
+		}
+		for docIdx := range p.index.documents {
+			if p.docStructDelivered[docIdx] {
+				continue
+			}
+			if err := checkContext(p.context); err != nil {
+				return err
+			}
+			pageLimit := math.MaxInt32
+			if docIdx < p.document {
+				pageLimit = len(p.index.documents[docIdx].Pages)
+			}
+			ds, arrived, maxPage, err := p.index.streamReadDocumentStructureIfPresent(p.context, p.index.documents[docIdx].Part, pageLimit)
+			if err != nil {
+				return err
+			}
+			if arrived {
+				p.docStructDelivered[docIdx] = true
+				p.docStructCached[docIdx] = ds
+				p.docStructMaxPage[docIdx] = maxPage
+				if err := p.options.OnDocumentStructure(p.context, docIdx, cloneDocumentStructure(ds)); err != nil {
+					return err
+				}
+				if err := checkContext(p.context); err != nil {
+					return err
+				}
+				if p.consumeOnly && p.ownedMemory != nil {
+					key := strings.ToLower(ds.Part)
+					if part := p.parts[key]; p.canReclaimPart(part) {
+						p.reclaimPart(key)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// finishMetadataCallbacks 在EOF阶段补发此前因延迟或晚到未能触发的核心属性与文档结构回调，并校验故事页码上界
+// 入参: r 已完成物理校验的最终阅读器
+// 返回: error 解析、页码越界、回调或取消错误
+func (p *streamPackage) finishMetadataCallbacks(r *Reader) error {
+	if p.options.OnCoreProperties != nil && !p.corePropsDelivered {
+		if err := checkContext(p.context); err != nil {
+			return err
+		}
+		props, err := r.CoreProperties(p.context)
+		if err != nil {
+			return err
+		}
+		if props != nil {
+			p.corePropsDelivered = true
+			p.corePropsCached = props
+			if err := p.options.OnCoreProperties(p.context, cloneCoreProperties(props)); err != nil {
+				return err
+			}
+			if err := checkContext(p.context); err != nil {
+				return err
+			}
+		}
+	}
+	if p.options.OnDocumentStructure != nil {
+		for docIdx := range r.documents {
+			if err := checkContext(p.context); err != nil {
+				return err
+			}
+			if p.docStructDelivered != nil && p.docStructDelivered[docIdx] {
+				if p.docStructMaxPage[docIdx] > len(r.documents[docIdx].Pages) {
+					return fmt.Errorf("%w: story page %d outside its fixed document", ErrInvalid, p.docStructMaxPage[docIdx])
+				}
+				continue
+			}
+			ds, err := r.DocumentStructure(p.context, docIdx)
+			if err != nil {
+				return err
+			}
+			if ds != nil {
+				if p.docStructDelivered == nil {
+					p.docStructDelivered = make(map[int]bool)
+				}
+				p.docStructDelivered[docIdx] = true
+				if err := p.options.OnDocumentStructure(p.context, docIdx, cloneDocumentStructure(ds)); err != nil {
+					return err
+				}
+				if err := checkContext(p.context); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // selectedPage 对索引中的未完成页面启用增量处理，完整页面沿用现有读取路径
 // 入参: name 部件URI, media 声明类型
 // 返回: bool 是否为当前索引页面
 func (p *streamPackage) selectedPage(name, media string) bool {
 	key := strings.ToLower(name)
-	if p.options.OnPage == nil || p.index == nil || !p.pageNames[key] || !strings.EqualFold(media, fixedContentType("fixedpage")) {
+	if p.options.OnPage == nil || p.index == nil || !p.pageNames[key] || !strings.EqualFold(opcMediaTypeBase(media), fixedContentType("fixedpage")) {
 		return false
 	}
 	part := p.parts[key]
@@ -782,7 +1561,7 @@ func (p *streamPackage) consumePageMarkup(part *streamPart, event StreamXMLToken
 	}
 	switch token := event.Token.(type) {
 	case xml.StartElement:
-		node := &xmlElement{Name: token.Name, Attr: append([]xml.Attr(nil), token.Attr...), Namespaces: maps.Clone(event.Namespaces)}
+		node := &xmlElement{Name: token.Name, Attr: append([]xml.Attr(nil), token.Attr...), Namespaces: p.cloneEventNamespaces(event.Namespaces)}
 		if len(s.stack) == 0 {
 			if s.root != nil {
 				return fmt.Errorf("%w: multiple streamed page roots", ErrInvalid)
@@ -907,13 +1686,14 @@ func (p *streamPackage) advancePageMarkup() error {
 // 入参: name 部件名, media 声明媒体类型
 // 返回: bool 是否属于当前固定布局索引
 func (p *streamPackage) selectedLayout(name, media string) bool {
-	if p.options.OnPage == nil || p.index == nil {
+	if !p.needsIndex() || p.index == nil {
 		return false
 	}
+	base := opcMediaTypeBase(media)
 	if strings.EqualFold(name, p.index.sequence) {
-		return strings.EqualFold(media, fixedContentType("fixeddocumentsequence"))
+		return strings.EqualFold(base, fixedContentType("fixeddocumentsequence"))
 	}
-	return p.documentKeys[strings.ToLower(name)] && strings.EqualFold(media, fixedContentType("fixeddocument"))
+	return p.documentKeys[strings.ToLower(name)] && strings.EqualFold(base, fixedContentType("fixeddocument"))
 }
 
 // consumeLayout 组装一个已闭合直接子树，共用MCE与固定布局校验，再更新临时索引和就绪页面
@@ -929,7 +1709,7 @@ func (p *streamPackage) consumeLayout(part *streamPart, event StreamXMLToken) er
 	}
 	switch token := event.Token.(type) {
 	case xml.StartElement:
-		node := &xmlElement{Name: token.Name, Attr: append([]xml.Attr(nil), token.Attr...), Namespaces: maps.Clone(event.Namespaces)}
+		node := &xmlElement{Name: token.Name, Attr: append([]xml.Attr(nil), token.Attr...), Namespaces: p.cloneEventNamespaces(event.Namespaces)}
 		if len(s.stack) == 0 {
 			if s.root != nil {
 				return fmt.Errorf("%w: multiple streamed layout roots", ErrInvalid)
@@ -1095,7 +1875,7 @@ func (p *streamPackage) advanceMetadataPart(name, kind string) error {
 		return nil
 	}
 	media := p.types.declaredContentType(name)
-	if !strings.EqualFold(media, fixedContentType(kind)) {
+	if !strings.EqualFold(opcMediaTypeBase(media), fixedContentType(kind)) {
 		return &PartError{Part: name, Err: fmt.Errorf("%w: streamed layout content type", ErrInvalid)}
 	}
 	return p.advanceXML(part, media)
@@ -1118,9 +1898,11 @@ func (p *streamPackage) applyLayoutIndex() error {
 		return nil
 	}
 	var references []string
-	if sequence.layout != nil && !sequence.layout.deferred {
+	if p.sequenceRead {
+		references = p.documents
+	} else if sequence.layout != nil && !sequence.layout.deferred {
 		references = sequence.layout.documents
-	} else if !p.sequenceRead {
+	} else {
 		if _, present := p.pagePkg.parts[strings.ToLower(sequence.name)]; !present {
 			return nil
 		}
@@ -1130,8 +1912,6 @@ func (p *streamPackage) applyLayoutIndex() error {
 			return err
 		}
 		p.sequenceRead = true
-	} else {
-		references = p.documents
 	}
 	if len(references) < len(p.documents) {
 		return fmt.Errorf("%w: streamed sequence prefix length", ErrInvalid)
@@ -1170,16 +1950,19 @@ func (p *streamPackage) applyLayoutIndex() error {
 		if !part.layout.closed {
 			return nil
 		}
+		if p.docStructMaxPage != nil && p.docStructMaxPage[p.document] > len(doc.Pages) {
+			return fmt.Errorf("%w: story page %d outside its fixed document", ErrInvalid, p.docStructMaxPage[p.document])
+		}
 		p.document++
 	}
 	return nil
 }
 
-// selectedRelationships 对页面消费者启用规范关系部件的语义，不按媒体类型解释一般附加XML
+// selectedRelationships 对页面或元数据消费者启用规范关系部件的语义，不按媒体类型解释一般附加XML
 // 入参: name 规范部件URI, media 声明类型
 // 返回: bool 是否处理关系语义
 func (p *streamPackage) selectedRelationships(name, media string) bool {
-	return p.options.OnPage != nil && opcRelationshipName(name) && strings.EqualFold(media, opcRelsType)
+	return p.needsIndex() && opcRelationshipName(name) && strings.EqualFold(media, opcRelsType)
 }
 
 // consumeRelationships 在原根作用域下处理闭合关系子树，共用OPC、MCE及关系值校验
@@ -1195,7 +1978,7 @@ func (p *streamPackage) consumeRelationships(part *streamPart, event StreamXMLTo
 	}
 	switch token := event.Token.(type) {
 	case xml.StartElement:
-		node := &xmlElement{Name: token.Name, Attr: append([]xml.Attr(nil), token.Attr...), Namespaces: maps.Clone(event.Namespaces)}
+		node := &xmlElement{Name: token.Name, Attr: append([]xml.Attr(nil), token.Attr...), Namespaces: p.cloneEventNamespaces(event.Namespaces)}
 		if len(s.stack) == 0 {
 			if s.root != nil {
 				return fmt.Errorf("%w: multiple streamed relationship roots", ErrInvalid)
@@ -1246,23 +2029,35 @@ func (p *streamPackage) consumeRelationships(part *streamPart, event StreamXMLTo
 		if err := p.activateStreamIndex(); err != nil {
 			return err
 		}
+		if strings.EqualFold(part.name, "/_rels/.rels") {
+			if err := p.emitMetadataCallbacks(); err != nil {
+				return err
+			}
+		}
 		if p.index != nil {
 			if strings.EqualFold(part.name, "/_rels/.rels") {
 				if s.discards[formatNamespace(p.index.format)+"/discard-control"] > 1 {
 					return fmt.Errorf("%w: multiple discard control relationships", ErrInvalid)
 				}
-				if err := p.updateDiscard(p.index); err != nil {
-					return err
+				if p.options.OnPage != nil {
+					if err := p.updateDiscard(p.index); err != nil {
+						return err
+					}
 				}
 				if err := p.applyLayoutIndex(); err != nil {
+					return err
+				}
+				if err := p.emitMetadataCallbacks(); err != nil {
 					return err
 				}
 				return p.emitReadyPages(part.name)
 			}
 			needed := s.closed
 			ticketBound := false
+			structBound := false
 			requiredType := formatNamespace(p.index.format) + "/required-resource"
 			ticketType := formatNamespace(p.index.format) + "/printticket"
+			structType := formatNamespace(p.index.format) + "/documentstructure"
 			for _, item := range s.items[before:] {
 				if item.Type == requiredType {
 					needed = true
@@ -1270,6 +2065,14 @@ func (p *streamPackage) consumeRelationships(part *streamPart, event StreamXMLTo
 				if item.Type == ticketType {
 					needed = true
 					ticketBound = true
+				}
+				if item.Type == structType {
+					structBound = true
+				}
+			}
+			if structBound || s.closed {
+				if err := p.emitMetadataCallbacks(); err != nil {
+					return err
 				}
 			}
 			if ticketBound {
@@ -1401,7 +2204,7 @@ func (p *streamPackage) rootRelationshipsPending() bool {
 // 入参: r 最终读取器
 // 返回: error 关系、源、前缀冲突或取消错误
 func (p *streamPackage) finishRelationships(r *Reader) error {
-	if p.options.OnPage == nil {
+	if !p.needsIndex() {
 		return nil
 	}
 	for _, key := range slices.Sorted(maps.Keys(p.parts)) {

@@ -559,7 +559,7 @@ func (c *printColorRuntime) image(brush *Brush, transform Matrix, alphaOnly bool
 		profile = source.transform.profile
 	}
 	tagged := imageCICPUsable(source.cicp) || source.gammaChroma != nil || source.srgb || source.jxr != nil && source.jxr.info.ColorEncoding != nil
-	if profile == nil && !tagged && c.source != nil && (c.plan.SourceSpace == PrintColorSourceSpaceRGB && !source.linear && imageColorChannels(source) == 3 || c.plan.SourceSpace == PrintColorSourceSpaceCMYK && imageColorChannels(source) == 4) {
+	if profile == nil && !tagged && !source.multiChannel && c.source != nil && (c.plan.SourceSpace == PrintColorSourceSpaceRGB && !source.linear && imageColorChannels(source) == 3 || c.plan.SourceSpace == PrintColorSourceSpaceCMYK && imageColorChannels(source) == 4) {
 		profile = c.source
 		copySource := *source
 		copySource.selectedProfile = profile

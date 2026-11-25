@@ -1095,6 +1095,13 @@ func (r *Reader) renderLoadedElements(elements []Element, transform Matrix, boun
 // 入参: elements 已加载元素, transform 场景到设备的变换, bounds 输出范围, options 绘制参数, fonts 私有字体缓存
 // 返回: *image.NRGBA 图像, error 资源、绘制或取消错误
 func (r *Reader) renderLoadedElementsFonts(elements []Element, transform Matrix, bounds image.Rectangle, options sceneRenderOptions, fonts *fontCache) (*image.NRGBA, error) {
+	r.attachSceneCaches(&options, fonts)
+	return renderScene(elements, transform, bounds, options)
+}
+
+// attachSceneCaches 为单次场景绘制绑定独立的字体、色彩与图像资源缓存，不跨调用共享可变状态
+// 入参: options 待填充资源加载回调的绘制参数, fonts 私有字体缓存
+func (r *Reader) attachSceneCaches(options *sceneRenderOptions, fonts *fontCache) {
 	options.font, options.format = fonts.load, r.format
 	colors := sceneColorCache{pkg: r.pkg, profiles: make(map[string]*iccProfile), transforms: make(map[string][4]*iccTransform), bytes: options.profileBytes, maxProfiles: options.profiles}
 	if options.device != nil {
@@ -1105,7 +1112,268 @@ func (r *Reader) renderLoadedElementsFonts(elements []Element, transform Matrix,
 	images.deferColor = len(options.printPlan) != 0
 	options.image = images.load
 	options.printProfiles = &colors
-	return renderScene(elements, transform, bounds, options)
+}
+
+// RenderElement 仅隔离光栅化单个元素到透明背景的最小外包整数像素画布，不混入页面其他背景元素
+// state指定顶层元素在页面或纸面坐标系下的完整图形状态（Matrix、Clip、Opacity、OpacityMask、EdgeMode、Negative与PrintColor）
+// 顶层element自身的RenderTransform、Clip、Opacity与OpacityMask由state接管而不重复叠加，子元素局部属性正常生效
+// 入参: ctx 取消Context，nil采用Background, part 相对资源解析基准部件URI，空值回退state.PagePart, element 单个Canvas/Path/Glyphs元素, state 有效图形状态, options 绘制参数，nil采用96DPI透明默认配置
+// 返回: *image.NRGBA 原点归零的透明背景隔离图像, Rect 图像在页面或纸面坐标系中的精确包围盒, error 参数、资源、预算或取消错误
+func (r *Reader) RenderElement(ctx context.Context, part string, element Element, state WalkState, options *RenderOptions) (*image.NRGBA, Rect, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, Rect{}, err
+	}
+	if err := r.readLock(); err != nil {
+		return nil, Rect{}, err
+	}
+	defer r.mu.RUnlock()
+	basePart := part
+	if basePart == "" {
+		basePart = state.PagePart
+	}
+	if basePart != "" {
+		var err error
+		basePart, err = opcPartName(basePart)
+		if err != nil {
+			return nil, Rect{}, err
+		}
+	}
+	if !geometryFinite(state.Opacity) || state.Opacity < 0 || state.Opacity > 1 || !geometryFillMatrixFinite(state.Matrix) {
+		return nil, Rect{}, fmt.Errorf("%w: render element state", ErrInvalid)
+	}
+	if state.EdgeMode != "" && state.EdgeMode != EdgeModeAliased {
+		return nil, Rect{}, fmt.Errorf("%w: render element edge mode", ErrInvalid)
+	}
+	if err := validatePrintColor(state.PrintColor); err != nil {
+		return nil, Rect{}, err
+	}
+	for _, clip := range state.Clip {
+		if clip.Geometry != nil && !geometryFillMatrixFinite(clip.Matrix) {
+			return nil, Rect{}, fmt.Errorf("%w: render element clip transform", ErrInvalid)
+		}
+	}
+	configuration := RenderOptions{}
+	if options != nil {
+		configuration = *options
+	}
+	configuration.Background = color.Transparent
+	settings, devTransform, err := configuration.settings(ctx)
+	if err != nil {
+		return nil, Rect{}, err
+	}
+	settings.outputColor = state.PrintColor.Mode
+	if configuration.Region != nil && (configuration.Region.Min.X > configuration.Region.Max.X || configuration.Region.Min.Y > configuration.Region.Max.Y) {
+		return nil, Rect{}, fmt.Errorf("%w: render element region", ErrInvalid)
+	}
+	core, err := isolateElementNode(element, basePart, state)
+	if err != nil {
+		return nil, Rect{}, err
+	}
+	if state.Opacity == 0 || geometryMatrixSingular(state.Matrix) {
+		return image.NewNRGBA(image.Rectangle{}), Rect{}, nil
+	}
+	current := core
+	if state.Negative {
+		negCanvas := &Canvas{ElementProperties: ElementProperties{Part: basePart, Opacity: 1}, Elements: []Element{current}}
+		settings.negative = map[*Canvas]bool{negCanvas: true}
+		current = negCanvas
+	}
+	for i := len(state.Clip) - 1; i >= 0; i-- {
+		clip := state.Clip[i]
+		if clip.Geometry == nil {
+			continue
+		}
+		if geometryMatrixSingular(clip.Matrix) {
+			return image.NewNRGBA(image.Rectangle{}), Rect{}, nil
+		}
+		clipGeom := *clip.Geometry
+		if clipGeom.Transform == nil {
+			m := clip.Matrix
+			clipGeom.Transform = &m
+		} else {
+			if !geometryFillMatrixFinite(*clipGeom.Transform) {
+				return nil, Rect{}, fmt.Errorf("%w: render element clip geometry transform", ErrInvalid)
+			}
+			composed := strokePathCompose(clip.Matrix, *clipGeom.Transform)
+			if !geometryFillMatrixFinite(composed) {
+				return nil, Rect{}, fmt.Errorf("%w: render element clip transform overflow", ErrLimit)
+			}
+			clipGeom.Transform = &composed
+		}
+		current = &Canvas{ElementProperties: ElementProperties{Part: basePart, Opacity: 1, Clip: &clipGeom}, Elements: []Element{current}}
+	}
+	if state.EdgeMode == EdgeModeAliased {
+		current = &Canvas{ElementProperties: ElementProperties{Part: basePart, Opacity: 1}, EdgeMode: EdgeModeAliased, Elements: []Element{current}}
+	}
+	fonts := &fontCache{pkg: r.pkg, data: make(map[string][]byte), faces: make(map[fontCacheKey]*fontSource), remaining: settings.fontBytes, maxFaces: settings.fonts}
+	r.attachSceneCaches(&settings, fonts)
+	sr := sceneRenderer{options: settings, active: make(map[Element]bool), elements: settings.elements, edges: settings.edges, work: settings.work, glyphs: settings.glyphs, exact: rasterMaxExact}
+	defer sr.cleanup()
+	nodes, err := sr.prepare([]Element{current}, devTransform, false, 0)
+	if err != nil {
+		return nil, Rect{}, err
+	}
+	bounds := nodes[0].bounds
+	if configuration.Region != nil {
+		bounds = bounds.Intersect(*configuration.Region)
+	}
+	if bounds.Empty() {
+		return image.NewNRGBA(image.Rectangle{}), Rect{}, nil
+	}
+	pixels, err := validateSceneOutput(bounds, devTransform, settings)
+	if err != nil {
+		return nil, Rect{}, err
+	}
+	if err := sr.reservePixels(pixels); err != nil {
+		return nil, Rect{}, err
+	}
+	output, err := sr.renderPrepared(nodes, bounds)
+	if err != nil {
+		return nil, Rect{}, err
+	}
+	pageRect, err := renderBoundsToPageRect(bounds, configuration, devTransform)
+	if err != nil {
+		return nil, Rect{}, err
+	}
+	output.Rect = image.Rect(0, 0, bounds.Dx(), bounds.Dy())
+	if err := checkContext(ctx); err != nil {
+		return nil, Rect{}, err
+	}
+	return output, pageRect, nil
+}
+
+// isolateElementNode 浅拷贝单个顶层元素并用WalkState接管其变换、透明度与蒙版，同时补齐相对资源解析所需的基准部件
+// 入参: element 单个绘制元素, basePart 规范化基准部件URI, state 顶层图形状态
+// 返回: Element 独立顶层元素副本, error 空元素、未知元素或字体URI错误
+func isolateElementNode(element Element, basePart string, state WalkState) (Element, error) {
+	matrix := state.Matrix
+	mask := cloneBrushWithPart(state.OpacityMask, basePart)
+	applyProps := func(props *ElementProperties) {
+		if props.Part == "" {
+			props.Part = basePart
+		}
+		props.RenderTransform = &matrix
+		props.Clip = nil
+		props.Opacity = state.Opacity
+		props.OpacityMask = mask
+	}
+	switch node := element.(type) {
+	case *Canvas:
+		if node == nil {
+			return nil, fmt.Errorf("%w: nil canvas element", ErrInvalid)
+		}
+		copied := *node
+		applyProps(&copied.ElementProperties)
+		if copied.EdgeMode == "" && state.EdgeMode == EdgeModeAliased {
+			copied.EdgeMode = EdgeModeAliased
+		}
+		return &copied, nil
+	case *Path:
+		if node == nil {
+			return nil, fmt.Errorf("%w: nil path element", ErrInvalid)
+		}
+		copied := *node
+		applyProps(&copied.ElementProperties)
+		copied.Fill = cloneBrushWithPart(copied.Fill, copied.Part)
+		copied.Stroke = cloneBrushWithPart(copied.Stroke, copied.Part)
+		if copied.Stroke != nil {
+			normalizePathStrokeDefaults(&copied)
+		}
+		return &copied, nil
+	case *Glyphs:
+		if node == nil {
+			return nil, fmt.Errorf("%w: nil glyphs element", ErrInvalid)
+		}
+		copied := *node
+		applyProps(&copied.ElementProperties)
+		copied.Fill = cloneBrushWithPart(copied.Fill, copied.Part)
+		if copied.FontPart == "" && copied.FontURI != "" {
+			uri, index, hasIndex, err := ParseFontURI(strings.Trim(copied.FontURI, " \t\r\n"))
+			if err != nil {
+				return nil, err
+			}
+			resolveBase := copied.Part
+			if resolveBase == "" {
+				resolveBase = "/"
+			}
+			fontPart, err := resolvePart(resolveBase, uri)
+			if err != nil {
+				return nil, err
+			}
+			copied.FontPart = fontPart
+			if hasIndex {
+				copied.CollectionIndex = index
+				copied.HasCollectionIndex = true
+			}
+		}
+		return &copied, nil
+	default:
+		return nil, fmt.Errorf("%w: nil or unknown scene element", ErrInvalid)
+	}
+}
+
+// cloneBrushWithPart 在画刷缺失基准部件时浅拷贝并补齐Part，不修改调用方原始画刷
+// 入参: brush 源画刷, basePart 基准部件URI
+// 返回: *Brush 原画刷或补齐基准部件的浅副本
+func cloneBrushWithPart(brush *Brush, basePart string) *Brush {
+	if brush == nil || brush.Part != "" || basePart == "" {
+		return brush
+	}
+	copied := *brush
+	copied.Part = basePart
+	return &copied
+}
+
+// renderBoundsToPageRect 将设备像素矩形精确换算回页面或纸面坐标系包围盒
+// 入参: bounds 非空设备整数像素范围, options 渲染配置, devTransform 页面到设备有效变换
+// 返回: Rect 页面或纸面坐标系中的轴对齐矩形, error 逆变换或坐标溢出错误
+func renderBoundsToPageRect(bounds image.Rectangle, options RenderOptions, devTransform Matrix) (Rect, error) {
+	if options.Transform == nil {
+		dpi := options.DPI
+		if dpi == 0 {
+			dpi = 96
+		}
+		scale := dpi / 96
+		rect := Rect{
+			X:      float64(bounds.Min.X) / scale,
+			Y:      float64(bounds.Min.Y) / scale,
+			Width:  float64(bounds.Dx()) / scale,
+			Height: float64(bounds.Dy()) / scale,
+		}
+		if !geometryFinite(rect.X, rect.Y, rect.Width, rect.Height, rect.X+rect.Width, rect.Y+rect.Height) {
+			return Rect{}, fmt.Errorf("%w: element page bounds overflow", ErrLimit)
+		}
+		return rect, nil
+	}
+	inverse, err := devTransform.Inverse()
+	if err != nil {
+		return Rect{}, err
+	}
+	corners := [4]Point{
+		{X: float64(bounds.Min.X), Y: float64(bounds.Min.Y)},
+		{X: float64(bounds.Max.X), Y: float64(bounds.Min.Y)},
+		{X: float64(bounds.Min.X), Y: float64(bounds.Max.Y)},
+		{X: float64(bounds.Max.X), Y: float64(bounds.Max.Y)},
+	}
+	first, err := geometryFillPoint(inverse, corners[0])
+	if err != nil {
+		return Rect{}, err
+	}
+	minX, minY, maxX, maxY := first.X, first.Y, first.X, first.Y
+	for _, corner := range corners[1:] {
+		pt, err := geometryFillPoint(inverse, corner)
+		if err != nil {
+			return Rect{}, err
+		}
+		minX, minY = min(minX, pt.X), min(minY, pt.Y)
+		maxX, maxY = max(maxX, pt.X), max(maxY, pt.Y)
+	}
+	width, height := maxX-minX, maxY-minY
+	if !geometryFinite(width, height) {
+		return Rect{}, fmt.Errorf("%w: element page bounds overflow", ErrLimit)
+	}
+	return Rect{X: minX, Y: minY, Width: width, Height: height}, nil
 }
 
 // sceneMaxIsolatedDepth 计算已准备场景树中同时活跃的最大隔离表面嵌套深度
@@ -1145,6 +1413,14 @@ func renderScene(elements []Element, transform Matrix, bounds image.Rectangle, o
 	if err != nil {
 		return nil, err
 	}
+	return r.renderPrepared(nodes, bounds)
+}
+
+// renderPrepared 将已完成准备的场景节点树按图块光栅化并降采样到目标范围，支持单核与多核并发执行
+// 入参: nodes 已准备场景节点树, bounds 目标设备整数像素范围
+// 返回: *image.NRGBA 渲染图像，设备模式下为nil, error 光栅化、颜色转换、预算或取消错误
+func (r *sceneRenderer) renderPrepared(nodes []*sceneNode, bounds image.Rectangle) (*image.NRGBA, error) {
+	options := r.options
 	var output *image.NRGBA
 	if options.device != nil {
 		if err := options.device.allocate(bounds); err != nil {
@@ -1219,7 +1495,7 @@ func renderScene(elements []Element, transform Matrix, bounds image.Rectangle, o
 		states[i] = acquireSceneWorker()
 	}
 	r.concurrent = true
-	err = runXPSWorkerSlots(r.options.context, workers, tileCount, func(runCtx context.Context, slot, task int) error {
+	err := runXPSWorkerSlots(r.options.context, workers, tileCount, func(runCtx context.Context, slot, task int) error {
 		if err := runCtx.Err(); err != nil {
 			r.cancelled.Store(true)
 			return err

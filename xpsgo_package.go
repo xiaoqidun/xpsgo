@@ -904,7 +904,7 @@ func (p *packageReader) readXMLPart(name string, ctx context.Context) (*xmlEleme
 		if err != nil {
 			return nil, err
 		}
-		if strings.EqualFold(media, resourceDictionaryContentType) {
+		if strings.EqualFold(opcMediaTypeBase(media), resourceDictionaryContentType) {
 			data, err := p.readItemsContext(ctx, key, p.limits.MaxPartBytes)
 			if err != nil {
 				return nil, err

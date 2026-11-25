@@ -22,14 +22,22 @@ import (
 	"sort"
 )
 
-// strokeDashMaxPattern 等常量限制描边虚线展开上限
+// strokeDashMaxPattern 等常量限制描边虚线展开上限及公开描边轮廓默认参数
 const (
-	strokeDashMaxPattern = 4096
-	strokeDashMaxWork    = 1 << 20
+	strokeDashMaxPattern          = 4096
+	strokeDashMaxWork             = 1 << 20
+	defaultStrokeOutlineTolerance = 0.25
+	defaultStrokeOutlineMaxEdges  = 200000
 )
 
 // errStrokePathRefine 表示当前弧长界不足以确定虚线端点，需要进一步细分
 var errStrokePathRefine = fmt.Errorf("%w: stroke dash endpoint requires refinement", ErrLimit)
+
+// StrokeOutlineOptions 设置描边转闭合轮廓几何时的逼近容限与边数预算，零值采用默认配置
+type StrokeOutlineOptions struct {
+	Tolerance float64
+	MaxEdges  int
+}
 
 // strokeDashSpan 表示中心线距离域中的闭合虚线区间，包括零长区间
 type strokeDashSpan struct {
@@ -1955,4 +1963,143 @@ func (b *strokeOutlineBuilder) pathPiece(piece strokePathPiece, style strokeOutl
 		return err
 	}
 	return b.cap(piece.points[len(piece.points)-1], piece.endDir, piece.endCap)
+}
+
+// StrokeOutline 将路径描边展开为非零绕数规则的闭合多边形填充几何，用于无损导出复杂端帽、虚线、局部不描边段与非均匀缩放描边
+// options为nil或零值字段采用默认容限0.25与边数上限200000，path中省略的端帽、连接与尖角限制按XPS规范默认值补齐
+// 入参: path 路径元素, transform 有效仿射变换矩阵, options 可选展开容限与边数预算
+// 返回: *Geometry 非零规则闭合填充几何, error 参数、样式、数值或预算错误
+func StrokeOutline(path *Path, transform Matrix, options *StrokeOutlineOptions) (*Geometry, error) {
+	if path == nil || path.Data == nil || !geometryFillMatrixFinite(transform) {
+		return nil, fmt.Errorf("%w: stroke outline parameters", ErrInvalid)
+	}
+	tolerance := defaultStrokeOutlineTolerance
+	maxEdges := defaultStrokeOutlineMaxEdges
+	if options != nil {
+		if options.Tolerance != 0 {
+			if !geometryFinite(options.Tolerance) || options.Tolerance < 0 {
+				return nil, fmt.Errorf("%w: stroke outline tolerance", ErrInvalid)
+			}
+			tolerance = options.Tolerance
+		}
+		if options.MaxEdges < 0 {
+			return nil, fmt.Errorf("%w: stroke outline max edges", ErrInvalid)
+		}
+		if options.MaxEdges > 0 {
+			maxEdges = options.MaxEdges
+		}
+	}
+	normalized := *path
+	if normalized.Stroke == nil {
+		normalized.Stroke = &Brush{Kind: BrushSolidColor, Opacity: 1}
+	}
+	normalizePathStrokeDefaults(&normalized)
+	edges, err := pathStrokeEdges(&normalized, transform, tolerance, maxEdges)
+	if err != nil {
+		return nil, err
+	}
+	return strokeEdgesToGeometry(edges)
+}
+
+// normalizePathStrokeDefaults 为未显式指定的路径描边端帽、连接样式与斜接上限补齐ECMA-388默认值
+// 入参: path 待补齐默认描边属性的路径
+func normalizePathStrokeDefaults(path *Path) {
+	if path.StrokeStartLineCap == "" {
+		path.StrokeStartLineCap = LineCapFlat
+	}
+	if path.StrokeEndLineCap == "" {
+		path.StrokeEndLineCap = LineCapFlat
+	}
+	if path.StrokeDashCap == "" {
+		path.StrokeDashCap = LineCapFlat
+	}
+	if path.StrokeLineJoin == "" {
+		path.StrokeLineJoin = LineJoinMiter
+	}
+	if path.StrokeMiterLimit == 0 {
+		path.StrokeMiterLimit = 10
+	}
+}
+
+// strokeEdgesToGeometry 校验边坐标有限性、抵消反向共享边并将有向边集整理为非零规则闭合多边形子路径几何
+// 入参: edges 描边引擎生成的有向边切片
+// 返回: *Geometry 非零规则闭合几何, error 非有限坐标错误
+func strokeEdgesToGeometry(edges []geometryEdge) (*Geometry, error) {
+	result := &Geometry{FillRule: GeometryNonZero}
+	if len(edges) == 0 {
+		return result, nil
+	}
+	counts := make(map[geometryEdge]int, len(edges))
+	for _, edge := range edges {
+		if !geometryFinite(edge.start.X, edge.start.Y, edge.end.X, edge.end.Y) {
+			return nil, fmt.Errorf("%w: non-finite stroke outline edge", ErrLimit)
+		}
+		if edge.start == edge.end {
+			continue
+		}
+		reverse := geometryEdge{start: edge.end, end: edge.start}
+		if counts[reverse] > 0 {
+			counts[reverse]--
+		} else {
+			counts[edge]++
+		}
+	}
+	filtered := make([]geometryEdge, 0, len(edges))
+	emitted := make(map[geometryEdge]int, len(counts))
+	for _, edge := range edges {
+		if edge.start == edge.end {
+			continue
+		}
+		if emitted[edge] < counts[edge] {
+			emitted[edge]++
+			filtered = append(filtered, edge)
+		}
+	}
+	if len(filtered) == 0 {
+		return result, nil
+	}
+	outgoing := make(map[Point][]int, len(filtered))
+	used := make([]bool, len(filtered))
+	for i, edge := range filtered {
+		outgoing[edge.start] = append(outgoing[edge.start], i)
+	}
+	for i, edge := range filtered {
+		if used[i] {
+			continue
+		}
+		used[i] = true
+		start := edge.start
+		current := edge.end
+		segments := []GeometrySegment{{Kind: GeometryLine, Point: current, IsStroked: true}}
+		for current != start {
+			list := outgoing[current]
+			nextIdx := -1
+			for len(list) > 0 {
+				candidate := list[0]
+				list = list[1:]
+				if !used[candidate] {
+					nextIdx = candidate
+					break
+				}
+			}
+			outgoing[current] = list
+			if nextIdx < 0 {
+				break
+			}
+			used[nextIdx] = true
+			current = filtered[nextIdx].end
+			if current != start {
+				segments = append(segments, GeometrySegment{Kind: GeometryLine, Point: current, IsStroked: true})
+			}
+		}
+		if current == start && len(segments) >= 2 {
+			result.Figures = append(result.Figures, GeometryFigure{
+				StartPoint: start,
+				IsFilled:   true,
+				IsClosed:   true,
+				Segments:   segments,
+			})
+		}
+	}
+	return result, nil
 }

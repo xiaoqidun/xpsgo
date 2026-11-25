@@ -29,12 +29,13 @@ import (
 	"strings"
 )
 
-// FontSubsetOptions 设置集合字体面索引、输入输出字节上限及字形解析工作上限
+// FontSubsetOptions 设置集合字体面索引、输入输出字节上限、字形解析工作上限及无cmap打印流子集容忍开关
 // MaxWork累计TrueType轮廓展开、CFF程序执行及替换程序字节，零值采用1048576个工作单元
 type FontSubsetOptions struct {
-	CollectionIndex uint32
-	MaxBytes        int64
-	MaxWork         int
+	CollectionIndex  uint32
+	MaxBytes         int64
+	MaxWork          int
+	AllowMissingCmap bool
 }
 
 // subsetCFFPrivate 保存重定位后的私有字典与未重编号的局部子程序索引
@@ -107,6 +108,7 @@ func subsetFontConfig(options *FontSubsetOptions, remaining *int) (FontSubsetOpt
 	configuration := DefaultFontSubsetOptions()
 	if options != nil {
 		configuration.CollectionIndex = options.CollectionIndex
+		configuration.AllowMissingCmap = options.AllowMissingCmap
 		if options.MaxBytes != 0 {
 			configuration.MaxBytes = options.MaxBytes
 		}
@@ -158,7 +160,7 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, config
 		return nil, err
 	}
 	var os2 *fontOS2Metrics
-	if _, hasOS2 := face.tables["OS/2"]; hasOS2 || !fontIsBitmapOnly(face) {
+	if _, hasOS2 := face.tables["OS/2"]; hasOS2 || !fontIsBitmapOnly(face) && !configuration.AllowMissingCmap {
 		var err error
 		os2, err = parseFontOS2Metrics(face)
 		if err != nil {
@@ -180,7 +182,7 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, config
 			return nil, fmt.Errorf("%w: font subset dependencies in %s", ErrUnsupported, tag)
 		}
 	}
-	fontMetrics, err := validateCreatedFontMetrics(face, os2)
+	fontMetrics, err := validateFontSubsetMetrics(face, os2, configuration.AllowMissingCmap)
 	if err != nil {
 		return nil, err
 	}

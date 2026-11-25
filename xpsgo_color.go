@@ -137,6 +137,28 @@ type Color struct {
 	Raw        string
 }
 
+// ColorResolveOptions 设置颜色解析的ICC渲染意图、打印输出色彩模式及反相开关
+type ColorResolveOptions struct {
+	Intent     RenderingIntent
+	PrintColor PrintColorMode
+	Negative   bool
+}
+
+// ResolvedColor 保存颜色经ICC与打印色彩策略解析后的精确线性值、量化sRGB、可选源CMYK及灰度结果
+type ResolvedColor struct {
+	Space        ColorSpace
+	ProfilePart  string
+	ProfileSpace string
+	Components   []float64
+	Alpha        float64
+	SRGB         color.NRGBA
+	SRGB16       color.NRGBA64
+	Linear       [3]float64
+	CMYK         [4]float64
+	HasCMYK      bool
+	Gray         float64
+}
+
 // renderColorSpace 表示页面与图层的合成工作色彩空间
 type renderColorSpace uint8
 
@@ -148,9 +170,14 @@ type renderColor struct {
 	a float64
 }
 
-// iccNamedColor 保存命名色的相对色度XYZ分量
+// iccNamedColor 保存命名色的名称、前后缀、连接空间坐标、相对色度XYZ及可选设备坐标
 type iccNamedColor struct {
-	xyz [3]float64
+	name   string
+	prefix string
+	suffix string
+	pcs    [3]float64
+	xyz    [3]float64
+	device []float64
 }
 
 // iccCurveKind 表示一维传递曲线的编码类型
@@ -237,6 +264,194 @@ func (s ColorSpace) String() string {
 	default:
 		return fmt.Sprintf("ColorSpace(%d)", s)
 	}
+}
+
+// ResolvePartURI 按源部件URI解析并规范化包内相对或绝对引用，拒绝外部URI、查询、片段及越界路径
+// 入参: basePart 源部件的包根URI，包根使用/, relURI 相对或包根URI
+// 返回: string 规范化包根URI, error 引用、编码或越界错误
+func ResolvePartURI(basePart, relURI string) (string, error) {
+	return resolvePart(basePart, relURI)
+}
+
+// ResolveColor 解析sRGB、scRGB及含ICC配置的ContextColor，支持按意图、负片及灰度黑白打印策略转换
+// 源为四通道CMYK配置且未启用反相或灰度单色转换时在CMYK保留原始源分量并置HasCMYK为真
+// 入参: ctx 取消Context，nil采用Background, basePart 源部件包根URI, value 待解析颜色, opts 色彩解析选项，nil采用默认值
+// 返回: ResolvedColor 解析后的多空间颜色结果, error 状态、参数、部件、配置、转换或取消错误
+func (r *Reader) ResolveColor(ctx context.Context, basePart string, value Color, opts *ColorResolveOptions) (ResolvedColor, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return ResolvedColor{}, err
+	}
+	if err := r.readLock(); err != nil {
+		return ResolvedColor{}, err
+	}
+	defer r.mu.RUnlock()
+	var cfg ColorResolveOptions
+	if opts != nil {
+		cfg = *opts
+	}
+	if cfg.Intent > IntentAbsoluteColorimetric || cfg.PrintColor > PrintColorMonochrome {
+		return ResolvedColor{}, fmt.Errorf("%w: color resolve options", ErrInvalid)
+	}
+	if !geometryFinite(value.Alpha) || value.Alpha < 0 || value.Alpha > 1 {
+		return ResolvedColor{}, fmt.Errorf("%w: invalid color alpha", ErrInvalid)
+	}
+	for _, component := range value.Components {
+		if !geometryFinite(component) {
+			return ResolvedColor{}, fmt.Errorf("%w: non-finite color component", ErrInvalid)
+		}
+	}
+	result := ResolvedColor{
+		Space:      value.Space,
+		Alpha:      value.Alpha,
+		Components: slices.Clone(value.Components),
+	}
+	var linear [3]float64
+	switch value.Space {
+	case ColorSRGB:
+		if len(value.Components) != 3 {
+			return ResolvedColor{}, fmt.Errorf("%w: sRGB color requires three components", ErrInvalid)
+		}
+		for i, component := range value.Components {
+			if component < 0 || component > 1 {
+				return ResolvedColor{}, fmt.Errorf("%w: sRGB component outside unit range", ErrInvalid)
+			}
+			linear[i] = renderSRGBToLinear(component)
+		}
+	case ColorScRGB:
+		if len(value.Components) != 3 {
+			return ResolvedColor{}, fmt.Errorf("%w: scRGB color requires three components", ErrInvalid)
+		}
+		linear = [3]float64{value.Components[0], value.Components[1], value.Components[2]}
+	case ColorContext:
+		sourceBase := basePart
+		if sourceBase == "" && strings.HasPrefix(value.ProfileURI, "/") {
+			sourceBase = "/"
+		}
+		part, err := resolvePart(sourceBase, value.ProfileURI)
+		if err != nil {
+			return ResolvedColor{}, err
+		}
+		media, err := r.pkg.contentType(part)
+		if err != nil {
+			return ResolvedColor{}, wrapPartError(part, "", err)
+		}
+		if !requiredResourceMedia(requiredProfile, media) {
+			return ResolvedColor{}, wrapPartError(part, "", fmt.Errorf("%w: color profile content type %q", ErrInvalid, media))
+		}
+		data, err := r.pkg.readPartContext(ctx, part)
+		if err != nil {
+			return ResolvedColor{}, wrapPartError(part, "", err)
+		}
+		profile, err := parseICCProfile(data)
+		if err != nil {
+			return ResolvedColor{}, wrapPartError(part, "", err)
+		}
+		iccIntent := uint32(1)
+		if cfg.Intent != IntentDefault {
+			iccIntent = uint32(cfg.Intent - 1)
+		}
+		transform, err := prepareICCTransform(profile, iccIntent)
+		if err != nil {
+			return ResolvedColor{}, wrapPartError(part, "", err)
+		}
+		if len(value.Components) != transform.inputChannels() {
+			return ResolvedColor{}, wrapPartError(part, "", fmt.Errorf("%w: context color channel count", ErrInvalid))
+		}
+		input := value.Components
+		var scaled [iccMaxChannels]float64
+		if transform.pipeline != nil && transform.pipeline.inputPrecision != 0 {
+			scale := 255.0
+			if transform.pipeline.inputPrecision == 2 {
+				scale = 65535
+			}
+			for i, component := range input {
+				scaled[i] = math.Floor(colorClamp(component)*scale+0.5) / scale
+			}
+			input = scaled[:len(input)]
+		}
+		linear, err = transform.linearRGB(input, false)
+		if err != nil {
+			return ResolvedColor{}, wrapPartError(part, "", err)
+		}
+		result.ProfilePart = part
+		result.ProfileSpace = profile.space
+		if profile.space == "CMYK" && profile.class != "nmcl" && len(value.Components) == 4 && !cfg.Negative && cfg.PrintColor != PrintColorGrayscale && cfg.PrintColor != PrintColorMonochrome {
+			result.CMYK = [4]float64{
+				colorClamp(value.Components[0]),
+				colorClamp(value.Components[1]),
+				colorClamp(value.Components[2]),
+				colorClamp(value.Components[3]),
+			}
+			result.HasCMYK = true
+		}
+	default:
+		return ResolvedColor{}, fmt.Errorf("%w: unsupported color space", ErrInvalid)
+	}
+	outLinear, luminance, err := applyPrintLinearColor(linear, cfg.Negative, cfg.PrintColor)
+	if err != nil {
+		return ResolvedColor{}, err
+	}
+	srgb := [3]float64{
+		renderLinearToSRGB(colorClamp(outLinear[0])),
+		renderLinearToSRGB(colorClamp(outLinear[1])),
+		renderLinearToSRGB(colorClamp(outLinear[2])),
+	}
+	result.Linear = outLinear
+	result.Gray = renderLinearToSRGB(luminance)
+	result.SRGB = color.NRGBA{
+		R: colorQuantize8(srgb[0]),
+		G: colorQuantize8(srgb[1]),
+		B: colorQuantize8(srgb[2]),
+		A: colorQuantize8(value.Alpha),
+	}
+	result.SRGB16 = color.NRGBA64{
+		R: colorQuantize16(srgb[0]),
+		G: colorQuantize16(srgb[1]),
+		B: colorQuantize16(srgb[2]),
+		A: colorQuantize16(value.Alpha),
+	}
+	return result, nil
+}
+
+// applyPrintLinearColor 对非预乘线性RGB依次施加负片反相及灰度或黑白单色转换，并返回最终线性RGB与BT.709线性亮度
+// 入参: linear 非预乘线性RGB分量, negative 是否启用负片反相, mode 打印输出色彩模式
+// 返回: [3]float64 转换后的线性RGB分量, float64 归一化BT.709线性亮度, error 数值范围错误
+func applyPrintLinearColor(linear [3]float64, negative bool, mode PrintColorMode) ([3]float64, float64, error) {
+	if negative {
+		for i := range 3 {
+			linear[i] = renderSignedSRGBToLinear(1 - renderSignedLinearToSRGB(linear[i]))
+		}
+		if !geometryFinite(linear[0], linear[1], linear[2]) {
+			return [3]float64{}, 0, fmt.Errorf("%w: negative color arithmetic", ErrLimit)
+		}
+	}
+	luminance := colorClamp(0.2126*linear[0] + 0.7152*linear[1] + 0.0722*linear[2])
+	if mode == PrintColorGrayscale || mode == PrintColorMonochrome {
+		if mode == PrintColorMonochrome {
+			if luminance >= 0.5 {
+				luminance = 1
+			} else {
+				luminance = 0
+			}
+		}
+		linear = [3]float64{luminance, luminance, luminance}
+	}
+	return linear, luminance, nil
+}
+
+// colorQuantize8 将归一化颜色或透明度分量四舍五入量化为八位无符号整数
+// 入参: value 有限归一化分量
+// 返回: uint8 八位量化结果
+func colorQuantize8(value float64) uint8 {
+	return uint8(math.Floor(colorClamp(value)*255 + 0.5))
+}
+
+// colorQuantize16 将归一化颜色或透明度分量四舍五入量化为十六位无符号整数
+// 入参: value 有限归一化分量
+// 返回: uint16 十六位量化结果
+func colorQuantize16(value float64) uint16 {
+	return uint16(math.Floor(colorClamp(value)*65535 + 0.5))
 }
 
 // ParseColor 解析sRGB、scRGB或ContextColor文本，不加载ICC配置文件或执行色彩转换
@@ -580,33 +795,58 @@ func parseICCNamedColor(profile *iccProfile) ([]iccNamedColor, error) {
 	if count > iccMaxNamedColors {
 		return nil, fmt.Errorf("%w: ICC named color count", ErrLimit)
 	}
-	if err := iccNamedASCII(data[20:52]); err != nil {
+	prefix, err := iccNamedASCIIText(data[20:52])
+	if err != nil {
 		return nil, err
 	}
-	if err := iccNamedASCII(data[52:84]); err != nil {
+	suffix, err := iccNamedASCIIText(data[52:84])
+	if err != nil {
 		return nil, err
 	}
 	colors := make([]iccNamedColor, int(count))
 	for i := range count {
 		row := data[84+i*stride : 84+(i+1)*stride]
-		if err := iccNamedASCII(row[:32]); err != nil {
+		name, err := iccNamedASCIIText(row[:32])
+		if err != nil {
 			return nil, err
 		}
 		var pcs [3]uint16
 		for axis := range 3 {
 			pcs[axis] = binary.BigEndian.Uint16(row[32+axis*2:])
 		}
+		var pcsCoord, xyz [3]float64
 		if profile.pcs == "XYZ " {
 			for axis := range 3 {
-				colors[i].xyz[axis] = float64(pcs[axis]) / 32768
+				xyz[axis] = float64(pcs[axis]) / 32768
 			}
+			pcsCoord = xyz
 		} else if profile.version >= 0x04000000 {
-			colors[i].xyz = iccLabToXYZ([3]float64{float64(pcs[0]) * 100 / 65535, float64(pcs[1])*255/65535 - 128, float64(pcs[2])*255/65535 - 128})
+			pcsCoord = [3]float64{float64(pcs[0]) * 100 / 65535, float64(pcs[1])*255/65535 - 128, float64(pcs[2])*255/65535 - 128}
+			xyz = iccLabToXYZ(pcsCoord)
 		} else {
-			colors[i].xyz = iccLabToXYZ([3]float64{min(100, float64(pcs[0])*100/65280), float64(pcs[1])/256 - 128, float64(pcs[2])/256 - 128})
+			pcsCoord = [3]float64{min(100, float64(pcs[0])*100/65280), float64(pcs[1])/256 - 128, float64(pcs[2])/256 - 128}
+			xyz = iccLabToXYZ(pcsCoord)
 		}
+		var dev []float64
+		if device != 0 {
+			dev = make([]float64, int(device))
+			for axis := range int(device) {
+				dev[axis] = float64(binary.BigEndian.Uint16(row[38+axis*2:])) / 65535
+			}
+		}
+		colors[i] = iccNamedColor{name: name, prefix: prefix, suffix: suffix, pcs: pcsCoord, xyz: xyz, device: dev}
 	}
 	return colors, nil
+}
+
+// iccNamedASCIIText 校验并提取零终止的7位ASCII命名色文本
+// 入参: data 固定长度原始字段
+// 返回: string 去除终止符的ASCII文本, error 编码或终止错误
+func iccNamedASCIIText(data []byte) (string, error) {
+	if err := iccNamedASCII(data); err != nil {
+		return "", err
+	}
+	return string(data[:bytes.IndexByte(data, 0)]), nil
 }
 
 // iccNamedASCII 校验固定长度的零终止7位ASCII字段，不解释名称为文件或资源引用

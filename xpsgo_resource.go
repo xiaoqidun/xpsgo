@@ -437,7 +437,7 @@ func (r *Reader) readResourceDictionaryLoader(part string, load xmlPartLoader, c
 	if err != nil {
 		return nil, &PartError{Part: part, Err: err}
 	}
-	if !strings.EqualFold(media, resourceDictionaryContentType) {
+	if !requiredResourceMedia(requiredDictionary, media) {
 		return nil, &PartError{Part: part, Err: fmt.Errorf("%w: unexpected resource dictionary content type %q", ErrInvalid, media)}
 	}
 	if load == nil {

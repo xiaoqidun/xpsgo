@@ -15,6 +15,7 @@
 package xpsgo
 
 import (
+	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -22,8 +23,11 @@ import (
 	"image"
 	"math"
 	"math/bits"
+	"slices"
 	"sort"
 	"sync"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // trueTypeMaxDepth 等常量限制TrueType字形解析资源上限
@@ -81,22 +85,24 @@ type cffFontParser struct {
 	private map[[2]uint32]cffPrivate
 }
 
-// fontSource 持有共享的只读字体数据，字符映射、轮廓和位图索引分别按需解析
+// fontSource 持有共享的只读字体数据，字符映射、反向映射、轮廓和位图索引分别按需解析
 type fontSource struct {
-	face         *fontFace
-	metrics      *fontMetrics
-	cmapOnce     sync.Once
-	cmap         *fontCmap
-	cmapErr      error
-	outlineOnce  sync.Once
-	trueType     *trueTypeFont
-	cff          *cffFont
-	outlineErr   error
-	bitmapMutex  sync.Mutex
-	bitmapLoaded bool
-	bitmaps      *fontBitmaps
-	bitmapErr    error
-	bitmapScale  fontSourceBitmapScale
+	face            *fontFace
+	metrics         *fontMetrics
+	cmapOnce        sync.Once
+	cmap            *fontCmap
+	cmapErr         error
+	reverseCmapOnce sync.Once
+	reverseCmap     map[uint16][]rune
+	outlineOnce     sync.Once
+	trueType        *trueTypeFont
+	cff             *cffFont
+	outlineErr      error
+	bitmapMutex     sync.Mutex
+	bitmapLoaded    bool
+	bitmaps         *fontBitmaps
+	bitmapErr       error
+	bitmapScale     fontSourceBitmapScale
 }
 
 // fontSourceBitmapScale 保存单个字体访问器独立的EBSC懒加载状态
@@ -259,6 +265,14 @@ type fontBitmapSelection struct {
 	ppemY  uint8
 	scaleX float64
 	scaleY float64
+}
+
+// fontBitmapRunRect 保存合并后的非零位图像素矩形在源像素坐标系下的半开边界
+type fontBitmapRunRect struct {
+	x0 int
+	y0 int
+	x1 int
+	y1 int
 }
 
 // parseCFFFont 连接指定字体的字符集、编码、字典及Type2执行Context，保留绘制参数而不执行绘制
@@ -571,6 +585,236 @@ func (f *fontSource) glyphIndex(char rune) (uint16, error) {
 	return f.cmap.unicodeGlyph(char)
 }
 
+// loadReverseCmap 按需构建从字形编号到升序去重Unicode码点切片的反向映射表
+func (f *fontSource) loadReverseCmap() {
+	f.cmapOnce.Do(f.loadCmap)
+	if f.cmapErr != nil || f.cmap == nil {
+		return
+	}
+	f.reverseCmap = f.cmap.buildReverseMap()
+}
+
+// glyphRunes 返回源字体cmap中映射到指定非零字形编号的升序去重Unicode码点副本
+// 入参: gid 字形编号
+// 返回: []rune 升序去重Unicode码点切片，无映射或无cmap时返回nil
+func (f *fontSource) glyphRunes(gid uint16) []rune {
+	if f == nil || f.metrics == nil || gid == 0 || gid >= f.metrics.numGlyphs {
+		return nil
+	}
+	f.reverseCmapOnce.Do(f.loadReverseCmap)
+	list := f.reverseCmap[gid]
+	if len(list) == 0 {
+		return nil
+	}
+	return slices.Clone(list)
+}
+
+// buildReverseMap 按当前选中cmap的平台、编码与子表格式枚举全部非零字形映射并生成升序去重反向索引
+// 返回: map[uint16][]rune 字形编号到升序去重Unicode码点的只读映射
+func (c *fontCmap) buildReverseMap() map[uint16][]rune {
+	if c == nil || len(c.data) < 2 || c.numGlyphs == 0 {
+		return nil
+	}
+	reverse := make(map[uint16][]rune)
+	add := func(gid uint16, r rune) {
+		if gid == 0 || uint32(gid) >= c.numGlyphs || !utf8.ValidRune(r) {
+			return
+		}
+		reverse[gid] = append(reverse[gid], r)
+	}
+	switch {
+	case c.platform == 3 && c.encoding >= 2 && c.encoding <= 5:
+		for r := rune(0); r < 0x80; r++ {
+			add(c.lookup(uint32(r)), r)
+		}
+		for _, rg := range fontCmapLegacyTables[c.encoding-2].load() {
+			for u := uint32(rg.first); u <= uint32(rg.last); u++ {
+				add(c.lookup(uint32(rg.code)+(u-uint32(rg.first))), rune(u))
+			}
+		}
+	case c.platform == 1 && c.encoding == 0:
+		for code := uint32(0); code < 256; code++ {
+			r := rune(code)
+			if code >= 0x80 {
+				r = fontCmapMacRoman[code-0x80]
+			}
+			add(c.lookup(code), r)
+		}
+	case c.platform == 0 || c.platform == 3 && (c.encoding == 0 || c.encoding == 1 || c.encoding == 10):
+		symbol := c.platform == 3 && c.encoding == 0
+		emit := func(code uint32, gid uint16) {
+			if gid == 0 || uint32(gid) >= c.numGlyphs {
+				return
+			}
+			if c.format == 8 && !symbol {
+				if code <= 0xffff {
+					if !c.is32(0) && !c.is32(code) {
+						add(gid, rune(code))
+					}
+					return
+				}
+				if c.is32(code >> 16) {
+					r := utf16.DecodeRune(rune(code>>16), rune(code&0xffff))
+					if r != utf8.RuneError && r > 0xffff {
+						add(gid, r)
+					}
+				}
+				return
+			}
+			if code <= utf8.MaxRune {
+				add(gid, rune(code))
+			}
+			if symbol && code >= 0xf020 && code <= 0xf0ff && c.lookup(code-0xf000) == 0 {
+				add(gid, rune(code-0xf000))
+			}
+		}
+		c.walkRawMappings(emit, c.format == 8 && !symbol)
+	}
+	if len(reverse) == 0 {
+		return nil
+	}
+	for gid, list := range reverse {
+		slices.Sort(list)
+		reverse[gid] = slices.Compact(list)
+	}
+	return reverse
+}
+
+// walkRawMappings 按子表原生格式枚举所有有效编码到非零字形编号的原始映射
+// 入参: emit 映射回调, utf16Pairs 是否允许遍历Format 8的高低代理对编码
+func (c *fontCmap) walkRawMappings(emit func(uint32, uint16), utf16Pairs bool) {
+	d := c.data
+	switch c.format {
+	case 0:
+		for code := uint32(0); code < 256; code++ {
+			if gid := uint16(d[6+code]); gid != 0 {
+				emit(code, gid)
+			}
+		}
+	case 2:
+		for hi := uint32(0); hi < 256; hi++ {
+			key := uint32(binary.BigEndian.Uint16(d[6+2*hi:]))
+			if key == 0 {
+				if gid := c.lookup(hi); gid != 0 {
+					emit(hi, gid)
+				}
+				continue
+			}
+			pos := 518 + key
+			first := uint32(binary.BigEndian.Uint16(d[pos:]))
+			count := uint32(binary.BigEndian.Uint16(d[pos+2:]))
+			delta := binary.BigEndian.Uint16(d[pos+4:])
+			offset := uint32(binary.BigEndian.Uint16(d[pos+6:]))
+			for i := uint32(0); i < count; i++ {
+				gid := binary.BigEndian.Uint16(d[pos+6+offset+2*i:])
+				if gid != 0 {
+					gid += delta
+					if gid != 0 {
+						emit((hi<<8)|(first+i), gid)
+					}
+				}
+			}
+		}
+	case 4:
+		for i := uint32(0); i < c.count; i++ {
+			end := uint32(binary.BigEndian.Uint16(d[14+2*i:]))
+			start := uint32(binary.BigEndian.Uint16(d[16+2*c.count+2*i:]))
+			delta := binary.BigEndian.Uint16(d[16+4*c.count+2*i:])
+			word := 16 + 6*c.count + 2*i
+			offset := uint32(binary.BigEndian.Uint16(d[word:]))
+			for code := start; code <= end; code++ {
+				var gid uint16
+				if offset == 0 {
+					gid = uint16(code) + delta
+				} else {
+					gid = binary.BigEndian.Uint16(d[word+offset+2*(code-start):])
+					if gid != 0 {
+						gid += delta
+					}
+				}
+				if gid != 0 {
+					emit(code, gid)
+				}
+			}
+		}
+	case 6, 10:
+		var start uint32
+		if c.format == 6 {
+			start = uint32(binary.BigEndian.Uint16(d[6:]))
+		} else {
+			start = binary.BigEndian.Uint32(d[12:])
+		}
+		for i := uint32(0); i < c.count; i++ {
+			code := uint64(start) + uint64(i)
+			if code > utf8.MaxRune {
+				break
+			}
+			if gid := binary.BigEndian.Uint16(d[uint64(c.arrayOffset)+2*uint64(i):]); gid != 0 {
+				emit(uint32(code), gid)
+			}
+		}
+	case 8, 12, 13:
+		for i := uint32(0); i < c.count; i++ {
+			pos := uint64(c.arrayOffset) + 12*uint64(i)
+			start := binary.BigEndian.Uint32(d[pos:])
+			end := binary.BigEndian.Uint32(d[pos+4:])
+			base := binary.BigEndian.Uint32(d[pos+8:])
+			if c.format == 8 && utf16Pairs {
+				if start <= 0xffff {
+					last := min(end, 0xffff)
+					for code := start; code <= last; code++ {
+						gid := uint16(base + code - start)
+						if gid != 0 {
+							emit(code, gid)
+						}
+					}
+				}
+				if end >= 0xd800dc00 && start <= 0xdbffdfff {
+					loBound := max(start, 0xd800dc00)
+					hiBound := min(end, 0xdbffdfff)
+					for high := loBound >> 16; high <= hiBound>>16; high++ {
+						if !c.is32(high) {
+							continue
+						}
+						loStart, loEnd := uint32(0xdc00), uint32(0xdfff)
+						if high == loBound>>16 {
+							loStart = max(loStart, loBound&0xffff)
+						}
+						if high == hiBound>>16 {
+							loEnd = min(loEnd, hiBound&0xffff)
+						}
+						for low := loStart; low <= loEnd; low++ {
+							code := (high << 16) | low
+							gid := uint16(base + code - start)
+							if gid != 0 {
+								emit(code, gid)
+							}
+						}
+					}
+				}
+				continue
+			}
+			if start > utf8.MaxRune {
+				break
+			}
+			last := min(end, uint32(utf8.MaxRune))
+			for code := start; code <= last; code++ {
+				if code >= 0xd800 && code <= 0xdfff {
+					code = 0xdfff
+					continue
+				}
+				gid := uint16(base)
+				if c.format != 13 {
+					gid = uint16(base + code - start)
+				}
+				if gid != 0 {
+					emit(code, gid)
+				}
+			}
+		}
+	}
+}
+
 // loadBitmaps 初始化嵌入位图目录，只缓存完整结果及确定性错误
 // 入参: charge 可选预算及取消回调
 // 返回: error 目录解析、预算或取消错误
@@ -685,6 +929,224 @@ func (f *fontSource) glyphOutline(gid uint16) (Geometry, error) {
 		return Geometry{}, err
 	}
 	return glyph.geometry, nil
+}
+
+// glyphBoldOutline 对指定字形的设计单位轮廓执行粗体向量扩张并返回非零填充闭合几何
+// 入参: gid 字形编号, radius 正的设计单位扩张半径
+// 返回: Geometry 独立加粗矢量轮廓, error 字形、轮廓、数值或预算错误
+func (f *fontSource) glyphBoldOutline(gid uint16, radius float64) (Geometry, error) {
+	outline, err := f.glyphOutline(gid)
+	if err != nil {
+		return Geometry{}, err
+	}
+	if len(outline.Figures) == 0 {
+		return outline, nil
+	}
+	options := defaultSceneRenderOptions()
+	options.context = context.Background()
+	options.tolerance = min(max(0.25, float64(f.metrics.unitsPerEm)/256), max(0.25, radius/2))
+	renderer := sceneRenderer{options: options, edges: options.edges, work: options.work, exact: rasterMaxExact}
+	region, err := renderer.bold(&outline, radius, IdentityMatrix(), true)
+	if err != nil {
+		return Geometry{}, err
+	}
+	slices.SortFunc(region.edges, func(a, b geometryEdge) int {
+		if c := cmp.Compare(a.start.X, b.start.X); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.start.Y, b.start.Y); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.end.X, b.end.X); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.end.Y, b.end.Y)
+	})
+	return walkEdgesToGeometry(region.edges), nil
+}
+
+// glyphBitmapOutline 按请求尺寸与书写方向解码指定位图字形，并将非零像素行程导出为UnitsPerEm设计单位闭合几何
+// 入参: gid 字形编号, ppem 请求像素字号，0表示最大默认strike, vertical 是否采用竖排方向
+// 返回: *Geometry 设计单位闭合矢量几何，空字形返回空Geometry, error 索引、缺位图表、度量或解码错误
+func (f *fontSource) glyphBitmapOutline(gid uint16, ppem uint16, vertical bool) (*Geometry, error) {
+	if gid >= f.metrics.numGlyphs {
+		return nil, fmt.Errorf("%w: font glyph index %d", ErrInvalid, gid)
+	}
+	selection, err := f.selectBitmapOutlineStrike(ppem, vertical)
+	if err != nil {
+		return nil, err
+	}
+	decoder := fontBitmapDecode{
+		font:       f.bitmaps,
+		strike:     &f.bitmaps.strikes[selection.strike],
+		path:       make(map[uint16]bool),
+		cache:      make(map[uint16]fontBitmapDecoded),
+		components: fontBitmapMaxComponents,
+		pixels:     fontBitmapMaxPixels,
+	}
+	decoded, present, err := decoder.decode(gid)
+	if err != nil {
+		return nil, err
+	}
+	if !present || decoded.mask == nil || decoded.mask.Rect.Empty() || decoded.metrics.width == 0 || decoded.metrics.height == 0 {
+		return &Geometry{}, nil
+	}
+	metrics := decoded.metrics
+	axis := metrics.horizontal
+	useVertical := vertical && metrics.hasVertical
+	if useVertical {
+		axis = metrics.vertical
+	} else if !metrics.hasHorizontal {
+		return nil, fmt.Errorf("%w: bitmap glyph has no horizontal bearing", ErrUnsupported)
+	}
+	unitsX := float64(f.metrics.unitsPerEm) / float64(selection.ppemX)
+	unitsY := float64(f.metrics.unitsPerEm) / float64(selection.ppemY)
+	bearingX := math.Round(float64(axis.bearingX) * selection.scaleX)
+	bearingY := math.Round(float64(axis.bearingY) * selection.scaleY)
+	if useVertical {
+		bearingY = -bearingY
+	}
+	designX := func(px int) float64 {
+		return (bearingX + float64(px)*selection.scaleX) * unitsX
+	}
+	designY := func(py int) float64 {
+		return (bearingY - float64(py)*selection.scaleY) * unitsY
+	}
+	return fontBitmapMaskToGeometry(decoded.mask, designX, designY)
+}
+
+// selectBitmapOutlineStrike 按ppem与方向选择最佳位图strike，ppem为0选最大分辨率，否则精确优先、最近回退
+// 入参: ppem 请求像素字号，0表示最大默认strike, vertical 是否竖排方向
+// 返回: fontBitmapSelection 选中的strike与缩放信息, error 缺位图表或strike选择错误
+func (f *fontSource) selectBitmapOutlineStrike(ppem uint16, vertical bool) (fontBitmapSelection, error) {
+	if ppem > 0 && ppem <= 255 {
+		selection, present, err := f.selectBitmapStrikeWithWork(ppem, ppem, vertical, nil)
+		if err != nil {
+			return fontBitmapSelection{}, err
+		}
+		if present {
+			return selection, nil
+		}
+	}
+	if err := f.loadBitmaps(nil); err != nil {
+		return fontBitmapSelection{}, err
+	}
+	if f.bitmaps == nil || len(f.bitmaps.strikes) == 0 {
+		return fontBitmapSelection{}, fmt.Errorf("%w: font has no embedded bitmaps", ErrUnsupported)
+	}
+	wantFlag := uint8(fontBitmapFlagHorizontal)
+	if vertical {
+		wantFlag = fontBitmapFlagVertical
+	}
+	best := -1
+	bestDist := math.Inf(1)
+	bestArea, bestEdge := -1, -1
+	for _, matchDirection := range []bool{true, false} {
+		for i, candidate := range f.bitmaps.strikes {
+			if candidate.ppemX == 0 || candidate.ppemY == 0 {
+				continue
+			}
+			if matchDirection && candidate.flags&wantFlag == 0 {
+				continue
+			}
+			if ppem == 0 {
+				area := int(candidate.ppemX) * int(candidate.ppemY)
+				edge := max(int(candidate.ppemX), int(candidate.ppemY))
+				if best < 0 || area > bestArea || area == bestArea && edge > bestEdge {
+					best, bestArea, bestEdge = i, area, edge
+				}
+				continue
+			}
+			dist := math.Hypot(float64(candidate.ppemX)-float64(ppem), float64(candidate.ppemY)-float64(ppem))
+			if best < 0 || dist < bestDist {
+				best, bestDist = i, dist
+			}
+		}
+		if best >= 0 {
+			break
+		}
+	}
+	if best < 0 {
+		return fontBitmapSelection{}, fmt.Errorf("%w: no matching bitmap strike", ErrUnsupported)
+	}
+	strike := f.bitmaps.strikes[best]
+	return fontBitmapSelection{strike: best, ppemX: strike.ppemX, ppemY: strike.ppemY, scaleX: 1, scaleY: 1}, nil
+}
+
+// fontBitmapMaskToGeometry 将位图掩码中所有非零像素按水平行程及垂直相同区间合并导出为闭合矢量几何
+// 入参: mask 位图覆盖掩码, designX 源像素横坐标到设计单位映射, designY 源像素纵坐标到设计单位映射
+// 返回: *Geometry 设计单位闭合矢量几何，全空掩码返回空Geometry, error 坐标溢出错误
+func fontBitmapMaskToGeometry(mask *image.Alpha, designX, designY func(int) float64) (*Geometry, error) {
+	if mask == nil || mask.Rect.Empty() {
+		return &Geometry{}, nil
+	}
+	active := make(map[[2]int]int)
+	var rects []fontBitmapRunRect
+	for y := mask.Rect.Min.Y; y < mask.Rect.Max.Y; y++ {
+		current := make(map[[2]int]bool)
+		for x := mask.Rect.Min.X; x < mask.Rect.Max.X; {
+			if mask.AlphaAt(x, y).A == 0 {
+				x++
+				continue
+			}
+			end := x + 1
+			for end < mask.Rect.Max.X && mask.AlphaAt(end, y).A != 0 {
+				end++
+			}
+			span := [2]int{x, end}
+			current[span] = true
+			if _, exists := active[span]; !exists {
+				active[span] = y
+			}
+			x = end
+		}
+		for span, yStart := range active {
+			if !current[span] {
+				rects = append(rects, fontBitmapRunRect{x0: span[0], y0: yStart, x1: span[1], y1: y})
+				delete(active, span)
+			}
+		}
+	}
+	for span, yStart := range active {
+		rects = append(rects, fontBitmapRunRect{x0: span[0], y0: yStart, x1: span[1], y1: mask.Rect.Max.Y})
+	}
+	if len(rects) == 0 {
+		return &Geometry{}, nil
+	}
+	slices.SortFunc(rects, func(a, b fontBitmapRunRect) int {
+		if c := cmp.Compare(a.y0, b.y0); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.x0, b.x0); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.y1, b.y1); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.x1, b.x1)
+	})
+	figures := make([]GeometryFigure, 0, len(rects))
+	for _, rect := range rects {
+		x0, x1 := designX(rect.x0), designX(rect.x1)
+		yTop, yBot := designY(rect.y0), designY(rect.y1)
+		if !geometryFinite(x0, x1, yTop, yBot) {
+			return nil, fmt.Errorf("%w: bitmap outline coordinate overflow", ErrLimit)
+		}
+		if yBot > yTop {
+			yBot, yTop = yTop, yBot
+		}
+		figures = append(figures, GeometryFigure{
+			StartPoint: Point{X: x0, Y: yBot},
+			IsFilled:   true,
+			IsClosed:   true,
+			Segments: []GeometrySegment{
+				{Kind: GeometryLine, Point: Point{X: x1, Y: yBot}, IsStroked: true},
+				{Kind: GeometryLine, Point: Point{X: x1, Y: yTop}, IsStroked: true},
+				{Kind: GeometryLine, Point: Point{X: x0, Y: yTop}, IsStroked: true},
+			},
+		})
+	}
+	return &Geometry{FillRule: GeometryNonZero, Figures: figures}, nil
 }
 
 // glyphYMax 读取TrueType声明上边界或计算CFF曲线的实际设计单位上边界

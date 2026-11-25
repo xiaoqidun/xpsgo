@@ -100,7 +100,7 @@ type fontCache struct {
 // FontEmbeddingPermission 表示OpenType字体OS/2表声明的嵌入许可级别
 type FontEmbeddingPermission uint8
 
-// FontResource 保存已解混淆的只读字体程序、名称、格式、度量及嵌入权限元数据
+// FontResource 保存已解混淆的只读字体程序、名称、格式、样式、度量及嵌入权限元数据
 // Data为独立字节副本，与内部解析状态隔离；Ascender与Descender采用hhea设计单位
 // EmbeddingPermission保留OS/2原始fsType位掩码，Permission表示许可级别，受限状态由IsRestricted提供
 type FontResource struct {
@@ -111,15 +111,43 @@ type FontResource struct {
 	IsCollection        bool
 	IsCFF               bool
 	FamilyName          string
+	SubfamilyName       string
+	FullName            string
 	PostScriptName      string
 	Data                []byte
 	UnitsPerEm          uint16
 	Ascender            int16
 	Descender           int16
+	TypoAscender        int16
+	TypoDescender       int16
 	GlyphCount          int
+	Weight              uint16
+	Italic              bool
+	FixedWidth          bool
+	Serif               bool
+	FontBBox            Rect
 	EmbeddingPermission uint16
 	Permission          FontEmbeddingPermission
 	source              *fontSource
+}
+
+// fontResourceNameSet 保存从name表提取的各类字体名称
+type fontResourceNameSet struct {
+	family     string
+	subfamily  string
+	full       string
+	postScript string
+}
+
+// fontResourceStyleInfo 保存从head、OS/2及post表提取的只读字体样式与包围盒元数据
+type fontResourceStyleInfo struct {
+	weight        uint16
+	italic        bool
+	fixedWidth    bool
+	serif         bool
+	fontBBox      Rect
+	typoAscender  int16
+	typoDescender int16
 }
 
 // fontMetrics 保存未缩放的字体设计度量及原始权限信息，不执行嵌入权限策略
@@ -247,7 +275,7 @@ func parseFontFace(data []byte, index uint32) (*fontFace, error) {
 	}
 	header := data[offset : uint64(offset)+12]
 	version := binary.BigEndian.Uint32(header)
-	if version != 0x00010000 && version != 0x4f54544f {
+	if version != 0x00010000 && version != 0x4f54544f && version != 0x74727565 {
 		return nil, fmt.Errorf("%w: font outline format %#x", ErrUnsupported, version)
 	}
 	count := uint64(binary.BigEndian.Uint16(header[4:]))
@@ -657,7 +685,8 @@ func (r *Reader) Font(ctx context.Context, fontURI string) (*FontResource, error
 		return nil, &PartError{Part: part, Err: err}
 	}
 	fsType, permission, _ := fontResourceEmbedding(source.metrics.os2)
-	familyName, postScriptName := fontResourceNames(face)
+	names := parseFontResourceNames(face)
+	style := fontResourceStyle(face, source.metrics)
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
@@ -668,17 +697,117 @@ func (r *Reader) Font(ctx context.Context, fontURI string) (*FontResource, error
 		Obfuscated:          obfuscated,
 		IsCollection:        face.collection,
 		IsCFF:               face.cff,
-		FamilyName:          familyName,
-		PostScriptName:      postScriptName,
+		FamilyName:          names.family,
+		SubfamilyName:       names.subfamily,
+		FullName:            names.full,
+		PostScriptName:      names.postScript,
 		Data:                bytes.Clone(face.data),
 		UnitsPerEm:          source.metrics.unitsPerEm,
 		Ascender:            source.metrics.hhea.ascender,
 		Descender:           source.metrics.hhea.descender,
+		TypoAscender:        style.typoAscender,
+		TypoDescender:       style.typoDescender,
 		GlyphCount:          int(source.metrics.numGlyphs),
+		Weight:              style.weight,
+		Italic:              style.italic,
+		FixedWidth:          style.fixedWidth,
+		Serif:               style.serif,
+		FontBBox:            style.fontBBox,
 		EmbeddingPermission: fsType,
 		Permission:          permission,
 		source:              source,
 	}, nil
+}
+
+// ExtractFontFace 从单面SFNT或TTC/OTC字体集合中无损提取指定索引的独立单面TTF/OTF字节
+// 集合提取时跳过失效的DSIG表，按OpenType规范重排表目录、四字节零填充对齐并重算全部表校验和及head校验和调整值
+// 容忍打印流子集字体缺失cmap、OS/2、post、name等非轮廓必需表，且不受OS/2 NoSubsetting标志阻断
+// 入参: data 原始单面SFNT或TTC/OTC集合字节, collectionIndex 零基字体面索引，单面字体必须为0
+// 返回: []byte 独立单面SFNT深拷贝字节, error 封装、索引、表目录或不支持格式错误
+func ExtractFontFace(data []byte, collectionIndex uint32) ([]byte, error) {
+	face, err := parseFontFace(data, collectionIndex)
+	if err != nil {
+		return nil, err
+	}
+	if !face.collection {
+		return bytes.Clone(data), nil
+	}
+	tags := slices.Sorted(maps.Keys(face.tables))
+	tags = slices.DeleteFunc(tags, func(tag string) bool { return tag == "DSIG" })
+	count := len(tags)
+	if count == 0 {
+		return nil, fmt.Errorf("%w: empty font table directory", ErrInvalid)
+	}
+	if count > 4095 {
+		return nil, fmt.Errorf("%w: font table directory range", ErrLimit)
+	}
+	total := uint64(12 + count*16)
+	hasHead := false
+	for _, tag := range tags {
+		table := face.tables[tag]
+		if tag == "head" {
+			if table.length < 12 {
+				return nil, fmt.Errorf("%w: truncated head table", ErrInvalid)
+			}
+			hasHead = true
+		}
+		total += (uint64(table.length) + 3) &^ uint64(3)
+		if total > uint64(int(^uint(0)>>1)) || total > uint64(^uint32(0)) {
+			return nil, fmt.Errorf("%w: extracted font size overflow", ErrLimit)
+		}
+	}
+	if !hasHead {
+		return nil, fmt.Errorf("%w: missing font table \"head\"", ErrInvalid)
+	}
+	output := make([]byte, int(total))
+	copy(output[:4], face.data[face.offset:uint64(face.offset)+4])
+	binary.BigEndian.PutUint16(output[4:], uint16(count))
+	selector := bits.Len(uint(count)) - 1
+	search := 16 << selector
+	binary.BigEndian.PutUint16(output[6:], uint16(search))
+	binary.BigEndian.PutUint16(output[8:], uint16(selector))
+	binary.BigEndian.PutUint16(output[10:], uint16(count*16-search))
+	position, headOffset := 12+count*16, -1
+	for index, tag := range tags {
+		raw, err := face.table(tag)
+		if err != nil {
+			return nil, err
+		}
+		copy(output[position:], raw)
+		if tag == "head" {
+			headOffset = position
+			clear(output[position+8 : position+12])
+		}
+		record := output[12+index*16 : 12+(index+1)*16]
+		copy(record, tag)
+		binary.BigEndian.PutUint32(record[4:], fontChecksum(output[position:position+len(raw)]))
+		binary.BigEndian.PutUint32(record[8:], uint32(position))
+		binary.BigEndian.PutUint32(record[12:], uint32(len(raw)))
+		position += (len(raw) + 3) &^ 3
+	}
+	binary.BigEndian.PutUint32(output[headOffset+8:], 0xb1b0afba-fontChecksum(output))
+	return output, nil
+}
+
+// StandaloneData 提取当前字体资源可直接嵌入的独立单面非混淆TTF/OTF字节
+// 入参: ctx 取消Context，nil采用Background
+// 返回: []byte 独立单面SFNT深拷贝字节, error 空资源、提取或取消错误
+func (f *FontResource) StandaloneData(ctx context.Context) ([]byte, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if f == nil || len(f.Data) == 0 {
+		return nil, fmt.Errorf("%w: empty font resource", ErrInvalid)
+	}
+	output, err := ExtractFontFace(f.Data, f.CollectionIndex)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	return output, nil
 }
 
 // IsRestricted 报告字体是否禁止编辑、禁止子集化或禁止矢量轮廓嵌入
@@ -697,6 +826,72 @@ func (f *FontResource) IsRestricted() bool {
 	return f.EmbeddingPermission&0x302 != 0
 }
 
+// HasCmap 报告字体面是否包含cmap字符映射表
+// 返回: bool 是否包含cmap表，nil或空资源返回false
+func (f *FontResource) HasCmap() bool {
+	face := fontFaceForResource(f)
+	if face == nil {
+		return false
+	}
+	_, ok := face.tables["cmap"]
+	return ok
+}
+
+// IsBitmapOnly 报告字体面是否为仅含嵌入位图表且无矢量轮廓表的纯位图字体
+// 返回: bool 是否为纯位图字体，nil或空资源返回false
+func (f *FontResource) IsBitmapOnly() bool {
+	return fontIsBitmapOnly(fontFaceForResource(f))
+}
+
+// CanEmbedPreviewPrint 报告字体是否允许以预览与打印、可编辑或可安装许可嵌入矢量轮廓
+// 返回: bool 是否允许预览打印级别及以上嵌入，仅受限、仅位图嵌入或未知资源返回false
+func (f *FontResource) CanEmbedPreviewPrint() bool {
+	if f == nil {
+		return false
+	}
+	if f.source != nil && f.source.metrics != nil {
+		if f.source.metrics.os2 == nil {
+			return true
+		}
+		rights, err := fontEmbeddingRights(f.source.metrics.os2)
+		return err == nil && rights&0x0202 == 0
+	}
+	switch f.Permission {
+	case FontEmbeddingInstallable, FontEmbeddingEditable, FontEmbeddingPreviewPrint:
+		return f.EmbeddingPermission&0x0202 == 0
+	default:
+		return false
+	}
+}
+
+// CanSubset 报告字体是否同时允许嵌入矢量轮廓且未声明NoSubsetting限制
+// 返回: bool 是否允许子集化嵌入，受限、禁止子集化或未知资源返回false
+func (f *FontResource) CanSubset() bool {
+	if !f.CanEmbedPreviewPrint() {
+		return false
+	}
+	if f.source != nil && f.source.metrics != nil && f.source.metrics.os2 != nil {
+		rights, err := fontEmbeddingRights(f.source.metrics.os2)
+		return err == nil && rights&0x0100 == 0
+	}
+	return f.EmbeddingPermission&0x0100 == 0
+}
+
+// BitmapEmbeddingOnly 报告字体OS/2表是否声明了仅位图嵌入限制位
+// 返回: bool 是否设置了仅位图嵌入标志，nil资源返回false
+func (f *FontResource) BitmapEmbeddingOnly() bool {
+	if f == nil {
+		return false
+	}
+	if f.source != nil && f.source.metrics != nil && f.source.metrics.os2 != nil {
+		rights, err := fontEmbeddingRights(f.source.metrics.os2)
+		if err == nil {
+			return rights&0x0200 != 0
+		}
+	}
+	return f.EmbeddingPermission&0x0200 != 0
+}
+
 // GlyphOutline 提取指定字形在设计单位下的矢量轮廓几何，纵轴向上且已按水平原点归一化
 // 入参: glyph 字形编号
 // 返回: *Geometry 独立轮廓几何, error 索引、格式或不支持的轮廓类型错误
@@ -709,6 +904,48 @@ func (f *FontResource) GlyphOutline(glyph uint16) (*Geometry, error) {
 		return nil, err
 	}
 	return &outline, nil
+}
+
+// GlyphBoldOutline 提取指定字形在设计单位下经粗体向量扩张后的闭合矢量轮廓几何
+// radius小于等于0时默认采用ECMA-388规范的1% em半径
+// 入参: gid 字形编号, radius 设计单位扩张半径，小于等于0时采用UnitsPerEm的1%
+// 返回: *Geometry 独立加粗矢量轮廓几何, error 空资源、参数、字形、轮廓或预算错误
+func (f *FontResource) GlyphBoldOutline(gid uint16, radius float64) (*Geometry, error) {
+	if f == nil || f.source == nil || f.source.metrics == nil || f.UnitsPerEm == 0 {
+		return nil, fmt.Errorf("%w: empty font resource", ErrInvalid)
+	}
+	if !geometryFinite(radius) {
+		return nil, fmt.Errorf("%w: invalid bold radius", ErrInvalid)
+	}
+	if radius <= 0 {
+		radius = float64(f.UnitsPerEm) * 0.01
+	}
+	outline, err := f.source.glyphBoldOutline(gid, radius)
+	if err != nil {
+		return nil, err
+	}
+	return &outline, nil
+}
+
+// GlyphBitmapOutline 将位图字体指定字形的像素行程按UnitsPerEm设计单位坐标系导出为闭合矢量几何
+// ppem为0时按方向优先选择最大分辨率strike，否则按精确EBLC、EBSC代用与最近欧氏距离依次回退选择
+// 入参: gid 字形编号, ppem 请求的像素字号，0表示选择最大默认strike, vertical 是否按竖排方向选择strike与度量
+// 返回: *Geometry 设计单位闭合矢量几何，空字形返回空Geometry, error 空资源、越界、缺位图表或解码错误
+func (f *FontResource) GlyphBitmapOutline(gid uint16, ppem uint16, vertical bool) (*Geometry, error) {
+	if f == nil || f.source == nil || f.source.face == nil || f.source.metrics == nil || f.UnitsPerEm == 0 {
+		return nil, fmt.Errorf("%w: empty font resource", ErrInvalid)
+	}
+	return f.source.glyphBitmapOutline(gid, ppem, vertical)
+}
+
+// GlyphRunes 通过源字体cmap反向映射查找映射到指定字形编号的升序去重Unicode码点列表
+// 入参: gid 字形编号
+// 返回: []rune 升序去重的独立Unicode码点切片，无cmap、gid为0或无映射时返回nil
+func (f *FontResource) GlyphRunes(gid uint16) []rune {
+	if f == nil || f.source == nil {
+		return nil
+	}
+	return f.source.glyphRunes(gid)
 }
 
 // GlyphAdvance 返回指定字形以em为单位归一化的水平步进宽度
@@ -793,20 +1030,82 @@ func fontIsBitmapOnly(face *fontFace) bool {
 	return hasEBLC || hasEBDT
 }
 
-// fontResourceNames 从SFNT名称表提取字体家族名与PostScript名称，表缺失或损坏时返回空字符串
-// 入参: face 已解析的字体面
-// 返回: string 字体家族名, string PostScript名称
-func fontResourceNames(face *fontFace) (string, string) {
+// fontFaceForResource 获取字体资源关联的只读字体面，无内部源时尝试解析Data字段
+// 入参: f 字体资源
+// 返回: *fontFace 字体面，不可用时返回nil
+func fontFaceForResource(f *FontResource) *fontFace {
+	if f == nil {
+		return nil
+	}
+	if f.source != nil && f.source.face != nil {
+		return f.source.face
+	}
+	if len(f.Data) == 0 {
+		return nil
+	}
+	face, err := parseFontFace(f.Data, f.CollectionIndex)
+	if err != nil {
+		return nil
+	}
+	return face
+}
+
+// fontResourceStyle 从head、OS/2与post表提取字体字重、斜体、等宽、衬线、设计包围盒及排版升降部元数据
+// 入参: face 已解析的字体面, metrics 已解析的字体度量
+// 返回: fontResourceStyleInfo 字体样式与包围盒信息
+func fontResourceStyle(face *fontFace, metrics *fontMetrics) fontResourceStyleInfo {
+	var style fontResourceStyleInfo
 	if face == nil {
-		return "", ""
+		return style
+	}
+	if head, err := face.table("head"); err == nil && len(head) >= 54 {
+		xMin := int16(binary.BigEndian.Uint16(head[36:]))
+		yMin := int16(binary.BigEndian.Uint16(head[38:]))
+		xMax := int16(binary.BigEndian.Uint16(head[40:]))
+		yMax := int16(binary.BigEndian.Uint16(head[42:]))
+		style.fontBBox = Rect{
+			X:      float64(xMin),
+			Y:      float64(yMin),
+			Width:  float64(int32(xMax) - int32(xMin)),
+			Height: float64(int32(yMax) - int32(yMin)),
+		}
+		if binary.BigEndian.Uint16(head[44:])&0x0002 != 0 {
+			style.italic = true
+		}
+	}
+	if os2, err := face.table("OS/2"); err == nil && len(os2) >= 78 {
+		style.weight = binary.BigEndian.Uint16(os2[4:])
+		if binary.BigEndian.Uint16(os2[62:])&0x0001 != 0 {
+			style.italic = true
+		}
+		if classID := os2[30]; (classID >= 1 && classID <= 5) || classID == 7 {
+			style.serif = true
+		}
+	}
+	if metrics != nil && metrics.os2 != nil {
+		style.typoAscender = metrics.os2.typoAscender
+		style.typoDescender = metrics.os2.typoDescender
+	}
+	if post, err := face.table("post"); err == nil && len(post) >= 16 {
+		style.fixedWidth = binary.BigEndian.Uint32(post[12:]) != 0
+	}
+	return style
+}
+
+// parseFontResourceNames 从SFNT名称表提取家族名、子族名、全名与PostScript名称，表缺失或损坏时返回零值
+// 入参: face 已解析的字体面
+// 返回: fontResourceNameSet 字体名称集合
+func parseFontResourceNames(face *fontFace) fontResourceNameSet {
+	if face == nil {
+		return fontResourceNameSet{}
 	}
 	data, err := face.table("name")
 	if err != nil || len(data) < 6 {
-		return "", ""
+		return fontResourceNameSet{}
 	}
 	format := binary.BigEndian.Uint16(data)
 	if format != 0 && format != 1 {
-		return "", ""
+		return fontResourceNameSet{}
 	}
 	count := int(binary.BigEndian.Uint16(data[2:]))
 	storage := int(binary.BigEndian.Uint16(data[4:]))
@@ -814,21 +1113,21 @@ func fontResourceNames(face *fontFace) (string, string) {
 	headerEnd := end
 	if format == 1 {
 		if end+2 > len(data) {
-			return "", ""
+			return fontResourceNameSet{}
 		}
 		headerEnd = end + 2 + 4*int(binary.BigEndian.Uint16(data[end:]))
 	}
 	if headerEnd > len(data) || storage < headerEnd || storage > len(data) {
-		return "", ""
+		return fontResourceNameSet{}
 	}
-	var family, typoFamily, postScript string
-	familyRank, typoRank, psRank := 0, 0, 0
+	var family, typoFamily, subfamily, typoSubfamily, fullName, postScript string
+	familyRank, typoRank, subRank, typoSubRank, fullRank, psRank := 0, 0, 0, 0, 0, 0
 	for offset := 6; offset < end; offset += 12 {
 		platform := binary.BigEndian.Uint16(data[offset:])
 		encoding := binary.BigEndian.Uint16(data[offset+2:])
 		language := binary.BigEndian.Uint16(data[offset+4:])
 		nameID := binary.BigEndian.Uint16(data[offset+6:])
-		if nameID != 1 && nameID != 6 && nameID != 16 {
+		if nameID != 1 && nameID != 2 && nameID != 4 && nameID != 6 && nameID != 16 && nameID != 17 {
 			continue
 		}
 		length := int(binary.BigEndian.Uint16(data[offset+8:]))
@@ -845,20 +1144,41 @@ func fontResourceNames(face *fontFace) (string, string) {
 			if rank > familyRank {
 				family, familyRank = text, rank
 			}
-		case 16:
-			if rank > typoRank {
-				typoFamily, typoRank = text, rank
+		case 2:
+			if rank > subRank {
+				subfamily, subRank = text, rank
+			}
+		case 4:
+			if rank > fullRank {
+				fullName, fullRank = text, rank
 			}
 		case 6:
 			if rank > psRank {
 				postScript, psRank = text, rank
+			}
+		case 16:
+			if rank > typoRank {
+				typoFamily, typoRank = text, rank
+			}
+		case 17:
+			if rank > typoSubRank {
+				typoSubfamily, typoSubRank = text, rank
 			}
 		}
 	}
 	if family == "" {
 		family = typoFamily
 	}
-	return family, postScript
+	resolvedSubfamily := typoSubfamily
+	if resolvedSubfamily == "" {
+		resolvedSubfamily = subfamily
+	}
+	return fontResourceNameSet{
+		family:     family,
+		subfamily:  resolvedSubfamily,
+		full:       fullName,
+		postScript: postScript,
+	}
 }
 
 // decodeFontNameRecord 按平台与编码解码单条OpenType名称记录并返回匹配优先级
@@ -1028,48 +1348,71 @@ func xorFontHeader(fontURI string, data []byte) ([]byte, error) {
 // 入参: face 已定位的只读字体面
 // 返回: error 缺表、结构错误或尚未支持的元数据格式
 func validateCreatedFontMetadata(face *fontFace) error {
-	_, err := validateCreatedFontMetrics(face, nil)
+	_, err := validateFontSubsetMetrics(face, nil, false)
 	return err
 }
 
-// validateCreatedFontMetrics 校验生产者字体必需表与元数据并返回基础度量，可复用已解析的OS/2避免重复解析
-// 入参: face 已定位的只读字体面, os2 可选已解析OS/2度量，nil时内部解析
+// validateFontSubsetMetrics 校验字体子集化或生产者所需的度量与元数据表，allowMissingCmap为真时允许缺失非轮廓元数据表
+// 入参: face 已定位的只读字体面, os2 可选已解析OS/2度量，nil时内部解析, allowMissingCmap 是否允许缺失cmap及附属非轮廓元数据表
 // 返回: *fontMetrics 已校验基础字体度量, error 缺表、结构错误或尚未支持的元数据格式
-func validateCreatedFontMetrics(face *fontFace, os2 *fontOS2Metrics) (*fontMetrics, error) {
+func validateFontSubsetMetrics(face *fontFace, os2 *fontOS2Metrics, allowMissingCmap bool) (*fontMetrics, error) {
+	if face == nil {
+		return nil, fmt.Errorf("%w: missing font face", ErrInvalid)
+	}
 	for _, table := range []struct {
 		tag     string
 		minimum int
-	}{{"cmap", 4}, {"head", 54}, {"hhea", 36}, {"hmtx", 4}, {"maxp", 6}, {"name", 6}, {"OS/2", 2}, {"post", 32}} {
+	}{{"head", 54}, {"hhea", 36}, {"hmtx", 4}, {"maxp", 6}} {
 		if _, err := fontMetricsTable(face, table.tag, table.minimum); err != nil {
 			return nil, err
 		}
 	}
-	cmap, _ := face.table("cmap")
-	if binary.BigEndian.Uint16(cmap) != 0 {
-		return nil, fmt.Errorf("%w: cmap metadata version", ErrUnsupported)
+	if _, hasCmap := face.tables["cmap"]; hasCmap || !allowMissingCmap {
+		cmap, err := fontMetricsTable(face, "cmap", 4)
+		if err != nil {
+			return nil, err
+		}
+		if binary.BigEndian.Uint16(cmap) != 0 {
+			return nil, fmt.Errorf("%w: cmap metadata version", ErrUnsupported)
+		}
+		count := int(binary.BigEndian.Uint16(cmap[2:]))
+		end := 4 + 8*count
+		if count == 0 || end > len(cmap) {
+			return nil, fmt.Errorf("%w: cmap encoding records", ErrInvalid)
+		}
+		for offset := 4; offset < end; offset += 8 {
+			start := uint64(binary.BigEndian.Uint32(cmap[offset+4:]))
+			if start < uint64(end) || start+2 > uint64(len(cmap)) {
+				return nil, fmt.Errorf("%w: cmap encoding offset", ErrInvalid)
+			}
+		}
 	}
-	count := int(binary.BigEndian.Uint16(cmap[2:]))
-	end := 4 + 8*count
-	if count == 0 || end > len(cmap) {
-		return nil, fmt.Errorf("%w: cmap encoding records", ErrInvalid)
-	}
-	for offset := 4; offset < end; offset += 8 {
-		start := uint64(binary.BigEndian.Uint32(cmap[offset+4:]))
-		if start < uint64(end) || start+2 > uint64(len(cmap)) {
-			return nil, fmt.Errorf("%w: cmap encoding offset", ErrInvalid)
+	if _, hasOS2 := face.tables["OS/2"]; hasOS2 || !allowMissingCmap {
+		if _, err := fontMetricsTable(face, "OS/2", 2); err != nil {
+			return nil, err
 		}
 	}
 	metrics, err := parseFontMetricsWithOS2(face, os2)
 	if err != nil {
 		return nil, err
 	}
-	name, _ := face.table("name")
-	if err := validateCreatedFontNames(name); err != nil {
-		return nil, err
+	if _, hasName := face.tables["name"]; hasName || !allowMissingCmap {
+		name, err := fontMetricsTable(face, "name", 6)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateCreatedFontNames(name); err != nil {
+			return nil, err
+		}
 	}
-	post, _ := face.table("post")
-	if err := validateCreatedFontPost(post, metrics.numGlyphs, face.cff); err != nil {
-		return nil, err
+	if _, hasPost := face.tables["post"]; hasPost || !allowMissingCmap {
+		post, err := fontMetricsTable(face, "post", 32)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateCreatedFontPost(post, metrics.numGlyphs, face.cff); err != nil {
+			return nil, err
+		}
 	}
 	return metrics, nil
 }
