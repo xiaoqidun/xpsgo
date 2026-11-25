@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // uriSubDelimiters 定义RFC 3986 URI子分隔符集合
@@ -181,31 +182,40 @@ func opcNormalizePath(value string, decodeUnreserved bool) (string, error) {
 	const hex = "0123456789ABCDEF"
 	var b strings.Builder
 	b.Grow(len(value))
+	var pctBuf [16]byte
 	for i := 0; i < len(value); i++ {
 		c := value[i]
 		if c == '%' {
-			if i+2 >= len(value) {
-				return "", fmt.Errorf("%w: invalid percent escape in %q", ErrInvalid, value)
-			}
-			hi, lo := opcHex(value[i+1]), opcHex(value[i+2])
-			if hi < 0 || lo < 0 {
-				return "", fmt.Errorf("%w: invalid percent escape in %q", ErrInvalid, value)
-			}
-			decoded := byte(hi*16 + lo)
-			if decoded == '/' || decoded == '\\' {
-				return "", fmt.Errorf("%w: forbidden percent escape in %q", ErrInvalid, value)
-			}
-			if opcUnreserved(decoded) {
-				if !decodeUnreserved {
+			pct := pctBuf[:0]
+			for i < len(value) && value[i] == '%' {
+				if i+2 >= len(value) {
+					return "", fmt.Errorf("%w: invalid percent escape in %q", ErrInvalid, value)
+				}
+				hi, lo := opcHex(value[i+1]), opcHex(value[i+2])
+				if hi < 0 || lo < 0 {
+					return "", fmt.Errorf("%w: invalid percent escape in %q", ErrInvalid, value)
+				}
+				decoded := byte(hi*16 + lo)
+				if decoded == '/' || decoded == '\\' {
 					return "", fmt.Errorf("%w: forbidden percent escape in %q", ErrInvalid, value)
 				}
-				b.WriteByte(decoded)
-			} else {
-				b.WriteByte('%')
-				b.WriteByte(hex[hi])
-				b.WriteByte(hex[lo])
+				pct = append(pct, decoded)
+				if opcUnreserved(decoded) {
+					if !decodeUnreserved {
+						return "", fmt.Errorf("%w: forbidden percent escape in %q", ErrInvalid, value)
+					}
+					b.WriteByte(decoded)
+				} else {
+					b.WriteByte('%')
+					b.WriteByte(hex[hi])
+					b.WriteByte(hex[lo])
+				}
+				i += 3
 			}
-			i += 2
+			if !utf8.Valid(pct) {
+				return "", fmt.Errorf("%w: invalid UTF-8 percent escape in %q", ErrInvalid, value)
+			}
+			i--
 		} else if opcUnreserved(c) || strings.ContainsRune("/!$&'()*+,;=:@", rune(c)) {
 			b.WriteByte(c)
 		} else {

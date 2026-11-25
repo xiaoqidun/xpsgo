@@ -144,6 +144,7 @@ type compositionIndex struct {
 	limits   Limits
 	raw      *xmlElement
 	active   *xmlElement
+	ordered  map[*xmlElement][]xmlContent
 	checked  bool
 	retained bool
 }
@@ -904,9 +905,6 @@ func convertCompositionSourceWithReport(source *compositionSource, format Format
 	result.pages = make([]PageReference, len(source.pages))
 	for i, page := range source.pages {
 		page.LinkTargets = slices.Clone(page.LinkTargets)
-		if source.format == FormatOpenXPS && format == FormatXPS {
-			page.LinkTargets = deduplicateStrings(page.LinkTargets)
-		}
 		result.pages[i] = page
 	}
 	result.documents = make([]Document, len(source.documents))
@@ -914,15 +912,12 @@ func convertCompositionSourceWithReport(source *compositionSource, format Format
 		doc.Pages = make([]PageReference, len(doc.Pages))
 		for j, page := range source.documents[i].Pages {
 			page.LinkTargets = slices.Clone(page.LinkTargets)
-			if source.format == FormatOpenXPS && format == FormatXPS {
-				page.LinkTargets = deduplicateStrings(page.LinkTargets)
-			}
 			doc.Pages[j] = page
 		}
 		result.documents[i] = doc
 	}
 	if source.rootRelationships.name != "" {
-		part, err := convertCompositionPartMarkup(source.rootRelationships, source.format, format, source.parts, budget)
+		part, _, _, err := convertCompositionPartMarkupTargets(source.rootRelationships, source.format, format, source.parts, budget)
 		if err != nil {
 			return nil, nil, &PartError{Part: source.rootRelationships.name, Err: err}
 		}
@@ -940,9 +935,25 @@ func convertCompositionSourceWithReport(source *compositionSource, format Format
 				return nil, nil, &PartError{Part: source.parts[key].name, Err: err}
 			}
 		}
-		part, err := convertCompositionPartMarkup(part, source.format, format, source.parts, budget)
+		part, pageTargets, linkModified, err := convertCompositionPartMarkupTargets(part, source.format, format, source.parts, budget)
 		if err != nil {
 			return nil, nil, &PartError{Part: source.parts[key].name, Err: err}
+		}
+		if linkModified {
+			offset := 0
+			for docIdx := range result.documents {
+				if strings.EqualFold(result.documents[docIdx].Part, part.name) {
+					for pageIdx := range result.documents[docIdx].Pages {
+						pageKey := strings.ToLower(result.documents[docIdx].Pages[pageIdx].Part)
+						normalized := slices.Clone(pageTargets[pageKey])
+						result.documents[docIdx].Pages[pageIdx].LinkTargets = normalized
+						if offset+pageIdx < len(result.pages) {
+							result.pages[offset+pageIdx].LinkTargets = slices.Clone(normalized)
+						}
+					}
+				}
+				offset += len(result.documents[docIdx].Pages)
+			}
 		}
 		result.parts[key] = part
 	}
@@ -990,12 +1001,12 @@ func validateCompositionFormatTicket(source string, relation Relationship, from,
 	return nil
 }
 
-// convertCompositionPartMarkup 转换方言绑定及关系类型，结合部件表在跨方言转换阶段提前校验打印票据媒体类型
+// convertCompositionPartMarkupTargets 转换方言绑定并返回OpenXPS转XPS时规范化的页面LinkTargets表与变更状态
 // 入参: part 原部件, source 原格式, target 目标格式, parts 可选原快照部件表, budget 共享预算
-// 返回: packagePart 目标部件，失败为空值, error 结构、表达能力、预算或取消错误
-func convertCompositionPartMarkup(part packagePart, source, target Format, parts map[string]packagePart, budget *compositionBudget) (packagePart, error) {
+// 返回: packagePart 目标部件, map[string][]string 页面小写URI到规范化LinkTargets的映射, bool 是否发生LinkTarget规范化, error 错误信息
+func convertCompositionPartMarkupTargets(part packagePart, source, target Format, parts map[string]packagePart, budget *compositionBudget) (packagePart, map[string][]string, bool, error) {
 	if err := budget.step(1); err != nil {
-		return packagePart{}, err
+		return packagePart{}, nil, false, err
 	}
 	layout, _ := fontUsageMarkup(part.media)
 	index := compositionIndexRoot(part.media) != ""
@@ -1006,37 +1017,37 @@ func convertCompositionPartMarkup(part packagePart, source, target Format, parts
 		relSource := relationshipSource(part.name)
 		records, err := compositionRelationshipRecords(relSource, part, budget)
 		if err != nil {
-			return packagePart{}, err
+			return packagePart{}, nil, false, err
 		}
 		edited := false
 		for index := range records {
 			if err := budget.step(1); err != nil {
-				return packagePart{}, err
+				return packagePart{}, nil, false, err
 			}
 			if err := validateCompositionFormatTicket(relSource, records[index], source, target, parts); err != nil {
-				return packagePart{}, err
+				return packagePart{}, nil, false, err
 			}
 			kind, err := compositionFormatRelationship(records[index].Type, source, target)
 			if err != nil {
-				return packagePart{}, err
+				return packagePart{}, nil, false, err
 			}
 			edited = edited || kind != records[index].Type
 			records[index].Type = kind
 		}
 		data, err := compositionRelationshipMarkup(part, records, edited, budget)
 		if err != nil {
-			return packagePart{}, err
+			return packagePart{}, nil, false, err
 		}
 		if edited {
 			part.data, part.items = data, nil
 		}
-		return part, nil
+		return part, nil, false, nil
 	}
 	if !layout && !definition && !discard {
-		return part, nil
+		return part, nil, false, nil
 	}
 	if err := validateCompositionFormatMarkup(part, source, budget); err != nil {
-		return packagePart{}, err
+		return packagePart{}, nil, false, err
 	}
 	namespace, destination := formatNamespace(source), formatNamespace(target)
 	namespaces := map[string]string{namespace: destination}
@@ -1045,7 +1056,7 @@ func convertCompositionPartMarkup(part packagePart, source, target Format, parts
 	}
 	for range 2 {
 		if err := budget.scan(int64(len(part.data))); err != nil {
-			return packagePart{}, err
+			return packagePart{}, nil, false, err
 		}
 	}
 	data, changed, err := rewriteXMLMappedAttributes(part.data, budget.limits, budget.context, namespaces, func(node *xmlElement, attribute xml.Attr) (string, bool, error) {
@@ -1105,68 +1116,50 @@ func convertCompositionPartMarkup(part packagePart, source, target Format, parts
 		return attribute.Value, false, nil
 	})
 	if err != nil {
-		return packagePart{}, err
+		return packagePart{}, nil, false, err
 	}
 	result := part
 	result.data = data
 	if changed {
 		result.items = nil
 	}
+	var pageTargets map[string][]string
+	linkModified := false
 	if source == FormatOpenXPS && target == FormatXPS && strings.EqualFold(result.media, fixedContentType("fixeddocument")) {
-		result, err = deduplicateCompositionLinkTargets(result, target, budget)
+		result, pageTargets, linkModified, err = deduplicateCompositionLinkTargets(result, target, budget)
 		if err != nil {
-			return packagePart{}, err
+			return packagePart{}, nil, false, err
 		}
 	}
 	if err := validateCompositionFormatMarkup(result, target, budget); err != nil {
 		if errors.Is(err, ErrInvalid) {
-			return packagePart{}, fmt.Errorf("%w: target document format: %v", ErrUnsupported, err)
+			return packagePart{}, nil, false, fmt.Errorf("%w: target document format: %v", ErrUnsupported, err)
 		}
-		return packagePart{}, err
+		return packagePart{}, nil, false, err
 	}
 	if err := budget.step(0); err != nil {
-		return packagePart{}, err
+		return packagePart{}, nil, false, err
 	}
-	return result, nil
+	return result, pageTargets, linkModified, nil
 }
 
-// deduplicateStrings 按首次出现顺序去除字符串切片中的重复项
-// 入参: values 原始字符串切片
-// 返回: []string 去重后的独立切片
-func deduplicateStrings(values []string) []string {
-	if len(values) < 2 {
-		return values
-	}
-	seen := make(map[string]bool, len(values))
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		if seen[value] {
-			continue
-		}
-		seen[value] = true
-		result = append(result, value)
-	}
-	return result
-}
-
-// deduplicateCompositionLinkTargets 将OpenXPS固定文档中合法重复或非NCName的LinkTarget规范化为XPS 1.0唯一标识
+// deduplicateCompositionLinkTargets 将OpenXPS固定文档中合法重复或非NCName的LinkTarget规范化为XPS 1.0唯一标识，保留MCE扩展与原相对顺序
 // 入参: part 已切换命名空间的固定文档部件, target 目标方言, budget 共享预算
-// 返回: packagePart 规范化后的文档部件, error 解析、编码、预算或取消错误
-func deduplicateCompositionLinkTargets(part packagePart, target Format, budget *compositionBudget) (packagePart, error) {
+// 返回: packagePart 规范化后的文档部件, map[string][]string 各页面规范化LinkTargets, bool 是否发生改写或去重, error 解析、编码、预算或取消错误
+func deduplicateCompositionLinkTargets(part packagePart, target Format, budget *compositionBudget) (packagePart, map[string][]string, bool, error) {
 	if err := budget.scan(int64(len(part.data))); err != nil {
-		return packagePart{}, err
-	}
-	root, err := decodeXMLVisit(part.data, budget.limits, func(_ xml.Token, _ *xmlElement) error { return budget.step(1) })
-	if err != nil {
-		return packagePart{}, err
+		return packagePart{}, nil, false, err
 	}
 	namespace := formatNamespace(target)
-	active, err := preprocessXMLContext(root, []string{namespace, namespace + "/resourcedictionary-key"}, budget.context)
+	active, ordered, err := preprocessXMLContentContext(part.data, []string{namespace, namespace + "/resourcedictionary-key"}, budget.limits, budget.context)
 	if err != nil {
-		return packagePart{}, err
+		return packagePart{}, nil, false, err
 	}
 	reserved := make(map[string]bool)
 	for _, pageNode := range active.Children {
+		if err := budget.step(1); err != nil {
+			return packagePart{}, nil, false, err
+		}
 		if pageNode.Name != (xml.Name{Space: namespace, Local: "PageContent"}) {
 			continue
 		}
@@ -1184,15 +1177,23 @@ func deduplicateCompositionLinkTargets(part packagePart, target Format, budget *
 		}
 	}
 	seen := make(map[string]bool)
+	pageTargets := make(map[string][]string)
 	counter := 0
 	modified := false
 	for _, pageNode := range active.Children {
 		if err := budget.step(1); err != nil {
-			return packagePart{}, err
+			return packagePart{}, nil, false, err
 		}
 		if pageNode.Name != (xml.Name{Space: namespace, Local: "PageContent"}) {
 			continue
 		}
+		pageKey := ""
+		if src, ok := pageNode.attribute("Source"); ok {
+			if resolved, resolveErr := resolvePart(part.name, src); resolveErr == nil {
+				pageKey = strings.ToLower(resolved)
+			}
+		}
+		var pageLinks []string
 		keptPageChildren := make([]*xmlElement, 0, len(pageNode.Children))
 		for _, child := range pageNode.Children {
 			if child.Name != (xml.Name{Space: namespace, Local: "PageContent.LinkTargets"}) {
@@ -1202,7 +1203,7 @@ func deduplicateCompositionLinkTargets(part packagePart, target Format, budget *
 			keptLinks := make([]*xmlElement, 0, len(child.Children))
 			for _, link := range child.Children {
 				if err := budget.step(1); err != nil {
-					return packagePart{}, err
+					return packagePart{}, nil, false, err
 				}
 				if link.Name != (xml.Name{Space: namespace, Local: "LinkTarget"}) {
 					keptLinks = append(keptLinks, link)
@@ -1218,12 +1219,14 @@ func deduplicateCompositionLinkTargets(part packagePart, target Format, budget *
 					continue
 				}
 				seen[val] = true
+				finalName := val
 				if !xmlNCName(val) {
 					for {
 						counter++
 						candidate := "Name_" + strconv.Itoa(counter)
 						if !reserved[candidate] && !seen[candidate] {
 							reserved[candidate], seen[candidate] = true, true
+							finalName = candidate
 							for i := range link.Attr {
 								if link.Attr[i].Name.Space == "" && link.Attr[i].Name.Local == "Name" {
 									link.Attr[i].Value = candidate
@@ -1235,9 +1238,10 @@ func deduplicateCompositionLinkTargets(part packagePart, target Format, budget *
 						}
 					}
 				}
+				pageLinks = append(pageLinks, finalName)
 				keptLinks = append(keptLinks, link)
 			}
-			if len(keptLinks) == 0 {
+			if len(keptLinks) == 0 && len(child.PreservedElements) == 0 {
 				modified = true
 				continue
 			}
@@ -1245,9 +1249,12 @@ func deduplicateCompositionLinkTargets(part packagePart, target Format, budget *
 			keptPageChildren = append(keptPageChildren, child)
 		}
 		pageNode.Children = keptPageChildren
+		if pageKey != "" {
+			pageTargets[pageKey] = pageLinks
+		}
 	}
 	if !modified {
-		return part, nil
+		return part, pageTargets, false, nil
 	}
 	var stripNS func(*xmlElement)
 	stripNS = func(node *xmlElement) {
@@ -1265,15 +1272,15 @@ func deduplicateCompositionLinkTargets(part packagePart, target Format, budget *
 	stripNS(active)
 	limits := budget.limits
 	limits.MaxMetadataBytes = min(limits.MaxMetadataBytes, limits.MaxPackageBytes)
-	data, err := createdMarkup(active, limits, budget.context)
+	data, err := createdMarkupContent(active, ordered, limits, budget.context)
 	if err != nil {
-		return packagePart{}, err
+		return packagePart{}, nil, false, err
 	}
 	if err := budget.scan(int64(len(data))); err != nil {
-		return packagePart{}, err
+		return packagePart{}, nil, false, err
 	}
 	part.data, part.items = data, nil
-	return part, nil
+	return part, pageTargets, true, nil
 }
 
 // validateCompositionFormatMarkup 校验方言差异及关系、签署请求等结构，不用目标规则替代源规则
@@ -1296,24 +1303,33 @@ func validateCompositionFormatMarkup(part packagePart, format Format, budget *co
 	discard := strings.EqualFold(part.media, fixedContentType("discard-control"))
 	namespace := formatNamespace(format)
 	graph := compositionProtectionGraph{source: &compositionSource{format: format}, budget: budget}
+	tracker := newResourceMarkupScopeTracker(format, false, budget.context)
 	root, err := decodeXMLVisit(part.data, budget.limits, func(token xml.Token, node *xmlElement) error {
 		if err := budget.step(1); err != nil {
 			return err
 		}
-		if _, start := token.(xml.StartElement); !start {
+		if layout {
+			skip, _, err := tracker.visit(token, node)
+			if err != nil {
+				return err
+			}
+			if _, start := token.(xml.StartElement); !start {
+				return nil
+			}
+			if skip {
+				return nil
+			}
+		} else {
+			if _, start := token.(xml.StartElement); !start {
+				return nil
+			}
+			if relations {
+				return compositionRelationshipElement(node, budget)
+			}
+			if definition {
+				return graph.definition(node)
+			}
 			return nil
-		}
-		if relations {
-			return compositionRelationshipElement(node, budget)
-		}
-		if definition {
-			return graph.definition(node)
-		}
-		if !layout {
-			return nil
-		}
-		if err := validateResourceMarkupElement(node, format); err != nil {
-			return err
 		}
 		if node.Name.Space == namespace && (node.Name.Local == "PolyBezierSegment" || node.Name.Local == "PolyQuadraticBezierSegment") {
 			value, present := node.attribute("Points")
@@ -1432,8 +1448,12 @@ func newCompositionIndex(value packagePart, format Format, budget *compositionBu
 		return nil, err
 	}
 	nodes := 0
+	content := &xmlContentReader{context: budget.context, limit: budget.limits.MaxXMLNodes, nodes: make(map[*xmlElement][]xmlContent)}
 	root, err := decodeXMLVisit(value.data, budget.limits, func(token xml.Token, node *xmlElement) error {
 		if err := budget.step(1); err != nil {
+			return err
+		}
+		if err := content.visit(token, node); err != nil {
 			return err
 		}
 		if _, start := token.(xml.StartElement); start {
@@ -1448,10 +1468,15 @@ func newCompositionIndex(value packagePart, format Format, budget *compositionBu
 	if err := budget.step(nodes); err != nil {
 		return nil, err
 	}
-	active, err := preprocessXMLContext(root, []string{namespace, namespace + "/resourcedictionary-key"}, budget.context)
+	processor := compatibilityProcessor{understood: map[string]bool{namespace: true, namespace + "/resourcedictionary-key": true, mcNamespace: true, xmlNamespace: true}, content: content.nodes, includePreserved: true, context: budget.context}
+	fragment, err := processor.element(root, compatibilityScope{})
 	if err != nil {
 		return nil, err
 	}
+	if len(fragment.elements) != 1 || len(compatibilityWords(fragment.text)) != 0 {
+		return nil, fmt.Errorf("%w: MCE preprocessing must retain exactly one root element", ErrInvalid)
+	}
+	active := fragment.elements[0]
 	if active.Name != (xml.Name{Space: namespace, Local: local}) {
 		return nil, fmt.Errorf("%w: composition index root", ErrInvalid)
 	}
@@ -1464,7 +1489,7 @@ func newCompositionIndex(value packagePart, format Format, budget *compositionBu
 	if err := budget.step(0); err != nil {
 		return nil, err
 	}
-	return &compositionIndex{original: value, format: format, limits: budget.limits, raw: root, active: active}, nil
+	return &compositionIndex{original: value, format: format, limits: budget.limits, raw: root, active: active, ordered: content.nodes}, nil
 }
 
 // matches 检查索引视图是否与指定原始部件身份及字节内容一致
@@ -1514,7 +1539,7 @@ func (c *compositionIndex) inspect(retain bool, budget *compositionBudget) error
 			if err := budget.step(len(node.Attr) + 1); err != nil {
 				return err
 			}
-			return compositionIndexAttributes(node, c.format)
+			return compositionIndexAttributes(node, c.format, compatibilityScope{}, false)
 		}); err != nil {
 			return err
 		}
@@ -1531,11 +1556,41 @@ func (c *compositionIndex) inspect(retain bool, budget *compositionBudget) error
 		if err := budget.step(len(node.Attr) + 1); err != nil {
 			return err
 		}
-		scope, err := processor.rules(node, inherited)
+		isBranch := node.Name.Space == mcNamespace && (node.Name.Local == "Choice" || node.Name.Local == "Fallback")
+		scope, err := processor.rulesChecked(node, inherited, !isBranch)
 		if err != nil {
 			return err
 		}
-		if err := compositionIndexAttributes(node, c.format); err != nil {
+		if node.Name.Space != ns && node.Name.Space != mcNamespace {
+			if !scope.ignorable[node.Name.Space] {
+				return fmt.Errorf("%w: opaque composition index element", ErrUnsupported)
+			}
+			if scope.processes(node.Name) {
+				if err := compatibilityNoXMLContext(node); err != nil {
+					return err
+				}
+				if err := processor.validateAttributes(node, scope, false); err != nil {
+					return err
+				}
+				if err := compositionIndexAttributes(node, c.format, scope, true); err != nil {
+					return err
+				}
+				for _, child := range node.Children {
+					if err := visit(child, scope); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			if !scope.preservesElement(node.Name) {
+				return fmt.Errorf("%w: opaque composition index element", ErrUnsupported)
+			}
+			if _, err := processor.preserveElement(node, scope); err != nil {
+				return err
+			}
+			return nil
+		}
+		if err := compositionIndexAttributes(node, c.format, scope, true); err != nil {
 			return err
 		}
 		if node.Name.Space == mcNamespace && node.Name.Local == "AlternateContent" {
@@ -1544,13 +1599,6 @@ func (c *compositionIndex) inspect(retain bool, budget *compositionBudget) error
 				if err := processor.alternative(child, scope, &selection); err != nil {
 					return err
 				}
-			}
-		} else if node.Name.Space != ns && node.Name.Space != mcNamespace {
-			if !scope.ignorable[node.Name.Space] || !scope.processes(node.Name) {
-				return fmt.Errorf("%w: opaque composition index element", ErrUnsupported)
-			}
-			if err := compatibilityNoXMLContext(node); err != nil {
-				return err
 			}
 		}
 		for _, child := range node.Children {
@@ -1570,10 +1618,10 @@ func (c *compositionIndex) inspect(retain bool, budget *compositionBudget) error
 	return nil
 }
 
-// compositionIndexAttributes 限定索引和兼容性包装的已知属性，不将私有名称或引用当普通文本
-// 入参: node 原始节点, format 原方言
+// compositionIndexAttributes 限定索引和兼容性包装的已知属性，原文保留路径仅放行声明保留的扩展属性
+// 入参: node 原始节点, format 原方言, scope 当前生效MCE作用域, retain 是否检查原文保留边界
 // 返回: error 未理解的元素或属性
-func compositionIndexAttributes(node *xmlElement, format Format) error {
+func compositionIndexAttributes(node *xmlElement, format Format, scope compatibilityScope, retain bool) error {
 	var allowed []string
 	if node.Name.Space == formatNamespace(format) {
 		switch node.Name.Local {
@@ -1602,6 +1650,9 @@ func compositionIndexAttributes(node *xmlElement, format Format) error {
 		if attr.Name.Space == mcNamespace && slices.Contains([]string{"Ignorable", "MustUnderstand", "ProcessContent", "PreserveElements", "PreserveAttributes"}, attr.Name.Local) {
 			continue
 		}
+		if attr.Name.Space != "" && scope.ignorable[attr.Name.Space] && (!retain || scope.preservesAttribute(attr.Name)) {
+			continue
+		}
 		if attr.Name.Space != "" || !slices.Contains(allowed, attr.Name.Local) {
 			return fmt.Errorf("%w: composition index private attribute", ErrUnsupported)
 		}
@@ -1624,40 +1675,81 @@ func (c *compositionIndex) visit(root *xmlElement, visit func(xml.Token, *xmlEle
 	return nil
 }
 
-// project 为明确派生的主索引生成独立核心标记，不携带被消费器忽略的扩展和命名空间声明
+// project 为明确派生的主索引生成独立核心标记，保留MCE声明的保留元素、保留属性及文档相对顺序
 // 入参: part 原部件身份, budget 共享预算
 // 返回: packagePart 独立派生索引, error 结构、预算或取消错误
 func (c *compositionIndex) project(part packagePart, budget *compositionBudget) (packagePart, error) {
 	if err := c.inspect(false, budget); err != nil {
 		return packagePart{}, err
 	}
-	var clone func(*xmlElement) (*xmlElement, error)
-	clone = func(node *xmlElement) (*xmlElement, error) {
-		if err := budget.step(2 + len(node.Attr) + len(node.Children)); err != nil {
+	clonedOrdered := make(map[*xmlElement][]xmlContent)
+	var clone func(*xmlElement, bool) (*xmlElement, error)
+	clone = func(node *xmlElement, preserved bool) (*xmlElement, error) {
+		if err := budget.step(2 + len(node.Attr) + len(node.Children) + len(node.PreservedElements) + len(node.PreservedAttributes)); err != nil {
 			return nil, err
 		}
-		copy := &xmlElement{Name: node.Name, Text: node.Text, Children: make([]*xmlElement, len(node.Children))}
-		for _, attr := range node.Attr {
-			if attr.Name.Space != xmlnsNamespace && attr.Name != (xml.Name{Local: "xmlns"}) {
-				copy.Attr = append(copy.Attr, attr)
+		copied := &xmlElement{
+			Name:                node.Name,
+			Text:                node.Text,
+			Namespaces:          maps.Clone(node.Namespaces),
+			PreservedAttributes: slices.Clone(node.PreservedAttributes),
+		}
+		if preserved {
+			copied.Attr = slices.Clone(node.Attr)
+		} else {
+			for _, attr := range node.Attr {
+				if attr.Name.Space != xmlnsNamespace && attr.Name != (xml.Name{Local: "xmlns"}) {
+					copied.Attr = append(copied.Attr, attr)
+				}
 			}
 		}
-		for index, child := range node.Children {
-			value, err := clone(child)
-			if err != nil {
-				return nil, err
+		childMap := make(map[*xmlElement]*xmlElement, len(node.Children)+len(node.PreservedElements))
+		if len(node.Children) != 0 {
+			copied.Children = make([]*xmlElement, len(node.Children))
+			for index, child := range node.Children {
+				value, err := clone(child, preserved)
+				if err != nil {
+					return nil, err
+				}
+				copied.Children[index] = value
+				childMap[child] = value
 			}
-			copy.Children[index] = value
 		}
-		return copy, nil
+		if len(node.PreservedElements) != 0 {
+			copied.PreservedElements = make([]*xmlElement, len(node.PreservedElements))
+			for index, item := range node.PreservedElements {
+				value, err := clone(item, true)
+				if err != nil {
+					return nil, err
+				}
+				copied.PreservedElements[index] = value
+				childMap[item] = value
+			}
+		}
+		if c.ordered != nil {
+			if items, ok := c.ordered[node]; ok {
+				mapped := make([]xmlContent, 0, len(items))
+				for _, item := range items {
+					if item.element != nil {
+						if value, exists := childMap[item.element]; exists {
+							mapped = append(mapped, xmlContent{element: value})
+						}
+						continue
+					}
+					mapped = append(mapped, item)
+				}
+				clonedOrdered[copied] = mapped
+			}
+		}
+		return copied, nil
 	}
-	root, err := clone(c.active)
+	root, err := clone(c.active, false)
 	if err != nil {
 		return packagePart{}, err
 	}
 	limits := budget.limits
 	limits.MaxMetadataBytes = min(limits.MaxMetadataBytes, limits.MaxPackageBytes)
-	data, err := createdMarkup(root, limits, budget.context)
+	data, err := createdMarkupContent(root, clonedOrdered, limits, budget.context)
 	if err != nil {
 		return packagePart{}, err
 	}
@@ -1980,22 +2072,34 @@ func (s *compositionCapture) markup(part packagePart, owner string) error {
 			return err
 		}
 	}
+	tracker := newResourceMarkupScopeTracker(s.source.format, false, s.budget.context)
 	visit := func(token xml.Token, node *xmlElement) error {
 		if err := s.budget.step(1); err != nil {
 			return err
 		}
-		if _, start := token.(xml.StartElement); !start {
-			return nil
-		}
-		if err := s.budget.step(len(node.Attr)); err != nil {
-			return err
-		}
-		if !layout {
-			return nil
-		}
-		if index == nil {
-			if err := validateResourceMarkupElement(node, s.source.format); err != nil {
+		if layout && index == nil {
+			skip, _, err := tracker.visit(token, node)
+			if err != nil {
 				return err
+			}
+			if _, start := token.(xml.StartElement); !start {
+				return nil
+			}
+			if err := s.budget.step(len(node.Attr)); err != nil {
+				return err
+			}
+			if skip {
+				return nil
+			}
+		} else {
+			if _, start := token.(xml.StartElement); !start {
+				return nil
+			}
+			if err := s.budget.step(len(node.Attr)); err != nil {
+				return err
+			}
+			if !layout {
+				return nil
 			}
 		}
 		for _, attribute := range node.Attr {

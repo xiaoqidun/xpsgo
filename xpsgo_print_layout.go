@@ -345,13 +345,13 @@ func (s *printLayoutSettings) mediaSize(media *PrintMedia) (printMediaPlacement,
 	if err != nil || option == nil {
 		return placement, err
 	}
-	if option.Name == (xml.Name{Space: printKeywordsNS, Local: "PSCustomMediaSize"}) {
+	if printPublicKeywordSpace(option.Name.Space) && option.Name.Local == "PSCustomMediaSize" {
 		return s.postScriptMedia(option, media)
 	}
 	dimensions, predefined := printMediaSizes[option.Name.Local]
-	predefined = predefined && option.Name.Space == printKeywordsNS
-	custom := option.Name == (xml.Name{Space: printKeywordsNS, Local: "CustomMediaSize"})
-	if option.Name.Space == printKeywordsNS && !predefined && !custom {
+	predefined = predefined && printPublicKeywordSpace(option.Name.Space)
+	custom := printPublicKeywordSpace(option.Name.Space) && option.Name.Local == "CustomMediaSize"
+	if printPublicKeywordSpace(option.Name.Space) && !predefined && !custom {
 		return placement, fmt.Errorf("%w: unknown public print media %s", ErrUnsupported, option.Name.Local)
 	}
 	if err := printOptionProperties(option, "MediaSizeWidth", "MediaSizeHeight"); err != nil {
@@ -589,31 +589,38 @@ func (s *PrintSettings) Layout(ctx context.Context, page *Page, media PrintMedia
 	return newPrintLayoutSettings(model, configuration).layout(page, media)
 }
 
-// option 读取指定层级的唯一选择，不按局部名称匹配其他命名空间
+// option 读取指定层级的唯一选择，仅匹配Print Schema公共关键字命名空间
 // 入参: elements 当前设置层级, name 公共Feature名称
 // 返回: *PrintSetting 已选Option, *PrintSetting Feature，未声明时均为nil, error 选择数量错误
 func (s *printLayoutSettings) option(elements []PrintSetting, name string) (*PrintSetting, *PrintSetting, error) {
+	var matched *PrintSetting
 	for index := range elements {
 		feature := &elements[index]
-		if feature.Kind != PrintSettingFeature || feature.Name != (xml.Name{Space: printKeywordsNS, Local: name}) {
+		if feature.Kind != PrintSettingFeature || !printPublicKeywordSpace(feature.Name.Space) || feature.Name.Local != name {
 			continue
 		}
-		var selected *PrintSetting
-		for child := range feature.Children {
-			value := &feature.Children[child]
-			if value.Kind == PrintSettingOption {
-				if selected != nil {
-					return nil, feature, fmt.Errorf("%w: multiple print layout options for %s", ErrInvalid, name)
-				}
-				selected = value
-			}
+		if matched != nil {
+			return nil, feature, fmt.Errorf("%w: duplicate print layout feature %s", ErrInvalid, name)
 		}
-		if selected == nil {
-			return nil, feature, fmt.Errorf("%w: missing print layout option for %s", ErrInvalid, name)
-		}
-		return selected, feature, nil
+		matched = feature
 	}
-	return nil, nil, nil
+	if matched == nil {
+		return nil, nil, nil
+	}
+	var selected *PrintSetting
+	for child := range matched.Children {
+		value := &matched.Children[child]
+		if value.Kind == PrintSettingOption {
+			if selected != nil {
+				return nil, matched, fmt.Errorf("%w: multiple print layout options for %s", ErrInvalid, name)
+			}
+			selected = value
+		}
+	}
+	if selected == nil {
+		return nil, matched, fmt.Errorf("%w: missing print layout option for %s", ErrInvalid, name)
+	}
+	return selected, matched, nil
 }
 
 // keyword 读取公共Option名称，允许说明性Property但不接受配置描述，私有选择不当作同名标准选项
@@ -623,7 +630,7 @@ func (s *printLayoutSettings) keyword(option *PrintSetting, fallback string) (st
 	if option == nil {
 		return fallback, nil
 	}
-	if option.Name.Space != printKeywordsNS {
+	if !printPublicKeywordSpace(option.Name.Space) {
 		return "", fmt.Errorf("%w: print layout option {%s}%s", ErrUnsupported, option.Name.Space, option.Name.Local)
 	}
 	for _, child := range option.Children {
@@ -642,7 +649,7 @@ func (s *printLayoutSettings) number(option *PrintSetting, name string) (float64
 		return 0, false, nil
 	}
 	for _, child := range option.Children {
-		if child.Kind != PrintSettingScoredProperty || child.Name != (xml.Name{Space: printKeywordsNS, Local: name}) {
+		if child.Kind != PrintSettingScoredProperty || !printPublicKeywordSpace(child.Name.Space) || child.Name.Local != name {
 			continue
 		}
 		value, reference := printScoredValue(child.Children)
@@ -668,7 +675,7 @@ func (s *printLayoutSettings) number(option *PrintSetting, name string) (float64
 	return 0, false, nil
 }
 
-// layout 组合页面镜像、内容缩放及物理介质方向，保持两个坐标空间的裁剪独立
+// layout 组合内容缩放、物理介质方向及物理介质轴向镜像，保持两个坐标空间的裁剪独立
 // 入参: page 页面, media 物理介质
 // 返回: *PrintLayout 布局, error 设置、区域或变换错误
 func (s *printLayoutSettings) layout(page *Page, media PrintMedia) (*PrintLayout, error) {
@@ -676,7 +683,7 @@ func (s *printLayoutSettings) layout(page *Page, media PrintMedia) (*PrintLayout
 		return nil, err
 	}
 	for _, value := range s.model.Elements {
-		if value.Kind == PrintSettingFeature && value.Name == (xml.Name{Space: printKeywordsNS, Local: "ScaleOffsetAlignment"}) {
+		if value.Kind == PrintSettingFeature && printPublicKeywordSpace(value.Name.Space) && value.Name.Local == "ScaleOffsetAlignment" {
 			return nil, fmt.Errorf("%w: ScaleOffsetAlignment must be a child of PageScaling", ErrInvalid)
 		}
 	}
@@ -715,10 +722,6 @@ func (s *printLayoutSettings) layout(page *Page, media PrintMedia) (*PrintLayout
 			return nil, fmt.Errorf("%w: print imageable area", ErrInvalid)
 		}
 	}
-	inverse, err := rotation.Inverse()
-	if err != nil {
-		return nil, err
-	}
 	pageBox := Rect{Width: page.Width, Height: page.Height}
 	content, bleed := pageBox, pageBox
 	if page.HasContentBox {
@@ -745,13 +748,17 @@ func (s *printLayoutSettings) layout(page *Page, media PrintMedia) (*PrintLayout
 	switch mirrorName {
 	case "None":
 	case "MirrorImageWidth":
-		mirror.A, mirror.E = -1, page.Width
+		mirror.A, mirror.E = -1, media.Width
 	case "MirrorImageHeight":
-		mirror.D, mirror.F = -1, page.Height
+		mirror.D, mirror.F = -1, media.Height
 	default:
 		return nil, fmt.Errorf("%w: print mirror option %s", ErrUnsupported, mirrorName)
 	}
-	content, bleed = printTransformBox(content, mirror), printTransformBox(bleed, mirror)
+	oriented := mirror.Mul(rotation)
+	inverse, err := oriented.Inverse()
+	if err != nil {
+		return nil, err
+	}
 	scaling, feature, err := s.option(s.model.Elements, "PageScaling")
 	if err != nil {
 		return nil, err
@@ -779,7 +786,7 @@ func (s *printLayoutSettings) layout(page *Page, media PrintMedia) (*PrintLayout
 	default:
 		return nil, fmt.Errorf("%w: print border option %s", ErrUnsupported, border)
 	}
-	transform := rotation.Mul(scale).Mul(mirror)
+	transform := oriented.Mul(scale)
 	transform.E += placement.offset.X
 	transform.F += placement.offset.Y
 	outputBox := printTransformBox(pageClip, transform)
@@ -875,7 +882,7 @@ func printOptionProperties(option *PrintSetting, names ...string) error {
 		}
 		allowed := false
 		for _, name := range names {
-			if child.Kind == PrintSettingScoredProperty && child.Name == (xml.Name{Space: printKeywordsNS, Local: name}) {
+			if child.Kind == PrintSettingScoredProperty && printPublicKeywordSpace(child.Name.Space) && child.Name.Local == name {
 				allowed = true
 				break
 			}
@@ -915,10 +922,10 @@ func printStripPrivateSetting(setting PrintSetting) PrintSetting {
 	}
 	children := make([]PrintSetting, 0, len(setting.Children))
 	for _, child := range setting.Children {
-		if setting.Kind == PrintSettingFeature && child.Kind == PrintSettingFeature && child.Name.Space != printKeywordsNS {
+		if setting.Kind == PrintSettingFeature && child.Kind == PrintSettingFeature && !printPublicKeywordSpace(child.Name.Space) {
 			continue
 		}
-		if (setting.Kind == PrintSettingOption || setting.Kind == PrintSettingScoredProperty) && child.Kind == PrintSettingScoredProperty && child.Name.Space != printKeywordsNS {
+		if (setting.Kind == PrintSettingOption || setting.Kind == PrintSettingScoredProperty) && child.Kind == PrintSettingScoredProperty && !printPublicKeywordSpace(child.Name.Space) {
 			continue
 		}
 		children = append(children, printStripPrivateSetting(child))
@@ -934,7 +941,7 @@ func (s *printLayoutSettings) scale(option, feature *PrintSetting, content, blee
 	if option == nil {
 		return IdentityMatrix(), nil
 	}
-	if option.Name.Space != printKeywordsNS {
+	if !printPublicKeywordSpace(option.Name.Space) {
 		return Matrix{}, fmt.Errorf("%w: private print scaling option", ErrUnsupported)
 	}
 	name := option.Name.Local
@@ -1056,15 +1063,15 @@ func (s *printLayoutSettings) customScale(option *PrintSetting, content Rect, an
 	return result, nil
 }
 
-// printLayoutGeometryFeature 判断公共关键字是否影响页面几何、作业拼版或安全策略，开启忽略选项时仍不可跳过
+// printLayoutGeometryFeature 判断公共关键字是否影响页面几何、作业拼版、插页或安全策略，开启忽略选项时仍不可跳过
 // 入参: name 展开关键字名称
-// 返回: bool 是否属于不可跳过的布局、拼版或策略Feature
+// 返回: bool 是否属于不可跳过的布局、拼版、插页或策略Feature
 func printLayoutGeometryFeature(name xml.Name) bool {
-	if name.Space != printKeywordsNS {
+	if !printPublicKeywordSpace(name.Space) {
 		return false
 	}
 	switch name.Local {
-	case "JobNUpAllDocumentsContiguously", "DocumentNUp", "PresentationDirection", "JobDuplexAllDocumentsContiguously", "DocumentDuplex", "PageForceFrontSide", "JobBindAllDocuments", "DocumentBinding", "JobCollateAllDocuments", "DocumentCollate", "JobPageOrder", "PagePoster", "ScaleOffsetAlignment", "Layering", "JobDigitalSignatureProcessing":
+	case "JobNUpAllDocumentsContiguously", "DocumentNUp", "PresentationDirection", "JobDuplexAllDocumentsContiguously", "DocumentDuplex", "PageForceFrontSide", "JobBindAllDocuments", "DocumentBinding", "JobCollateAllDocuments", "DocumentCollate", "JobPageOrder", "PagePoster", "ScaleOffsetAlignment", "Layering", "JobDigitalSignatureProcessing", "JobPrimaryCoverFront", "JobPrimaryCoverBack", "DocumentCoverFront", "DocumentCoverBack", "JobPrimaryBannerSheet", "DocumentBannerSheet", "JobErrorSheet":
 		return true
 	}
 	return false
@@ -1078,7 +1085,7 @@ func validatePrintLayoutFeatures(settings *PrintSettings, ignoreUnsupported bool
 		if value.Kind != PrintSettingFeature {
 			continue
 		}
-		if value.Name.Space != printKeywordsNS {
+		if !printPublicKeywordSpace(value.Name.Space) {
 			if ignoreUnsupported {
 				continue
 			}
@@ -1093,7 +1100,7 @@ func validatePrintLayoutFeatures(settings *PrintSettings, ignoreUnsupported bool
 			return fmt.Errorf("%w: print rendering feature %s", ErrUnsupported, value.Name.Local)
 		}
 		for _, child := range value.Children {
-			if child.Kind == PrintSettingFeature && (value.Name.Local != "PageScaling" || child.Name != (xml.Name{Space: printKeywordsNS, Local: "ScaleOffsetAlignment"})) {
+			if child.Kind == PrintSettingFeature && (value.Name.Local != "PageScaling" || !printPublicKeywordSpace(child.Name.Space) || child.Name.Local != "ScaleOffsetAlignment") {
 				return fmt.Errorf("%w: print rendering subfeature {%s}%s", ErrUnsupported, child.Name.Space, child.Name.Local)
 			}
 		}
@@ -1132,7 +1139,7 @@ func (s *printLayoutSettings) binding(name string) (PrintFinishing, bool, error)
 		}
 	}
 	method, known := printBindingNames[option.Name.Local]
-	if option.Name.Space != printKeywordsNS || !known {
+	if !printPublicKeywordSpace(option.Name.Space) || !known {
 		return PrintFinishing{}, true, fmt.Errorf("%w: print binding option {%s}%s", ErrUnsupported, option.Name.Space, option.Name.Local)
 	}
 	if method == PrintBindingNone {
@@ -1307,7 +1314,7 @@ func (p *printSheetPacker) posterGrid(count int, area Rect) (int, int, error) {
 func printSinglePosterSettings(settings *PrintSettings, options printSettingsConfig) (*PrintSettings, error) {
 	present := false
 	for _, element := range settings.Elements {
-		if element.Kind == PrintSettingFeature && element.Name == (xml.Name{Space: printKeywordsNS, Local: "PagePoster"}) {
+		if element.Kind == PrintSettingFeature && printPublicKeywordSpace(element.Name.Space) && element.Name.Local == "PagePoster" {
 			present = true
 			break
 		}
@@ -1329,7 +1336,7 @@ func printSinglePosterSettings(settings *PrintSettings, options printSettingsCon
 	}
 	result := &PrintSettings{Version: settings.Version}
 	for _, element := range settings.Elements {
-		if element.Kind != PrintSettingFeature || element.Name != (xml.Name{Space: printKeywordsNS, Local: "PagePoster"}) {
+		if element.Kind != PrintSettingFeature || !printPublicKeywordSpace(element.Name.Space) || element.Name.Local != "PagePoster" {
 			result.Elements = append(result.Elements, element)
 		}
 	}

@@ -486,10 +486,13 @@ func (p *streamPackage) finishPages(r *Reader) error {
 func streamPotentialPrintTicketMedia(format Format, media string) bool {
 	base, _, _ := strings.Cut(media, ";")
 	base = strings.TrimSpace(base)
+	if base == "" {
+		return false
+	}
 	if strings.EqualFold(base, printTicketType) {
 		return true
 	}
-	if format != FormatOpenXPS || !xmlMedia(base) {
+	if format != FormatOpenXPS || standardResourceMedia(base) != 0 {
 		return false
 	}
 	for _, known := range []string{
@@ -500,11 +503,14 @@ func streamPotentialPrintTicketMedia(format Format, media string) bool {
 		fixedContentType("storyfragments"),
 		fixedContentType("discard-control"),
 		fixedContentType("signaturedefinitions"),
-		resourceDictionaryContentType,
 		opcRelsType,
 		opcCoreType,
 		opcSignatureType,
+		opcSignatureOriginType,
+		opcCertificateType,
 		"application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
+		"model/x3d+xml",
+		"model/x3d+binary",
 	} {
 		if strings.EqualFold(base, known) {
 			return false
@@ -564,38 +570,17 @@ func (r *Reader) pageTicketTargets(ctx context.Context, index int) ([]string, er
 	return result, nil
 }
 
-// recordTicketTarget 登记已解析的打印票据目标小写URI，用于判断包内声明的票据是否已全部绑定
-// 入参: target 规范化票据目标绝对URI
-func (p *streamPackage) recordTicketTarget(target string) {
-	if p.ticketRefs == nil {
-		p.ticketRefs = make(map[string]bool)
+// streamRelsPossible 检查内容类型流是否允许指定关系部件在包中出现
+// 入参: relsKey 关系部件的小写规范URI
+// 返回: bool 该关系部件是否可能存在于当前包
+func (p *streamPackage) streamRelsPossible(relsKey string) bool {
+	if p.types == nil {
+		return false
 	}
-	p.ticketRefs[strings.ToLower(target)] = true
-}
-
-// pendingPrintTickets 检查包内是否仍存在尚未到达或尚未被关系绑定的潜在打印票据声明
-// 返回: bool 是否仍有待决票据, []string 尚未到达的票据覆盖部件键列表
-func (p *streamPackage) pendingPrintTickets() (bool, []string) {
-	for _, media := range p.types.defaults {
-		if streamPotentialPrintTicketMedia(p.index.format, media) {
-			return true, nil
-		}
+	if p.types.overrides[relsKey] != "" {
+		return true
 	}
-	pending := false
-	var waits []string
-	for key, media := range p.types.overrides {
-		if !streamPotentialPrintTicketMedia(p.index.format, media) {
-			continue
-		}
-		_, arrived := p.pagePkg.parts[key]
-		if !arrived || !p.ticketRefs[key] {
-			pending = true
-			if !arrived {
-				waits = append(waits, key)
-			}
-		}
-	}
-	return pending, waits
+	return p.types.defaults["rels"] != ""
 }
 
 // streamPageTicketsReady 检查页面三级关系及打印票据部件是否均已就绪，避免交错未闭合或晚到关系静默丢失票据
@@ -609,7 +594,6 @@ func (p *streamPackage) streamPageTicketsReady(index int) ([]string, bool, error
 	}
 	mayTicket := p.mayHavePrintTicket()
 	var waits []string
-	var missingRels []string
 	for _, source := range []string{p.index.sequence, docPart, pagePart} {
 		if err := checkContext(p.context); err != nil {
 			return nil, false, err
@@ -628,7 +612,6 @@ func (p *streamPackage) streamPageTicketsReady(index int) ([]string, bool, error
 				return nil, true, nil
 			}
 			if target != "" {
-				p.recordTicketTarget(target)
 				targetKey := strings.ToLower(target)
 				if _, exists := p.pagePkg.parts[targetKey]; !exists {
 					waits = append(waits, targetKey)
@@ -648,7 +631,6 @@ func (p *streamPackage) streamPageTicketsReady(index int) ([]string, bool, error
 				return nil, true, nil
 			}
 			if target != "" {
-				p.recordTicketTarget(target)
 				targetKey := strings.ToLower(target)
 				if _, exists := p.pagePkg.parts[targetKey]; !exists {
 					waits = append(waits, targetKey)
@@ -658,19 +640,8 @@ func (p *streamPackage) streamPageTicketsReady(index int) ([]string, bool, error
 			}
 			continue
 		}
-		if mayTicket {
-			missingRels = append(missingRels, relsKey)
-		}
-	}
-	if len(missingRels) != 0 {
-		pending, ticketWaits := p.pendingPrintTickets()
-		for _, relsKey := range missingRels {
-			if pending || p.types.overrides[relsKey] != "" {
-				waits = append(waits, relsKey)
-			}
-		}
-		if pending && len(ticketWaits) != 0 {
-			waits = append(waits, ticketWaits...)
+		if mayTicket && p.streamRelsPossible(relsKey) {
+			waits = append(waits, relsKey)
 		}
 	}
 	return waits, false, nil
@@ -1292,7 +1263,6 @@ func (p *streamPackage) consumeRelationships(part *streamPart, event StreamXMLTo
 			ticketBound := false
 			requiredType := formatNamespace(p.index.format) + "/required-resource"
 			ticketType := formatNamespace(p.index.format) + "/printticket"
-			source := relationshipSource(part.name)
 			for _, item := range s.items[before:] {
 				if item.Type == requiredType {
 					needed = true
@@ -1300,11 +1270,6 @@ func (p *streamPackage) consumeRelationships(part *streamPart, event StreamXMLTo
 				if item.Type == ticketType {
 					needed = true
 					ticketBound = true
-					if item.TargetMode == TargetModeInternal {
-						if resolved, err := resolvePart(source, item.Target); err == nil {
-							p.recordTicketTarget(resolved)
-						}
-					}
 				}
 			}
 			if ticketBound {

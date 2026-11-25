@@ -52,34 +52,37 @@ type imageSampleCache struct {
 
 // imageSampler 保存图像画刷的设备逆变换、物理坐标、色彩编码及颜色采样状态
 type imageSampler struct {
-	image       *rasterImage
-	inverse     Matrix
-	viewbox     Rect
-	viewport    Rect
-	tile        TileMode
-	opacity     float64
-	space       renderColorSpace
-	alphaOnly   bool
-	filterX     bool
-	filterY     bool
-	charge      func(uint64) error
-	reserve     func(int) error
-	release     func(int)
-	reserved    int
-	filter      *imageBrushFilter
-	filterErr   error
-	filterWork  uint64
-	lastPoint   Point
-	lastColor   renderColor
-	lastValid   bool
-	jxr         jxrRowCache
-	jxrMode     jxrSampleMode
-	jxrKey      jxrLinearKey
-	cicp        *imageCICPTransform
-	toneMapPeak float64
-	cachePool   sync.Pool
-	convert     func([iccMaxChannels]float64, float64, bool) (renderColor, error)
-	mu          sync.Mutex
+	image          *rasterImage
+	inverse        Matrix
+	viewbox        Rect
+	viewport       Rect
+	tile           TileMode
+	opacity        float64
+	space          renderColorSpace
+	alphaOnly      bool
+	filterX        bool
+	filterY        bool
+	charge         func(uint64) error
+	reserve        func(int) error
+	release        func(int)
+	reserved       int
+	filter         *imageBrushFilter
+	filterErr      error
+	filterWork     uint64
+	lastPoint      Point
+	lastColor      renderColor
+	lastValid      bool
+	jxr            jxrRowCache
+	jxrMode        jxrSampleMode
+	jxrKey         jxrLinearKey
+	cicp           *imageCICPTransform
+	gammaChroma    *imageGammaChromaTransform
+	toneMapPeak    float64
+	hdrNominalPeak float64
+	deviceOutput   bool
+	cachePool      sync.Pool
+	convert        func([iccMaxChannels]float64, float64, bool) (renderColor, error)
+	mu             sync.Mutex
 }
 
 // imageBrushFilter 保存已转入合成空间的常量或单轴均值，不持有源像素的可变副本
@@ -149,10 +152,10 @@ func makeImageByteToUnit() [256]float64 {
 	return table
 }
 
-// newImageSampler 按渲染意图与HDR峰值亮度构建图像画刷采样器，统一处理JXR三模式、PNG CICP与色调映射
-// 入参: brush 图像画刷, source 图像资源, transform 所属元素的设备变换, space 合成空间, alphaOnly 是否仅读取透明度, jxrIntent 显式源渲染意图, hdrPeakNits 可选HDR参考峰值亮度
+// newImageSampler 按渲染意图、HDR峰值亮度与是否面向设备目标ICC构建图像画刷采样器，统一处理JXR三模式、PNG CICP、gAMA/cHRM与色调映射
+// 入参: brush 图像画刷, source 图像资源, transform 所属元素的设备变换, space 合成空间, alphaOnly 是否仅读取透明度, jxrIntent 显式源渲染意图, hdrPeakNits 可选HDR参考峰值亮度, deviceOutput 是否输出至目标ICC设备管线
 // 返回: *imageSampler 本次绘制独占的采样器, error 属性、能力或数值错误
-func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space renderColorSpace, alphaOnly bool, jxrIntent RenderingIntent, hdrPeakNits float64) (*imageSampler, error) {
+func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space renderColorSpace, alphaOnly bool, jxrIntent RenderingIntent, hdrPeakNits float64, deviceOutput bool) (*imageSampler, error) {
 	if brush == nil || brush.Kind != BrushImage || source == nil || source.bounds().Empty() || !geometryFinite(source.dpi.X, source.dpi.Y) || source.dpi.X <= 0 || source.dpi.Y <= 0 {
 		return nil, fmt.Errorf("%w: image brush source", ErrInvalid)
 	}
@@ -163,9 +166,12 @@ func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space 
 		return nil, fmt.Errorf("%w: image blend space", ErrUnsupported)
 	}
 	var cicpTransform *imageCICPTransform
+	var gammaChroma *imageGammaChromaTransform
 	var jxrMode jxrSampleMode
 	var jxrKey jxrLinearKey
 	var toneMapPeak float64
+	var hdrNominalPeak float64
+	channels := imageColorChannels(source)
 	if source.jxr == nil && brush.ImageProfileURI == "" && !source.associatedProfile && source.selectedProfile == nil && imageCICPUsable(source.cicp) {
 		if source.transform != nil {
 			view := *source
@@ -173,34 +179,29 @@ func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space 
 			source = &view
 		}
 		var err error
-		cicpTransform, err = prepareImageCICP(source.cicp, imageSourceBitDepth(source), hdrPeakNits)
+		cicpTransform, err = prepareImageCICP(source.cicp, channels, imageSourceBitDepth(source), hdrPeakNits)
 		if err != nil {
 			return nil, err
 		}
 		if cicpTransform != nil {
 			if cicpTransform.hdr {
 				toneMapPeak = cicpTransform.peakNits
-			} else if hdrPeakNits > 0 {
+				if !alphaOnly {
+					if cicpTransform.transfer == 16 {
+						hdrNominalPeak = 10000
+					} else {
+						hdrNominalPeak = 1000
+					}
+				}
+			} else if hdrPeakNits > 0 && source.linear {
 				toneMapPeak = hdrPeakNits
 			}
 		}
 	} else {
 		var err error
-		if source.jxr != nil && source.transform == nil && source.selectedProfile == nil && source.cicp != nil && len(source.profile) > 0 {
-			view := *source
-			view.cicp = nil
-			resolved, resolveErr := standaloneImageColor(&view)
-			if resolveErr != nil {
-				return nil, resolveErr
-			}
-			restored := *resolved
-			restored.cicp = source.cicp
-			source = &restored
-		} else {
-			source, err = standaloneImageColor(source)
-			if err != nil {
-				return nil, err
-			}
+		source, err = standaloneImageColor(source)
+		if err != nil {
+			return nil, err
 		}
 		if source.jxr != nil {
 			effectiveProfile := source.selectedProfile
@@ -217,26 +218,32 @@ func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space 
 				} else {
 					jxrMode = jxrSampleNative
 				}
-			} else if effectiveProfile != nil && (isExternal || source.selectedProfile != nil || effectiveProfile.class == "nmcl") {
+			} else if effectiveProfile != nil && (isExternal || source.selectedProfile != nil || effectiveProfile.class == "nmcl" || deviceOutput && jxrIntent == IntentAbsoluteColorimetric && effectiveProfile.version>>24 == 2 && effectiveProfile.class == "mntr" && !effectiveProfile.hasChad) {
 				if effectiveProfile.space == "YCbr" {
 					jxrMode = jxrSampleNative
 				} else {
 					jxrMode = jxrSampleRGB
 				}
 			} else {
-				jxrMode = jxrSampleLinear
-				intent := jxrIntentFromRender(jxrIntent)
-				if jxrIntent == IntentDefault && source.transform != nil {
-					intent = jxrIntentFromICC(source.transform.intent)
-				}
-				jxrKey = jxrLinearKey{
-					applyCICP:   source.jxr.info.ColorEncoding != nil,
-					applyICC:    len(source.profile) > 0 && len(source.jxr.info.ICCProfile) > 0,
-					intent:      intent,
-					hdrPeakNits: hdrPeakNits,
+				hasEmbeddedICC := len(source.profile) > 0 && len(source.jxr.info.ICCProfile) > 0
+				hasCICP := source.jxr.info.ColorEncoding != nil
+				if !hasEmbeddedICC && !hasCICP && source.jxr.info.ColorHint == jxrgo.ColorHintUnspecified {
+					jxrMode = jxrSampleRGB
+				} else {
+					jxrMode = jxrSampleLinear
+					intent := jxrIntentFromRender(jxrIntent)
+					if jxrIntent == IntentDefault && source.transform != nil {
+						intent = jxrIntentFromICC(source.transform.intent)
+					}
+					jxrKey = jxrLinearKey{
+						applyCICP:   hasCICP,
+						applyICC:    hasEmbeddedICC,
+						intent:      intent,
+						hdrPeakNits: hdrPeakNits,
+					}
 				}
 			}
-			if jxrMode == jxrSampleLinear && source.cicp != nil && (source.cicp.transfer == 16 || source.cicp.transfer == 18) {
+			if jxrMode == jxrSampleLinear && !jxrKey.applyICC && jxrKey.applyCICP && source.cicp != nil && (source.cicp.transfer == 16 || source.cicp.transfer == 18) {
 				if hdrPeakNits > 0 {
 					toneMapPeak = hdrPeakNits
 				} else if source.cicp.transfer == 16 {
@@ -244,14 +251,25 @@ func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space 
 				} else {
 					toneMapPeak = 1000
 				}
-			} else if hdrPeakNits > 0 && (source.linear || jxrMode == jxrSampleLinear) {
+				if !alphaOnly {
+					if source.cicp.transfer == 16 {
+						hdrNominalPeak = 10000
+					} else {
+						hdrNominalPeak = 1000
+					}
+				}
+			} else if hdrPeakNits > 0 && source.linear {
 				toneMapPeak = hdrPeakNits
 			}
-		} else if hdrPeakNits > 0 && source.linear {
-			toneMapPeak = hdrPeakNits
+		} else {
+			if brush.ImageProfileURI == "" && !source.associatedProfile && source.selectedProfile == nil && source.transform == nil && source.gammaChroma != nil {
+				gammaChroma = prepareImageGammaChroma(source.gammaChroma, channels)
+			}
+			if hdrPeakNits > 0 && source.linear {
+				toneMapPeak = hdrPeakNits
+			}
 		}
 	}
-	channels := imageColorChannels(source)
 	if !alphaOnly && source.transform == nil && source.selectedProfile == nil && cicpTransform == nil && (channels == 2 || channels > 4 || channels == 4 && source.multiChannel) {
 		return nil, fmt.Errorf("%w: default device image color conversion", ErrUnsupported)
 	}
@@ -282,20 +300,23 @@ func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space 
 		return nil, err
 	}
 	sampler := &imageSampler{
-		image:       source,
-		inverse:     inverse,
-		viewbox:     brush.Viewbox,
-		viewport:    brush.Viewport,
-		tile:        brush.TileMode,
-		opacity:     brush.Opacity,
-		space:       space,
-		alphaOnly:   alphaOnly,
-		filterX:     filterX,
-		filterY:     filterY,
-		jxrMode:     jxrMode,
-		jxrKey:      jxrKey,
-		cicp:        cicpTransform,
-		toneMapPeak: toneMapPeak,
+		image:          source,
+		inverse:        inverse,
+		viewbox:        brush.Viewbox,
+		viewport:       brush.Viewport,
+		tile:           brush.TileMode,
+		opacity:        brush.Opacity,
+		space:          space,
+		alphaOnly:      alphaOnly,
+		filterX:        filterX,
+		filterY:        filterY,
+		jxrMode:        jxrMode,
+		jxrKey:         jxrKey,
+		cicp:           cicpTransform,
+		gammaChroma:    gammaChroma,
+		toneMapPeak:    toneMapPeak,
+		hdrNominalPeak: hdrNominalPeak,
+		deviceOutput:   deviceOutput,
 	}
 	if collapsed {
 		sampler.filterX, sampler.filterY = true, true
@@ -520,31 +541,12 @@ func (s *imageSampler) bilinearWithCache(point Point, jxrCache *jxrRowCache) (re
 	return result, nil
 }
 
-// pixelColorWithCache 在原生通道上执行颜色转换并预乘透明度，支持JPEG XR滑动行缓存、CICP与常见格式零分配快路径
+// sampleSourceComponents 读取源像素原生分量并完成JXR、CICP、PNG gAMA/cHRM及无ICC sYCC前置预处理
 // 入参: x 源横坐标, y 源纵坐标, jxrCache 可选JPEG XR滑动行缓存
-// 返回: renderColor 合成空间颜色, error 颜色或通道错误
-func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (renderColor, error) {
-	if s.image.jxr == nil && s.image.native == nil && s.image.transform == nil && s.convert == nil && s.cicp == nil && s.toneMapPeak == 0 && !s.image.linear && s.image.channels != 1 && (s.space == renderSRGB || s.space == renderScRGB) {
-		if nrgba, ok := s.image.pixels.(*image.NRGBA); ok {
-			if !image.Pt(x, y).In(nrgba.Rect) {
-				return renderColor{}, nil
-			}
-			i := nrgba.PixOffset(x, y)
-			a := nrgba.Pix[i+3]
-			if a == 0 {
-				return renderColor{}, nil
-			}
-			r, g, b, av := imageByteToUnit[nrgba.Pix[i]], imageByteToUnit[nrgba.Pix[i+1]], imageByteToUnit[nrgba.Pix[i+2]], imageByteToUnit[a]
-			if s.space == renderScRGB {
-				r = renderSRGBToLinear(r)
-				g = renderSRGBToLinear(g)
-				b = renderSRGBToLinear(b)
-			}
-			return renderColor{r * av, g * av, b * av, av}, nil
-		}
-	}
+// 返回: [iccMaxChannels]float64 分量数组, float64 有限透明度, int 有效通道数, bool 分量是否已线性化为scRGB, bool 是否已由JXR线性读取器完成色彩转换, error 读取或非有限错误
+func (s *imageSampler) sampleSourceComponents(x, y int, jxrCache *jxrRowCache) ([iccMaxChannels]float64, float64, int, bool, bool, error) {
 	var components [iccMaxChannels]float64
-	alpha, channels, jxrLinear, cicpLinear := 1.0, imageColorChannels(s.image), false, false
+	alpha, channels, jxrLinear, colorLinear := 1.0, imageColorChannels(s.image), false, false
 	if source := s.image.jxr; source != nil {
 		var err error
 		if jxrCache != nil {
@@ -560,7 +562,7 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 			}
 		}
 		if err != nil {
-			return renderColor{}, err
+			return components, 0, 0, false, false, err
 		}
 		if s.jxrMode == jxrSampleLinear {
 			jxrLinear = true
@@ -570,7 +572,7 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 		}
 	} else if source := s.image.native; source != nil {
 		if source.channels < 1 || source.channels > len(components) {
-			return renderColor{}, fmt.Errorf("%w: image source channels", ErrUnsupported)
+			return components, 0, 0, false, false, fmt.Errorf("%w: image source channels", ErrUnsupported)
 		}
 		stride := source.channels
 		if source.alpha {
@@ -599,24 +601,78 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 		alpha = float64(value.A) / 65535
 	}
 	if !geometryFinite(alpha) {
-		return renderColor{}, fmt.Errorf("%w: non-finite raster alpha interpretation", ErrUnsupported)
+		return components, 0, 0, false, false, fmt.Errorf("%w: non-finite raster alpha interpretation", ErrUnsupported)
+	}
+	if alpha == 0 {
+		return components, 0, channels, false, jxrLinear, nil
+	}
+	if s.alphaOnly && s.convert == nil {
+		return components, colorClamp(alpha), channels, false, jxrLinear, nil
+	}
+	if s.image.native != nil && s.image.native.floating != nil || s.image.jxr != nil && s.image.linear {
+		for i := range channels {
+			if !geometryFinite(components[i]) {
+				return components, 0, 0, false, false, fmt.Errorf("%w: non-finite raster color interpretation", ErrUnsupported)
+			}
+		}
+	}
+	if !jxrLinear && s.image.transform == nil && s.image.selectedProfile == nil {
+		if s.cicp != nil {
+			rgb := s.cicp.toLinearSRGB(components[0], components[1], components[2], channels == 1)
+			components[0], components[1], components[2] = rgb[0], rgb[1], rgb[2]
+			colorLinear = true
+			channels = 3
+		} else if s.gammaChroma != nil {
+			rgb := s.gammaChroma.toLinearSRGB(components[0], components[1], components[2], channels == 1)
+			components[0], components[1], components[2] = rgb[0], rgb[1], rgb[2]
+			colorLinear = true
+			channels = 3
+		} else if s.image.jxr != nil && s.jxrMode == jxrSampleRGB {
+			components[0] = renderSignedSRGBToLinear(components[0])
+			components[1] = renderSignedSRGBToLinear(components[1])
+			components[2] = renderSignedSRGBToLinear(components[2])
+			colorLinear = true
+			channels = 3
+		}
+	}
+	if channels == 1 && s.image.transform == nil && s.image.selectedProfile == nil {
+		components[1], components[2] = components[0], components[0]
+	}
+	return components, alpha, channels, s.image.linear || jxrLinear || colorLinear, jxrLinear, nil
+}
+
+// pixelColorWithCache 在原生通道上执行颜色转换并预乘透明度，支持JPEG XR滑动行缓存、CICP、gAMA/cHRM与常见格式零分配快路径
+// 入参: x 源横坐标, y 源纵坐标, jxrCache 可选JPEG XR滑动行缓存
+// 返回: renderColor 合成空间颜色, error 颜色或通道错误
+func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (renderColor, error) {
+	if s.image.jxr == nil && s.image.native == nil && s.image.transform == nil && s.convert == nil && s.cicp == nil && s.gammaChroma == nil && s.toneMapPeak == 0 && !s.image.linear && s.image.channels != 1 && (s.space == renderSRGB || s.space == renderScRGB) {
+		if nrgba, ok := s.image.pixels.(*image.NRGBA); ok {
+			if !image.Pt(x, y).In(nrgba.Rect) {
+				return renderColor{}, nil
+			}
+			i := nrgba.PixOffset(x, y)
+			a := nrgba.Pix[i+3]
+			if a == 0 {
+				return renderColor{}, nil
+			}
+			r, g, b, av := imageByteToUnit[nrgba.Pix[i]], imageByteToUnit[nrgba.Pix[i+1]], imageByteToUnit[nrgba.Pix[i+2]], imageByteToUnit[a]
+			if s.space == renderScRGB {
+				r = renderSRGBToLinear(r)
+				g = renderSRGBToLinear(g)
+				b = renderSRGBToLinear(b)
+			}
+			return renderColor{r * av, g * av, b * av, av}, nil
+		}
+	}
+	components, alpha, channels, linear, jxrLinear, err := s.sampleSourceComponents(x, y, jxrCache)
+	if err != nil {
+		return renderColor{}, err
 	}
 	if alpha == 0 {
 		return renderColor{}, nil
 	}
 	if s.alphaOnly && s.convert == nil {
-		a := colorClamp(alpha)
-		if a == 0 {
-			return renderColor{}, nil
-		}
-		return renderColor{a: a}, nil
-	}
-	if s.image.native != nil && s.image.native.floating != nil || s.image.jxr != nil && s.image.linear {
-		for i := range channels {
-			if !geometryFinite(components[i]) {
-				return renderColor{}, fmt.Errorf("%w: non-finite raster color interpretation", ErrUnsupported)
-			}
-		}
+		return renderColor{a: alpha}, nil
 	}
 	if s.image.transform != nil && !jxrLinear {
 		if channels < 1 || channels > len(components) {
@@ -629,30 +685,20 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 			return renderColor{}, fmt.Errorf("%w: image profile channels", ErrInvalid)
 		}
 		input := components[:s.image.transform.inputChannels()]
-		floating := s.image.transform.pipeline != nil && s.image.transform.pipeline.floating
-		if !floating && imageExtendedLinearSample(s.image, input) {
-			return renderColor{}, fmt.Errorf("%w: extended-range linear image requires floating-point ICC DToB transform", ErrUnsupported)
+		if s.image.transform.pipeline != nil && !s.image.transform.pipeline.floating && imageRejectClampedLUT(s.image, input) {
+			return renderColor{}, fmt.Errorf("%w: extended-range image requires floating-point ICC DToB or matrix-TRC transform", ErrUnsupported)
 		}
-		rgb, err := s.image.transform.linearRGB(input)
+		rgb, err := s.image.transform.linearRGB(input, imageUseExtendedTRC(s.image, s.jxrMode), s.deviceOutput)
 		if err != nil {
 			return renderColor{}, err
 		}
 		return imageRGBToRenderColor(rgb[0], rgb[1], rgb[2], alpha, ColorScRGB, s.space, s.toneMapPeak)
 	}
-	if s.cicp != nil && !jxrLinear {
-		rgb := s.cicp.toLinearSRGB(components[0], components[1], components[2], channels == 1)
-		components[0], components[1], components[2] = rgb[0], rgb[1], rgb[2]
-		cicpLinear = true
-		channels = 3
-	}
-	if channels == 1 {
-		components[1], components[2] = components[0], components[0]
-	}
 	if s.convert != nil {
 		if channels < 1 || channels > len(components) {
 			return renderColor{}, fmt.Errorf("%w: image source channels", ErrUnsupported)
 		}
-		return s.convert(components, alpha, s.image.linear || jxrLinear || cicpLinear)
+		return s.convert(components, alpha, linear)
 	}
 	if channels == 4 && !s.image.multiChannel {
 		c, m, yv, k := colorClamp(components[0]), colorClamp(components[1]), colorClamp(components[2]), colorClamp(components[3])
@@ -661,39 +707,59 @@ func (s *imageSampler) pixelColorWithCache(x, y int, jxrCache *jxrRowCache) (ren
 		return renderColor{}, fmt.Errorf("%w: default device image color conversion", ErrUnsupported)
 	}
 	space := ColorSRGB
-	if s.image.linear || jxrLinear || cicpLinear {
+	if linear {
 		space = ColorScRGB
 	}
 	return imageRGBToRenderColor(components[0], components[1], components[2], alpha, space, s.space, s.toneMapPeak)
 }
 
-// imageExtendedLinearSample 判断图像样本是否包含扩展范围线性浮点或定点分量
+// jxrHasExtendedFormat 判断JPEG XR图像是否包含定点、浮点或RGBE等扩展范围颜色通道
+// 入参: source JPEG XR图像视图
+// 返回: bool 是否含非无符号扩展范围颜色通道
+func jxrHasExtendedFormat(source *jxrImage) bool {
+	if source == nil {
+		return false
+	}
+	for i := range source.channels {
+		if source.components[i].Info().Format != jxrgo.SampleUnsigned {
+			return true
+		}
+	}
+	return false
+}
+
+// imageUseExtendedTRC 判断当前图像采样送入ICC矩阵或灰阶TRC时是否启用无裁剪扩展外推
+// 入参: source 图像资源, mode JPEG XR采样模式
+// 返回: bool 是否启用TRC扩展范围外推
+func imageUseExtendedTRC(source *rasterImage, mode jxrSampleMode) bool {
+	if source.linear || source.native != nil && source.native.floating != nil {
+		return true
+	}
+	return source.jxr != nil && (mode == jxrSampleRGB || jxrHasExtendedFormat(source.jxr))
+}
+
+// imageRejectClampedLUT 判断扩展范围样本送入非浮点整数ICC查找表时是否应拒绝静默裁剪
 // 入参: source 图像资源, input 送入ICC转换的源分量切片
-// 返回: bool 是否需要浮点DToB管线避免裁剪截断
-func imageExtendedLinearSample(source *rasterImage, input []float64) bool {
-	if !source.linear {
-		if source.native != nil && source.native.floating != nil {
-			for _, value := range input {
-				if value < 0 || value > 1 {
-					return true
-				}
+// 返回: bool 是否需要浮点DToB或矩阵TRC避免整数LUT静默截断
+func imageRejectClampedLUT(source *rasterImage, input []float64) bool {
+	hasExtendedType := source.native != nil && source.native.floating != nil || jxrHasExtendedFormat(source.jxr)
+	if source.linear {
+		if hasExtendedType {
+			return true
+		}
+		for _, value := range input {
+			if value < 0 || value > 1 {
+				return true
 			}
 		}
+		return false
+	}
+	if !hasExtendedType {
 		return false
 	}
 	for _, value := range input {
 		if value < 0 || value > 1 {
 			return true
-		}
-	}
-	if source.native != nil && source.native.floating != nil {
-		return true
-	}
-	if source.jxr != nil {
-		for i := range source.jxr.channels {
-			if source.jxr.components[i].Info().Format != jxrgo.SampleUnsigned {
-				return true
-			}
 		}
 	}
 	return false

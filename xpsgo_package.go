@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -121,13 +122,14 @@ type packageZIPLayout struct {
 
 // packageZIPLocal 保存中央目录指定的本地记录范围，供重叠及描述符校验使用
 type packageZIPLocal struct {
-	file        *zip.File
-	start       int64
-	data        int64
-	end         int64
-	finish      int64
-	zip64       bool
-	cdSizeZIP64 bool
+	file         *zip.File
+	start        int64
+	data         int64
+	end          int64
+	finish       int64
+	localVersion uint16
+	zip64        bool
+	cdSizeZIP64  bool
 }
 
 // newPackageReaderWithLimits 建立ZIP部件索引并解析内容类型，校验条目上限与声明解压字节上限
@@ -587,7 +589,7 @@ func opcSpecificContentType(media string) bool {
 	return false
 }
 
-// opcNormalizeExtension 按ECMA-376 Part 2 §A.3校验并规范化Default/@Extension，解码未保留字符并大写十六进制转义
+// opcNormalizeExtension 按ECMA-376 Part 2 §A.3校验并规范化Default/@Extension，解码未保留字符并校验UTF-8百分号序列
 // 入参: value 原始扩展名字符串
 // 返回: string 规范化扩展名, bool 是否符合ST_Extension
 func opcNormalizeExtension(value string) (string, bool) {
@@ -597,28 +599,37 @@ func opcNormalizeExtension(value string) (string, bool) {
 	const hex = "0123456789ABCDEF"
 	var b strings.Builder
 	b.Grow(len(value))
+	var pctBuf [16]byte
 	for i := 0; i < len(value); i++ {
 		c := value[i]
 		if c == '%' {
-			if i+2 >= len(value) {
+			pct := pctBuf[:0]
+			for i < len(value) && value[i] == '%' {
+				if i+2 >= len(value) {
+					return "", false
+				}
+				hi, lo := opcHex(value[i+1]), opcHex(value[i+2])
+				if hi < 0 || lo < 0 {
+					return "", false
+				}
+				decoded := byte(hi*16 + lo)
+				if decoded == '.' || decoded == '/' || decoded == '\\' {
+					return "", false
+				}
+				pct = append(pct, decoded)
+				if opcUnreserved(decoded) {
+					b.WriteByte(decoded)
+				} else {
+					b.WriteByte('%')
+					b.WriteByte(hex[hi])
+					b.WriteByte(hex[lo])
+				}
+				i += 3
+			}
+			if !utf8.Valid(pct) {
 				return "", false
 			}
-			hi, lo := opcHex(value[i+1]), opcHex(value[i+2])
-			if hi < 0 || lo < 0 {
-				return "", false
-			}
-			decoded := byte(hi*16 + lo)
-			if decoded == '.' || decoded == '/' || decoded == '\\' {
-				return "", false
-			}
-			if opcUnreserved(decoded) {
-				b.WriteByte(decoded)
-			} else {
-				b.WriteByte('%')
-				b.WriteByte(hex[hi])
-				b.WriteByte(hex[lo])
-			}
-			i += 2
+			i--
 		} else if c == '.' || !(opcUnreserved(c) || strings.ContainsRune("!$&'()*+,:=@", rune(c))) {
 			return "", false
 		} else {
@@ -1112,7 +1123,7 @@ func readPackageZIPLocal(input io.ReaderAt, boundary, offset int64, file *zip.Fi
 	if file.Method == zip.Store && file.CompressedSize64 != file.UncompressedSize64 {
 		return packageZIPLocal{}, fmt.Errorf("%w: stored ZIP item sizes", ErrInvalid)
 	}
-	return packageZIPLocal{file: file, start: offset, data: data, end: data + int64(file.CompressedSize64), zip64: zip64, cdSizeZIP64: cdSizeZIP64}, nil
+	return packageZIPLocal{file: file, start: offset, data: data, end: data + int64(file.CompressedSize64), localVersion: version, zip64: zip64, cdSizeZIP64: cdSizeZIP64}, nil
 }
 
 // packageZIP64Extra 提取扩展字段中唯一的ZIP64载荷并校验全部扩展块边界
@@ -1203,6 +1214,9 @@ func packageZIP64Values(extra []byte, uncompressed, compressed, offset, disk uin
 		}
 		extended = extended[bytes:]
 	}
+	if present && len(extended) != 0 {
+		return 0, 0, 0, 0, false, fmt.Errorf("%w: trailing bytes in ZIP64 field", ErrInvalid)
+	}
 	return uncompressed, compressed, offset, disk, present, nil
 }
 
@@ -1210,37 +1224,62 @@ func packageZIP64Values(extra []byte, uncompressed, compressed, offset, disk uin
 // 入参: input 包输入, boundary 下一记录边界, record 当前物理条目
 // 返回: int 描述符字节数, error 字段、边界或输入错误
 func packageZIPDescriptorLength(input io.ReaderAt, boundary int64, record packageZIPLocal) (int, error) {
-	width := 4
+	widths := []int{4}
 	if record.zip64 || record.cdSizeZIP64 || record.file.CompressedSize64 >= 0xffffffff || record.file.UncompressedSize64 >= 0xffffffff {
-		width = 8
+		widths = []int{8}
+	} else if record.localVersion >= 45 || record.file.ReaderVersion >= 45 {
+		widths = []int{8, 4}
 	}
-	length := 4 + 2*width
-	var data [24]byte
+	var data [28]byte
 	available := min(int64(len(data)), boundary-record.end)
-	if available < int64(length) {
+	if available <= 0 {
 		return 0, fmt.Errorf("%w: truncated ZIP data descriptor", ErrInvalid)
 	}
 	if err := readPackageZIPAt(input, boundary, record.end, data[:int(available)]); err != nil {
 		return 0, err
 	}
-	for _, start := range []int{0, 4} {
-		if start != 0 && (binary.LittleEndian.Uint32(data[:]) != packageZIPDescriptorSignature || int(available) < start+length) {
-			continue
-		}
-		if binary.LittleEndian.Uint32(data[start:]) != record.file.CRC32 {
-			continue
-		}
-		compressed, uncompressed := uint64(0), uint64(0)
-		if width == 4 {
-			compressed = uint64(binary.LittleEndian.Uint32(data[start+4:]))
-			uncompressed = uint64(binary.LittleEndian.Uint32(data[start+8:]))
-		} else {
-			compressed = binary.LittleEndian.Uint64(data[start+4:])
-			uncompressed = binary.LittleEndian.Uint64(data[start+12:])
-		}
-		if compressed == record.file.CompressedSize64 && uncompressed == record.file.UncompressedSize64 {
+	checked := false
+	for _, width := range widths {
+		length := 4 + 2*width
+		for _, start := range []int{0, 4} {
+			if start != 0 && (int(available) < 4 || binary.LittleEndian.Uint32(data[:]) != packageZIPDescriptorSignature) {
+				continue
+			}
+			if int(available) < start+length {
+				continue
+			}
+			checked = true
+			if binary.LittleEndian.Uint32(data[start:]) != record.file.CRC32 {
+				continue
+			}
+			compressed, uncompressed := uint64(0), uint64(0)
+			if width == 4 {
+				compressed = uint64(binary.LittleEndian.Uint32(data[start+4:]))
+				uncompressed = uint64(binary.LittleEndian.Uint32(data[start+8:]))
+			} else {
+				compressed = binary.LittleEndian.Uint64(data[start+4:])
+				uncompressed = binary.LittleEndian.Uint64(data[start+12:])
+			}
+			if compressed != record.file.CompressedSize64 || uncompressed != record.file.UncompressedSize64 {
+				continue
+			}
+			if len(widths) > 1 && width == 8 {
+				endPos := record.end + int64(start+length)
+				if endPos < boundary {
+					if int(available) < start+length+4 {
+						continue
+					}
+					sig := binary.LittleEndian.Uint32(data[start+length : start+length+4])
+					if sig != packageZIPLocalSignature && sig != packageZIPCentralSignature && sig != packageZIPEndSignature && sig != packageZIP64EndSignature && sig != packageZIPDigitalSignature {
+						continue
+					}
+				}
+			}
 			return start + length, nil
 		}
+	}
+	if !checked {
+		return 0, fmt.Errorf("%w: truncated ZIP data descriptor", ErrInvalid)
 	}
 	return 0, fmt.Errorf("%w: ZIP descriptor CRC or sizes", ErrInvalid)
 }
@@ -1266,20 +1305,24 @@ func locatePackageZIP64End(input io.ReaderAt, locatorPos int64, relOffset uint64
 		return locatorPos - 56, ok, err
 	}
 	floor := int64(relOffset)
-	maxSpan := min(locatorPos-floor, min(limits.MaxPackageBytes, 1<<20)+12)
-	scanStart := locatorPos - maxSpan
-	chunkLen := int(locatorPos - scanStart)
-	if chunkLen < 56 {
-		return 0, false, nil
+	if limits.MaxPackageBytes < locatorPos-floor-12 {
+		floor = locatorPos - limits.MaxPackageBytes - 12
 	}
-	buf := make([]byte, chunkLen)
-	if err := readPackageZIPAt(input, locatorPos, scanStart, buf); err != nil {
-		return 0, false, err
-	}
-	for i := len(buf) - 56; i >= 0; i-- {
-		if binary.LittleEndian.Uint32(buf[i:i+4]) == packageZIP64EndSignature && binary.LittleEndian.Uint64(buf[i+4:i+12]) == uint64(len(buf)-i-12) {
-			return scanStart + int64(i), true, nil
+	const chunkSize = 64 << 10
+	buf := make([]byte, chunkSize+11)
+	for high := locatorPos - 56; high >= floor; {
+		low := max(floor, high-chunkSize+1)
+		readLen := int(high - low + 12)
+		if err := readPackageZIPAt(input, locatorPos, low, buf[:readLen]); err != nil {
+			return 0, false, err
 		}
+		for i := int(high - low); i >= 0; i-- {
+			pos := low + int64(i)
+			if binary.LittleEndian.Uint32(buf[i:i+4]) == packageZIP64EndSignature && binary.LittleEndian.Uint64(buf[i+4:i+12]) == uint64(locatorPos-pos-12) {
+				return pos, true, nil
+			}
+		}
+		high = low - 1
 	}
 	return 0, false, nil
 }
@@ -1358,7 +1401,7 @@ func readPackageZIPEnd(input io.ReaderAt, size int64, limits Limits) (packageZIP
 		if diskNumber != 0 || cdStartDisk != 0 || diskEntries != totalEntries {
 			return packageZIPLayout{}, fmt.Errorf("%w: multiple ZIP disks", ErrUnsupported)
 		}
-		if directorySize == 0xffffffff || directoryOffset == 0xffffffff {
+		if diskEntries == 0xffff || totalEntries == 0xffff || directorySize == 0xffffffff || directoryOffset == 0xffffffff {
 			return packageZIPLayout{}, fmt.Errorf("%w: missing ZIP64 end locator", ErrInvalid)
 		}
 	}
@@ -1373,15 +1416,88 @@ func readPackageZIPEnd(input io.ReaderAt, size int64, limits Limits) (packageZIP
 		if directorySize > uint64(boundary) || directoryOffset > uint64(boundary)-directorySize {
 			return packageZIPLayout{}, fmt.Errorf("%w: ZIP central directory bounds", ErrInvalid)
 		}
-		layout.base = boundary - int64(directorySize) - int64(directoryOffset)
-		var signature [4]byte
-		if layout.base != 0 && directoryOffset <= uint64(size-4) {
-			if err := readPackageZIPAt(input, size, int64(directoryOffset), signature[:]); err != nil {
+		dirSize, dirOff := int64(directorySize), int64(directoryOffset)
+		hasCentral := func(pos int64) (bool, error) {
+			if dirSize == 0 {
+				return true, nil
+			}
+			if pos < 0 || pos > boundary-4 {
+				return false, nil
+			}
+			var signature [4]byte
+			if err := readPackageZIPAt(input, boundary, pos, signature[:]); err != nil {
+				return false, err
+			}
+			return binary.LittleEndian.Uint32(signature[:]) == packageZIPCentralSignature, nil
+		}
+		hasDigitalSig := func(pos int64) (bool, error) {
+			if pos == boundary {
+				return true, nil
+			}
+			if pos < 0 || boundary-pos < 6 {
+				return false, nil
+			}
+			var digital [6]byte
+			if err := readPackageZIPAt(input, boundary, pos, digital[:]); err != nil {
+				return false, err
+			}
+			return binary.LittleEndian.Uint32(digital[:]) == packageZIPDigitalSignature && pos+6+int64(binary.LittleEndian.Uint16(digital[4:])) == boundary, nil
+		}
+		resolved := false
+		if dirOff+dirSize == boundary {
+			layout.base, resolved = 0, true
+		} else {
+			okCentral, err := hasCentral(dirOff)
+			if err != nil {
 				return packageZIPLayout{}, err
 			}
-			if binary.LittleEndian.Uint32(signature[:]) == packageZIPCentralSignature {
-				layout.base = 0
+			if okCentral {
+				okSig, err := hasDigitalSig(dirOff + dirSize)
+				if err != nil {
+					return packageZIPLayout{}, err
+				}
+				if okSig {
+					layout.base, resolved = 0, true
+				}
 			}
+		}
+		if !resolved && dirSize > 0 {
+			candBase := boundary - dirSize - dirOff
+			okCentral, err := hasCentral(candBase + dirOff)
+			if err != nil {
+				return packageZIPLayout{}, err
+			}
+			if okCentral {
+				layout.base, resolved = candBase, true
+			}
+		}
+		if !resolved && dirSize > 0 {
+			minSigPos := max(dirOff+dirSize, boundary-(6+packageZIPMetadataLimit))
+			maxSigPos := boundary - 6
+			if minSigPos <= maxSigPos {
+				scan := make([]byte, int(boundary-minSigPos))
+				if err := readPackageZIPAt(input, boundary, minSigPos, scan); err != nil {
+					return packageZIPLayout{}, err
+				}
+				for idx := int(maxSigPos - minSigPos); idx >= 0; idx-- {
+					sigPos := minSigPos + int64(idx)
+					if binary.LittleEndian.Uint32(scan[idx:idx+4]) != packageZIPDigitalSignature || sigPos+6+int64(binary.LittleEndian.Uint16(scan[idx+4:idx+6])) != boundary {
+						continue
+					}
+					candBase := sigPos - dirSize - dirOff
+					okCentral, err := hasCentral(candBase + dirOff)
+					if err != nil {
+						return packageZIPLayout{}, err
+					}
+					if okCentral {
+						layout.base, resolved = candBase, true
+						break
+					}
+				}
+			}
+		}
+		if !resolved {
+			layout.base = 0
 		}
 	}
 	layout.central = layout.base + int64(directoryOffset)

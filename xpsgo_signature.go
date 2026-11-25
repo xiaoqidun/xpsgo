@@ -235,7 +235,6 @@ type signatureNamespaceScan struct {
 
 // signatureRelationship 保存关系变换筛选与规范化后的关系属性
 type signatureRelationship struct {
-	node  *xmlElement
 	id    string
 	typ   string
 	attrs []xml.Attr
@@ -2420,7 +2419,7 @@ func signaturePartReference(value string) (string, string, error) {
 	return name, media, nil
 }
 
-// signatureRelationshipXML 按OPC规范执行MCE、关系排序筛选并保留原元素槽位与非元素内容
+// signatureRelationshipXML 按ISO/IEC 29500-2:2008执行MCE、补全默认TargetMode、排序属性与关系并清除根内非元素内容
 // 入参: data 原始关系XML, transform 关系选择条件, limits XML及输出上限, ctx 取消Context
 // 返回: []byte 独立变换XML, error 结构、MCE、预算或取消错误，失败无部分结果
 func signatureRelationshipXML(data []byte, transform SignatureTransform, limits Limits, ctx context.Context) ([]byte, error) {
@@ -2439,7 +2438,7 @@ func signatureRelationshipXML(data []byte, transform SignatureTransform, limits 
 	if err != nil {
 		return nil, err
 	}
-	processor := compatibilityProcessor{understood: map[string]bool{mcNamespace: true, xmlNamespace: true, opcRelsNS: true}, content: content.nodes, context: ctx}
+	processor := compatibilityProcessor{understood: map[string]bool{mcNamespace: true, xmlNamespace: true, opcRelsNS: true}, context: ctx}
 	fragment, err := processor.element(root, compatibilityScope{})
 	if err != nil {
 		return nil, err
@@ -2479,15 +2478,20 @@ func signatureRelationshipXML(data []byte, transform SignatureTransform, limits 
 		if err != nil || uri.Scheme == "" || !uriReference(target) {
 			return nil, fmt.Errorf("%w: relationship transform URI", ErrInvalid)
 		}
-		if mode, hasMode := attrs["TargetMode"]; hasMode && TargetMode(mode) != TargetModeInternal && TargetMode(mode) != TargetModeExternal {
+		mode, hasMode := attrs["TargetMode"]
+		if hasMode && TargetMode(mode) != TargetModeInternal && TargetMode(mode) != TargetModeExternal {
 			return nil, fmt.Errorf("%w: relationship transform TargetMode", ErrInvalid)
 		}
-		item := signatureRelationship{node: child, id: id, typ: typ}
+		item := signatureRelationship{id: id, typ: typ}
 		for _, attr := range child.Attr {
 			if attr.Name.Space == "" && attr.Name.Local != "xmlns" {
 				item.attrs = append(item.attrs, attr)
 			}
 		}
+		if !hasMode {
+			item.attrs = append(item.attrs, xml.Attr{Name: xml.Name{Local: "TargetMode"}, Value: string(TargetModeInternal)})
+		}
+		slices.SortFunc(item.attrs, func(a, b xml.Attr) int { return strings.Compare(a.Name.Local, b.Name.Local) })
 		relationships = append(relationships, item)
 	}
 	slices.SortFunc(relationships, func(a, b signatureRelationship) int { return strings.Compare(a.id, b.id) })
@@ -2499,37 +2503,22 @@ func signatureRelationshipXML(data []byte, transform SignatureTransform, limits 
 	for _, typ := range transform.RelationshipTypes {
 		wantedType[typ] = true
 	}
-	filtered := make([]xmlContent, 0, len(content.nodes[root]))
-	index := 0
-	byNode := make(map[*xmlElement]signatureRelationship)
-	for _, item := range content.nodes[root] {
+	selected := make([]signatureRelationship, 0, len(relationships))
+	for _, relationship := range relationships {
 		if err := checkContext(ctx); err != nil {
 			return nil, err
 		}
-		if item.element == nil {
-			filtered = append(filtered, item)
-			continue
-		}
-		relationship := relationships[index]
-		index++
 		if wantedID[relationship.id] || wantedType[relationship.typ] {
-			filtered = append(filtered, xmlContent{element: relationship.node})
-			byNode[relationship.node] = relationship
+			selected = append(selected, relationship)
 		}
 	}
-	for len(filtered) != 0 && filtered[0].element == nil {
-		filtered = filtered[1:]
-	}
-	for len(filtered) != 0 && filtered[len(filtered)-1].element == nil {
-		filtered = filtered[:len(filtered)-1]
-	}
-	return signatureRelationshipOutput(content, filtered, byNode, limit, ctx)
+	return signatureRelationshipOutput(content, selected, limit, ctx)
 }
 
-// signatureRelationshipOutput 输出仅使用关系默认命名空间的XML，保留原属性及非元素词元并移除关系内容
-// 入参: content 根外词元, items 排序筛选后的根内内容, relationships 关系属性索引, limit 输出字节上限, ctx 取消Context
+// signatureRelationshipOutput 按ISO/IEC 29500-2:2008输出仅使用关系默认命名空间的XML，补全TargetMode并清除根内非元素内容
+// 入参: content 根外词元, selected 排序筛选后的关系列表, limit 输出字节上限, ctx 取消Context
 // 返回: []byte 独立XML字节, error 序列化、预算或取消错误
-func signatureRelationshipOutput(content *xmlContentReader, items []xmlContent, relationships map[*xmlElement]signatureRelationship, limit int64, ctx context.Context) ([]byte, error) {
+func signatureRelationshipOutput(content *xmlContentReader, selected []signatureRelationship, limit int64, ctx context.Context) ([]byte, error) {
 	var output bytes.Buffer
 	writer := packageOutput{writer: &output, context: ctx, limit: limit}
 	encoder := xml.NewEncoder(&writer)
@@ -2542,17 +2531,10 @@ func signatureRelationshipOutput(content *xmlContentReader, items []xmlContent, 
 	if err := encoder.EncodeToken(root); err != nil {
 		return nil, err
 	}
-	for _, item := range items {
+	for _, relationship := range selected {
 		if err := checkContext(ctx); err != nil {
 			return nil, err
 		}
-		if item.element == nil {
-			if err := encoder.EncodeToken(item.token); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		relationship := relationships[item.element]
 		start := xml.StartElement{Name: xml.Name{Local: "Relationship"}, Attr: relationship.attrs}
 		if err := encoder.EncodeToken(start); err != nil {
 			return nil, err

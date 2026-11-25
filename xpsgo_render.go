@@ -67,7 +67,7 @@ type RenderLimits struct {
 // RenderOptions 设置页面绘制参数，零值字段采用DefaultRenderOptions默认值，不修改页面内容
 // DPI默认96（先应用Transform再按DPI缩放），Region为nil取变换后整像素范围，Background为nil默认白色（color.Transparent输出透明底）
 // ColorSpace预览默认ColorSRGB、设备默认ColorScRGB，Samples可选1/2/4/8（默认8），Tolerance默认0.025像素，Workers零值自动按核数选择
-// HDRPeakNits设置HDR色调映射与HLG参考峰值亮度（单位cd/m²），零值时对PQ默认10000、对HLG默认1000且不影响普通SDR像素；非零值时同时对scRGB及线性图像输出按该峰值执行BT.2446色调映射
+// HDRPeakNits设置HDR色调映射与HLG参考峰值亮度（单位cd/m²），零值时PQ按10000、HLG按1000自动色调映射且不影响普通SDR像素；非零值时仅对HDR及线性扩展图像或scRGB输出按该峰值执行BT.2446色调映射
 type RenderOptions struct {
 	DPI         float64
 	Transform   *Matrix
@@ -142,6 +142,7 @@ type sceneColorCache struct {
 	bytes           int64
 	maxProfiles     int
 	sourceIntent    RenderingIntent
+	deviceOutput    bool
 }
 
 // String 返回ICC渲染意图的名称
@@ -1175,7 +1176,7 @@ func (c *sceneColorCache) vector(part string, value Color) (Color, error) {
 		}
 		input = scaled[:len(input)]
 	}
-	rgb, err := transform.linearRGB(input)
+	rgb, err := transform.linearRGB(input, false, c.deviceOutput)
 	if err != nil {
 		return Color{}, err
 	}

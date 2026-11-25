@@ -1541,9 +1541,6 @@ func (s *fontBitmapStrike) parseIndex(data []byte, first, last uint16, dataSize 
 			return fmt.Errorf("%w: bitmap glyph %d index range or order", ErrInvalid, gid)
 		}
 		previous = gid
-		if start == end && (format == 1 || format == 3) {
-			continue
-		}
 		s.entries = append(s.entries, fontBitmapEntry{gid: gid, imageFormat: imageFormat, start: base + start, end: base + end, fixed: fixed, metrics: metrics})
 	}
 	return nil
@@ -1569,6 +1566,11 @@ func (d *fontBitmapDecode) decode(gid uint16) (fontBitmapDecoded, bool, error) {
 	}
 	entry := d.strike.entries[i]
 	data := d.font.data[entry.start:entry.end]
+	if !entry.fixed && len(data) == 0 {
+		result := fontBitmapDecoded{mask: image.NewAlpha(image.Rectangle{})}
+		d.cache[gid] = result
+		return result, true, nil
+	}
 	metrics, skip, err := d.strike.imageMetrics(entry, data)
 	if err != nil {
 		return fontBitmapDecoded{}, true, err
@@ -1627,6 +1629,9 @@ func (d *fontBitmapDecode) decode(gid uint16) (fontBitmapDecoded, bool, error) {
 // 入参: entry 已验证索引项, data 对应EBDT区间
 // 返回: fontBitmapMetrics 原始度量, int 后续数据偏移, error 截断或能力错误
 func (s *fontBitmapStrike) imageMetrics(entry fontBitmapEntry, data []byte) (fontBitmapMetrics, int, error) {
+	if !entry.fixed && len(data) == 0 {
+		return fontBitmapMetrics{}, 0, nil
+	}
 	switch entry.imageFormat {
 	case 1, 2, 8:
 		skip := 5

@@ -103,7 +103,6 @@ type streamPackage struct {
 	pageWait     map[string]bool
 	pageHold     bool
 	pageTickets  [][]string
-	ticketRefs   map[string]bool
 	documents    []string
 	document     int
 	documentKeys map[string]bool

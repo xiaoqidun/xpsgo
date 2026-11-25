@@ -43,6 +43,9 @@ var iccPCSFromLinearRGB, _ = iccInverseMatrix(iccPCSDisplayMatrix)
 // iccPCSWhite 保存ICC标准D50连接空间白点XYZ坐标
 var iccPCSWhite = [3]float64{0.9642, 1, 0.8249}
 
+// iccD65White 保存标准D65显示参考白点XYZ坐标
+var iccD65White = [3]float64{0.3127 / 0.3290, 1, (1 - 0.3127 - 0.3290) / 0.3290}
+
 // iccXYZD65ToLinearRGB 保存D65参考白XYZ到线性sRGB的直接显示矩阵
 var iccXYZD65ToLinearRGB = iccDisplayD65Matrix()
 
@@ -1475,10 +1478,10 @@ func prepareICCTransform(profile *iccProfile, intent uint32) (*iccTransform, err
 	return t, nil
 }
 
-// toXYZ 将源分量转换为物理XYZ，区分现代和传统Lab编码及绝对色度白点
-// 入参: input 源设备的归一化颜色
+// toXYZ 将源分量转换为物理XYZ，区分现代和传统Lab编码及绝对色度白点，可选对矩阵及灰阶TRC启用无裁剪扩展外推
+// 入参: input 源设备的颜色分量, extended 是否对TRC启用扩展范围外推
 // 返回: [3]float64 D50条件XYZ, error 输入、计算或能力错误
-func (t *iccTransform) toXYZ(input []float64) ([3]float64, error) {
+func (t *iccTransform) toXYZ(input []float64, extended bool) ([3]float64, error) {
 	if t == nil || t.profile == nil || len(input) != t.inputChannels() {
 		return [3]float64{}, fmt.Errorf("%w: ICC source color channels", ErrInvalid)
 	}
@@ -1513,7 +1516,13 @@ func (t *iccTransform) toXYZ(input []float64) ([3]float64, error) {
 			xyz = iccLabToXYZ(lab)
 		}
 	} else if t.gray {
-		value, err := t.curves[0].evaluate(input[0])
+		var value float64
+		var err error
+		if extended {
+			value, err = t.curves[0].evaluateExtended(input[0])
+		} else {
+			value, err = t.curves[0].evaluate(input[0])
+		}
 		if err != nil {
 			return [3]float64{}, err
 		}
@@ -1527,7 +1536,13 @@ func (t *iccTransform) toXYZ(input []float64) ([3]float64, error) {
 	} else {
 		var linear [3]float64
 		for i := range 3 {
-			value, err := t.curves[i].evaluate(input[i])
+			var value float64
+			var err error
+			if extended {
+				value, err = t.curves[i].evaluateExtended(input[i])
+			} else {
+				value, err = t.curves[i].evaluate(input[i])
+			}
 			if err != nil {
 				return [3]float64{}, err
 			}
@@ -1546,16 +1561,18 @@ func (t *iccTransform) toXYZ(input []float64) ([3]float64, error) {
 	return xyz, nil
 }
 
-// linearRGB 转换为线性sRGB，保留显示色域之外的值供后续合成或输出策略处理
-// 入参: input 源设备归一化颜色
+// linearRGB 转换为线性sRGB，支持TRC扩展外推及面向设备ICC连接空间的绝对白点保真传输
+// 入参: input 源设备颜色分量, extended 是否对TRC启用扩展范围外推, devicePCS 是否面向目标ICC连接空间保留源绝对白点
 // 返回: [3]float64 线性sRGB分量, error 源转换错误
-func (t *iccTransform) linearRGB(input []float64) ([3]float64, error) {
-	xyz, err := t.toXYZ(input)
+func (t *iccTransform) linearRGB(input []float64, extended, devicePCS bool) ([3]float64, error) {
+	xyz, err := t.toXYZ(input, extended)
 	if err != nil {
 		return [3]float64{}, err
 	}
-	if t.intent == 3 && !t.absolutePCS && t.profile.version>>24 == 2 && t.profile.class == "mntr" && !t.hasChad {
-		return iccMatrixColor(iccXYZD65ToLinearRGB, xyz), nil
+	if !devicePCS && t.intent == 3 && !t.absolutePCS && t.profile.version>>24 == 2 && t.profile.class == "mntr" && !t.hasChad {
+		for i := range 3 {
+			xyz[i] *= iccPCSWhite[i] / iccD65White[i]
+		}
 	}
 	return iccMatrixColor(iccPCSDisplayMatrix, xyz), nil
 }

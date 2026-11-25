@@ -811,7 +811,7 @@ func parseDiscardControl(root *xmlElement, part, namespace string, step func() e
 // 返回: error 过早释放、未知引用语义、预算或取消错误
 func (r *Reader) validateDiscardLifetime(control *DiscardControl, ctx context.Context) error {
 	budget := resourceMergeBudget{bytes: r.limits.MaxPackageBytes, work: r.limits.MaxXMLNodes, seen: make(map[string]bool), context: ctx}
-	graph, err := r.resourceReferenceGraph(&budget)
+	graph, err := r.resourceReferenceGraphMode(&budget, false)
 	if err != nil {
 		return err
 	}

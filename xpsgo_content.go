@@ -624,15 +624,18 @@ func (g *contentGraph) bitmapGlyphYMax(font *fontSource, glyphs *Glyphs, transfo
 			return fallback, nil
 		}
 		entry := strike.entries[index]
+		if !entry.fixed && entry.start == entry.end {
+			return 0, nil
+		}
 		metrics, _, err := strike.imageMetrics(entry, font.bitmaps.data[entry.start:entry.end])
 		if err != nil {
 			return fallback, nil
 		}
-		if metrics.hasVertical {
-			return 0, nil
-		}
 		if metrics.hasHorizontal && selection.ppemY != 0 {
 			return math.Round(float64(metrics.horizontal.bearingY)*selection.scaleY) * float64(font.metrics.unitsPerEm) / float64(selection.ppemY), nil
+		}
+		if metrics.hasVertical && selection.ppemY != 0 {
+			return fallback - math.Round(float64(metrics.vertical.bearingY)*selection.scaleY)*float64(font.metrics.unitsPerEm)/float64(selection.ppemY), nil
 		}
 		return fallback, nil
 	}

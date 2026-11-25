@@ -84,6 +84,12 @@ var printSurfacePool sync.Pool
 // renderPrintColorLinearTable 保存八位sRGB的线性解码值，初始化后只读，供目标页像素转换共享
 var renderPrintColorLinearTable = newRenderPrintColorLinearTable()
 
+// printWorkingSRGB 与 printWorkingScRGB 保存无ICC内建只读工作空间，避免逐像素反相或灰度转换产生堆分配
+var (
+	printWorkingSRGB  = &printWorkingSpace{space: ColorSRGB, channels: 3}
+	printWorkingScRGB = &printWorkingSpace{space: ColorScRGB, channels: 3}
+)
+
 // PrintColorMode 表示目标纸面的输出色彩，零值表示票据未声明，不改变输出
 type PrintColorMode uint8
 
@@ -175,6 +181,42 @@ type printColorRuntime struct {
 	mu            sync.RWMutex
 	transforms    map[*iccProfile][4]*iccTransform
 	nativeMatch   map[*iccProfile]bool
+}
+
+// printNativePixel 保存工作空间预乘多通道分量与透明度，供打印图像单遍双线性与面积滤波共享
+type printNativePixel struct {
+	value [iccMaxChannels]float64
+	alpha float64
+}
+
+// printImageSampleCache 保存单个工作Goroutine独占的打印图像单点结果及JPEG XR滑动行缓存
+type printImageSampleCache struct {
+	point Point
+	pixel printNativePixel
+	valid bool
+	jxr   jxrRowCache
+}
+
+// printImageFilter 保存打印多通道图像小图块面积加权均值缓存
+type printImageFilter struct {
+	values []printNativePixel
+	first  int
+}
+
+// printImageSampler 在四至十五通道打印工作空间执行单遍源解码与ICC转换，消除多平面重复计算
+type printImageSampler struct {
+	base           *imageSampler
+	runtime        *printColorRuntime
+	profile        *iccProfile
+	working        *printWorkingSpace
+	intent         RenderingIntent
+	useExtendedTRC bool
+	filter         *printImageFilter
+	filterErr      error
+	reserved       int
+	cache          printImageSampleCache
+	cachePool      sync.Pool
+	mu             sync.Mutex
 }
 
 // String 返回打印输出色彩模式名称
@@ -326,9 +368,9 @@ func (c *printColorRuntime) previewSample(sample printNativeSample) sceneSample 
 		if err != nil {
 			return renderColor{}, err
 		}
-		space := &printWorkingSpace{space: ColorScRGB, channels: 3}
+		space := printWorkingScRGB
 		if c.renderer.options.space == renderSRGB {
-			space.space = ColorSRGB
+			space = printWorkingSRGB
 		}
 		value, err = value.convert(space, c.renderer)
 		if err != nil {
@@ -338,10 +380,10 @@ func (c *printColorRuntime) previewSample(sample printNativeSample) sceneSample 
 	}
 }
 
-// brush 为打印执行建立保持颜色编码的采样器，复用既有几何和图块映射
-// 入参: brush 原始画刷, transform 使用位置变换, aliased 边缘模式, depth 当前深度
+// brush 为打印执行建立保持颜色编码的采样器，复用既有几何和图块映射并支持透明度掩模透传
+// 入参: brush 原始画刷, transform 使用位置变换, aliased 边缘模式, depth 当前深度, alphaOnly 是否仅读取透明度掩模
 // 返回: printNativeSample 原生采样器, error 画刷、资源或预算错误
-func (c *printColorRuntime) brush(brush *Brush, transform Matrix, aliased bool, depth int) (printNativeSample, error) {
+func (c *printColorRuntime) brush(brush *Brush, transform Matrix, aliased bool, depth int, alphaOnly bool) (printNativeSample, error) {
 	r := c.renderer
 	if brush == nil || !geometryFinite(brush.Opacity) || brush.Opacity < 0 || brush.Opacity > 1 {
 		return nil, fmt.Errorf("%w: print brush opacity", ErrInvalid)
@@ -360,7 +402,7 @@ func (c *printColorRuntime) brush(brush *Brush, transform Matrix, aliased bool, 
 	case BrushLinearGradient, BrushRadialGradient:
 		return c.gradient(brush, transform)
 	case BrushImage:
-		return c.image(brush, transform)
+		return c.image(brush, transform, alphaOnly)
 	case BrushVisual:
 		r.nativeSample = nil
 		_, err := r.visualBrush(brush, transform, aliased, depth)
@@ -476,16 +518,40 @@ func (c *printColorRuntime) gradient(brush *Brush, transform Matrix) (printNativ
 	}, nil
 }
 
-// image 复用原生图像解码及重采样器，在取样前选择正确ICC而不先降为RGB图像
-// 入参: brush 图像画刷, transform 使用位置变换
+// image 复用原生图像解码及重采样器，在取样前选择正确ICC而不先降为RGB图像，多通道工作空间单遍转换
+// 入参: brush 图像画刷, transform 使用位置变换, alphaOnly 是否仅用于透明度掩模
 // 返回: printNativeSample 原生图像采样器, error 解码、配置或预算错误
-func (c *printColorRuntime) image(brush *Brush, transform Matrix) (printNativeSample, error) {
+func (c *printColorRuntime) image(brush *Brush, transform Matrix, alphaOnly bool) (printNativeSample, error) {
 	if c.renderer.options.image == nil {
 		return nil, fmt.Errorf("%w: print image loader", ErrUnsupported)
 	}
 	source, err := c.renderer.options.image(brush)
 	if err != nil {
 		return nil, err
+	}
+	if alphaOnly {
+		sampler, err := newImageSampler(brush, source, transform, renderScRGB, true, IntentDefault, c.renderer.options.hdrPeakNits, false)
+		if err != nil {
+			return nil, err
+		}
+		sampler.charge, sampler.reserve, sampler.release = c.renderer.charge, c.renderer.reservePixels, c.renderer.releaseLive
+		if sampler.filterX || sampler.filterY {
+			c.renderer.hasFiltered = true
+		}
+		c.renderer.registerCleanup(sampler.releaseFilter)
+		return func(point, center Point) (printNativeColor, error) {
+			var col renderColor
+			var err error
+			if c.renderer.concurrent {
+				col, err = sampler.sampleAtPooled(point, center)
+			} else {
+				col, err = sampler.sampleAt(point, center)
+			}
+			if err != nil {
+				return printNativeColor{}, err
+			}
+			return printNativeColor{alpha: col.a}, nil
+		}, nil
 	}
 	var profile *iccProfile
 	profile = source.selectedProfile
@@ -537,28 +603,37 @@ func (c *printColorRuntime) image(brush *Brush, transform Matrix) (printNativeSa
 			}
 		}
 	}
+	if profile != nil && source.selectedProfile == nil {
+		view := *source
+		view.selectedProfile = profile
+		source = &view
+	}
 	if native {
 		working = c.device
 	}
-	count := (working.channels + 2) / 3
 	jxrIntent := c.sourceIntent(profile, true)
-	var samplers [printColorMaxPlanes]*imageSampler
-	for plane := range count {
-		sampler, err := newImageSampler(brush, source, transform, renderScRGB, false, jxrIntent, c.renderer.options.hdrPeakNits)
-		if err != nil {
-			return nil, err
-		}
-		sampler.charge, sampler.reserve, sampler.release = c.renderer.charge, c.renderer.reservePixels, c.renderer.releaseLive
-		if sampler.filterX || sampler.filterY {
-			c.renderer.hasFiltered = true
-		}
-		c.renderer.registerCleanup(sampler.releaseFilter)
+	sampler, err := newImageSampler(brush, source, transform, renderScRGB, false, jxrIntent, c.renderer.options.hdrPeakNits, false)
+	if err != nil {
+		return nil, err
+	}
+	sampler.charge, sampler.reserve, sampler.release = c.renderer.charge, c.renderer.reservePixels, c.renderer.releaseLive
+	if sampler.filterX || sampler.filterY {
+		c.renderer.hasFiltered = true
+	}
+	c.renderer.registerCleanup(sampler.releaseFilter)
+	intent := c.destinationIntent(profile, true)
+	useExtendedTRC := imageUseExtendedTRC(source, sampler.jxrMode)
+	if working.channels <= 3 {
 		sampler.convert = func(components [iccMaxChannels]float64, alpha float64, linear bool) (renderColor, error) {
+			alpha = colorClamp(alpha)
+			if alpha == 0 {
+				return renderColor{}, nil
+			}
 			space := ColorSRGB
 			if linear {
 				space = ColorScRGB
 			}
-			value, err := c.color(profile, components, alpha, space, true)
+			value, err := c.colorWith(profile, components, alpha, space, true, source, useExtendedTRC)
 			if err != nil {
 				return renderColor{}, err
 			}
@@ -568,42 +643,367 @@ func (c *printColorRuntime) image(brush *Brush, transform Matrix) (printNativeSa
 			}
 			packed := renderColor{a: alpha}
 			var values [3]float64
-			for j := range 3 {
-				if channel := plane*3 + j; channel < working.channels {
-					values[j] = value.value[channel] * alpha
-				}
+			for j := range working.channels {
+				values[j] = value.value[j] * alpha
 			}
 			packed.r, packed.g, packed.b = values[0], values[1], values[2]
 			return packed, nil
 		}
-		samplers[plane] = sampler
-	}
-	intent := c.destinationIntent(profile, true)
-	return func(point, center Point) (printNativeColor, error) {
-		value := printNativeColor{space: working, blend: c.working, intent: intent}
-		for plane := range count {
+		return func(point, center Point) (printNativeColor, error) {
 			var color renderColor
 			var err error
 			if c.renderer.concurrent {
-				color, err = samplers[plane].sampleAtPooled(point, center)
+				color, err = sampler.sampleAtPooled(point, center)
 			} else {
-				color, err = samplers[plane].sampleAt(point, center)
+				color, err = sampler.sampleAt(point, center)
 			}
 			if err != nil {
 				return printNativeColor{}, err
 			}
-			value.alpha = color.a
+			value := printNativeColor{alpha: color.a, space: working, blend: c.working, intent: intent}
 			if color.a == 0 {
-				continue
+				return value, nil
 			}
 			for j, component := range [3]float64{color.r, color.g, color.b} {
-				if channel := plane*3 + j; channel < working.channels {
-					value.value[channel] = component / color.a
+				if j < working.channels {
+					value.value[j] = component / color.a
 				}
 			}
+			return value, nil
+		}, nil
+	}
+	multi := &printImageSampler{
+		base:           sampler,
+		runtime:        c,
+		profile:        profile,
+		working:        working,
+		intent:         intent,
+		useExtendedTRC: useExtendedTRC,
+	}
+	c.renderer.registerCleanup(multi.releaseFilter)
+	return multi.sample, nil
+}
+
+// pixelColor 单遍读取源像素分量并执行一次多通道ICC及工作空间转换，输出预乘多通道像素
+// 入参: x 源横坐标, y 源纵坐标, jxrCache 可选JPEG XR滑动行缓存
+// 返回: printNativePixel 工作空间预乘像素, error 采样、扩展范围或颜色转换错误
+func (p *printImageSampler) pixelColor(x, y int, jxrCache *jxrRowCache) (printNativePixel, error) {
+	components, alpha, channels, linear, _, err := p.base.sampleSourceComponents(x, y, jxrCache)
+	if err != nil {
+		return printNativePixel{}, err
+	}
+	alpha = colorClamp(alpha)
+	if alpha == 0 {
+		return printNativePixel{}, nil
+	}
+	if channels < 1 || channels > len(components) {
+		return printNativePixel{}, fmt.Errorf("%w: image source channels", ErrUnsupported)
+	}
+	space := ColorSRGB
+	if linear {
+		space = ColorScRGB
+	}
+	value, err := p.runtime.colorWith(p.profile, components, alpha, space, true, p.base.image, p.useExtendedTRC)
+	if err != nil {
+		return printNativePixel{}, err
+	}
+	value, err = value.convert(p.working, p.runtime.renderer)
+	if err != nil {
+		return printNativePixel{}, err
+	}
+	out := printNativePixel{alpha: alpha}
+	for ch := range p.working.channels {
+		out.value[ch] = value.value[ch] * alpha
+	}
+	return out, nil
+}
+
+// bilinearWithCache 对多通道工作空间像素执行单遍预乘双线性插值
+// 入参: point 已换算物理分辨率的源像素坐标, jxrCache 可选JPEG XR滑动行缓存
+// 返回: printNativePixel 插值后的预乘多通道像素, error 颜色转换错误
+func (p *printImageSampler) bilinearWithCache(point Point, jxrCache *jxrRowCache) (printNativePixel, error) {
+	bounds := p.base.image.bounds()
+	dx, dy := bounds.Dx(), bounds.Dy()
+	x := max(0, min(float64(dx-1), point.X-0.5))
+	y := max(0, min(float64(dy-1), point.Y-0.5))
+	x0, y0 := int(math.Floor(x)), int(math.Floor(y))
+	tx, ty := x-float64(x0), y-float64(y0)
+	if tx == 0 && ty == 0 {
+		return p.pixelColor(bounds.Min.X+x0, bounds.Min.Y+y0, jxrCache)
+	}
+	x1, y1 := min(x0+1, dx-1), min(y0+1, dy-1)
+	chCount := p.working.channels
+	if ty == 0 {
+		c0, err := p.pixelColor(bounds.Min.X+x0, bounds.Min.Y+y0, jxrCache)
+		if err != nil {
+			return printNativePixel{}, err
 		}
-		return value, nil
-	}, nil
+		c1, err := p.pixelColor(bounds.Min.X+x1, bounds.Min.Y+y0, jxrCache)
+		if err != nil {
+			return printNativePixel{}, err
+		}
+		w0 := 1 - tx
+		out := printNativePixel{alpha: colorClamp(c0.alpha*w0 + c1.alpha*tx)}
+		for ch := range chCount {
+			out.value[ch] = c0.value[ch]*w0 + c1.value[ch]*tx
+		}
+		return out, nil
+	}
+	if tx == 0 {
+		c0, err := p.pixelColor(bounds.Min.X+x0, bounds.Min.Y+y0, jxrCache)
+		if err != nil {
+			return printNativePixel{}, err
+		}
+		c1, err := p.pixelColor(bounds.Min.X+x0, bounds.Min.Y+y1, jxrCache)
+		if err != nil {
+			return printNativePixel{}, err
+		}
+		w0 := 1 - ty
+		out := printNativePixel{alpha: colorClamp(c0.alpha*w0 + c1.alpha*ty)}
+		for ch := range chCount {
+			out.value[ch] = c0.value[ch]*w0 + c1.value[ch]*ty
+		}
+		return out, nil
+	}
+	c00, err := p.pixelColor(bounds.Min.X+x0, bounds.Min.Y+y0, jxrCache)
+	if err != nil {
+		return printNativePixel{}, err
+	}
+	c10, err := p.pixelColor(bounds.Min.X+x1, bounds.Min.Y+y0, jxrCache)
+	if err != nil {
+		return printNativePixel{}, err
+	}
+	c01, err := p.pixelColor(bounds.Min.X+x0, bounds.Min.Y+y1, jxrCache)
+	if err != nil {
+		return printNativePixel{}, err
+	}
+	c11, err := p.pixelColor(bounds.Min.X+x1, bounds.Min.Y+y1, jxrCache)
+	if err != nil {
+		return printNativePixel{}, err
+	}
+	wx0, wx1, wy0, wy1 := 1-tx, tx, 1-ty, ty
+	w00, w10, w01, w11 := wx0*wy0, wx1*wy0, wx0*wy1, wx1*wy1
+	out := printNativePixel{alpha: colorClamp(((c00.alpha*w00 + c10.alpha*w10) + c01.alpha*w01) + c11.alpha*w11)}
+	for ch := range chCount {
+		out.value[ch] = ((c00.value[ch]*w00 + c10.value[ch]*w10) + c01.value[ch]*w01) + c11.value[ch]*w11
+	}
+	return out, nil
+}
+
+// prepareFilter 延迟构建多通道小图块面积加权均值缓存
+// 返回: error 转换、预算或取消错误
+func (p *printImageSampler) prepareFilter() error {
+	if p.filter != nil || p.filterErr != nil {
+		return p.filterErr
+	}
+	value, err := p.buildFilter()
+	if err != nil {
+		p.filterErr = err
+		return err
+	}
+	p.filter = value
+	return nil
+}
+
+// buildFilter 单遍遍历源像素积分全部工作空间通道，严格按等效平面容量扣减存活预算
+// 返回: *printImageFilter 完整均值缓存, error 转换、预算或取消错误
+func (p *printImageSampler) buildFilter() (*printImageFilter, error) {
+	s := p.base
+	bounds := s.image.bounds()
+	x, err := newImageBrushFilterAxis(s.viewbox.X, s.viewbox.Width, s.image.dpi.X/96, bounds.Dx(), s.filterX)
+	if err != nil {
+		return nil, err
+	}
+	y, err := newImageBrushFilterAxis(s.viewbox.Y, s.viewbox.Height, s.image.dpi.Y/96, bounds.Dy(), s.filterY)
+	if err != nil {
+		return nil, err
+	}
+	nx, ny := uint64(x.last-x.first), uint64(y.last-y.first)
+	first, count := 0, 1
+	if !s.filterX {
+		first, count = x.first, int(nx)
+	} else if !s.filterY {
+		first, count = y.first, int(ny)
+	}
+	if nx == 0 || ny == 0 {
+		first, count = 0, 1
+	}
+	if count > imageBrushFilterMaxCache || ny != 0 && nx > imageBrushFilterMaxWork/ny {
+		return nil, fmt.Errorf("%w: image brush filter cache", ErrLimit)
+	}
+	if err := s.imageFilterCharge(nx*ny + uint64(count)*4); err != nil {
+		return nil, err
+	}
+	reserveUnits := count * ((p.working.channels + 2) / 3)
+	committed := false
+	if s.reserve != nil {
+		if err := s.reserve(reserveUnits); err != nil {
+			return nil, err
+		}
+		p.reserved += reserveUnits
+		defer func() {
+			if !committed && s.release != nil && reserveUnits > 0 {
+				p.reserved -= reserveUnits
+				s.release(reserveUnits)
+			}
+		}()
+	}
+	values := make([]printNativePixel, count)
+	if nx == 0 || ny == 0 {
+		committed = true
+		return &printImageFilter{values: values}, nil
+	}
+	var rows jxrRowCache
+	var visited uint64
+	chCount := p.working.channels
+	for py := y.first; py < y.last; py++ {
+		wy := y.weight(py)
+		for px := x.first; px < x.last; px++ {
+			if visited%256 == 0 {
+				if err := s.imageFilterCharge(0); err != nil {
+					return nil, err
+				}
+			}
+			visited++
+			weight := x.weight(px) * wy
+			if weight == 0 {
+				continue
+			}
+			c, err := p.pixelColor(bounds.Min.X+px, bounds.Min.Y+py, &rows)
+			if err != nil {
+				return nil, err
+			}
+			index := 0
+			if !s.filterX {
+				index = px - first
+			} else if !s.filterY {
+				index = py - first
+			}
+			v := &values[index]
+			for ch := range chCount {
+				v.value[ch] += c.value[ch] * weight
+			}
+			v.alpha += c.alpha * weight
+		}
+	}
+	if err := s.imageFilterCharge(0); err != nil {
+		return nil, err
+	}
+	committed = true
+	return &printImageFilter{values: values, first: first}, nil
+}
+
+// filteredColor 读取多通道均值缓存并对未平均轴执行线性插值
+// 入参: point 像素中心对应的源像素位置
+// 返回: printNativePixel 预乘多通道颜色, error 缓存构建错误
+func (p *printImageSampler) filteredColor(point Point) (printNativePixel, error) {
+	if err := p.prepareFilter(); err != nil {
+		return printNativePixel{}, err
+	}
+	f := p.filter
+	if len(f.values) == 0 {
+		return printNativePixel{}, nil
+	}
+	if p.base.filterX && p.base.filterY {
+		c := f.values[0]
+		c.alpha = colorClamp(c.alpha)
+		return c, nil
+	}
+	position, count := point.X, p.base.image.bounds().Dx()
+	if p.base.filterX {
+		position, count = point.Y, p.base.image.bounds().Dy()
+	}
+	pos := max(0, min(float64(count-1), position-0.5))
+	index := int(math.Floor(pos))
+	t := pos - float64(index)
+	i, j := max(0, min(len(f.values)-1, index-f.first)), max(0, min(len(f.values)-1, index+1-f.first))
+	a, b := f.values[i], f.values[j]
+	w0 := 1 - t
+	out := printNativePixel{alpha: colorClamp(a.alpha*w0 + b.alpha*t)}
+	for ch := range p.working.channels {
+		out.value[ch] = a.value[ch]*w0 + b.value[ch]*t
+	}
+	return out, nil
+}
+
+// releaseFilter 释放多通道过滤与行缓存并归还存活像素预算
+func (p *printImageSampler) releaseFilter() {
+	p.filter = nil
+	p.cache.jxr.source = nil
+	p.cache.jxr.valid = [2]bool{}
+	if p.reserved != 0 && p.base != nil && p.base.release != nil {
+		count := p.reserved
+		p.reserved = 0
+		p.base.release(count)
+	}
+}
+
+// sample 并发安全地采样多通道打印图像画刷，非滤波路径通过对象池零锁复用单点及JPEG XR行缓存
+// 入参: point 当前覆盖位置, center 设备像素中心
+// 返回: printNativeColor 非预乘多通道工作颜色, error 采样、预算或数值错误
+func (p *printImageSampler) sample(point, center Point) (printNativeColor, error) {
+	if !geometryFinite(point.X, point.Y, center.X, center.Y) {
+		return printNativeColor{}, fmt.Errorf("%w: image device coordinates", ErrLimit)
+	}
+	s := p.base
+	filtered := s.filterX || s.filterY
+	concurrent := p.runtime.renderer.concurrent
+	var cache *printImageSampleCache
+	if filtered {
+		if concurrent {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+		}
+		if err := s.imageFilterCharge(1); err != nil {
+			return printNativeColor{}, err
+		}
+		cache = &p.cache
+	} else if concurrent {
+		if pooled, ok := p.cachePool.Get().(*printImageSampleCache); ok && pooled != nil {
+			cache = pooled
+		} else {
+			cache = &printImageSampleCache{}
+		}
+		defer p.cachePool.Put(cache)
+	} else {
+		cache = &p.cache
+	}
+	pt, visible, err := s.coordinate(point, true)
+	if err != nil || !visible {
+		return printNativeColor{space: p.working, blend: p.runtime.working, intent: p.intent}, err
+	}
+	bounds := s.image.bounds()
+	if !s.filterX && (pt.X < 0 || pt.X >= float64(bounds.Dx())) || !s.filterY && (pt.Y < 0 || pt.Y >= float64(bounds.Dy())) {
+		return printNativeColor{space: p.working, blend: p.runtime.working, intent: p.intent}, nil
+	}
+	pt, _, err = s.coordinate(center, false)
+	if err != nil {
+		return printNativeColor{}, err
+	}
+	var px printNativePixel
+	if cache.valid && pt == cache.point {
+		px = cache.pixel
+	} else {
+		if filtered {
+			px, err = p.filteredColor(pt)
+		} else {
+			px, err = p.bilinearWithCache(pt, &cache.jxr)
+		}
+		if err != nil {
+			return printNativeColor{}, err
+		}
+		cache.point, cache.pixel, cache.valid = pt, px, true
+	}
+	alpha := px.alpha * s.opacity
+	out := printNativeColor{space: p.working, blend: p.runtime.working, intent: p.intent}
+	if alpha == 0 {
+		return out, nil
+	}
+	out.alpha = alpha
+	for ch := range p.working.channels {
+		out.value[ch] = px.value[ch] / px.alpha
+	}
+	return out, nil
 }
 
 // ColorPlan 从已合并打印设置中提取颜色管理计划，不执行设备默认选择或颜色转换
@@ -1083,7 +1483,7 @@ func (r *sceneRenderer) printColorTile(nodes []*sceneNode, storage *printSurface
 				return err
 			}
 			if r.options.outputColor == PrintColorGrayscale || r.options.outputColor == PrintColorMonochrome {
-				value, err = value.convert(&printWorkingSpace{space: ColorScRGB, channels: 3}, r)
+				value, err = value.convert(printWorkingScRGB, r)
 				if err != nil {
 					return err
 				}
@@ -1424,7 +1824,7 @@ func (r *sceneRenderer) drawPrintColor(node *sceneNode, target []printNativeColo
 			value.alpha *= node.opacity
 			if node.negative {
 				var err error
-				value, err = value.convert(&printWorkingSpace{space: ColorSRGB, channels: 3}, r)
+				value, err = value.convert(printWorkingSRGB, r)
 				if err != nil {
 					return err
 				}
@@ -1580,7 +1980,7 @@ func (r *sceneRenderer) samplePrintColorNode(node *sceneNode, point, center Poin
 	result.alpha *= node.opacity
 	if node.negative && result.alpha != 0 {
 		var err error
-		result, err = result.convert(&printWorkingSpace{space: ColorSRGB, channels: 3}, r)
+		result, err = result.convert(printWorkingSRGB, r)
 		if err != nil {
 			return printNativeColor{}, err
 		}
@@ -1844,7 +2244,7 @@ func (s *printWorkingSpace) xyz(values [iccMaxChannels]float64) ([3]float64, err
 		if err := s.renderer.charge(printICCSourceWork(forward)); err != nil {
 			return [3]float64{}, err
 		}
-		return forward.toXYZ(values[:s.channels])
+		return forward.toXYZ(values[:s.channels], false)
 	}
 	rgb := [3]float64{values[0], values[1], values[2]}
 	if s.space == ColorSRGB {
@@ -1900,7 +2300,7 @@ func (s *printWorkingSpace) encode(xyz [3]float64) ([iccMaxChannels]float64, err
 // 入参: target 目标工作编码, r 场景渲染器
 // 返回: printNativeColor 目标编码颜色, error 预算或变换错误
 func (c printNativeColor) convert(target *printWorkingSpace, r *sceneRenderer) (printNativeColor, error) {
-	if c.space == target || c.alpha == 0 || c.space != nil && target != nil && c.space.profile != nil && target.profile != nil && c.space.hash == target.hash {
+	if c.space == target || c.alpha == 0 || c.space != nil && target != nil && (c.space.profile != nil && target.profile != nil && c.space.hash == target.hash || c.space.profile == nil && target.profile == nil && c.space.space == target.space) {
 		c.space = target
 		return c, nil
 	}
@@ -2092,6 +2492,13 @@ func (c *printColorRuntime) destinationIntent(profile *iccProfile, raster bool) 
 // 入参: profile 源ICC，nil表示内建编码, value 原始分量, alpha 透明度, space 内建源编码, raster 是否为图像
 // 返回: printNativeColor 非预乘颜色, error 变换或预算错误
 func (c *printColorRuntime) color(profile *iccProfile, value [iccMaxChannels]float64, alpha float64, space ColorSpace, raster bool) (printNativeColor, error) {
+	return c.colorWith(profile, value, alpha, space, raster, nil, false)
+}
+
+// colorWith 将源分量连接到PCS，对扩展范围图像按DToB优先、矩阵TRC外推、整数LUT防截断规则处理
+// 入参: profile 源ICC，nil表示内建编码, value 原始分量, alpha 透明度, space 内建源编码, raster 是否为图像, source 可选源图像资源, extendedTRC 是否对TRC启用扩展外推
+// 返回: printNativeColor 非预乘颜色, error 变换、扩展范围或预算错误
+func (c *printColorRuntime) colorWith(profile *iccProfile, value [iccMaxChannels]float64, alpha float64, space ColorSpace, raster bool, source *rasterImage, extendedTRC bool) (printNativeColor, error) {
 	result := printNativeColor{value: value, alpha: alpha, blend: c.working, intent: c.destinationIntent(profile, raster)}
 	native, err := c.native(profile)
 	if err != nil {
@@ -2124,10 +2531,14 @@ func (c *printColorRuntime) color(profile *iccProfile, value [iccMaxChannels]flo
 		if e != nil {
 			return printNativeColor{}, e
 		}
+		input := value[:transform.inputChannels()]
+		if source != nil && transform.pipeline != nil && !transform.pipeline.floating && imageRejectClampedLUT(source, input) {
+			return printNativeColor{}, fmt.Errorf("%w: extended-range image requires floating-point ICC DToB or matrix-TRC transform", ErrUnsupported)
+		}
 		if e := c.renderer.charge(printICCSourceWork(transform)); e != nil {
 			return printNativeColor{}, e
 		}
-		xyz, err = transform.toXYZ(value[:transform.inputChannels()])
+		xyz, err = transform.toXYZ(input, extendedTRC)
 	} else {
 		builtin := printWorkingSpace{space: space, channels: 3}
 		xyz, err = builtin.xyz(value)
@@ -2366,7 +2777,7 @@ func newPrintColorRuntime(plan *PrintColorPlan, options *PrintColorOptions, colo
 	return c, nil
 }
 
-// printICCSourceWork 计算源管线每次求值的保守工作权重，包含全部CLUT角点
+// printICCSourceWork 计算源管线每次求值的保守工作权重，包含全部CLUT角点、浮点矩阵与分段曲线
 // 入参: transform 已准备源连接
 // 返回: uint64 本次求值工作量
 func printICCSourceWork(transform *iccTransform) uint64 {
@@ -2378,8 +2789,12 @@ func printICCSourceWork(transform *iccTransform) uint64 {
 				work += uint64((1 << len(stage.grid)) * stage.outputs * 2)
 			case iccStageMatrix:
 				work += 24
+			case iccStageFloatMatrix:
+				work += uint64(stage.inputs*stage.outputs+stage.outputs) * 2
 			case iccStageCurves:
 				work += uint64(len(stage.curves) * 4)
+			case iccStageSegmentedCurves:
+				work += uint64(len(stage.segCurves) * 8)
 			}
 		}
 	}

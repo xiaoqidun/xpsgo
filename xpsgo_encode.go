@@ -33,21 +33,22 @@ type EncodeOptions struct {
 	Part   string
 }
 
-// pageEncoder 构造独立的固定页面标记，限制展开工作量、检测引用循环并隔离共享VisualBrush内联命名冲突
+// pageEncoder 构造独立的固定页面标记，限制展开工作量、检测引用循环并隔离共享元素与VisualBrush内联命名冲突
 type pageEncoder struct {
-	format           Format
-	ns               string
-	part             string
-	limits           Limits
-	ctx              context.Context
-	active           map[any]bool
-	seenNames        map[string]bool
-	emittedBrushes   map[*Brush]bool
-	emittedElements  map[Element]bool
-	visualBrushReuse int
-	work             int
-	bytes            int64
-	scope            map[string]string
+	format        Format
+	ns            string
+	part          string
+	limits        Limits
+	ctx           context.Context
+	active        map[any]bool
+	elemCount     map[Element]int
+	mainElemCount map[Element]int
+	emittedName   map[Element]bool
+	inVisualBrush int
+	prescanWork   int
+	work          int
+	bytes         int64
+	scope         map[string]string
 }
 
 // DefaultEncodeOptions 返回默认编码选项
@@ -81,12 +82,15 @@ func EncodePage(ctx context.Context, output io.Writer, page *Page, options *Enco
 	if formatNamespace(configuration.Format) == "" {
 		return 0, fmt.Errorf("%w: invalid page format", ErrInvalid)
 	}
-	p := pageEncoder{format: configuration.Format, ns: formatNamespace(configuration.Format), part: page.Part, limits: configuration.Limits, ctx: ctx, active: make(map[any]bool), seenNames: make(map[string]bool), emittedBrushes: make(map[*Brush]bool), emittedElements: make(map[Element]bool)}
+	p := pageEncoder{format: configuration.Format, ns: formatNamespace(configuration.Format), part: page.Part, limits: configuration.Limits, ctx: ctx, active: make(map[any]bool), elemCount: make(map[Element]int), mainElemCount: make(map[Element]int), emittedName: make(map[Element]bool)}
 	p.scope = map[string]string{"": p.ns, "xml": xmlNamespace}
 	var err error
 	if p.part == "" {
 		p.part = "/"
 	} else if p.part, err = opcPartName(p.part); err != nil {
+		return 0, err
+	}
+	if err := p.prescanPage(page); err != nil {
 		return 0, err
 	}
 	root, err := p.page(page)
@@ -125,6 +129,114 @@ func EncodePage(ctx context.Context, output io.Writer, page *Page, options *Enco
 		return counted.count, err
 	}
 	return counted.count, checkContext(p.ctx)
+}
+
+// prescanStep 累计预扫描工作量并检查深度、复杂度与取消信号
+// 入参: depth 当前对象图深度
+// 返回: error 取消或复杂度错误
+func (p *pageEncoder) prescanStep(depth int) error {
+	if err := checkContext(p.ctx); err != nil {
+		return err
+	}
+	if depth > p.limits.MaxXMLDepth || p.prescanWork >= p.limits.MaxXMLNodes {
+		return fmt.Errorf("%w: page encoding complexity", ErrLimit)
+	}
+	p.prescanWork++
+	return nil
+}
+
+// prescanPage 预扫描整页元素与VisualBrush指针引用计数，区分正文主树与画刷内联展开位置
+// 入参: value 页面模型
+// 返回: error 循环引用、复杂度或取消错误
+func (p *pageEncoder) prescanPage(value *Page) error {
+	if err := p.prescanStep(1); err != nil {
+		return err
+	}
+	for _, element := range value.Elements {
+		if err := p.prescanElement(element, 2, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// prescanElement 递归统计元素指针在全页与正文主树的出现次数，并检测循环引用
+// 入参: value 绘制元素, depth 当前深度, inBrush 是否位于VisualBrush内联展开中
+// 返回: error 循环引用、复杂度或取消错误
+func (p *pageEncoder) prescanElement(value Element, depth int, inBrush bool) error {
+	var props ElementProperties
+	switch typed := value.(type) {
+	case *Canvas:
+		if typed == nil {
+			return nil
+		}
+		props = typed.ElementProperties
+	case *Path:
+		if typed == nil {
+			return nil
+		}
+		props = typed.ElementProperties
+	case *Glyphs:
+		if typed == nil {
+			return nil
+		}
+		props = typed.ElementProperties
+	default:
+		return nil
+	}
+	if p.active[value] {
+		return fmt.Errorf("%w: cyclic drawing model", ErrInvalid)
+	}
+	if err := p.prescanStep(depth); err != nil {
+		return err
+	}
+	p.active[value] = true
+	defer delete(p.active, value)
+	p.elemCount[value]++
+	if !inBrush {
+		p.mainElemCount[value]++
+	}
+	if err := p.prescanBrush(props.OpacityMask, depth+2); err != nil {
+		return err
+	}
+	switch typed := value.(type) {
+	case *Canvas:
+		for _, child := range typed.Elements {
+			if err := p.prescanElement(child, depth+1, inBrush); err != nil {
+				return err
+			}
+		}
+	case *Path:
+		if err := p.prescanBrush(typed.Fill, depth+2); err != nil {
+			return err
+		}
+		if err := p.prescanBrush(typed.Stroke, depth+2); err != nil {
+			return err
+		}
+	case *Glyphs:
+		if err := p.prescanBrush(typed.Fill, depth+2); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// prescanBrush 预扫描画刷中的VisualBrush子树并检测画刷循环引用
+// 入参: value 画刷模型, depth 当前深度
+// 返回: error 循环引用、复杂度或取消错误
+func (p *pageEncoder) prescanBrush(value *Brush, depth int) error {
+	if value == nil {
+		return nil
+	}
+	if p.active[value] {
+		return fmt.Errorf("%w: cyclic brush model", ErrInvalid)
+	}
+	p.active[value] = true
+	defer delete(p.active, value)
+	if value.Kind == BrushVisual && value.Visual != nil {
+		return p.prescanElement(value.Visual, depth+2, true)
+	}
+	return nil
 }
 
 // step 累计一次模型展开工作，不以共享对象数量代替实际输出复杂度
@@ -233,7 +345,6 @@ func (p *pageEncoder) page(value *Page) (*xmlElement, error) {
 		if err := p.attr(root, "Name", value.Name); err != nil {
 			return nil, err
 		}
-		p.seenNames[value.Name] = true
 	}
 	for _, box := range []struct {
 		name    string
@@ -501,12 +612,8 @@ func (p *pageEncoder) brush(value *Brush, depth int) (*xmlElement, error) {
 	if contentProperties(value.Visual) == nil {
 		return nil, fmt.Errorf("%w: missing or unknown brush visual", ErrInvalid)
 	}
-	reused := p.emittedBrushes[value] || p.emittedElements[value.Visual]
-	p.emittedBrushes[value] = true
-	if reused {
-		p.visualBrushReuse++
-		defer func() { p.visualBrushReuse-- }()
-	}
+	p.inVisualBrush++
+	defer func() { p.inVisualBrush-- }()
 	visual, err := p.element(value.Visual, depth+2)
 	if err != nil {
 		return nil, err
@@ -601,12 +708,11 @@ func (p *pageEncoder) element(value Element, depth int) (*xmlElement, error) {
 	}
 	p.active[value] = true
 	defer delete(p.active, value)
-	p.emittedElements[value] = true
 	node, err := p.node(name, depth)
 	if err != nil {
 		return nil, err
 	}
-	if err := p.properties(node, properties, depth); err != nil {
+	if err := p.properties(node, value, properties, depth); err != nil {
 		return nil, err
 	}
 	switch value := value.(type) {
@@ -637,10 +743,10 @@ func (p *pageEncoder) element(value Element, depth int) (*xmlElement, error) {
 	return node, nil
 }
 
-// properties 编码所有绘制元素的共同局部属性，显式零透明度不会被当作缺省值
-// 入参: node 目标节点, value 局部属性, depth 节点深度
+// properties 编码所有绘制元素的共同局部属性，显式零透明度不会被当作缺省值，共享指针仅在主树或首次展开保留唯一Name
+// 入参: node 目标节点, owner 当前元素指针, value 局部属性, depth 节点深度
 // 返回: error 属性、循环或预算错误
-func (p *pageEncoder) properties(node *xmlElement, value ElementProperties, depth int) error {
+func (p *pageEncoder) properties(node *xmlElement, owner Element, value ElementProperties, depth int) error {
 	if !geometryFinite(value.Opacity) || value.Opacity < 0 || value.Opacity > 1 {
 		return fmt.Errorf("%w: element opacity", ErrInvalid)
 	}
@@ -650,11 +756,19 @@ func (p *pageEncoder) properties(node *xmlElement, value ElementProperties, dept
 		}
 	}
 	if value.Name != "" {
-		if p.visualBrushReuse == 0 || !p.seenNames[value.Name] {
+		emitName := p.elemCount[owner] <= 1
+		if !emitName && !p.emittedName[owner] {
+			if p.mainElemCount[owner] > 0 {
+				emitName = p.inVisualBrush == 0
+			} else {
+				emitName = true
+			}
+		}
+		if emitName {
 			if err := p.attr(node, "Name", value.Name); err != nil {
 				return err
 			}
-			p.seenNames[value.Name] = true
+			p.emittedName[owner] = true
 		}
 	}
 	if value.Language != nil {

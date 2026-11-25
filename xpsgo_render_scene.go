@@ -153,26 +153,27 @@ type sceneWorkerState struct {
 
 // sceneRenderer 保存一次绘制的独立状态及共享预算
 type sceneRenderer struct {
-	options        sceneRenderOptions
-	active         map[Element]bool
-	elements       int
-	edges          int
-	work           uint64
-	live           int
-	glyphs         int
-	exact          int
-	printRuntime   *printColorRuntime
-	nativeSample   printNativeSample
-	printContext   map[*Canvas]*printColorRuntime
-	printSideSpace *printWorkingSpace
-	brushMeta      sceneBrushMeta
-	visualCount    int
-	hasFiltered    bool
-	concurrent     bool
-	cancelled      atomic.Bool
-	budgetMu       sync.Mutex
-	visualMu       sync.Mutex
-	cleanups       []func()
+	options          sceneRenderOptions
+	active           map[Element]bool
+	elements         int
+	edges            int
+	work             uint64
+	live             int
+	glyphs           int
+	exact            int
+	printRuntime     *printColorRuntime
+	nativeSample     printNativeSample
+	printContext     map[*Canvas]*printColorRuntime
+	printSideSpace   *printWorkingSpace
+	brushMeta        sceneBrushMeta
+	visualCount      int
+	hasFiltered      bool
+	concurrent       bool
+	cancelled        atomic.Bool
+	sceneHDRPeakNits atomic.Uint64
+	budgetMu         sync.Mutex
+	visualMu         sync.Mutex
+	cleanups         []func()
 }
 
 // newSceneParser 创建独立页面的绘制数据解析器
@@ -1097,6 +1098,7 @@ func (r *Reader) renderLoadedElementsFonts(elements []Element, transform Matrix,
 	colors := sceneColorCache{pkg: r.pkg, profiles: make(map[string]*iccProfile), transforms: make(map[string][4]*iccTransform), bytes: options.profileBytes, maxProfiles: options.profiles}
 	if options.device != nil {
 		colors.sourceIntent = options.device.sourceIntent
+		colors.deviceOutput = true
 	}
 	options.color = colors.vector
 	images := sceneImageCache{pkg: r.pkg, images: make(map[string]*rasterImage), bytes: options.imageBytes, pixels: options.imagePixels, maxImages: options.images, colors: &colors, context: withJXRDecodeWorkers(options.context, options.workers), format: r.format}
@@ -1580,7 +1582,7 @@ func (r *sceneRenderer) brushMode(brush *Brush, transform Matrix, aliased bool, 
 	r.nativeSample = nil
 	r.brushMeta = sceneBrushMeta{}
 	if r.printRuntime != nil {
-		native, err := r.printRuntime.brush(brush, transform, aliased, depth)
+		native, err := r.printRuntime.brush(brush, transform, aliased, depth, maskOnly)
 		if err != nil {
 			return nil, err
 		}
@@ -1642,9 +1644,12 @@ func (r *sceneRenderer) brushMode(brush *Brush, transform Matrix, aliased bool, 
 		if r.options.device != nil {
 			sourceIntent = r.options.device.sourceIntent
 		}
-		sampler, err := newImageSampler(brush, data, transform, space, maskOnly, sourceIntent, r.options.hdrPeakNits)
+		sampler, err := newImageSampler(brush, data, transform, space, maskOnly, sourceIntent, r.options.hdrPeakNits, r.options.device != nil)
 		if err != nil {
 			return nil, err
+		}
+		if !maskOnly && sampler.hdrNominalPeak > 0 {
+			r.recordHDRPeakNits(sampler.hdrNominalPeak)
 		}
 		sampler.charge = r.charge
 		sampler.reserve = r.reservePixels
@@ -1675,6 +1680,23 @@ func (r *sceneRenderer) brushMode(brush *Brush, transform Matrix, aliased bool, 
 		return sample, nil
 	default:
 		return nil, fmt.Errorf("%w: scene brush kind %d", ErrUnsupported, brush.Kind)
+	}
+}
+
+// recordHDRPeakNits 并发安全地记录当前页面实际走HDR PQ或HLG路径的最大标称峰值亮度
+// 入参: peak 本图像源的标称峰值亮度（cd/m²）
+func (r *sceneRenderer) recordHDRPeakNits(peak float64) {
+	if !(peak > 0) || !geometryFinite(peak) {
+		return
+	}
+	for {
+		curBits := r.sceneHDRPeakNits.Load()
+		if peak <= math.Float64frombits(curBits) {
+			return
+		}
+		if r.sceneHDRPeakNits.CompareAndSwap(curBits, math.Float64bits(peak)) {
+			return
+		}
 	}
 }
 
@@ -1881,6 +1903,10 @@ func (r *sceneRenderer) tile(nodes []*sceneNode, surface *renderSurface, output 
 		return nil
 	}
 	fastSRGB := r.options.space == renderSRGB && r.options.outputColor != PrintColorGrayscale && r.options.outputColor != PrintColorMonochrome
+	scRGBTonePeak := r.options.hdrPeakNits
+	if scRGBTonePeak == 0 {
+		scRGBTonePeak = math.Float64frombits(r.sceneHDRPeakNits.Load())
+	}
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		rowBase := (y - bounds.Min.Y) * samples * surfStride
 		outOff := (y-output.Rect.Min.Y)*output.Stride + (bounds.Min.X-output.Rect.Min.X)*4
@@ -1943,8 +1969,8 @@ func (r *sceneRenderer) tile(nodes []*sceneNode, surface *renderSurface, output 
 				}
 			} else {
 				var err error
-				if r.options.space == renderScRGB && r.options.hdrPeakNits > 0 {
-					outColor, err = renderColorToNRGBAToneMapped(c, r.options.hdrPeakNits)
+				if r.options.space == renderScRGB && scRGBTonePeak > 0 {
+					outColor, err = renderColorToNRGBAToneMapped(c, scRGBTonePeak)
 				} else {
 					outColor, err = renderColorToNRGBA(c, r.options.space)
 				}

@@ -486,6 +486,57 @@ func (b *printPlanBuilder) build() (*PrintPlan, error) {
 	if b.selected == 0 {
 		return b.finish(&PrintPlan{JobFinishing: jobFinishing, DocumentFinishing: documentFinishing})
 	}
+	plan := &PrintPlan{JobFinishing: jobFinishing, DocumentFinishing: documentFinishing}
+	if jobFinishing.Binding == PrintBindingBooklet {
+		var jobPages []printPlanPage
+		for _, document := range documents {
+			if len(document.pages) == 0 {
+				continue
+			}
+			if document.collated {
+				for range document.copies {
+					for _, page := range document.pages {
+						for range page.copies {
+							if err := b.step(1); err != nil {
+								return nil, err
+							}
+							if len(jobPages) >= b.options.MaxPlacements {
+								return nil, fmt.Errorf("%w: booklet page count", ErrLimit)
+							}
+							jobPages = append(jobPages, page)
+						}
+					}
+				}
+			} else {
+				for _, page := range document.pages {
+					if document.copies > b.options.MaxPlacements/page.copies {
+						return nil, fmt.Errorf("%w: booklet page count", ErrLimit)
+					}
+					for range document.copies * page.copies {
+						if err := b.step(1); err != nil {
+							return nil, err
+						}
+						if len(jobPages) >= b.options.MaxPlacements {
+							return nil, fmt.Errorf("%w: booklet page count", ErrLimit)
+						}
+						jobPages = append(jobPages, page)
+					}
+				}
+			}
+		}
+		template := &PrintPlan{}
+		packer := printSheetPacker{builder: b, output: template, temporary: true}
+		if err := packer.bookletPages(jobPages, jobFinishing, duplex, manual); err != nil {
+			return nil, err
+		}
+		if err := b.copyDocument(plan, template.Sheets, copies, collated == "Collated"); err != nil {
+			return nil, err
+		}
+		if order == "Reverse" {
+			slices.Reverse(plan.Sheets)
+		}
+		return b.finish(plan)
+	}
 	continuous := nup > 1 || duplex != PrintSimplex
 	if continuous {
 		for _, document := range documents {
@@ -494,7 +545,6 @@ func (b *printPlanBuilder) build() (*PrintPlan, error) {
 			}
 		}
 	}
-	plan := &PrintPlan{JobFinishing: jobFinishing, DocumentFinishing: documentFinishing}
 	if continuous {
 		rounds := copies
 		if collated == "Uncollated" {
@@ -790,6 +840,9 @@ func (b *printPlanBuilder) document(index int, source Document, first int, job *
 	if result.documentFinishing.Binding != PrintBindingNone {
 		result.finishing = result.documentFinishing
 		result.separate = true
+		if result.documentFinishing.Binding == PrintBindingBooklet {
+			result.separateCopies = true
+		}
 	}
 	result.copies, err = control.count("DocumentCopiesAllPages", 1, b.options.MaxPlacements)
 	if err != nil {
@@ -814,6 +867,9 @@ func (b *printPlanBuilder) document(index int, source Document, first int, job *
 			return result, fmt.Errorf("%w: document NUp conflicts with job NUp", ErrUnsupported)
 		}
 	}
+	if result.finishing.Binding == PrintBindingBooklet && result.nup > 1 {
+		return result, fmt.Errorf("%w: booklet binding conflicts with NUp", ErrUnsupported)
+	}
 	documentDuplex, documentManual, err := control.duplex("DocumentDuplex")
 	if err != nil {
 		return result, err
@@ -829,7 +885,7 @@ func (b *printPlanBuilder) document(index int, source Document, first int, job *
 		}
 	}
 	ranges := ""
-	if value := control.values[xml.Name{Space: printKeywordsNS, Local: "DocumentPageRanges"}]; value != nil {
+	if value := printParamValue(control.values, "DocumentPageRanges"); value != nil {
 		if value.Type != (xml.Name{Space: printValueNS, Local: "string"}) {
 			return result, fmt.Errorf("%w: document page ranges type", ErrInvalid)
 		}
@@ -855,6 +911,9 @@ func (b *printPlanBuilder) document(index int, source Document, first int, job *
 				return result, err
 			}
 			page.document = index
+			if page.poster > 1 && result.finishing.Binding == PrintBindingBooklet {
+				return result, fmt.Errorf("%w: booklet binding conflicts with poster", ErrUnsupported)
+			}
 			if page.poster > 1 && result.nup != 1 {
 				return result, fmt.Errorf("%w: poster and NUp require incompatible sheet counts", ErrUnsupported)
 			}
@@ -899,11 +958,19 @@ func (b *printPlanBuilder) page(index int, source string, document *PrintSetting
 	if err != nil {
 		return result, err
 	}
-	model, result.colorPlan, err = printColorPlanSettings(b.settings.context, model, &b.settings.PrintSettingsOptions)
+	ignoreUnsupported := b.options.IgnoreUnsupportedFeatures || b.options.Print.IgnoreUnsupportedFeatures
+	cleaned, colorPlan, err := printColorPlanSettings(b.settings.context, model, &b.settings.PrintSettingsOptions)
 	if err != nil {
-		return result, err
+		if !ignoreUnsupported || !errors.Is(err, ErrUnsupported) {
+			return result, err
+		}
+		model = printStripColorPlanFeatures(model)
+		result.colorPlan = nil
+	} else {
+		model = cleaned
+		result.colorPlan = colorPlan
 	}
-	layoutSettings, err := printPlanLayoutSettings(model, b.signatures != nil, b.options.IgnoreUnsupportedFeatures || b.options.Print.IgnoreUnsupportedFeatures)
+	layoutSettings, err := printPlanLayoutSettings(model, b.signatures != nil, ignoreUnsupported)
 	if err != nil {
 		return result, err
 	}
@@ -939,14 +1006,14 @@ func printPlanLayoutSettings(settings *PrintSettings, signatures, ignoreUnsuppor
 	}
 	result := &PrintSettings{Version: settings.Version}
 	for _, setting := range settings.Elements {
-		if setting.Kind == PrintSettingFeature && setting.Name.Space == printKeywordsNS {
+		if setting.Kind == PrintSettingFeature && printPublicKeywordSpace(setting.Name.Space) {
 			switch setting.Name.Local {
 			case "JobCollateAllDocuments", "DocumentCollate", "JobPageOrder", "PageForceFrontSide", "PagePoster", "JobBindAllDocuments", "DocumentBinding", "JobDuplexAllDocumentsContiguously", "DocumentDuplex", "JobNUpAllDocumentsContiguously", "DocumentNUp":
 				for _, child := range setting.Children {
 					if child.Kind != PrintSettingFeature {
 						continue
 					}
-					if setting.Name.Local != "JobNUpAllDocumentsContiguously" && setting.Name.Local != "DocumentNUp" || child.Name != (xml.Name{Space: printKeywordsNS, Local: "PresentationDirection"}) {
+					if setting.Name.Local != "JobNUpAllDocumentsContiguously" && setting.Name.Local != "DocumentNUp" || !printPublicKeywordSpace(child.Name.Space) || child.Name.Local != "PresentationDirection" {
 						return nil, fmt.Errorf("%w: unhandled print plan subfeature", ErrUnsupported)
 					}
 				}
@@ -1008,11 +1075,23 @@ func (b *printPlanBuilder) merge(source string, base *PrintSettings) (*PrintSett
 	return merged, nil
 }
 
+// printParamValue 按Print Schema公共关键字命名空间优先级查找参数值
+// 入参: values 参数映射, name 参数本地名称
+// 返回: *PrintValue 匹配值，未声明时为nil
+func printParamValue(values map[xml.Name]*PrintValue, name string) *PrintValue {
+	for _, space := range [4]string{printKeywordsNS, printKeywordsV11NS, printKeywordsV12NS, printKeywords2NS} {
+		if value := values[xml.Name{Space: space, Local: name}]; value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
 // count 读取正整数份数并在乘法或循环展开前检查上限，不截断大整数
 // 入参: name 参数名称, fallback 缺省值, maximum 本次容量上限
 // 返回: int 份数, error 类型、数值、资源或取消错误
 func (s *printLayoutSettings) count(name string, fallback, maximum int) (int, error) {
-	value := s.values[xml.Name{Space: printKeywordsNS, Local: name}]
+	value := printParamValue(s.values, name)
 	if value == nil {
 		return fallback, nil
 	}
@@ -1064,7 +1143,7 @@ func (s *printLayoutSettings) choice(name, fallback string, allowed ...string) (
 // 返回: *PrintValue 值，未声明为nil, error 未初始化参数错误
 func (s *printLayoutSettings) scored(option *PrintSetting, name string) (*PrintValue, error) {
 	for _, property := range option.Children {
-		if property.Kind != PrintSettingScoredProperty || property.Name != (xml.Name{Space: printKeywordsNS, Local: name}) {
+		if property.Kind != PrintSettingScoredProperty || !printPublicKeywordSpace(property.Name.Space) || property.Name.Local != name {
 			continue
 		}
 		value, reference := printScoredValue(property.Children)
@@ -1088,7 +1167,7 @@ func (s *printLayoutSettings) nup(name string, maximum int) (int, string, error)
 		return 1, "RightBottom", err
 	}
 	for _, child := range feature.Children {
-		if child.Kind == PrintSettingFeature && child.Name != (xml.Name{Space: printKeywordsNS, Local: "PresentationDirection"}) {
+		if child.Kind == PrintSettingFeature && (!printPublicKeywordSpace(child.Name.Space) || child.Name.Local != "PresentationDirection") {
 			return 0, "", fmt.Errorf("%w: unhandled print plan subfeature", ErrUnsupported)
 		}
 	}
@@ -1130,7 +1209,7 @@ func (s *printLayoutSettings) duplex(name string) (PrintDuplex, bool, error) {
 	if err != nil || option == nil {
 		return PrintSimplex, false, err
 	}
-	if option.Name.Space != printKeywordsNS {
+	if !printPublicKeywordSpace(option.Name.Space) {
 		return PrintSimplex, false, fmt.Errorf("%w: private duplex option", ErrUnsupported)
 	}
 	mode := PrintSimplex
@@ -1162,10 +1241,28 @@ func (s *printLayoutSettings) duplex(name string) (PrintDuplex, bool, error) {
 	return mode, value.Text == "Manual", nil
 }
 
-// document 按源页面顺序放置页面副本，PageCopies不会被NUp或逐份设置分散
+// document 按源页面顺序放置页面副本，PageCopies不会被NUp或逐份设置分散，Booklet按骑马订书帖拼版
 // 入参: document 文档描述
 // 返回: error 纸张、页面、预算或取消错误
 func (p *printSheetPacker) document(document printPlanDocument) error {
+	if document.finishing.Binding == PrintBindingBooklet {
+		if err := p.flush(); err != nil {
+			return err
+		}
+		var pages []printPlanPage
+		for _, page := range document.pages {
+			for range page.copies {
+				if err := p.builder.step(1); err != nil {
+					return err
+				}
+				if len(pages) >= p.builder.options.MaxPlacements {
+					return fmt.Errorf("%w: booklet page count", ErrLimit)
+				}
+				pages = append(pages, page)
+			}
+		}
+		return p.bookletPages(pages, document.finishing, document.duplex, document.manual)
+	}
 	for _, page := range document.pages {
 		for range page.copies {
 			var err error
@@ -1180,6 +1277,135 @@ func (p *printSheetPacker) document(document printPlanDocument) error {
 		}
 	}
 	return nil
+}
+
+// bookletPages 按标准骑马订小册子规则将页流补齐至四的倍数并生成双面对折拼版纸张
+// 入参: pages 已展开的逻辑页流, finishing 小册子装订参数, duplex 显式双面方式，单面时默认改用短边双面, manual 是否手动双面
+// 返回: error 几何、容量或取消错误
+func (p *printSheetPacker) bookletPages(pages []printPlanPage, finishing PrintFinishing, duplex PrintDuplex, manual bool) error {
+	if len(pages) == 0 {
+		return nil
+	}
+	if duplex == PrintSimplex {
+		duplex = PrintDuplexShortEdge
+	}
+	padded := ((len(pages) + 3) / 4) * 4
+	sheets := padded / 4
+	for sheetIndex := range sheets {
+		if err := p.builder.step(1); err != nil {
+			return err
+		}
+		frontSlots := [2]int{padded - 1 - 2*sheetIndex, 2 * sheetIndex}
+		backSlots := [2]int{2*sheetIndex + 1, padded - 2 - 2*sheetIndex}
+		ref := pages[frontSlots[1]]
+		front, err := p.bookletSide(pages, frontSlots, ref, finishing, duplex, false)
+		if err != nil {
+			return err
+		}
+		var back *PrintSide
+		if backSlots[0] < len(pages) || backSlots[1] < len(pages) {
+			side, err := p.bookletSide(pages, backSlots, ref, finishing, duplex, true)
+			if err != nil {
+				return err
+			}
+			back = &side
+		}
+		sheet := PrintSheet{Front: front, Back: back, Duplex: duplex, ManualDuplex: manual}
+		if err := p.builder.appendSheet(p.output, sheet, p.temporary); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// bookletSide 将小册子正反面的最多两个书帖槽位映射到折脊两侧的有效可打印区域，避开中心装订留白
+// 入参: pages 逻辑页流, slots 左右或上下槽位逻辑页序号, ref 纸张介质基准页, finishing 装订设置, duplex 双面方式, back 是否为背面
+// 返回: PrintSide 独立纸面, error 变换或范围错误
+func (p *printSheetPacker) bookletSide(pages []printPlanPage, slots [2]int, ref printPlanPage, finishing PrintFinishing, duplex PrintDuplex, back bool) (PrintSide, error) {
+	side := PrintSide{Width: ref.layout.Width, Height: ref.layout.Height, MediaClip: ref.layout.MediaClip, Color: ref.color}
+	for _, index := range slots {
+		if index < len(pages) {
+			side.Color = pages[index].color
+			break
+		}
+	}
+	side.Gutter = printBindingGutter(finishing, side, duplex, back)
+	phys, base, usable := printBookletCells(side)
+	for slot, index := range slots {
+		if index >= len(pages) {
+			continue
+		}
+		page := pages[index]
+		if len(side.Pages) > 0 && !printSideColorTargetEqual(side, page.colorPlan) {
+			p.builder.addDiagnostic(Diagnostic{Element: "PageDestinationColorProfile", Message: "different target declarations start a separate print side"})
+		}
+		target, clipBound := usable[slot], usable[slot]
+		if target.Width <= 0 || target.Height <= 0 {
+			target, clipBound = base[slot], base[slot]
+		}
+		if target.Width <= 0 || target.Height <= 0 {
+			target, clipBound = phys[slot], side.MediaClip
+		}
+		src := page.layout.MediaClip
+		if src.Width <= 0 || src.Height <= 0 {
+			src = Rect{Width: page.layout.Width, Height: page.layout.Height}
+		}
+		factor := min(target.Width/src.Width, target.Height/src.Height)
+		mapping := Matrix{
+			A: factor,
+			D: factor,
+			E: target.X + (target.Width-factor*src.Width)/2 - factor*src.X,
+			F: target.Y + (target.Height-factor*src.Height)/2 - factor*src.Y,
+		}
+		placement := PrintPlacement{
+			Page:          page.index,
+			DocumentIndex: page.document,
+			Transform:     mapping.Mul(page.layout.Transform),
+			PageClip:      page.layout.PageClip,
+			MediaClip:     printClampBox(printTransformBox(page.layout.MediaClip, mapping), clipBound),
+			Watermark:     page.watermark,
+			Negative:      page.negative,
+			Color:         clonePrintColorPlan(page.colorPlan),
+		}
+		if factor <= 0 || !geometryFillMatrixFinite(placement.Transform) || !geometryFinite(placement.MediaClip.X, placement.MediaClip.Y, placement.MediaClip.Width, placement.MediaClip.Height) {
+			return PrintSide{}, fmt.Errorf("%w: print booklet mapping", ErrLimit)
+		}
+		side.Pages = append(side.Pages, placement)
+	}
+	return side, nil
+}
+
+// printBookletCells 按纸张居中折脊切分物理半页、可打印半页与扣除中心留白后的有效槽位矩形
+// 入参: side 已计算Gutter的纸面
+// 返回: [2]Rect 物理半页, [2]Rect 可打印半页, [2]Rect 扣除留白后的有效槽位
+func printBookletCells(side PrintSide) ([2]Rect, [2]Rect, [2]Rect) {
+	var phys, base, usable [2]Rect
+	if side.Height > side.Width {
+		mid := side.Height / 2
+		phys[0] = Rect{X: 0, Y: 0, Width: side.Width, Height: mid}
+		phys[1] = Rect{X: 0, Y: mid, Width: side.Width, Height: side.Height - mid}
+		base[0] = printClampBox(phys[0], side.MediaClip)
+		base[1] = printClampBox(phys[1], side.MediaClip)
+		usable = base
+		if side.Gutter != nil && side.Gutter.Height > 0 {
+			usable[0].Height = max(0, min(base[0].Y+base[0].Height, side.Gutter.Y)-base[0].Y)
+			bottomStart := max(base[1].Y, side.Gutter.Y+side.Gutter.Height)
+			usable[1] = Rect{X: base[1].X, Y: bottomStart, Width: base[1].Width, Height: max(0, base[1].Y+base[1].Height-bottomStart)}
+		}
+	} else {
+		mid := side.Width / 2
+		phys[0] = Rect{X: 0, Y: 0, Width: mid, Height: side.Height}
+		phys[1] = Rect{X: mid, Y: 0, Width: side.Width - mid, Height: side.Height}
+		base[0] = printClampBox(phys[0], side.MediaClip)
+		base[1] = printClampBox(phys[1], side.MediaClip)
+		usable = base
+		if side.Gutter != nil && side.Gutter.Width > 0 {
+			usable[0].Width = max(0, min(base[0].X+base[0].Width, side.Gutter.X)-base[0].X)
+			rightStart := max(base[1].X, side.Gutter.X+side.Gutter.Width)
+			usable[1] = Rect{X: rightStart, Y: base[1].Y, Width: max(0, base[1].X+base[1].Width-rightStart), Height: base[1].Height}
+		}
+	}
+	return phys, base, usable
 }
 
 // flush 结束当前物理纸张，空背面保持nil，不插入伪造的源页面
@@ -1662,14 +1888,25 @@ func printSideGutterClip(media Rect, gutter *Rect) (*Geometry, error) {
 	return clip, nil
 }
 
-// renderNegativeColor 在当前合成空间以alpha减分量反相预乘颜色并保持alpha与扩展范围
-// 入参: value 当前工作空间颜色
+// renderNegativeColor 按指定合成空间执行负片反相，scRGB线性路径经非线性sRGB反相后再返回线性空间，sRGB路径保持预乘alpha与扩展范围
+// 入参: value 当前工作空间预乘颜色, space 工作合成空间
 // 返回: renderColor 反相颜色, error 非法输入或算术范围错误
-func renderNegativeColor(value renderColor) (renderColor, error) {
+func renderNegativeColor(value renderColor, space renderColorSpace) (renderColor, error) {
 	if err := value.validate(); err != nil {
 		return renderColor{}, err
 	}
-	result := renderColor{r: value.a - value.r, g: value.a - value.g, b: value.a - value.b, a: value.a}
+	var result renderColor
+	if space == renderScRGB {
+		if value.a == 0 {
+			return renderColor{}, nil
+		}
+		invert := func(channel float64) float64 {
+			return renderSRGBToLinear(1-renderLinearToSRGB(colorClamp(channel/value.a))) * value.a
+		}
+		result = renderColor{r: invert(value.r), g: invert(value.g), b: invert(value.b), a: value.a}
+	} else {
+		result = renderColor{r: value.a - value.r, g: value.a - value.g, b: value.a - value.b, a: value.a}
+	}
 	if !geometryFinite(result.r, result.g, result.b) {
 		return renderColor{}, fmt.Errorf("%w: negative color arithmetic", ErrLimit)
 	}
@@ -1684,7 +1921,7 @@ func (r *sceneRenderer) negative(surface *renderSurface) error {
 		return err
 	}
 	for index, value := range surface.pixels {
-		converted, err := renderNegativeColor(value)
+		converted, err := renderNegativeColor(value, r.options.space)
 		if err != nil {
 			return err
 		}
@@ -1761,7 +1998,7 @@ func (s *printLayoutSettings) watermark() (*PrintWatermark, error) {
 	if err != nil || option == nil {
 		return nil, err
 	}
-	if option.Name == (xml.Name{Space: printKeywordsNS, Local: "None"}) {
+	if printPublicKeywordSpace(option.Name.Space) && option.Name.Local == "None" {
 		for _, child := range feature.Children {
 			if child.Kind == PrintSettingFeature {
 				return nil, fmt.Errorf("%w: print watermark subfeature", ErrUnsupported)
@@ -1772,11 +2009,11 @@ func (s *printLayoutSettings) watermark() (*PrintWatermark, error) {
 		}
 		return nil, checkContext(s.options.context)
 	}
-	if option.Name != (xml.Name{Space: printKeywordsNS, Local: "Text"}) {
+	if !printPublicKeywordSpace(option.Name.Space) || option.Name.Local != "Text" {
 		return nil, fmt.Errorf("%w: print watermark option", ErrUnsupported)
 	}
 	for _, child := range feature.Children {
-		if child.Kind == PrintSettingFeature && child.Name != (xml.Name{Space: printKeywordsNS, Local: "Layering"}) {
+		if child.Kind == PrintSettingFeature && (!printPublicKeywordSpace(child.Name.Space) || child.Name.Local != "Layering") {
 			return nil, fmt.Errorf("%w: print watermark subfeature", ErrUnsupported)
 		}
 	}
@@ -1891,7 +2128,7 @@ func printWatermarkSettings(settings *PrintSettings, options printSettingsConfig
 	}
 	present := false
 	for _, setting := range settings.Elements {
-		if setting.Kind == PrintSettingFeature && setting.Name == (xml.Name{Space: printKeywordsNS, Local: "PageWatermark"}) {
+		if setting.Kind == PrintSettingFeature && printPublicKeywordSpace(setting.Name.Space) && setting.Name.Local == "PageWatermark" {
 			present = true
 			break
 		}
@@ -1909,7 +2146,7 @@ func printWatermarkSettings(settings *PrintSettings, options printSettingsConfig
 	}
 	result := &PrintSettings{Version: settings.Version}
 	for _, setting := range settings.Elements {
-		if setting.Kind != PrintSettingFeature || setting.Name != (xml.Name{Space: printKeywordsNS, Local: "PageWatermark"}) {
+		if setting.Kind != PrintSettingFeature || !printPublicKeywordSpace(setting.Name.Space) || setting.Name.Local != "PageWatermark" {
 			result.Elements = append(result.Elements, setting)
 		}
 	}
@@ -2015,7 +2252,7 @@ func printSignaturePolicy(settings *PrintSettings, ctx context.Context) (PrintSi
 	if option == nil {
 		return PrintSignatureIgnore, checkContext(ctx)
 	}
-	if option.Name.Space != printKeywordsNS {
+	if !printPublicKeywordSpace(option.Name.Space) {
 		return PrintSignatureFromTicket, fmt.Errorf("%w: private digital signature processing option", ErrUnsupported)
 	}
 	if err := printOptionProperties(option); err != nil {
@@ -2039,7 +2276,7 @@ func printSignaturePolicy(settings *PrintSettings, ctx context.Context) (PrintSi
 func printSignatureLayoutSettings(settings *PrintSettings) *PrintSettings {
 	result := &PrintSettings{Version: settings.Version}
 	for _, setting := range settings.Elements {
-		if setting.Kind != PrintSettingFeature || setting.Name != (xml.Name{Space: printKeywordsNS, Local: "JobDigitalSignatureProcessing"}) {
+		if setting.Kind != PrintSettingFeature || !printPublicKeywordSpace(setting.Name.Space) || setting.Name.Local != "JobDigitalSignatureProcessing" {
 			result.Elements = append(result.Elements, setting)
 		}
 	}

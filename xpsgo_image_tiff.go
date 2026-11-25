@@ -776,8 +776,8 @@ func tiffOrientedPoint(x, y, w, h int, orientation uint32) (int, int) {
 	}
 }
 
-// applyTIFFOrientation 按TIFF Tag 274对解码后的像素缓冲执行旋转或镜像变换，并在轴交换时同步交换DPI
-// 入参: result 已解码的TIFF图像, orientation 合法方向值2到8
+// applyTIFFOrientation 按EXIF/TIFF Tag 274对解码后的像素缓冲执行旋转或镜像变换，并在轴交换时同步交换DPI
+// 入参: result 已解码的栅格图像, orientation 合法方向值2到8
 func applyTIFFOrientation(result *rasterImage, orientation uint32) {
 	bounds := result.bounds()
 	w, h := bounds.Dx(), bounds.Dy()
@@ -818,14 +818,79 @@ func applyTIFFOrientation(result *rasterImage, orientation uint32) {
 		result.native = dst
 		return
 	}
-	if src, ok := result.pixels.(*image.NRGBA64); ok {
+	switch src := result.pixels.(type) {
+	case *image.NRGBA64:
 		dst := image.NewNRGBA64(dstBounds)
 		for y := range h {
 			for x := range w {
 				dx, dy := tiffOrientedPoint(x, y, w, h, orientation)
-				sAt := src.PixOffset(x, y)
+				sAt := src.PixOffset(bounds.Min.X+x, bounds.Min.Y+y)
 				dAt := dst.PixOffset(dx, dy)
 				copy(dst.Pix[dAt:dAt+8], src.Pix[sAt:sAt+8])
+			}
+		}
+		result.pixels = dst
+	case *image.NRGBA:
+		dst := image.NewNRGBA(dstBounds)
+		for y := range h {
+			for x := range w {
+				dx, dy := tiffOrientedPoint(x, y, w, h, orientation)
+				sAt := src.PixOffset(bounds.Min.X+x, bounds.Min.Y+y)
+				dAt := dst.PixOffset(dx, dy)
+				copy(dst.Pix[dAt:dAt+4], src.Pix[sAt:sAt+4])
+			}
+		}
+		result.pixels = dst
+	case *image.RGBA:
+		dst := image.NewRGBA(dstBounds)
+		for y := range h {
+			for x := range w {
+				dx, dy := tiffOrientedPoint(x, y, w, h, orientation)
+				sAt := src.PixOffset(bounds.Min.X+x, bounds.Min.Y+y)
+				dAt := dst.PixOffset(dx, dy)
+				copy(dst.Pix[dAt:dAt+4], src.Pix[sAt:sAt+4])
+			}
+		}
+		result.pixels = dst
+	case *image.Gray:
+		dst := image.NewGray(dstBounds)
+		for y := range h {
+			for x := range w {
+				dx, dy := tiffOrientedPoint(x, y, w, h, orientation)
+				dst.Pix[dst.PixOffset(dx, dy)] = src.Pix[src.PixOffset(bounds.Min.X+x, bounds.Min.Y+y)]
+			}
+		}
+		result.pixels = dst
+	case *image.CMYK:
+		dst := image.NewCMYK(dstBounds)
+		for y := range h {
+			for x := range w {
+				dx, dy := tiffOrientedPoint(x, y, w, h, orientation)
+				sAt := src.PixOffset(bounds.Min.X+x, bounds.Min.Y+y)
+				dAt := dst.PixOffset(dx, dy)
+				copy(dst.Pix[dAt:dAt+4], src.Pix[sAt:sAt+4])
+			}
+		}
+		result.pixels = dst
+	case *image.YCbCr:
+		dst := image.NewNRGBA(dstBounds)
+		for y := range h {
+			for x := range w {
+				dx, dy := tiffOrientedPoint(x, y, w, h, orientation)
+				sx, sy := bounds.Min.X+x, bounds.Min.Y+y
+				ci := src.COffset(sx, sy)
+				r, g, b := color.YCbCrToRGB(src.Y[src.YOffset(sx, sy)], src.Cb[ci], src.Cr[ci])
+				dAt := dst.PixOffset(dx, dy)
+				dst.Pix[dAt], dst.Pix[dAt+1], dst.Pix[dAt+2], dst.Pix[dAt+3] = r, g, b, 255
+			}
+		}
+		result.pixels = dst
+	case image.Image:
+		dst := image.NewNRGBA64(dstBounds)
+		for y := range h {
+			for x := range w {
+				dx, dy := tiffOrientedPoint(x, y, w, h, orientation)
+				dst.SetNRGBA64(dx, dy, imagePixel(src, bounds.Min.X+x, bounds.Min.Y+y))
 			}
 		}
 		result.pixels = dst
@@ -1499,15 +1564,11 @@ func (l *tiffLegacyJPEG) stream(entropy []byte, region image.Rectangle) ([]byte,
 	return data, nil
 }
 
-// signedSample16 将有符号整型样本按SMinSampleValue/SMaxSampleValue线性映射到十六位，绝不对Alpha通道做符号位异或
-// 入参: raw 原始位宽样本值, channel 通道序号, isAlpha 是否为透明度通道, scale 无符号位宽缩放因子
+// signedSample16 将全通道有符号二进制补码样本按SMinSampleValue/SMaxSampleValue或标准有符号范围线性映射到十六位
+// 入参: raw 原始位宽样本值, channel 通道序号, scale 无符号位宽缩放因子
 // 返回: uint16 十六位归一化样本
-func (f *tiffPixelFormat) signedSample16(raw uint16, channel int, isAlpha bool, scale uint16) uint16 {
-	if isAlpha {
-		if (!f.hasSMin && !f.hasSMax) || f.sMin[channel] < 0 {
-			return raw * scale
-		}
-	} else if !f.hasSMin && !f.hasSMax {
+func (f *tiffPixelFormat) signedSample16(raw uint16, channel int, scale uint16) uint16 {
+	if !f.hasSMin && !f.hasSMax {
 		if f.bits == 16 {
 			return raw ^ 0x8000
 		}
@@ -1537,19 +1598,18 @@ func (f *tiffPixelFormat) writeRowRange(out *image.NRGBA64, x0, y, width int, ro
 		var sample [4]uint16
 		for c := range int(f.channels) {
 			bit := (x*int(f.channels) + c) * int(f.bits)
-			isAlpha := f.alpha != 0 && c == int(f.channels)-1
 			switch f.bits {
 			case 16:
 				raw := f.order.Uint16(row[bit/8:])
 				if f.sampleFormat == 2 {
-					sample[c] = f.signedSample16(raw, c, isAlpha, 1)
+					sample[c] = f.signedSample16(raw, c, 1)
 				} else {
 					sample[c] = raw
 				}
 			case 8:
 				raw := uint16(row[bit/8])
 				if f.sampleFormat == 2 {
-					sample[c] = f.signedSample16(raw, c, isAlpha, scale)
+					sample[c] = f.signedSample16(raw, c, scale)
 				} else {
 					sample[c] = raw
 				}
@@ -1613,18 +1673,17 @@ func (f *tiffPixelFormat) writeComponentRange(out *imageComponents, x0, y, width
 		var sample [5]uint16
 		for channel := range int(f.channels) {
 			at := (x*int(f.channels) + channel) * int(f.bits/8)
-			isAlpha := f.alpha != 0 && channel == int(f.channels)-1
 			if f.bits == 16 {
 				value := f.order.Uint16(row[at:])
 				if f.sampleFormat == 2 {
-					sample[channel] = f.signedSample16(value, channel, isAlpha, 1)
+					sample[channel] = f.signedSample16(value, channel, 1)
 				} else {
 					sample[channel] = value
 				}
 			} else {
 				value := uint16(row[at])
 				if f.sampleFormat == 2 {
-					sample[channel] = f.signedSample16(value, channel, isAlpha, scale)
+					sample[channel] = f.signedSample16(value, channel, scale)
 				} else {
 					sample[channel] = value * scale
 				}

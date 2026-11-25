@@ -370,23 +370,35 @@ func (c *compositionFontCheck) parse(part packagePart, whole bool) (*composition
 		}
 	}
 	result := &compositionFontMarkup{}
+	tracker := newResourceMarkupScopeTracker(c.source.format, false, c.budget.context)
 	visit := func(token xml.Token, node *xmlElement) error {
 		if err := c.budget.step(1); err != nil {
 			return err
 		}
-		if _, start := token.(xml.StartElement); !start {
-			return nil
-		}
-		if node.Name.Space == mcNamespace && !slices.Contains([]string{"AlternateContent", "Choice", "Fallback"}, node.Name.Local) {
-			return fmt.Errorf("%w: composition font compatibility element", ErrUnsupported)
-		}
 		if index == nil {
-			if err := validateResourceMarkupElement(node, c.source.format); err != nil {
+			skip, _, err := tracker.visit(token, node)
+			if err != nil {
 				return err
 			}
-		}
-		if err := c.budget.step(len(node.Attr)); err != nil {
-			return err
+			if _, start := token.(xml.StartElement); !start {
+				return nil
+			}
+			if err := c.budget.step(len(node.Attr)); err != nil {
+				return err
+			}
+			if skip {
+				return nil
+			}
+		} else {
+			if _, start := token.(xml.StartElement); !start {
+				return nil
+			}
+			if node.Name.Space == mcNamespace && !slices.Contains([]string{"AlternateContent", "Choice", "Fallback"}, node.Name.Local) {
+				return fmt.Errorf("%w: composition font compatibility element", ErrUnsupported)
+			}
+			if err := c.budget.step(len(node.Attr)); err != nil {
+				return err
+			}
 		}
 		for _, attr := range node.Attr {
 			if attr.Name.Space == mcNamespace && !slices.Contains([]string{"Ignorable", "MustUnderstand", "ProcessContent", "PreserveElements", "PreserveAttributes"}, attr.Name.Local) {
@@ -941,15 +953,20 @@ func rewriteCompositionMarkup(value packagePart, options compositionMarkupOption
 		if err := budget.scan(int64(len(value.data))); err != nil {
 			return nil, err
 		}
+		tracker := newResourceMarkupScopeTracker(options.format, false, budget.context)
 		root, err := decodeXMLVisit(value.data, budget.limits, func(token xml.Token, node *xmlElement) error {
 			if err := budget.step(1); err != nil {
+				return err
+			}
+			skip, scope, err := tracker.visit(token, node)
+			if err != nil {
 				return err
 			}
 			if _, start := token.(xml.StartElement); !start {
 				return nil
 			}
-			if err := validateResourceMarkupElement(node, options.format); err != nil {
-				return err
+			if skip {
+				return nil
 			}
 			if node.Name.Space == structureNamespace(options.format) || node.Name.Space == mcNamespace && !slices.Contains([]string{"AlternateContent", "Choice", "Fallback"}, node.Name.Local) {
 				return fmt.Errorf("%w: composition markup element %s", ErrUnsupported, node.Name.Local)
@@ -958,6 +975,9 @@ func rewriteCompositionMarkup(value packagePart, options compositionMarkupOption
 				return err
 			}
 			for _, attr := range node.Attr {
+				if attr.Name.Space != "" && scope.ignorable[attr.Name.Space] {
+					continue
+				}
 				if !compositionMarkupAttribute(node, attr, options.format) {
 					return fmt.Errorf("%w: composition markup attribute {%s}%s", ErrUnsupported, attr.Name.Space, attr.Name.Local)
 				}
@@ -1416,8 +1436,13 @@ func (c *compositionNameCollector) root(part packagePart, local string) (*xmlEle
 		return nil, err
 	}
 	nodes := 0
+	tracker := newResourceMarkupScopeTracker(c.format, false, c.budget.context)
 	root, err := decodeXMLVisit(part.data, c.budget.limits, func(token xml.Token, node *xmlElement) error {
 		if err := c.budget.step(1); err != nil {
+			return err
+		}
+		_, _, err := tracker.visit(token, node)
+		if err != nil {
 			return err
 		}
 		if _, start := token.(xml.StartElement); start {
@@ -1425,7 +1450,6 @@ func (c *compositionNameCollector) root(part packagePart, local string) (*xmlEle
 			if err := c.budget.step(len(node.Attr)); err != nil {
 				return err
 			}
-			return validateResourceMarkupElement(node, c.format)
 		}
 		return nil
 	})
@@ -1492,8 +1516,26 @@ func (c *compositionNameCollector) visual(node *xmlElement, resource, branch boo
 	if err != nil {
 		return err
 	}
-	if err := c.mce.validateAttributes(node, scope, branch); err != nil {
+	control := branch || node.Name.Space == mcNamespace && node.Name.Local == "AlternateContent"
+	if err := c.mce.validateAttributes(node, scope, control); err != nil {
 		return err
+	}
+	if !c.mce.understood[node.Name.Space] {
+		if !scope.ignorable[node.Name.Space] {
+			return fmt.Errorf("%w: composition page element namespace %q", ErrUnsupported, node.Name.Space)
+		}
+		if !scope.processes(node.Name) {
+			return nil
+		}
+		if err := compatibilityNoXMLContext(node); err != nil {
+			return err
+		}
+		for _, child := range node.Children {
+			if err := c.visual(child, resource, false, seen, scope); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	if node.Name.Space == mcNamespace {
 		if node.Name.Local == "AlternateContent" {
@@ -2325,26 +2367,39 @@ func (g *compositionProtectionGraph) markup(part packagePart) error {
 		}
 	}
 	nodes := 0
+	tracker := newResourceMarkupScopeTracker(g.source.format, false, g.budget.context)
 	visit := func(token xml.Token, node *xmlElement) error {
 		if err := g.budget.step(1); err != nil {
 			return err
 		}
-		if _, start := token.(xml.StartElement); !start {
-			return nil
-		}
-		nodes++
-		if err := g.attributes(node); err != nil {
-			return err
-		}
-		if knownPrint {
-			return compositionPrintRepresentable(node, capabilities)
-		}
-		if definition {
-			return g.definition(node)
-		}
-		if index == nil {
-			if err := validateResourceMarkupElement(node, g.source.format); err != nil {
+		if !knownPrint && !definition && index == nil {
+			skip, _, err := tracker.visit(token, node)
+			if err != nil {
 				return fmt.Errorf("%w: protected markup semantics: %v", ErrUnsupported, err)
+			}
+			if _, start := token.(xml.StartElement); !start {
+				return nil
+			}
+			nodes++
+			if err := g.attributes(node); err != nil {
+				return err
+			}
+			if skip {
+				return nil
+			}
+		} else {
+			if _, start := token.(xml.StartElement); !start {
+				return nil
+			}
+			nodes++
+			if err := g.attributes(node); err != nil {
+				return err
+			}
+			if knownPrint {
+				return compositionPrintRepresentable(node, capabilities)
+			}
+			if definition {
+				return g.definition(node)
 			}
 		}
 		for _, attr := range node.Attr {

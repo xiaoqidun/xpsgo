@@ -117,6 +117,14 @@ type imageCICPTransform struct {
 	peakNits     float64
 }
 
+// imageGammaChromaTransform 保存已校验的PNG gAMA线性化幂次与cHRM到D65线性sRGB转换矩阵
+type imageGammaChromaTransform struct {
+	hasGamma     bool
+	invGamma     float64
+	hasMatrix    bool
+	linearMatrix [9]float64
+}
+
 // ColorSpace 表示颜色的源色彩空间
 type ColorSpace uint8
 
@@ -410,6 +418,17 @@ func renderSRGBToLinear(value float64) float64 {
 	return math.Pow((value+0.055)/1.055, 2.4)
 }
 
+// renderSignedSRGBToLinear 将带符号扩展色域sRGB分量按对称IEC 61966-2-1曲线解码为线性光值
+// 入参: value 有限sRGB分量，允许小于零或大于一
+// 返回: float64 对应线性分量
+func renderSignedSRGBToLinear(value float64) float64 {
+	magnitude := math.Abs(value)
+	if magnitude <= 0.04045 {
+		return value / 12.92
+	}
+	return math.Copysign(math.Pow((magnitude+0.055)/1.055, 2.4), value)
+}
+
 // renderLinearToSRGB 将归一化线性分量编码为sRGB值，不变换alpha
 // 入参: value 单位区间内的有限线性分量
 // 返回: float64 对应sRGB分量
@@ -578,6 +597,8 @@ func parseICCNamedColor(profile *iccProfile) ([]iccNamedColor, error) {
 			for axis := range 3 {
 				colors[i].xyz[axis] = float64(pcs[axis]) / 32768
 			}
+		} else if profile.version >= 0x04000000 {
+			colors[i].xyz = iccLabToXYZ([3]float64{float64(pcs[0]) * 100 / 65535, float64(pcs[1])*255/65535 - 128, float64(pcs[2])*255/65535 - 128})
 		} else {
 			colors[i].xyz = iccLabToXYZ([3]float64{min(100, float64(pcs[0])*100/65280), float64(pcs[1])/256 - 128, float64(pcs[2])/256 - 128})
 		}
@@ -743,6 +764,96 @@ func (c iccCurve) evaluate(value float64) (float64, error) {
 		return 0, fmt.Errorf("%w: non-real ICC curve value", ErrInvalid)
 	}
 	return colorClamp(result), nil
+}
+
+// evaluateExtended 按ICC曲线公式在扩展范围无裁剪求值，采样曲线超出单位区间时沿端点斜率线性外推
+// 入参: value 有限输入分量
+// 返回: float64 无裁剪曲线输出, error 非实数函数或输入错误
+func (c iccCurve) evaluateExtended(value float64) (float64, error) {
+	if !geometryFinite(value) {
+		return 0, fmt.Errorf("%w: ICC curve input", ErrInvalid)
+	}
+	var result float64
+	switch c.kind {
+	case iccCurveIdentity:
+		return value, nil
+	case iccCurveGamma:
+		g := c.parameters[0]
+		if g == 0 {
+			return 1, nil
+		}
+		if g == 1 {
+			return value, nil
+		}
+		result = math.Copysign(math.Pow(math.Abs(value), g), value)
+	case iccCurveSampled:
+		if value >= 0 && value <= 1 {
+			return c.evaluate(value)
+		}
+		if c.precision != 1 && c.precision != 2 {
+			return 0, fmt.Errorf("%w: ICC curve sample precision", ErrInvalid)
+		}
+		count := len(c.values) / c.precision
+		if count < 2 {
+			return 0, fmt.Errorf("%w: ICC sampled curve", ErrInvalid)
+		}
+		if value < 0 {
+			y0, y1 := iccInverseCurveSample(c, 0), iccInverseCurveSample(c, 1)
+			result = y0 + (y1-y0)*float64(count-1)*value
+		} else {
+			y0, y1 := iccInverseCurveSample(c, count-2), iccInverseCurveSample(c, count-1)
+			result = y1 + (y1-y0)*float64(count-1)*(value-1)
+		}
+	case iccCurveParametric:
+		p := c.parameters
+		switch c.function {
+		case 0:
+			if p[0] == 0 {
+				return 1, nil
+			}
+			if p[0] == 1 {
+				return value, nil
+			}
+			result = math.Copysign(math.Pow(math.Abs(value), p[0]), value)
+		case 1, 2:
+			if value >= -p[2]/p[1] {
+				base := p[1]*value + p[2]
+				if p[0] == 0 {
+					result = 1
+				} else if base > 0 {
+					result = math.Pow(base, p[0])
+				}
+			}
+			if c.function == 2 {
+				result += p[3]
+			}
+		case 3, 4:
+			if value >= p[4] {
+				base := p[1]*value + p[2]
+				if p[0] == 0 {
+					result = 1
+				} else if base != 0 || p[0] < 0 {
+					result = math.Pow(base, p[0])
+				}
+				if c.function == 4 {
+					result += p[5]
+				}
+			} else {
+				result = p[3] * value
+				if c.function == 4 {
+					result += p[6]
+				}
+			}
+		default:
+			return 0, fmt.Errorf("%w: ICC curve function", ErrUnsupported)
+		}
+	default:
+		return 0, fmt.Errorf("%w: ICC curve kind", ErrInvalid)
+	}
+	if !geometryFinite(result) {
+		return 0, fmt.Errorf("%w: non-real ICC curve value", ErrInvalid)
+	}
+	return result, nil
 }
 
 // prepareICCInverseCurve 验证TRC并缓存求逆所需的端点及幂分段边界
@@ -1760,11 +1871,14 @@ func imageCICPUsable(cicp *imageCICP) bool {
 }
 
 // prepareImageCICP 校验并构建非JXR图像的H.273 CICP线性转换器，输出相对100 cd/m²归一化的D65线性scRGB
-// 入参: cicp 图像CICP四元组, bits 每通道编码位深（8、16或0表示浮点）, hdrPeakNits 可选HDR峰值亮度
-// 返回: *imageCICPTransform CICP转换器，未指定时为nil, error 不支持的CICP参数错误
-func prepareImageCICP(cicp *imageCICP, bits int, hdrPeakNits float64) (*imageCICPTransform, error) {
+// 入参: cicp 图像CICP四元组, channels 源颜色通道数, bits 每通道编码位深（8、16或0表示浮点）, hdrPeakNits 可选HDR峰值亮度
+// 返回: *imageCICPTransform CICP转换器，未指定时为nil, error 不支持或非法的CICP参数错误
+func prepareImageCICP(cicp *imageCICP, channels, bits int, hdrPeakNits float64) (*imageCICPTransform, error) {
 	if !imageCICPUsable(cicp) {
 		return nil, nil
+	}
+	if channels == 1 && cicp.primaries == 10 {
+		return nil, fmt.Errorf("%w: CICP CIE XYZ primaries require three channels", ErrInvalid)
 	}
 	if cicp.matrix != 0 {
 		return nil, fmt.Errorf("%w: unsupported CICP matrix %d for RGB/Gray image", ErrUnsupported, cicp.matrix)
@@ -1858,6 +1972,76 @@ func (t *imageCICPTransform) toLinearSRGB(r, g, b float64, gray bool) [3]float64
 	}
 	if gray && !t.hdr && t.primaries != 10 {
 		return [3]float64{rgb[0], rgb[0], rgb[0]}
+	}
+	return iccMatrixColor(t.linearMatrix, rgb)
+}
+
+// prepareImageGammaChroma 校验并构建PNG gAMA与cHRM线性转换器，灰度图像仅应用gAMA
+// 入参: gc 图像伽马与色度坐标元数据, channels 源颜色通道数
+// 返回: *imageGammaChromaTransform 转换器，无有效参数时返回nil
+func prepareImageGammaChroma(gc *imageGammaChroma, channels int) *imageGammaChromaTransform {
+	if gc == nil {
+		return nil
+	}
+	hasGamma := gc.hasGamma && geometryFinite(gc.gamma) && gc.gamma > 0
+	invGamma := 0.0
+	if hasGamma {
+		invGamma = 1 / gc.gamma
+		if !geometryFinite(invGamma) {
+			hasGamma = false
+		}
+	}
+	hasMatrix := false
+	var linearMatrix [9]float64
+	if channels != 1 && gc.hasChrm &&
+		geometryFinite(gc.whiteX, gc.whiteY, gc.redX, gc.redY, gc.greenX, gc.greenY, gc.blueX, gc.blueY) &&
+		gc.whiteX > 0 && gc.whiteY > 0 && gc.whiteX+gc.whiteY < 1 &&
+		gc.redX >= 0 && gc.redY > 0 && gc.redX+gc.redY <= 1 &&
+		gc.greenX >= 0 && gc.greenY > 0 && gc.greenX+gc.greenY <= 1 &&
+		gc.blueX >= 0 && gc.blueY > 0 && gc.blueX+gc.blueY <= 1 {
+		matrix, kr, kb, ok := cicpChromaticityToSRGB(
+			[3][2]float64{{gc.redX, gc.redY}, {gc.greenX, gc.greenY}, {gc.blueX, gc.blueY}},
+			[2]float64{gc.whiteX, gc.whiteY},
+		)
+		if ok && kr > 0 && kb > 0 && 1-kr-kb > 0 {
+			hasMatrix = true
+			linearMatrix = matrix
+		}
+	}
+	if !hasGamma && !hasMatrix {
+		return nil
+	}
+	return &imageGammaChromaTransform{
+		hasGamma:     hasGamma,
+		invGamma:     invGamma,
+		hasMatrix:    hasMatrix,
+		linearMatrix: linearMatrix,
+	}
+}
+
+// toLinearSRGB 将归一化PNG像素按gAMA与cHRM转换为D65线性scRGB，灰度图像仅执行伽马解码
+// 入参: r, g, b 源像素分量, gray 是否为单通道灰度源
+// 返回: [3]float64 D65线性scRGB三通道
+func (t *imageGammaChromaTransform) toLinearSRGB(r, g, b float64, gray bool) [3]float64 {
+	if gray {
+		v := colorClamp(r)
+		if t.hasGamma {
+			v = math.Pow(v, t.invGamma)
+		} else {
+			v = renderSRGBToLinear(v)
+		}
+		return [3]float64{v, v, v}
+	}
+	rgb := [3]float64{colorClamp(r), colorClamp(g), colorClamp(b)}
+	for i, v := range rgb {
+		if t.hasGamma {
+			rgb[i] = math.Pow(v, t.invGamma)
+		} else {
+			rgb[i] = renderSRGBToLinear(v)
+		}
+	}
+	if !t.hasMatrix {
+		return rgb
 	}
 	return iccMatrixColor(t.linearMatrix, rgb)
 }
@@ -2014,24 +2198,46 @@ func cicpHDRInverseTransfer(value float64, transfer uint8) float64 {
 	return (math.Exp((value-cicpHLGC)/cicpHLGA) + cicpHLGB) / 12
 }
 
-// cicpHLGDisplayLight 按BT.2100参考峰值亮度执行HLG场景光到归一化显示光的OOTF变换
+// cicpHLGDisplayLight 按BT.2100-2参考峰值亮度及表5注5f系统伽马公式将HLG场景光转换为归一化显示光
 // 入参: rgb 线性场景RGB, weights 场景亮度权重, peakNits 参考显示峰值亮度
 // 返回: [3]float64 相对peakNits归一化的显示光RGB
 func cicpHLGDisplayLight(rgb, weights [3]float64, peakNits float64) [3]float64 {
 	luma := weights[0]*rgb[0] + weights[1]*rgb[1] + weights[2]*rgb[2]
+	if !(luma > 0) {
+		return [3]float64{}
+	}
 	gamma := 1.2
 	if peakNits != 1000 {
-		gamma = 1.2 + 0.42*math.Log10(peakNits/1000)
+		if peakNits >= 400 && peakNits <= 2000 {
+			gamma = 1.2 + 0.42*math.Log10(peakNits/1000)
+		} else {
+			gamma = 1.2 * math.Pow(1.111, math.Log2(peakNits/1000))
+		}
 	}
-	gain := math.Pow(max(0, luma), gamma-1)
-	return [3]float64{rgb[0] * gain, rgb[1] * gain, rgb[2] * gain}
+	gain := math.Pow(luma, gamma-1)
+	for i := range rgb {
+		if rgb[i] != 0 {
+			rgb[i] *= gain
+		}
+	}
+	return rgb
 }
 
-// renderBT2446MethodA 按ITU-R BT.2446方法A将相对100 cd/m²的线性scRGB映射至100 cd/m²线性sRGB
+// renderBT2446MethodA 按ITU-R BT.2446方法A将相对100 cd/m²的线性scRGB映射至100 cd/m²线性sRGB，峰值不高于100 cd/m²时裁剪恒等输出
 // 入参: linearSRGB 相对100 cd/m²归一化的线性scRGB, peakNits HDR标称峰值亮度（cd/m²）
 // 返回: [3]float64 映射后的100 cd/m²线性sRGB
 func renderBT2446MethodA(linearSRGB [3]float64, peakNits float64) [3]float64 {
 	if !(peakNits > 0) {
+		return linearSRGB
+	}
+	if peakNits <= 100 {
+		for i, v := range linearSRGB {
+			if !(v > 0) {
+				linearSRGB[i] = 0
+			} else if v > 1 {
+				linearSRGB[i] = 1
+			}
+		}
 		return linearSRGB
 	}
 	bt2020 := iccMatrixColor(cicpSRGBToBT2020, linearSRGB)

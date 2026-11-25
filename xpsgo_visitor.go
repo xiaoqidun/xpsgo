@@ -110,7 +110,7 @@ type WalkPathEvent struct {
 }
 
 // WalkGlyphsEvent 保存规范化字形序列、定位结果与按需提取的矢量轮廓，State.Opacity为累计不透明度，LocalOpacity为自身不透明度
-// FontURI为包根绝对URI（含可选#CollectionIndex），Outlines按Glyphs顺序保存字体设计单位轮廓（含粗体扩张与OpenXPS偏移）及最终Transform
+// FontURI为包根绝对URI（含可选#CollectionIndex），Outlines按Glyphs顺序保存字体设计单位轮廓（含粗体扩张）及最终Transform
 // Fill、Outlines元素及State内指针字段均为只读零拷贝视图，回调期间及返回后不得修改
 type WalkGlyphsEvent struct {
 	State               WalkState
@@ -1247,18 +1247,7 @@ func (w *sceneWalker) populateGlyphPositions(ctx context.Context, glyphs *Glyphs
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
-		shifted := glyph
-		if run.bold && w.reader.format == FormatOpenXPS {
-			shift := glyphs.FontRenderingEmSize / 100
-			shifted.origin.X += shift
-			shifted.origin.Y -= shift
-			shifted.matrix.E += shift
-			shifted.matrix.F -= shift
-			if !geometryFinite(shifted.origin.X, shifted.origin.Y, shifted.matrix.E, shifted.matrix.F) {
-				return wrapPartError(state.PagePart, "Glyphs", fmt.Errorf("%w: bold glyph transform range", ErrLimit))
-			}
-		}
-		pos, err := contentGlyphPosition(shifted, state.Matrix, run.rtl)
+		pos, err := contentGlyphPosition(glyph, state.Matrix, run.rtl)
 		if err != nil {
 			return wrapPartError(state.PagePart, "Glyphs", err)
 		}

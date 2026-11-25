@@ -64,7 +64,7 @@ type boldBoundaryEvent struct {
 	delta int
 }
 
-// glyphPaint 定位字形并按独立填充规则合并为单次文字绘制，含OpenXPS粗体平移偏移
+// glyphPaint 定位字形并按独立填充规则合并为单次文字绘制，遵循ECMA-388不改变粗体基线原点
 // 入参: glyphs 字形元素, transform 有效设备变换, aliased 是否按输出像素中心判断归属, depth 当前元素深度
 // 返回: []scenePaint 字形并集及画刷, error 字体、几何或能力错误
 func (r *sceneRenderer) glyphPaint(glyphs *Glyphs, transform Matrix, aliased bool, depth int) ([]scenePaint, error) {
@@ -115,11 +115,6 @@ func (r *sceneRenderer) glyphPaint(glyphs *Glyphs, transform Matrix, aliased boo
 			return nil, err
 		}
 		local := glyph.matrix
-		if run.bold && r.options.format == FormatOpenXPS {
-			shift := glyphs.FontRenderingEmSize / 100
-			local.E += shift
-			local.F -= shift
-		}
 		matrix := strokePathCompose(transform, local)
 		if !geometryFillMatrixFinite(matrix) {
 			return nil, fmt.Errorf("%w: scene glyph transform range", ErrLimit)
@@ -251,6 +246,9 @@ func (r *sceneRenderer) glyphBitmapPaint(source *fontSource, glyphs *Glyphs, sel
 		if err != nil {
 			return 0, err
 		}
+		if decoded.mask == nil || decoded.mask.Rect.Empty() || decoded.metrics.width == 0 || decoded.metrics.height == 0 {
+			return 0, nil
+		}
 		if decoded.metrics.hasVertical {
 			return 0, nil
 		}
@@ -278,6 +276,9 @@ func (r *sceneRenderer) glyphBitmapPaint(source *fontSource, glyphs *Glyphs, sel
 			return nil, err
 		}
 		metrics := decoded.metrics
+		if decoded.mask == nil || decoded.mask.Rect.Empty() || metrics.width == 0 || metrics.height == 0 {
+			continue
+		}
 		axis := metrics.horizontal
 		local := glyph.matrix
 		vertical := run.sideways && metrics.hasVertical
@@ -286,10 +287,6 @@ func (r *sceneRenderer) glyphBitmapPaint(source *fontSource, glyphs *Glyphs, sel
 			local.E, local.F = glyph.origin.X, glyph.origin.Y
 		} else if !metrics.hasHorizontal {
 			return nil, fmt.Errorf("%w: bitmap glyph has no horizontal bearing", ErrUnsupported)
-		}
-		if run.bold && r.options.format == FormatOpenXPS {
-			local.E += glyphs.FontRenderingEmSize / 100
-			local.F -= glyphs.FontRenderingEmSize / 100
 		}
 		width := int(math.Round(float64(metrics.width) * selection.scaleX))
 		height := int(math.Round(float64(metrics.height) * selection.scaleY))

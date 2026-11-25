@@ -52,6 +52,21 @@ type imageCICP struct {
 	fullRange bool
 }
 
+// imageGammaChroma 保存PNG gAMA与cHRM声明的伽马与CIE色度坐标
+type imageGammaChroma struct {
+	hasGamma bool
+	gamma    float64
+	hasChrm  bool
+	whiteX   float64
+	whiteY   float64
+	redX     float64
+	redY     float64
+	greenX   float64
+	greenY   float64
+	blueX    float64
+	blueY    float64
+}
+
 // rasterImage 保存图像原生分量、颜色解释及物理分辨率
 type rasterImage struct {
 	pixels            image.Image
@@ -62,6 +77,7 @@ type rasterImage struct {
 	profile           []byte
 	profileCompressed bool
 	cicp              *imageCICP
+	gammaChroma       *imageGammaChroma
 	transform         *iccTransform
 	selectedProfile   *iccProfile
 	associatedProfile bool
@@ -110,17 +126,19 @@ type ImageResource struct {
 	source      *rasterImage
 }
 
-// rasterMetadata 保存图像分辨率、原生通道数、内嵌配置文件及CICP色彩编码
+// rasterMetadata 保存图像分辨率、原生通道数、内嵌配置文件、CICP及伽马色度元数据
 type rasterMetadata struct {
 	dpi                Point
 	channels           int
 	profile            []byte
 	profileCompressed  bool
 	cicp               *imageCICP
+	gammaChroma        *imageGammaChroma
 	jpegProcess        byte
 	jpegJFIF           bool
 	jpegAdobe          bool
 	jpegAdobeTransform byte
+	jpegOrientation    uint32
 }
 
 // pngCompressionLayout 保存连续IDAT块的物理范围，范围内只包含图像压缩流及块封装
@@ -260,7 +278,11 @@ func decodeRasterImageWithMemory(ctx context.Context, data []byte, media string,
 	if decoded.Bounds() != image.Rect(0, 0, config.Width, config.Height) {
 		return nil, fmt.Errorf("%w: inconsistent decoded image dimensions", ErrInvalid)
 	}
-	return &rasterImage{pixels: decoded, dpi: metadata.dpi, channels: metadata.channels, profile: metadata.profile, profileCompressed: metadata.profileCompressed, cicp: metadata.cicp}, nil
+	out := &rasterImage{pixels: decoded, dpi: metadata.dpi, channels: metadata.channels, profile: metadata.profile, profileCompressed: metadata.profileCompressed, cicp: metadata.cicp, gammaChroma: metadata.gammaChroma}
+	if metadata.jpegOrientation > 1 {
+		applyTIFFOrientation(out, metadata.jpegOrientation)
+	}
+	return out, nil
 }
 
 // rasterImageDecodeError 保留资源和能力错误，不将标准解码器的能力缺失误判为无效图像
@@ -495,7 +517,7 @@ func (r *ImageResource) Sample(x, y int, components []float64) (float64, error) 
 	return float64(value.A) / 65535, nil
 }
 
-// pngImageMetadata 读取分辨率、CICP色彩编码和内嵌配置文件，按PNG第三版规则校验块顺序与优先级
+// pngImageMetadata 读取分辨率、CICP色彩编码、内嵌配置文件与gAMA/cHRM，按PNG第三版规则校验块顺序与优先级
 // 入参: data 完整PNG数据
 // 返回: rasterMetadata 图像元数据, error 数据或资源错误
 func pngImageMetadata(data []byte) (rasterMetadata, error) {
@@ -504,7 +526,8 @@ func pngImageMetadata(data []byte) (rasterMetadata, error) {
 		return rasterMetadata{}, fmt.Errorf("%w: PNG signature", ErrInvalid)
 	}
 	seen := false
-	profileSeen, srgbSeen, cicpSeen, paletteSeen, imageSeen := false, false, false, false, false
+	profileSeen, srgbSeen, cicpSeen, gamaSeen, chrmSeen, paletteSeen, imageSeen := false, false, false, false, false, false, false
+	var gammaChroma imageGammaChroma
 	for pos := uint64(8); pos < uint64(len(data)); {
 		if uint64(len(data))-pos < 12 {
 			return rasterMetadata{}, fmt.Errorf("%w: truncated PNG chunk", ErrInvalid)
@@ -551,7 +574,7 @@ func pngImageMetadata(data []byte) (rasterMetadata, error) {
 				metadata.dpi = Point{96, 96 * (float64(y) / float64(x))}
 			}
 		case "iCCP":
-			if profileSeen || srgbSeen || imageSeen {
+			if profileSeen || srgbSeen || paletteSeen || imageSeen {
 				return rasterMetadata{}, fmt.Errorf("%w: PNG profile placement", ErrInvalid)
 			}
 			profileSeen = true
@@ -562,13 +585,56 @@ func pngImageMetadata(data []byte) (rasterMetadata, error) {
 			metadata.profile = profile
 			metadata.profileCompressed = true
 		case "sRGB":
-			if profileSeen || srgbSeen || imageSeen || size != 1 || chunk[4] > 3 {
+			if profileSeen || srgbSeen || paletteSeen || imageSeen || size != 1 || chunk[4] > 3 {
 				return rasterMetadata{}, fmt.Errorf("%w: PNG sRGB chunk", ErrInvalid)
 			}
 			srgbSeen = true
+		case "gAMA":
+			if gamaSeen || paletteSeen || imageSeen || size != 4 {
+				return rasterMetadata{}, fmt.Errorf("%w: PNG gAMA chunk", ErrInvalid)
+			}
+			raw := binary.BigEndian.Uint32(chunk[4:])
+			if raw == 0 {
+				return rasterMetadata{}, fmt.Errorf("%w: PNG gAMA zero value", ErrInvalid)
+			}
+			gamaSeen = true
+			gammaChroma.hasGamma = true
+			gammaChroma.gamma = float64(raw) / 100000
+		case "cHRM":
+			if chrmSeen || paletteSeen || imageSeen || size != 32 {
+				return rasterMetadata{}, fmt.Errorf("%w: PNG cHRM chunk", ErrInvalid)
+			}
+			wx := float64(binary.BigEndian.Uint32(chunk[4:])) / 100000
+			wy := float64(binary.BigEndian.Uint32(chunk[8:])) / 100000
+			rx := float64(binary.BigEndian.Uint32(chunk[12:])) / 100000
+			ry := float64(binary.BigEndian.Uint32(chunk[16:])) / 100000
+			gx := float64(binary.BigEndian.Uint32(chunk[20:])) / 100000
+			gy := float64(binary.BigEndian.Uint32(chunk[24:])) / 100000
+			bx := float64(binary.BigEndian.Uint32(chunk[28:])) / 100000
+			by := float64(binary.BigEndian.Uint32(chunk[32:])) / 100000
+			if !(wx > 0 && wy > 0 && wx+wy < 1 && rx >= 0 && ry > 0 && rx+ry <= 1 && gx >= 0 && gy > 0 && gx+gy <= 1 && bx >= 0 && by > 0 && bx+by <= 1) {
+				return rasterMetadata{}, fmt.Errorf("%w: PNG cHRM coordinates", ErrInvalid)
+			}
+			if math.Abs((rx-bx)*(gy-by)-(gx-bx)*(ry-by)) <= 1e-9 {
+				return rasterMetadata{}, fmt.Errorf("%w: PNG cHRM degenerate primaries", ErrInvalid)
+			}
+			_, kr, kb, ok := cicpChromaticityToSRGB([3][2]float64{{rx, ry}, {gx, gy}, {bx, by}}, [2]float64{wx, wy})
+			if !ok || kr <= 0 || kb <= 0 || 1-kr-kb <= 0 {
+				return rasterMetadata{}, fmt.Errorf("%w: PNG cHRM chromaticity", ErrInvalid)
+			}
+			chrmSeen = true
+			gammaChroma.hasChrm = true
+			gammaChroma.whiteX, gammaChroma.whiteY = wx, wy
+			gammaChroma.redX, gammaChroma.redY = rx, ry
+			gammaChroma.greenX, gammaChroma.greenY = gx, gy
+			gammaChroma.blueX, gammaChroma.blueY = bx, by
 		case "IEND":
 			if size != 0 || pos+12 != uint64(len(data)) {
 				return rasterMetadata{}, fmt.Errorf("%w: PNG ending", ErrInvalid)
+			}
+			if !imageCICPUsable(metadata.cicp) && !profileSeen && !srgbSeen && (gamaSeen || chrmSeen) {
+				gc := gammaChroma
+				metadata.gammaChroma = &gc
 			}
 			return metadata, nil
 		}
@@ -577,7 +643,7 @@ func pngImageMetadata(data []byte) (rasterMetadata, error) {
 	return rasterMetadata{}, fmt.Errorf("%w: missing PNG ending", ErrInvalid)
 }
 
-// jpegImageMetadata 按EXIF优先于JFIF解析分辨率，并按片段序号合并内嵌ICC配置文件
+// jpegImageMetadata 按EXIF优先于JFIF解析分辨率与方向，并按片段序号合并内嵌ICC配置文件
 // 入参: data 完整JPEG数据, maxProfileBytes 配置文件字节上限
 // 返回: rasterMetadata 图像元数据, error 标记、元数据或资源错误
 func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, error) {
@@ -586,7 +652,7 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 	}
 	metadata := rasterMetadata{dpi: Point{96, 96}}
 	var exif Point
-	hasExif := false
+	hasExif, hasOrient := false, false
 	var profiles [256][]byte
 	profileCount, profileSize := 0, int64(0)
 	entropy := false
@@ -655,7 +721,9 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 			if unit > 2 || x == 0 || y == 0 {
 				return rasterMetadata{}, fmt.Errorf("%w: JFIF density", ErrInvalid)
 			}
-			if unit != 0 {
+			if unit == 0 {
+				metadata.dpi = Point{96, 96 * (float64(y) / float64(x))}
+			} else {
 				factor := 1.0
 				if unit == 2 {
 					factor = 2.54
@@ -666,7 +734,7 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 			metadata.jpegAdobe = true
 			metadata.jpegAdobeTransform = payload[11]
 		case marker == 0xe1 && bytes.HasPrefix(payload, []byte("Exif\x00\x00")):
-			value, present, err := exifImageResolution(payload[6:])
+			value, present, orientation, hasOrientation, err := exifImageMetadata(payload[6:])
 			if err != nil {
 				return rasterMetadata{}, err
 			}
@@ -675,6 +743,12 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 					return rasterMetadata{}, fmt.Errorf("%w: conflicting EXIF resolution", ErrInvalid)
 				}
 				exif, hasExif = value, true
+			}
+			if hasOrientation {
+				if hasOrient && metadata.jpegOrientation != orientation {
+					return rasterMetadata{}, fmt.Errorf("%w: conflicting EXIF orientation", ErrInvalid)
+				}
+				metadata.jpegOrientation, hasOrient = orientation, true
 			}
 		case marker == 0xe2 && bytes.HasPrefix(payload, []byte("ICC_PROFILE\x00")):
 			if len(payload) <= 14 {
@@ -696,13 +770,13 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 	return rasterMetadata{}, fmt.Errorf("%w: truncated JPEG", ErrInvalid)
 }
 
-// exifImageResolution 从EXIF首个图像目录读取分辨率，忽略缩略图及显示方向提示
+// exifImageMetadata 从EXIF首个图像目录读取物理分辨率、无单位纵横比与方向Tag 274
 // 入参: data 去除EXIF前缀的TIFF数据
-// 返回: Point 分辨率, bool 是否指定物理分辨率, error 目录或数值错误
-func exifImageResolution(data []byte) (Point, bool, error) {
+// 返回: Point 分辨率, bool 是否指定分辨率, uint32 方向编号, bool 是否声明方向, error 目录或数值错误
+func exifImageMetadata(data []byte) (Point, bool, uint32, bool, error) {
 	invalid := fmt.Errorf("%w: EXIF resolution metadata", ErrInvalid)
 	if len(data) < 8 {
-		return Point{}, false, invalid
+		return Point{}, false, 0, false, invalid
 	}
 	var order binary.ByteOrder
 	switch string(data[:2]) {
@@ -711,37 +785,50 @@ func exifImageResolution(data []byte) (Point, bool, error) {
 	case "MM":
 		order = binary.BigEndian
 	default:
-		return Point{}, false, invalid
+		return Point{}, false, 0, false, invalid
 	}
 	if order.Uint16(data[2:]) != 42 {
-		return Point{}, false, invalid
+		return Point{}, false, 0, false, invalid
 	}
 	pos := uint64(order.Uint32(data[4:]))
 	if pos < 8 || pos > uint64(len(data))-2 {
-		return Point{}, false, invalid
+		return Point{}, false, 0, false, invalid
 	}
 	count := uint64(order.Uint16(data[pos:]))
 	if count*12+6 > uint64(len(data))-pos {
-		return Point{}, false, invalid
+		return Point{}, false, 0, false, invalid
 	}
 	dpi := Point{}
 	unit := uint16(2)
 	seen := [3]bool{}
 	hasColor := false
+	orientation := uint32(0)
+	seenOrient := false
 	for i := uint64(0); i < count; i++ {
 		entry := data[pos+2+12*i : pos+14+12*i]
 		tag := order.Uint16(entry)
+		if tag == 274 {
+			if seenOrient || order.Uint16(entry[2:]) != 3 || order.Uint32(entry[4:]) != 1 {
+				return Point{}, false, 0, false, invalid
+			}
+			value := uint32(order.Uint16(entry[8:]))
+			if value < 1 || value > 8 {
+				return Point{}, false, 0, false, invalid
+			}
+			orientation, seenOrient = value, true
+			continue
+		}
 		if tag == 34665 {
 			if hasColor || order.Uint16(entry[2:]) != 4 || order.Uint32(entry[4:]) != 1 {
-				return Point{}, false, invalid
+				return Point{}, false, 0, false, invalid
 			}
 			hasColor = true
 			offset := uint64(order.Uint32(entry[8:]))
 			if offset == pos {
-				return Point{}, false, invalid
+				return Point{}, false, 0, false, invalid
 			}
 			if err := exifImageColor(data, order, offset); err != nil {
-				return Point{}, false, err
+				return Point{}, false, 0, false, err
 			}
 		}
 		if tag != 282 && tag != 283 && tag != 296 {
@@ -752,26 +839,26 @@ func exifImageResolution(data []byte) (Point, bool, error) {
 			index = 2
 		}
 		if seen[index] || order.Uint32(entry[4:]) != 1 {
-			return Point{}, false, invalid
+			return Point{}, false, 0, false, invalid
 		}
 		seen[index] = true
 		if tag == 296 {
 			if order.Uint16(entry[2:]) != 3 {
-				return Point{}, false, invalid
+				return Point{}, false, 0, false, invalid
 			}
 			unit = order.Uint16(entry[8:])
 			continue
 		}
 		if order.Uint16(entry[2:]) != 5 {
-			return Point{}, false, invalid
+			return Point{}, false, 0, false, invalid
 		}
 		offset := uint64(order.Uint32(entry[8:]))
 		if offset > uint64(len(data))-8 {
-			return Point{}, false, invalid
+			return Point{}, false, 0, false, invalid
 		}
 		n, d := order.Uint32(data[offset:]), order.Uint32(data[offset+4:])
 		if n == 0 || d == 0 {
-			return Point{}, false, invalid
+			return Point{}, false, 0, false, invalid
 		}
 		if tag == 282 {
 			dpi.X = float64(n) / float64(d)
@@ -780,16 +867,19 @@ func exifImageResolution(data []byte) (Point, bool, error) {
 		}
 	}
 	if unit < 1 || unit > 3 || seen[0] != seen[1] {
-		return Point{}, false, invalid
+		return Point{}, false, 0, false, invalid
 	}
-	if !seen[0] || unit == 1 {
-		return Point{}, false, nil
+	if !seen[0] {
+		return Point{}, false, orientation, seenOrient, nil
+	}
+	if unit == 1 {
+		return Point{96, 96 * (dpi.Y / dpi.X)}, true, orientation, seenOrient, nil
 	}
 	if unit == 3 {
 		dpi.X *= 2.54
 		dpi.Y *= 2.54
 	}
-	return dpi, true, nil
+	return dpi, true, orientation, seenOrient, nil
 }
 
 // exifImageColor 校验EXIF颜色空间声明，未校准颜色由ICC或像素格式解释
@@ -968,7 +1058,7 @@ func (c *sceneImageCache) colorImage(brush *Brush, part string, source *rasterIm
 	if err := checkContext(c.context); err != nil {
 		return nil, err
 	}
-	if brush.ImageProfileURI == "" && (source.cicp != nil || len(source.profile) == 0) {
+	if brush.ImageProfileURI == "" && (source.jxr == nil && imageCICPUsable(source.cicp) || len(source.profile) == 0) {
 		return source, nil
 	}
 	if c.colors == nil {
@@ -1014,7 +1104,7 @@ func (c *sceneImageCache) colorImage(brush *Brush, part string, source *rasterIm
 			return nil, e
 		}
 	}
-	if transform == nil && source.cicp == nil && len(source.profile) != 0 {
+	if transform == nil && (source.jxr != nil || !imageCICPUsable(source.cicp)) && len(source.profile) != 0 {
 		transform, err = c.colors.embedded(part, source.profile, source.profileCompressed)
 		if e := checkContext(c.context); e != nil {
 			return nil, e
@@ -1059,7 +1149,7 @@ func defaultImageProfile(source *rasterImage) *rasterImage {
 // 入参: source 图像资源
 // 返回: *rasterImage 颜色解释独立的图像视图, error 配置文件或能力错误
 func standaloneImageColor(source *rasterImage) (*rasterImage, error) {
-	if source.transform != nil || source.selectedProfile != nil || source.cicp != nil || len(source.profile) == 0 {
+	if source.transform != nil || source.selectedProfile != nil || source.jxr == nil && imageCICPUsable(source.cicp) || len(source.profile) == 0 {
 		return source, nil
 	}
 	data := source.profile
@@ -1537,7 +1627,13 @@ func decodeLosslessJPEGImage(data []byte, metadata rasterMetadata, maxPixels uin
 				return nil, fmt.Errorf("%w: incomplete lossless JPEG components", ErrInvalid)
 			}
 			convertLosslessJPEGColor(out, colorSpace, uint32(frame[0]))
+			if metadata.jpegOrientation > 1 {
+				applyTIFFOrientation(out, metadata.jpegOrientation)
+			}
 			return out, nil
+		}
+		if marker == 1 {
+			continue
 		}
 		if len(stream.data)-pos < 2 {
 			return nil, fmt.Errorf("%w: lossless JPEG marker length", ErrInvalid)
@@ -1669,6 +1765,9 @@ func decodeLosslessJPEGScan(out *rasterImage, frame, scan, data []byte, huffman 
 	predictor, point := uint32(scan[len(scan)-3]), uint32(scan[len(scan)-1])
 	if predictor < 1 || predictor > 7 || scan[len(scan)-2] != 0 || point >= uint32(frame[0]) {
 		return 0, fmt.Errorf("%w: lossless JPEG prediction parameters", ErrInvalid)
+	}
+	if restart != 0 && int(restart)%out.bounds().Dx() != 0 {
+		return 0, fmt.Errorf("%w: lossless JPEG restart interval", ErrInvalid)
 	}
 	l := tiffLegacyJPEG{channels: int(scan[0]), lossless: true, bits: uint32(frame[0]), restart: restart}
 	var components [4]int

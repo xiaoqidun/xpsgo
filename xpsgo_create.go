@@ -2038,12 +2038,31 @@ func createdNode(namespace, name string) *xmlElement {
 	return &xmlElement{Name: xml.Name{Space: namespace, Local: name}, Namespaces: map[string]string{"": namespace, "xml": xmlNamespace}}
 }
 
-// createdMarkup 输出由标准结构生成的独立XML，检查字符、文本位置及结构规模
+// createdMarkup 输出由标准结构生成的独立XML，保留元素上的MCE保留扩展及必要命名空间声明
 // 入参: root 标准根节点, limits 资源上限, ctx 取消Context
 // 返回: []byte XML数据, error 取消、字符、结构或预算错误
 func createdMarkup(root *xmlElement, limits Limits, ctx context.Context) ([]byte, error) {
+	return createdMarkupContent(root, nil, limits, ctx)
+}
+
+// createdMarkupContent 输出由标准结构及可选有序内容生成的独立XML，保留原始MCE保留元素、保留属性及相对顺序
+// 入参: root 标准根节点, ordered 可选有序内容索引, limits 资源上限, ctx 取消Context
+// 返回: []byte XML数据, error 取消、字符、结构或预算错误
+func createdMarkupContent(root *xmlElement, ordered map[*xmlElement][]xmlContent, limits Limits, ctx context.Context) ([]byte, error) {
+	if hasPreservedMarkup(root, root.Name.Space) {
+		return createdPreservedMarkup(root, ordered, limits, ctx)
+	}
 	node := *root
-	node.Attr = append([]xml.Attr{{Name: xml.Name{Local: "xmlns"}, Value: root.Name.Space}}, root.Attr...)
+	hasDefaultNS := false
+	for _, attr := range root.Attr {
+		if attr.Name == (xml.Name{Local: "xmlns"}) {
+			hasDefaultNS = true
+			break
+		}
+	}
+	if !hasDefaultNS {
+		node.Attr = append([]xml.Attr{{Name: xml.Name{Local: "xmlns"}, Value: root.Name.Space}}, root.Attr...)
+	}
 	root = &node
 	count := 0
 	var validate func(*xmlElement, int) error
@@ -2081,6 +2100,365 @@ func createdMarkup(root *xmlElement, limits Limits, ctx context.Context) ([]byte
 	counted := packageOutput{writer: &output, context: ctx, limit: limit}
 	encoder := xml.NewEncoder(&counted)
 	if err := encodePageNode(encoder, root, ctx); err != nil {
+		return nil, err
+	}
+	if err := encoder.Flush(); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}
+
+// hasPreservedMarkup 检查元素树是否包含需透传的MCE保留元素、保留属性或跨命名空间节点
+// 入参: node 当前元素, defaultNS 根默认命名空间
+// 返回: bool 是否需要走保留扩展序列化路径
+func hasPreservedMarkup(node *xmlElement, defaultNS string) bool {
+	if node == nil {
+		return false
+	}
+	if len(node.PreservedElements) != 0 || len(node.PreservedAttributes) != 0 || node.Name.Space != defaultNS {
+		return true
+	}
+	for _, child := range node.Children {
+		if hasPreservedMarkup(child, defaultNS) {
+			return true
+		}
+	}
+	return false
+}
+
+// createdPreservedMarkup 构造带MCE保留元素、保留属性与命名空间声明的独立XML输出，不修改输入树
+// 入参: root 根节点, ordered 可选有序内容索引, limits 资源上限, ctx 取消Context
+// 返回: []byte 独立UTF-8 XML, error 字符、命名空间、预算或取消错误
+func createdPreservedMarkup(root *xmlElement, ordered map[*xmlElement][]xmlContent, limits Limits, ctx context.Context) ([]byte, error) {
+	defaultNS := root.Name.Space
+	prefixes := make(map[string]string)
+	used := map[string]bool{"xml": true, "xmlns": true}
+	extSeq := 0
+	bindPrefix := func(uri string, hints map[string]string) (string, error) {
+		if uri == "" {
+			return "", nil
+		}
+		if uri == xmlNamespace {
+			return "xml", nil
+		}
+		if uri == xmlnsNamespace {
+			return "", fmt.Errorf("%w: reserved XML namespace binding", ErrInvalid)
+		}
+		if existing, ok := prefixes[uri]; ok {
+			return existing, nil
+		}
+		if uri == mcNamespace && !used["mc"] {
+			prefixes[uri], used["mc"] = "mc", true
+			return "mc", nil
+		}
+		if len(hints) != 0 {
+			for _, prefix := range slices.Sorted(maps.Keys(hints)) {
+				if prefix != "" && prefix != "xml" && prefix != "xmlns" && hints[prefix] == uri && xmlNCName(prefix) && !used[prefix] {
+					prefixes[uri], used[prefix] = prefix, true
+					return prefix, nil
+				}
+			}
+		}
+		for {
+			extSeq++
+			cand := "ext" + strconv.Itoa(extSeq)
+			if !used[cand] {
+				prefixes[uri], used[cand] = cand, true
+				return cand, nil
+			}
+		}
+	}
+	ignorable := make(map[string]bool)
+	preserveElems := make(map[string]bool)
+	preserveAttrs := make(map[string]bool)
+	count := 0
+	var scanPreserved func(*xmlElement, map[string]string, int) error
+	scanPreserved = func(node *xmlElement, fallbackNS map[string]string, depth int) error {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		count++
+		if count > limits.MaxXMLNodes || depth > limits.MaxXMLDepth {
+			return fmt.Errorf("%w: generated XML complexity", ErrLimit)
+		}
+		if !xmlTextValid(node.Text) {
+			return fmt.Errorf("%w: invalid generated XML text", ErrInvalid)
+		}
+		hints := node.Namespaces
+		if len(hints) == 0 {
+			hints = fallbackNS
+		}
+		if node.Name.Space != "" && node.Name.Space != defaultNS {
+			if _, err := bindPrefix(node.Name.Space, hints); err != nil {
+				return err
+			}
+		}
+		for _, attr := range node.Attr {
+			if !xmlTextValid(attr.Value) {
+				return fmt.Errorf("%w: invalid generated XML attribute", ErrInvalid)
+			}
+			if attr.Name.Space == "" || attr.Name.Space == xmlnsNamespace || attr.Name.Space == xmlNamespace {
+				continue
+			}
+			if _, err := bindPrefix(attr.Name.Space, hints); err != nil {
+				return err
+			}
+		}
+		for _, attr := range node.PreservedAttributes {
+			if !xmlTextValid(attr.Value) {
+				return fmt.Errorf("%w: invalid generated XML attribute", ErrInvalid)
+			}
+			if attr.Name.Space != "" && attr.Name.Space != xmlNamespace {
+				if _, err := bindPrefix(attr.Name.Space, hints); err != nil {
+					return err
+				}
+			}
+		}
+		for _, child := range node.Children {
+			if err := scanPreserved(child, hints, depth+1); err != nil {
+				return err
+			}
+		}
+		for _, item := range node.PreservedElements {
+			if err := scanPreserved(item, hints, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	var scanConsumed func(*xmlElement, int) error
+	scanConsumed = func(node *xmlElement, depth int) error {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		count++
+		if count > limits.MaxXMLNodes || depth > limits.MaxXMLDepth {
+			return fmt.Errorf("%w: generated XML complexity", ErrLimit)
+		}
+		if !xmlTextValid(node.Text) || len(node.Children) != 0 && !xmlWhitespace(node.Text) {
+			return fmt.Errorf("%w: invalid or ambiguous generated XML text", ErrInvalid)
+		}
+		if node.Name.Space != "" && node.Name.Space != defaultNS {
+			if _, err := bindPrefix(node.Name.Space, node.Namespaces); err != nil {
+				return err
+			}
+		}
+		for _, attr := range node.Attr {
+			if !xmlTextValid(attr.Value) {
+				return fmt.Errorf("%w: invalid generated XML attribute", ErrInvalid)
+			}
+			if attr.Name.Space == "" || attr.Name.Space == xmlnsNamespace || attr.Name.Space == xmlNamespace || attr.Name.Space == node.Name.Space+"/resourcedictionary-key" {
+				continue
+			}
+			if _, err := bindPrefix(attr.Name.Space, node.Namespaces); err != nil {
+				return err
+			}
+		}
+		for _, attr := range node.PreservedAttributes {
+			if !xmlTextValid(attr.Value) {
+				return fmt.Errorf("%w: invalid generated XML attribute", ErrInvalid)
+			}
+			if attr.Name.Space != "" && attr.Name.Space != xmlNamespace {
+				prefix, err := bindPrefix(attr.Name.Space, node.Namespaces)
+				if err != nil {
+					return err
+				}
+				ignorable[prefix] = true
+				preserveAttrs[prefix+":"+attr.Name.Local] = true
+			}
+		}
+		for _, item := range node.PreservedElements {
+			hints := item.Namespaces
+			if len(hints) == 0 {
+				hints = node.Namespaces
+			}
+			if item.Name.Space != "" {
+				prefix, err := bindPrefix(item.Name.Space, hints)
+				if err != nil {
+					return err
+				}
+				ignorable[prefix] = true
+				preserveElems[prefix+":"+item.Name.Local] = true
+			}
+			if err := scanPreserved(item, node.Namespaces, depth+1); err != nil {
+				return err
+			}
+		}
+		for _, child := range node.Children {
+			if err := scanConsumed(child, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := scanConsumed(root, 1); err != nil {
+		return nil, err
+	}
+	mcPrefix := ""
+	if len(ignorable) != 0 {
+		var err error
+		mcPrefix, err = bindPrefix(mcNamespace, root.Namespaces)
+		if err != nil {
+			return nil, err
+		}
+	}
+	limit := min(limits.MaxPartBytes, limits.MaxPackageBytes)
+	if root.Name.Space == opcTypesNS || root.Name.Space == opcRelsNS {
+		limit = min(limit, limits.MaxMetadataBytes)
+	}
+	var output bytes.Buffer
+	counted := packageOutput{writer: &output, context: ctx, limit: limit}
+	encoder := xml.NewEncoder(&counted)
+	var encodeNode func(*xmlElement, bool, bool, bool) error
+	encodeNode = func(node *xmlElement, isRoot, isPreserved, emptyDefault bool) error {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		localName := node.Name.Local
+		needEmptyDefault := false
+		if node.Name.Space == "" {
+			if isPreserved && !emptyDefault {
+				needEmptyDefault = true
+			}
+		} else if node.Name.Space != defaultNS || emptyDefault {
+			if prefix := prefixes[node.Name.Space]; prefix != "" {
+				localName = prefix + ":" + node.Name.Local
+			}
+		}
+		start := xml.StartElement{Name: xml.Name{Local: localName}}
+		if isRoot {
+			if defaultNS != "" {
+				if err := xmlNamespaceOutput("", defaultNS); err != nil {
+					return err
+				}
+				start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: defaultNS})
+			}
+			type nsEntry struct {
+				prefix string
+				uri    string
+			}
+			entries := make([]nsEntry, 0, len(prefixes))
+			for uri, prefix := range prefixes {
+				entries = append(entries, nsEntry{prefix: prefix, uri: uri})
+			}
+			slices.SortFunc(entries, func(a, b nsEntry) int { return strings.Compare(a.prefix, b.prefix) })
+			for _, entry := range entries {
+				if err := xmlNamespaceOutput(entry.prefix, entry.uri); err != nil {
+					return err
+				}
+				start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xmlns:" + entry.prefix}, Value: entry.uri})
+			}
+			if len(ignorable) != 0 {
+				start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: mcPrefix + ":Ignorable"}, Value: strings.Join(slices.Sorted(maps.Keys(ignorable)), " ")})
+				if len(preserveElems) != 0 {
+					start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: mcPrefix + ":PreserveElements"}, Value: strings.Join(slices.Sorted(maps.Keys(preserveElems)), " ")})
+				}
+				if len(preserveAttrs) != 0 {
+					start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: mcPrefix + ":PreserveAttributes"}, Value: strings.Join(slices.Sorted(maps.Keys(preserveAttrs)), " ")})
+				}
+			}
+		} else if needEmptyDefault {
+			start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: ""})
+		}
+		appendAttr := func(attr xml.Attr) {
+			switch attr.Name.Space {
+			case xmlnsNamespace:
+				return
+			case "":
+				if attr.Name.Local == "xmlns" {
+					return
+				}
+			case xmlNamespace:
+				attr.Name = xml.Name{Local: "xml:" + attr.Name.Local}
+			default:
+				if attr.Name.Space == node.Name.Space+"/resourcedictionary-key" {
+					attr.Name = xml.Name{Local: "r:" + attr.Name.Local}
+				} else if prefix := prefixes[attr.Name.Space]; prefix != "" {
+					attr.Name = xml.Name{Local: prefix + ":" + attr.Name.Local}
+				}
+			}
+			start.Attr = append(start.Attr, attr)
+		}
+		for _, attr := range node.Attr {
+			appendAttr(attr)
+		}
+		for _, attr := range node.PreservedAttributes {
+			appendAttr(attr)
+		}
+		if err := encoder.EncodeToken(start); err != nil {
+			return err
+		}
+		childEmptyDefault := emptyDefault || needEmptyDefault
+		if ordered != nil {
+			if items, ok := ordered[node]; ok {
+				allowedChild := make(map[*xmlElement]bool, len(node.Children))
+				for _, child := range node.Children {
+					allowedChild[child] = true
+				}
+				allowedPreserved := make(map[*xmlElement]bool, len(node.PreservedElements))
+				for _, item := range node.PreservedElements {
+					allowedPreserved[item] = true
+				}
+				emitted := make(map[*xmlElement]bool, len(node.Children)+len(node.PreservedElements))
+				for _, item := range items {
+					if item.element != nil {
+						if allowedChild[item.element] {
+							emitted[item.element] = true
+							if err := encodeNode(item.element, false, isPreserved, childEmptyDefault); err != nil {
+								return err
+							}
+						} else if allowedPreserved[item.element] {
+							emitted[item.element] = true
+							if err := encodeNode(item.element, false, true, childEmptyDefault); err != nil {
+								return err
+							}
+						}
+						continue
+					}
+					if isPreserved {
+						if data, ok := item.token.(xml.CharData); ok && !xmlTextValid(string(data)) {
+							return fmt.Errorf("%w: invalid generated XML text", ErrInvalid)
+						}
+						if err := encoder.EncodeToken(item.token); err != nil {
+							return err
+						}
+					}
+				}
+				for _, child := range node.Children {
+					if !emitted[child] {
+						if err := encodeNode(child, false, isPreserved, childEmptyDefault); err != nil {
+							return err
+						}
+					}
+				}
+				for _, item := range node.PreservedElements {
+					if !emitted[item] {
+						if err := encodeNode(item, false, true, childEmptyDefault); err != nil {
+							return err
+						}
+					}
+				}
+				return encoder.EncodeToken(start.End())
+			}
+		}
+		if node.Text != "" {
+			if err := encoder.EncodeToken(xml.CharData(node.Text)); err != nil {
+				return err
+			}
+		}
+		for _, child := range node.Children {
+			if err := encodeNode(child, false, isPreserved, childEmptyDefault); err != nil {
+				return err
+			}
+		}
+		for _, item := range node.PreservedElements {
+			if err := encodeNode(item, false, true, childEmptyDefault); err != nil {
+				return err
+			}
+		}
+		return encoder.EncodeToken(start.End())
+	}
+	if err := encodeNode(root, true, false, false); err != nil {
 		return nil, err
 	}
 	if err := encoder.Flush(); err != nil {

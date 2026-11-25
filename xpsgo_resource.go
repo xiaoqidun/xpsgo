@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"maps"
 	"mime"
@@ -68,7 +69,6 @@ type resourceParser struct {
 	load    resourceLoader
 	graph   *resourceGraph
 	remote  map[string]*resourceScope
-	active  map[string]bool
 	nodes   int
 }
 
@@ -143,6 +143,16 @@ type resourceMergeBudget struct {
 	context context.Context
 }
 
+// resourceMarkupScopeTracker 在词元遍历期间维护MCE作用域栈，识别合法可忽略及保留扩展
+type resourceMarkupScopeTracker struct {
+	format         Format
+	models         bool
+	processor      compatibilityProcessor
+	scopes         []compatibilityScope
+	ignoredDepth   int
+	preservedDepth int
+}
+
 // ResourceRemoval 记录移除的标准资源及其逻辑字节数，包含一并移除的附属关系标记
 // Bytes不是ZIP压缩后的节省量；不会把非资源附件或签名部件当作清理候选
 type ResourceRemoval struct {
@@ -181,7 +191,7 @@ func parseResourceGraphContext(part string, root *xmlElement, format Format, lim
 	p := &resourceParser{
 		format: format, limits: limits, load: load, context: ctx,
 		graph:  &resourceGraph{PagePart: canonical, Bindings: make(map[*xmlElement]map[string]*resourceDefinition), Parts: make(map[*xmlElement]string)},
-		remote: make(map[string]*resourceScope), active: make(map[string]bool),
+		remote: make(map[string]*resourceScope),
 	}
 	if err := p.walk(root, canonical, nil, false, false, 1); err != nil {
 		return nil, err
@@ -302,7 +312,7 @@ func (p *resourceParser) walk(node *xmlElement, part string, scope *resourceScop
 				return resourceError(part, child, "resource container requires exactly one dictionary")
 			}
 			var err error
-			childScope, err = p.dictionary(child.Children[0], part, scope, remote, false, depth+2)
+			childScope, err = p.dictionary(child.Children[0], part, scope, remote, depth+2)
 			if err != nil {
 				return err
 			}
@@ -329,9 +339,9 @@ func (p *resourceParser) walk(node *xmlElement, part string, scope *resourceScop
 }
 
 // dictionary 顺序解析资源字典，定义的引用解析完成后才将其键加入作用域
-// 入参: node 字典元素, part 定义部件, parent 外层作用域, remote 是否为远程内容, root 是否为远程部件根, depth 当前深度
+// 入参: node 字典元素, part 定义部件, parent 外层作用域, remote 是否为远程内容, depth 当前深度
 // 返回: *resourceScope 已完成的字典作用域, error 字典或引用错误
-func (p *resourceParser) dictionary(node *xmlElement, part string, parent *resourceScope, remote, root bool, depth int) (*resourceScope, error) {
+func (p *resourceParser) dictionary(node *xmlElement, part string, parent *resourceScope, remote bool, depth int) (*resourceScope, error) {
 	if err := p.enter(node, part, depth); err != nil {
 		return nil, err
 	}
@@ -342,8 +352,8 @@ func (p *resourceParser) dictionary(node *xmlElement, part string, parent *resou
 		return nil, &PartError{Part: part, Element: node.Name.Local, Err: err}
 	}
 	if source, ok := node.attribute("Source"); ok {
-		if len(node.Children) != 0 || remote && !root {
-			return nil, resourceError(part, node, "Source forbids local definitions and remote definition descendants cannot import dictionaries")
+		if len(node.Children) != 0 || remote {
+			return nil, resourceError(part, node, "Source forbids local definitions and remote resource dictionaries cannot specify Source")
 		}
 		target, err := resolvePart(part, strings.Trim(source, " \t\r\n"))
 		if err != nil {
@@ -374,17 +384,14 @@ func (p *resourceParser) dictionary(node *xmlElement, part string, parent *resou
 	return scope, nil
 }
 
-// loadRemote 隔离页面作用域加载远程字典并检测部件引用循环
+// loadRemote 隔离页面作用域加载远程字典并按部件名缓存解析结果
 // 入参: part 规范化部件URI, depth 当前深度
-// 返回: *resourceScope 独立远程作用域, error 部件或循环错误
+// 返回: *resourceScope 独立远程作用域, error 部件、加载或预算错误
 func (p *resourceParser) loadRemote(part string, depth int) (*resourceScope, error) {
 	if err := checkContext(p.context); err != nil {
 		return nil, err
 	}
 	key := strings.ToLower(part)
-	if p.active[key] {
-		return nil, &PartError{Part: part, Err: fmt.Errorf("%w: cyclic resource dictionary Source", ErrInvalid)}
-	}
 	if cached := p.remote[key]; cached != nil {
 		return cached, nil
 	}
@@ -394,14 +401,12 @@ func (p *resourceParser) loadRemote(part string, depth int) (*resourceScope, err
 	if p.load == nil {
 		return nil, &PartError{Part: part, Err: fmt.Errorf("%w: remote dictionary loader unavailable", ErrUnsupported)}
 	}
-	p.active[key] = true
-	defer delete(p.active, key)
 	p.graph.RemoteParts = append(p.graph.RemoteParts, part)
 	node, err := p.load(part)
 	if err != nil {
 		return nil, err
 	}
-	scope, err := p.dictionary(node, part, nil, true, true, depth)
+	scope, err := p.dictionary(node, part, nil, true, depth)
 	if err != nil {
 		return nil, err
 	}
@@ -856,17 +861,27 @@ func rewriteResourceAttribute(source string, node *xmlElement, attribute xml.Att
 // 返回: []byte 比较数据, string 需保留的部件身份，空值可跨部件比较, error XML、引用或预算错误
 func resourceDictionaryIdentity(part packagePart, format Format, limits Limits, budget *resourceMergeBudget, aliases map[string]string) ([]byte, string, error) {
 	scope := ""
+	tracker := newResourceMarkupScopeTracker(format, false, budget.context)
 	_, err := decodeXMLVisit(part.data, limits, func(token xml.Token, node *xmlElement) error {
+		skip, mceScope, err := tracker.visit(token, node)
+		if err != nil {
+			return err
+		}
 		if _, start := token.(xml.StartElement); !start {
 			return nil
 		}
 		if err := budget.charge(1); err != nil {
 			return err
 		}
-		if err := validateResourceMarkupElement(node, format); err != nil {
-			return err
+		if skip {
+			scope = strings.ToLower(part.name)
+			return nil
 		}
 		for _, a := range node.Attr {
+			if a.Name.Space != "" && mceScope.ignorable[a.Name.Space] {
+				scope = strings.ToLower(part.name)
+				continue
+			}
 			if !dictionaryKnownAttribute(node, a, format) {
 				scope = strings.ToLower(part.name)
 			}
@@ -1089,10 +1104,17 @@ func resolveDictionaryNavigations(dictPart string, values, pageHosts []string, a
 	return nil
 }
 
-// resourceReferenceGraph 构造原始部件引用图，供清理及资源生存期校验使用
+// resourceReferenceGraph 构造原始部件引用图，包含资源、关系及导航引用边
 // 入参: budget 扫描及遍历预算
 // 返回: *resourceReachability 已校验引用图, error 标记、引用或预算错误
 func (r *Reader) resourceReferenceGraph(budget *resourceMergeBudget) (*resourceReachability, error) {
+	return r.resourceReferenceGraphMode(budget, true)
+}
+
+// resourceReferenceGraphMode 构造原始部件引用图，可按需排除超链接导航边以供资源生存期校验使用
+// 入参: budget 扫描及遍历预算, includeNavigation 是否纳入FixedPage.NavigateUri及OutlineTarget导航边
+// 返回: *resourceReachability 已校验引用图, error 标记、引用或预算错误
+func (r *Reader) resourceReferenceGraphMode(budget *resourceMergeBudget, includeNavigation bool) (*resourceReachability, error) {
 	if err := budget.charge(len(r.pkg.parts)); err != nil {
 		return nil, err
 	}
@@ -1202,18 +1224,26 @@ func (r *Reader) resourceReferenceGraph(budget *resourceMergeBudget) (*resourceR
 		}
 		dictionary := strings.EqualFold(media, resourceDictionaryContentType)
 		modelMarkup := false
+		tracker := newResourceMarkupScopeTracker(r.format, true, budget.context)
 		root, err := decodeXMLVisit(data, r.limits, func(token xml.Token, node *xmlElement) error {
+			if discard {
+				if _, start := token.(xml.StartElement); !start {
+					return nil
+				}
+				return budget.charge(1)
+			}
+			skip, _, err := tracker.visit(token, node)
+			if err != nil {
+				return err
+			}
 			if _, start := token.(xml.StartElement); !start {
 				return nil
 			}
 			if err := budget.charge(1); err != nil {
 				return err
 			}
-			if discard {
+			if skip {
 				return nil
-			}
-			if err := validateResourceMarkup(node, r.format, true); err != nil {
-				return err
 			}
 			modelMarkup = modelMarkup || node.Name.Space == openXPS3DNamespace
 			for _, a := range node.Attr {
@@ -1248,7 +1278,7 @@ func (r *Reader) resourceReferenceGraph(budget *resourceMergeBudget) (*resourceR
 						return err
 					}
 				}
-				if resourceIdentityAttribute(node, a, r.format) {
+				if includeNavigation && resourceIdentityAttribute(node, a, r.format) {
 					if dictionary && a.Name.Local == "FixedPage.NavigateUri" {
 						dictNavigations[key] = append(dictNavigations[key], a.Value)
 						continue
@@ -1509,7 +1539,7 @@ func resourceNavigationPart(source, value string) (string, error) {
 	return resolvePart(source, uri.EscapedPath())
 }
 
-// resourceDiscardIdentities 校验释放提示并保留目标与哨兵部件身份，拒绝未知扩展语义
+// resourceDiscardIdentities 校验释放提示并保留目标与哨兵部件身份，放行合法可忽略扩展并拒绝未声明未知语义
 // 入参: root 原始提示标记, part 提示部件, format 当前格式, reserved 保留身份集合, budget 累计预算
 // 返回: error 标记、未理解扩展或预算错误
 func resourceDiscardIdentities(root *xmlElement, part string, format Format, reserved map[string]bool, budget *resourceMergeBudget) error {
@@ -1517,10 +1547,41 @@ func resourceDiscardIdentities(root *xmlElement, part string, format Format, res
 		return err
 	}
 	namespace := formatNamespace(format) + "/discard-control"
-	var visit func(*xmlElement) error
-	visit = func(node *xmlElement) error {
+	processor := compatibilityProcessor{understood: map[string]bool{namespace: true, mcNamespace: true, xmlNamespace: true}, context: budget.context}
+	var visit func(*xmlElement, compatibilityScope) error
+	visit = func(node *xmlElement, inherited compatibilityScope) error {
 		if err := budget.charge(1); err != nil {
 			return err
+		}
+		scope := inherited
+		if format == FormatOpenXPS {
+			for _, attr := range node.Attr {
+				if attr.Name.Space == mcNamespace && !slices.Contains([]string{"Ignorable", "MustUnderstand", "ProcessContent", "PreserveElements", "PreserveAttributes"}, attr.Name.Local) {
+					return fmt.Errorf("%w: preserved discard compatibility attribute %s", ErrUnsupported, attr.Name.Local)
+				}
+			}
+			isBranch := node.Name.Space == mcNamespace && (node.Name.Local == "Choice" || node.Name.Local == "Fallback")
+			var err error
+			scope, err = processor.rulesChecked(node, inherited, !isBranch)
+			if err != nil {
+				if errors.Is(err, ErrInvalid) {
+					return fmt.Errorf("%w: %v", ErrUnsupported, err)
+				}
+				return err
+			}
+		}
+		if node.Name.Space != namespace && node.Name.Space != mcNamespace {
+			if format == FormatOpenXPS && scope.ignorable[node.Name.Space] {
+				if scope.processes(node.Name) {
+					for _, child := range node.Children {
+						if err := visit(child, scope); err != nil {
+							return err
+						}
+					}
+				}
+				return nil
+			}
+			return fmt.Errorf("%w: preserved discard namespace %q", ErrUnsupported, node.Name.Space)
 		}
 		if !xmlWhitespace(node.Text) {
 			return fmt.Errorf("%w: preserved discard text", ErrUnsupported)
@@ -1529,7 +1590,7 @@ func resourceDiscardIdentities(root *xmlElement, part string, format Format, res
 			if node.Name.Local != "DiscardControl" && node.Name.Local != "Discard" {
 				return fmt.Errorf("%w: preserved discard element %s", ErrUnsupported, node.Name.Local)
 			}
-		} else if node.Name.Space != mcNamespace || !slices.Contains([]string{"AlternateContent", "Choice", "Fallback"}, node.Name.Local) {
+		} else if !slices.Contains([]string{"AlternateContent", "Choice", "Fallback"}, node.Name.Local) {
 			return fmt.Errorf("%w: preserved discard namespace %q", ErrUnsupported, node.Name.Space)
 		}
 		for _, attr := range node.Attr {
@@ -1540,6 +1601,9 @@ func resourceDiscardIdentities(root *xmlElement, part string, format Format, res
 				if !slices.Contains([]string{"Ignorable", "MustUnderstand", "ProcessContent", "PreserveElements", "PreserveAttributes"}, attr.Name.Local) {
 					return fmt.Errorf("%w: preserved discard compatibility attribute %s", ErrUnsupported, attr.Name.Local)
 				}
+				continue
+			}
+			if format == FormatOpenXPS && attr.Name.Space != "" && scope.ignorable[attr.Name.Space] {
 				continue
 			}
 			known := node.Name.Space == namespace && node.Name.Local == "Discard" && (attr.Name.Local == "Target" || attr.Name.Local == "SentinelPage") || node.Name.Space == mcNamespace && node.Name.Local == "Choice" && attr.Name.Local == "Requires"
@@ -1557,13 +1621,13 @@ func resourceDiscardIdentities(root *xmlElement, part string, format Format, res
 			}
 		}
 		for _, child := range node.Children {
-			if err := visit(child); err != nil {
+			if err := visit(child, scope); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	return visit(root)
+	return visit(root, compatibilityScope{})
 }
 
 // resourceModelMedia 识别OpenXPS定义的X3D媒体类型，不按文件后缀猜测模型或接受类型参数
@@ -1616,25 +1680,114 @@ func (r *Reader) hasResourceModels(budget *resourceMergeBudget) (bool, error) {
 	return false, nil
 }
 
-// validateResourceMarkupElement 校验原始布局标记的语义覆盖，不过滤保留分支或加载字体数据
-// 入参: node 原始元素, format 包格式
-// 返回: error 未理解的保留元素、属性或XML作用域错误
-func validateResourceMarkupElement(node *xmlElement, format Format) error {
-	return validateResourceMarkup(node, format, false)
+// newResourceMarkupScopeTracker 创建用于词元遍历的MCE作用域跟踪器，支持合法可忽略及保留扩展校验
+// 入参: format 包格式, models 是否识别3D模型画刷, ctx 取消Context
+// 返回: *resourceMarkupScopeTracker 作用域跟踪器
+func newResourceMarkupScopeTracker(format Format, models bool, ctx context.Context) *resourceMarkupScopeTracker {
+	namespace := formatNamespace(format)
+	understood := map[string]bool{
+		namespace:                             true,
+		namespace + "/resourcedictionary-key": true,
+		structureNamespace(format):            true,
+		mcNamespace:                           true,
+		xmlNamespace:                          true,
+	}
+	if models && format == FormatOpenXPS {
+		understood[openXPS3DNamespace] = true
+	}
+	return &resourceMarkupScopeTracker{format: format, models: models, processor: compatibilityProcessor{understood: understood, context: ctx}}
 }
 
-// validateResourceMarkup 校验原始布局标记的保留语义，可按需启用3D模型画刷识别
-// 入参: node 原始元素, format 包格式, models 是否识别模型画刷的保留语义
+// visit 跟踪词元进出栈的MCE作用域，放行合法可忽略扩展并校验保留元素内部MustUnderstand及属性规则
+// 入参: token 当前XML词元, node 当前元素节点
+// 返回: bool 是否应跳过消费标记语义扫描, compatibilityScope 当前元素生效作用域, error 兼容性或未支持语义错误
+func (t *resourceMarkupScopeTracker) visit(token xml.Token, node *xmlElement) (bool, compatibilityScope, error) {
+	if _, end := token.(xml.EndElement); end {
+		if len(t.scopes) != 0 {
+			if t.ignoredDepth == len(t.scopes) {
+				t.ignoredDepth = 0
+			}
+			if t.preservedDepth == len(t.scopes) {
+				t.preservedDepth = 0
+			}
+			t.scopes = t.scopes[:len(t.scopes)-1]
+		}
+		return true, compatibilityScope{}, nil
+	}
+	if _, start := token.(xml.StartElement); !start {
+		return true, compatibilityScope{}, nil
+	}
+	inherited := compatibilityScope{}
+	if len(t.scopes) != 0 {
+		inherited = t.scopes[len(t.scopes)-1]
+	}
+	if t.ignoredDepth > 0 {
+		scope := inherited
+		if t.preservedDepth > 0 {
+			isControl := node.Name.Space == mcNamespace
+			isBranch := isControl && (node.Name.Local == "Choice" || node.Name.Local == "Fallback")
+			var err error
+			scope, err = t.processor.rulesChecked(node, inherited, !isBranch)
+			if err != nil {
+				return false, scope, err
+			}
+			if isControl && node.Name.Local != "AlternateContent" && !isBranch {
+				return false, scope, fmt.Errorf("%w: unexpected MCE element %s", ErrInvalid, node.Name.Local)
+			}
+			if err := t.processor.validateAttributes(node, scope, isControl); err != nil {
+				return false, scope, err
+			}
+		}
+		t.scopes = append(t.scopes, scope)
+		return true, scope, nil
+	}
+	isControl := node.Name.Space == mcNamespace
+	isBranch := isControl && (node.Name.Local == "Choice" || node.Name.Local == "Fallback")
+	scope, err := t.processor.rulesChecked(node, inherited, !isBranch)
+	if err != nil {
+		return false, scope, err
+	}
+	t.scopes = append(t.scopes, scope)
+	if !t.processor.understood[node.Name.Space] {
+		if !scope.ignorable[node.Name.Space] {
+			return false, scope, fmt.Errorf("%w: preserved resource namespace %q", ErrUnsupported, node.Name.Space)
+		}
+		if scope.processes(node.Name) {
+			if err := compatibilityNoXMLContext(node); err != nil {
+				return false, scope, err
+			}
+			if err := t.processor.validateAttributes(node, scope, false); err != nil {
+				return false, scope, err
+			}
+			return true, scope, nil
+		}
+		if scope.preservesElement(node.Name) {
+			if err := t.processor.validateAttributes(node, scope, false); err != nil {
+				return false, scope, err
+			}
+			t.preservedDepth = len(t.scopes)
+		}
+		t.ignoredDepth = len(t.scopes)
+		return true, scope, nil
+	}
+	if err := validateResourceMarkupScope(node, t.format, t.models, scope); err != nil {
+		return false, scope, err
+	}
+	return false, scope, nil
+}
+
+// validateResourceMarkupScope 在已知MCE作用域下校验原始布局标记，放行当前作用域合法可忽略扩展属性与元素
+// 入参: node 原始元素, format 包格式, models 是否识别模型画刷的保留语义, scope 当前生效MCE作用域
 // 返回: error 未理解标记、属性或XML作用域错误
-func validateResourceMarkup(node *xmlElement, format Format, models bool) error {
+func validateResourceMarkupScope(node *xmlElement, format Format, models bool, scope compatibilityScope) error {
 	namespace := formatNamespace(format)
 	if models && node.Name.Space == openXPS3DNamespace {
-		if format != FormatOpenXPS {
-			return fmt.Errorf("%w: 3D brush outside OpenXPS", ErrUnsupported)
-		}
 		return resourceModelBrushAttributes(node)
 	}
 	if node.Name.Space != namespace && node.Name.Space != structureNamespace(format) && node.Name.Space != mcNamespace {
+		if scope.ignorable[node.Name.Space] {
+			return nil
+		}
 		return fmt.Errorf("%w: preserved resource namespace %q", ErrUnsupported, node.Name.Space)
 	}
 	if node.Name.Space == namespace && !fontUsageElement(node.Name.Local) {
@@ -1643,8 +1796,24 @@ func validateResourceMarkup(node *xmlElement, format Format, models bool) error 
 	if node.Name.Space == structureNamespace(format) && !resourceStructureElement(node.Name.Local) {
 		return fmt.Errorf("%w: preserved structure element %s", ErrUnsupported, node.Name.Local)
 	}
+	isControl := node.Name.Space == mcNamespace
 	for _, attr := range node.Attr {
-		if attr.Name.Space != "" && attr.Name.Space != xmlnsNamespace && attr.Name.Space != xmlNamespace && attr.Name.Space != mcNamespace && attr.Name.Space != namespace+"/resourcedictionary-key" {
+		if attr.Name.Space == xmlnsNamespace || attr.Name == (xml.Name{Local: "xmlns"}) || attr.Name.Space == mcNamespace {
+			continue
+		}
+		if attr.Name.Space != "" && scope.ignorable[attr.Name.Space] {
+			continue
+		}
+		if isControl {
+			if attr.Name.Space == "" && node.Name.Local == "Choice" && attr.Name.Local == "Requires" {
+				continue
+			}
+			if attr.Name.Space == "" || attr.Name.Space == xmlNamespace || attr.Name.Space == namespace || attr.Name.Space == structureNamespace(format) || attr.Name.Space == namespace+"/resourcedictionary-key" {
+				return fmt.Errorf("%w: attribute {%s}%s on MCE %s", ErrInvalid, attr.Name.Space, attr.Name.Local, node.Name.Local)
+			}
+			return fmt.Errorf("%w: preserved resource attribute {%s}%s", ErrUnsupported, attr.Name.Space, attr.Name.Local)
+		}
+		if attr.Name.Space != "" && attr.Name.Space != xmlNamespace && attr.Name.Space != namespace+"/resourcedictionary-key" {
 			return fmt.Errorf("%w: preserved resource attribute {%s}%s", ErrUnsupported, attr.Name.Space, attr.Name.Local)
 		}
 		if attr.Name.Space == xmlNamespace && attr.Name.Local != "lang" {
@@ -1663,7 +1832,9 @@ func validateResourceMarkup(node *xmlElement, format Format, models bool) error 
 	if node.Name.Space == namespace && slices.Contains([]string{"Canvas", "Path", "Glyphs"}, node.Name.Local) {
 		value := *node
 		value.Children = nil
-		value.Attr = slices.DeleteFunc(slices.Clone(node.Attr), func(a xml.Attr) bool { return a.Name.Space == mcNamespace })
+		value.Attr = slices.DeleteFunc(slices.Clone(node.Attr), func(a xml.Attr) bool {
+			return a.Name.Space == mcNamespace || a.Name.Space != "" && scope.ignorable[a.Name.Space]
+		})
 		if _, err := visualAttributes(&value, format); err != nil {
 			return err
 		}

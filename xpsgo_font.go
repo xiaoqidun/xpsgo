@@ -1776,12 +1776,18 @@ func (r *Reader) FontUsage(ctx context.Context, options *OptimizationOptions) ([
 			return nil, err
 		}
 		c.fonts.remaining -= int64(len(data))
+		tracker := newResourceMarkupScopeTracker(r.format, false, ctx)
 		root, err := decodeXMLVisit(data, r.limits, func(token xml.Token, node *xmlElement) error {
+			if _, start := token.(xml.StartElement); start {
+				if err := c.charge(1); err != nil {
+					return err
+				}
+			}
+			if _, _, err := tracker.visit(token, node); err != nil {
+				return err
+			}
 			if _, start := token.(xml.StartElement); !start {
 				return nil
-			}
-			if err := c.charge(1); err != nil {
-				return err
 			}
 			return c.element(part, node)
 		})
@@ -1829,16 +1835,19 @@ func (c *fontUsageCollector) charge(count int) error {
 	return nil
 }
 
-// element 校验原始标记的支持范围并汇总字形，不过滤兼容分支或不可见内容
+// element 校验Glyphs原始属性并汇总字形，不过滤兼容分支或不可见内容
 // 入参: part 标记所属部件, node 原始节点
 // 返回: error 未理解标记或字形选择错误
 func (c *fontUsageCollector) element(part string, node *xmlElement) error {
-	if err := validateResourceMarkupElement(node, c.reader.format); err != nil {
-		return err
-	}
 	namespace := formatNamespace(c.reader.format)
 	if node.Name != (xml.Name{Space: namespace, Local: "Glyphs"}) {
 		return nil
+	}
+	keyNS := namespace + "/resourcedictionary-key"
+	for _, attr := range node.Attr {
+		if attr.Name.Space != "" && attr.Name.Space != xmlnsNamespace && attr.Name.Space != namespace && attr.Name.Space != keyNS && attr.Name.Space != mcNamespace && attr.Name.Space != xmlNamespace {
+			return fmt.Errorf("%w: ignorable extension attribute %s", ErrUnsupported, attr.Name.Local)
+		}
 	}
 	value := *node
 	value.Children = nil

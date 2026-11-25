@@ -997,7 +997,7 @@ func (w *zipMetadataWriter) CreateRaw(header *zip.FileHeader) (io.Writer, error)
 		return nil, err
 	}
 	extra := len(header.Extra)
-	if header.Flags&8 == 0 && (header.CompressedSize64 > 1<<32-1 || header.UncompressedSize64 > 1<<32-1) {
+	if header.Flags&8 == 0 && (header.CompressedSize64 >= 1<<32-1 || header.UncompressedSize64 >= 1<<32-1) {
 		extra += 20
 	}
 	if err := validateZIPMetadata(len(header.Name), extra, 0); err != nil {

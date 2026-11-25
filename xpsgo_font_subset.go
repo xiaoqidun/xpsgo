@@ -25,6 +25,7 @@ import (
 	"math"
 	"math/bits"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -156,16 +157,23 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, config
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	os2, err := parseFontOS2Metrics(face)
-	if err != nil {
-		return nil, err
+	var os2 *fontOS2Metrics
+	if _, hasOS2 := face.tables["OS/2"]; hasOS2 || !fontIsBitmapOnly(face) {
+		var err error
+		os2, err = parseFontOS2Metrics(face)
+		if err != nil {
+			return nil, err
+		}
+		rights, err := fontEmbeddingRights(os2)
+		if err != nil {
+			return nil, err
+		}
+		if rights&0x302 != 0 {
+			return nil, fmt.Errorf("%w: font embedding or subsetting restriction", ErrRestricted)
+		}
 	}
-	rights, err := fontEmbeddingRights(os2)
-	if err != nil {
-		return nil, err
-	}
-	if rights&0x302 != 0 {
-		return nil, fmt.Errorf("%w: font embedding or subsetting restriction", ErrRestricted)
+	if fontIsBitmapOnly(face) {
+		return nil, fmt.Errorf("%w: bitmap-only font subsetting", ErrUnsupported)
 	}
 	for _, tag := range []string{"fvar", "COLR", "SVG "} {
 		if _, present := face.tables[tag]; present {
@@ -453,7 +461,7 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 		remaining -= len(programs[index])
 	}
 	profile := subsetFontProfile{}
-	var cffBounds [4]int64
+	var cffBounds [4]float64
 	hasCFFBounds := false
 	for _, gid := range queue {
 		geometry := subsetCFFCloneGeometry(selected[gid].geometry)
@@ -475,17 +483,24 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 		}
 		geometry.Figures = slices.DeleteFunc(geometry.Figures, func(figure GeometryFigure) bool { return len(figure.Segments) == 0 })
 		hasOutline := len(geometry.Figures) != 0
-		if hasOutline && !font.cid {
-			cb, err := geometry.Bounds()
+		if hasOutline {
+			bboxGeometry := geometry
+			if font.cid {
+				if fdMatrix := font.fontDict[font.fdSelect[gid]].matrix; fdMatrix != nil {
+					bboxGeometry = subsetCFFCloneGeometry(geometry)
+					if err := fontTransformOutline(&bboxGeometry, *fdMatrix); err != nil {
+						return nil, err
+					}
+				}
+			}
+			cb, err := bboxGeometry.Bounds()
 			if err != nil {
 				return nil, err
 			}
-			cxMin, cyMin := math.Floor(cb.X), math.Floor(cb.Y)
-			cxMax, cyMax := math.Ceil(cb.X+cb.Width), math.Ceil(cb.Y+cb.Height)
-			if cxMin < math.MinInt32 || cyMin < math.MinInt32 || cxMax > math.MaxInt32 || cyMax > math.MaxInt32 {
+			box := [4]float64{cb.X, cb.Y, cb.X + cb.Width, cb.Y + cb.Height}
+			if !geometryFinite(box[0], box[1], box[2], box[3]) {
 				return nil, fmt.Errorf("%w: subset CFF FontBBox range", ErrLimit)
 			}
-			box := [4]int64{int64(cxMin), int64(cyMin), int64(cxMax), int64(cyMax)}
 			if !hasCFFBounds {
 				cffBounds, hasCFFBounds = box, true
 			} else {
@@ -508,15 +523,6 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 		xMax, yMax := math.Ceil(bounds.X+bounds.Width), math.Ceil(bounds.Y+bounds.Height)
 		if xMin < -32768 || yMin < -32768 || xMax > 32767 || yMax > 32767 {
 			return nil, fmt.Errorf("%w: subset CFF bounds outside FWORD", ErrInvalid)
-		}
-		if hasOutline && font.cid {
-			box := [4]int64{int64(xMin), int64(yMin), int64(xMax), int64(yMax)}
-			if !hasCFFBounds {
-				cffBounds, hasCFFBounds = box, true
-			} else {
-				cffBounds[0], cffBounds[1] = min(cffBounds[0], box[0]), min(cffBounds[1], box[1])
-				cffBounds[2], cffBounds[3] = max(cffBounds[2], box[2]), max(cffBounds[3], box[3])
-			}
 		}
 		bounds = Rect{X: xMin, Y: yMin, Width: xMax - xMin, Height: yMax - yMin}
 		if err := profile.addBounds(gid, bounds, hasOutline, metrics); err != nil {
@@ -667,10 +673,10 @@ func encodeSubsetCFFIndex(objects [][]byte, maximum int64) ([]byte, error) {
 	return data, nil
 }
 
-// patchSubsetCFFDict 按固定宽度整数替换指定CFF字典条目并保持其余条目原字节不变
-// 入参: original 原字典, values 替换或补入的整数条目, maximum 输出字节上限
-// 返回: []byte 字典数据, error 原字典、整数范围或字节预算错误
-func patchSubsetCFFDict(original []byte, values map[uint16][]int64, maximum int64) ([]byte, error) {
+// patchSubsetCFFDictReal 按固定宽度整数及浮点数替换指定CFF字典条目并保持其余条目原字节不变
+// 入参: original 原字典, values 替换或补入的固定宽度整数条目, reals 替换或补入的浮点或紧凑整数条目, maximum 输出字节上限
+// 返回: []byte 字典数据, error 原字典、数值范围或字节预算错误
+func patchSubsetCFFDictReal(original []byte, values map[uint16][]int64, reals map[uint16][]float64, maximum int64) ([]byte, error) {
 	if _, err := parseCFFDict(original); err != nil {
 		return nil, err
 	}
@@ -701,6 +707,13 @@ func patchSubsetCFFDict(original []byte, values map[uint16][]int64, maximum int6
 				return nil, err
 			}
 			seen[operator] = true
+		} else if operands, replace := reals[operator]; replace {
+			var err error
+			entry, err = subsetCFFFloatEntry(operator, operands)
+			if err != nil {
+				return nil, err
+			}
+			seen[operator] = true
 		}
 		if int64(len(entry)) > maximum-int64(len(output)) {
 			return nil, fmt.Errorf("%w: subset CFF DICT budget", ErrLimit)
@@ -714,9 +727,20 @@ func patchSubsetCFFDict(original []byte, values map[uint16][]int64, maximum int6
 			missing = append(missing, operator)
 		}
 	}
+	for operator := range reals {
+		if !seen[operator] {
+			missing = append(missing, operator)
+		}
+	}
 	slices.Sort(missing)
 	for _, operator := range missing {
-		entry, err := subsetCFFEntry(operator, values[operator])
+		var entry []byte
+		var err error
+		if operands, ok := values[operator]; ok {
+			entry, err = subsetCFFEntry(operator, operands)
+		} else {
+			entry, err = subsetCFFFloatEntry(operator, reals[operator])
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -746,10 +770,94 @@ func subsetCFFEntry(operator uint16, values []int64) ([]byte, error) {
 	return append(data, byte(operator)), nil
 }
 
-// encodeSubsetCFFWithBBox 重建CFF1表并在提供字符空间包围盒时同步更新Top DICT的FontBBox
+// subsetCFFFloatEntry 编码支持紧凑整数及标准CFF Real浮点操作数的字典条目
+// 入参: operator 字典操作符, values 有限浮点操作数
+// 返回: []byte 字典条目, error 非有限值或编码超限错误
+func subsetCFFFloatEntry(operator uint16, values []float64) ([]byte, error) {
+	var data []byte
+	for _, value := range values {
+		encoded, err := subsetCFFNumberOperand(value)
+		if err != nil {
+			return nil, err
+		}
+		data = append(data, encoded...)
+	}
+	if operator > 255 {
+		data = append(data, byte(operator>>8))
+	}
+	return append(data, byte(operator)), nil
+}
+
+// subsetCFFNumberOperand 按Adobe TN #5176编码单个CFF DICT数值，精确int32整数紧凑写出，其余用byte 30实数编码
+// 入参: value 有限浮点数值
+// 返回: []byte 操作数字节, error 非有限值或长度超限错误
+func subsetCFFNumberOperand(value float64) ([]byte, error) {
+	if !geometryFinite(value) {
+		return nil, fmt.Errorf("%w: subset CFF DICT non-finite number", ErrInvalid)
+	}
+	if value == 0 {
+		return []byte{139}, nil
+	}
+	if math.Trunc(value) == value && value >= math.MinInt32 && value <= math.MaxInt32 {
+		n := int64(value)
+		switch {
+		case n >= -107 && n <= 107:
+			return []byte{byte(n + 139)}, nil
+		case n >= 108 && n <= 1131:
+			v := n - 108
+			return []byte{byte(247 + v/256), byte(v % 256)}, nil
+		case n >= -1131 && n <= -108:
+			v := -n - 108
+			return []byte{byte(251 + v/256), byte(v % 256)}, nil
+		case n >= -32768 && n <= 32767:
+			return []byte{28, byte(n >> 8), byte(n)}, nil
+		default:
+			return binary.BigEndian.AppendUint32([]byte{29}, uint32(int32(n))), nil
+		}
+	}
+	text := strconv.FormatFloat(value, 'g', -1, 64)
+	var nibbles []byte
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+			nibbles = append(nibbles, text[i]-'0')
+		case '.':
+			nibbles = append(nibbles, 10)
+		case '-':
+			nibbles = append(nibbles, 14)
+		case 'e', 'E':
+			if i+1 < len(text) && text[i+1] == '-' {
+				nibbles = append(nibbles, 12)
+				i++
+			} else {
+				nibbles = append(nibbles, 11)
+				if i+1 < len(text) && text[i+1] == '+' {
+					i++
+				}
+			}
+		default:
+			return nil, fmt.Errorf("%w: subset CFF DICT real syntax", ErrInvalid)
+		}
+	}
+	nibbles = append(nibbles, 15)
+	if len(nibbles)%2 != 0 {
+		nibbles = append(nibbles, 15)
+	}
+	if len(nibbles)/2 >= cffMaxRealBytes {
+		return nil, fmt.Errorf("%w: subset CFF DICT real length", ErrLimit)
+	}
+	data := make([]byte, 1+len(nibbles)/2)
+	data[0] = 30
+	for i := 0; i < len(nibbles); i += 2 {
+		data[1+i/2] = nibbles[i]<<4 | nibbles[i+1]
+	}
+	return data, nil
+}
+
+// encodeSubsetCFFWithBBox 重建CFF1表并在提供FontBBox时同步更新Top DICT的FontBBox
 // 入参: ctx 取消Context, font 原CFF字体, programs 按原GID排列的新字形程序, fontBBox 可选四元组FontBBox, options 字节上限
 // 返回: []byte 独立CFF表, error 字典、布局、范围或取消错误
-func encodeSubsetCFFWithBBox(ctx context.Context, font *cffFont, programs [][]byte, fontBBox []int64, options FontSubsetOptions) ([]byte, error) {
+func encodeSubsetCFFWithBBox(ctx context.Context, font *cffFont, programs [][]byte, fontBBox []float64, options FontSubsetOptions) ([]byte, error) {
 	maximum := min(options.MaxBytes, int64(math.MaxInt32))
 	set := font.set
 	_, afterName, err := parseCFFIndex(set.data, uint32(set.data[2]))
@@ -805,8 +913,9 @@ func encodeSubsetCFFWithBBox(ctx context.Context, font *cffFont, programs [][]by
 		return nil, err
 	}
 	values := map[uint16][]int64{15: {0}, 17: {0}}
+	var reals map[uint16][]float64
 	if len(fontBBox) == 4 {
-		values[5] = fontBBox
+		reals = map[uint16][]float64{5: fontBBox}
 	}
 	if font.cid {
 		values[0x0c24], values[0x0c25] = []int64{0}, []int64{0}
@@ -816,7 +925,7 @@ func encodeSubsetCFFWithBBox(ctx context.Context, font *cffFont, programs [][]by
 			values[16] = []int64{0}
 		}
 	}
-	top, err := patchSubsetCFFDict(topObjects[0], values, maximum)
+	top, err := patchSubsetCFFDictReal(topObjects[0], values, reals, maximum)
 	if err != nil {
 		return nil, err
 	}
@@ -886,7 +995,7 @@ func encodeSubsetCFFWithBBox(ctx context.Context, font *cffFont, programs [][]by
 		}
 		values[0x0c25][0] = position
 		for index, dictionary := range dictionaries {
-			dictionaries[index], err = patchSubsetCFFDict(dictionary, map[uint16][]int64{18: {int64(privates[index].size), 0}}, maximum)
+			dictionaries[index], err = patchSubsetCFFDictReal(dictionary, map[uint16][]int64{18: {int64(privates[index].size), 0}}, nil, maximum)
 			if err != nil {
 				return nil, err
 			}
@@ -914,7 +1023,7 @@ func encodeSubsetCFFWithBBox(ctx context.Context, font *cffFont, programs [][]by
 			privatePositions[privateKeys[index]] = position
 		}
 		if font.cid {
-			dictionaries[index], err = patchSubsetCFFDict(dictionaries[index], map[uint16][]int64{18: {int64(private.size), position}}, maximum)
+			dictionaries[index], err = patchSubsetCFFDictReal(dictionaries[index], map[uint16][]int64{18: {int64(private.size), position}}, nil, maximum)
 			if err != nil {
 				return nil, err
 			}
@@ -932,7 +1041,7 @@ func encodeSubsetCFFWithBBox(ctx context.Context, font *cffFont, programs [][]by
 		}
 		copy(output[fdPosition:fdPosition+fdLength], data)
 	}
-	top, err = patchSubsetCFFDict(topObjects[0], values, maximum)
+	top, err = patchSubsetCFFDictReal(topObjects[0], values, reals, maximum)
 	if err != nil {
 		return nil, err
 	}
@@ -1008,11 +1117,11 @@ func buildSubsetCFFPrivate(source []byte, fd cffFontDict, maximum int64) (subset
 	if _, present := fd.private.dict.value(19); !present {
 		return subsetCFFPrivate{size: len(original), data: original}, nil
 	}
-	dict, err := patchSubsetCFFDict(original, map[uint16][]int64{19: {0}}, maximum)
+	dict, err := patchSubsetCFFDictReal(original, map[uint16][]int64{19: {0}}, nil, maximum)
 	if err != nil {
 		return subsetCFFPrivate{}, err
 	}
-	dict, err = patchSubsetCFFDict(original, map[uint16][]int64{19: {int64(len(dict))}}, maximum)
+	dict, err = patchSubsetCFFDictReal(original, map[uint16][]int64{19: {int64(len(dict))}}, nil, maximum)
 	if err != nil {
 		return subsetCFFPrivate{}, err
 	}

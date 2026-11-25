@@ -204,21 +204,28 @@ func executeCompositionPlan(plan *compositionPlan, names *compositionNames, root
 			source := plan.sources[document.source]
 			part := strings.ToLower(source.documents[document.original].Part)
 			if source.retained[part] {
+				identity := true
 				for _, page := range document.pages {
 					for original, target := range names.pages[page] {
 						if err := plan.budget.step(1); err != nil {
 							return nil, err
 						}
 						if original != target {
-							return nil, fmt.Errorf("%w: raw document requires original name identity", ErrInvalid)
+							identity = false
+							break
 						}
 					}
+					if !identity {
+						break
+					}
 				}
-				x.rawDocs[index] = true
-				origin := compositionOrigin{document.source, part}
-				x.docParts[origin] = append(x.docParts[origin], index)
-				if err := x.schedule(compositionPartKey{document.source, part, index, -1}, document.part); err != nil {
-					return nil, err
+				if identity {
+					x.rawDocs[index] = true
+					origin := compositionOrigin{document.source, part}
+					x.docParts[origin] = append(x.docParts[origin], index)
+					if err := x.schedule(compositionPartKey{document.source, part, index, -1}, document.part); err != nil {
+						return nil, err
+					}
 				}
 			}
 		}
@@ -1203,6 +1210,7 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 	var original packagePart
 	var firstTicket compositionOrigin
 	firstTicketTarget := ""
+	hasTicketRelation := false
 	hasRaw := false
 	storyAssigned := false
 	for _, origin := range origins {
@@ -1250,7 +1258,7 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 				if err != nil {
 					return err
 				}
-				if ticket && len(origins) > 1 && len(x.tickets[key]) != 0 {
+				if ticket && len(origins) > 1 && firstTicketTarget != "" {
 					equal, err := x.sameRawTicket(firstTicket, compositionOrigin{origin.source, part})
 					if err != nil {
 						return err
@@ -1264,7 +1272,7 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 				if err != nil {
 					return err
 				}
-				if ticket && len(origins) > 1 && len(x.tickets[key]) == 0 && firstTicketTarget == "" {
+				if ticket && len(origins) > 1 && firstTicketTarget == "" {
 					firstTicket = compositionOrigin{origin.source, part}
 					firstTicketTarget = mapped.Target
 				}
@@ -1280,8 +1288,11 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 					return err
 				}
 				tickets = append(tickets, part)
-				if len(origins) > 1 && len(x.tickets[key]) != 0 {
-					continue
+				if len(origins) > 1 {
+					if hasTicketRelation {
+						continue
+					}
+					hasTicketRelation = true
 				}
 			}
 			relations = append(relations, mapped)
@@ -1410,19 +1421,33 @@ func (x *compositionExecution) validateTickets() error {
 		if len(tickets) < 2 {
 			continue
 		}
-		firstKey := strings.ToLower(tickets[0])
-		first, exists := x.output.parts[firstKey]
-		needsMerge := false
-		for _, ticket := range tickets[1:] {
-			if err := x.plan.budget.step(1); err != nil {
-				return err
+		active := make([]string, 0, len(tickets))
+		for index, ticket := range tickets {
+			if index > 0 {
+				if err := x.plan.budget.step(1); err != nil {
+					return err
+				}
 			}
+			if ticket != "" {
+				active = append(active, ticket)
+			}
+		}
+		if len(active) == 0 {
+			continue
+		}
+		firstKey := strings.ToLower(active[0])
+		first, exists := x.output.parts[firstKey]
+		if !exists {
+			return fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
+		}
+		if len(active) == 1 {
+			continue
+		}
+		needsMerge := false
+		for _, ticket := range active[1:] {
 			key := strings.ToLower(ticket)
 			value, present := x.output.parts[key]
-			if tickets[0] == "" && ticket == "" {
-				continue
-			}
-			if !exists || !present || !strings.EqualFold(first.media, value.media) {
+			if !present || !strings.EqualFold(first.media, value.media) {
 				return fmt.Errorf("%w: conflicting composition print-ticket scopes", ErrUnsupported)
 			}
 			if firstKey == key {
@@ -1468,7 +1493,7 @@ func (x *compositionExecution) validateTickets() error {
 			}
 		}
 		if needsMerge {
-			replaced, err := x.mergeScopeTickets(scope, tickets, first.media)
+			replaced, err := x.mergeScopeTickets(scope, active, first.media)
 			if err != nil {
 				return err
 			}
@@ -1631,7 +1656,7 @@ func printSettingsConflict(left, right *PrintSettings, budget *compositionBudget
 	return printSettingListsConflict(left.Elements, right.Elements, budget)
 }
 
-// printSettingListsConflict 对比同级设置元素切片，仅允许正交互补或完全语义等价的重叠项
+// printSettingListsConflict 对比同级设置元素切片，仅允许正交互补或完全语义等价的重叠项，同时检出同前缀族作用域关键字冲突
 // 入参: left, right 同级元素切片, budget 共享预算
 // 返回: bool 是否存在冲突, error 预算或取消错误
 func printSettingListsConflict(left, right []PrintSetting, budget *compositionBudget) (bool, error) {
@@ -1640,17 +1665,26 @@ func printSettingListsConflict(left, right []PrintSetting, budget *compositionBu
 		name xml.Name
 	}
 	byKey := make(map[key][]PrintSetting, len(left))
+	leftFamilies := make(map[printPrefixKey]xml.Name, len(left))
 	for _, item := range left {
 		if err := budget.step(1); err != nil {
 			return false, err
 		}
 		k := key{item.Kind, item.Name}
 		byKey[k] = append(byKey[k], item)
+		if familyKey, _, ok := printPrefixFamily(item); ok {
+			leftFamilies[familyKey] = item.Name
+		}
 	}
 	rightByKey := make(map[key][]PrintSetting, len(right))
 	for _, item := range right {
 		if err := budget.step(1); err != nil {
 			return false, err
+		}
+		if familyKey, _, ok := printPrefixFamily(item); ok {
+			if prevName, exists := leftFamilies[familyKey]; exists && prevName != item.Name {
+				return true, nil
+			}
 		}
 		k := key{item.Kind, item.Name}
 		rightByKey[k] = append(rightByKey[k], item)
@@ -1676,7 +1710,7 @@ func printSettingListsConflict(left, right []PrintSetting, budget *compositionBu
 	return false, nil
 }
 
-// printSettingEqual 递归判断两个PrintSetting节点是否语义等价，不依赖子节点顺序或默认xs:string拼写
+// printSettingEqual 递归判断两个PrintSetting节点是否语义等价，QName按展开名、数值按精确数值比较且不依赖子节点顺序
 // 入参: a, b 待比较节点, budget 共享预算
 // 返回: bool 是否语义等价, error 预算或取消错误
 func printSettingEqual(a, b PrintSetting, budget *compositionBudget) (bool, error) {
@@ -1697,7 +1731,55 @@ func printSettingEqual(a, b PrintSetting, budget *compositionBudget) (bool, erro
 		if typeB == (xml.Name{}) {
 			typeB = xml.Name{Space: printValueNS, Local: "string"}
 		}
-		if typeA != typeB || a.Value.Text != b.Value.Text || a.Value.QName != b.Value.QName {
+		if typeA != typeB {
+			return false, nil
+		}
+		if typeA.Space == printValueNS {
+			switch typeA.Local {
+			case "QName":
+				if a.Value.QName != (xml.Name{}) || b.Value.QName != (xml.Name{}) {
+					if a.Value.QName != b.Value.QName {
+						return false, nil
+					}
+				} else if strings.Trim(a.Value.Text, " \t\r\n") != strings.Trim(b.Value.Text, " \t\r\n") {
+					return false, nil
+				}
+			case "integer", "decimal":
+				left := strings.Trim(a.Value.Text, " \t\r\n")
+				right := strings.Trim(b.Value.Text, " \t\r\n")
+				if left == "" || right == "" {
+					if left != right {
+						return false, nil
+					}
+				} else {
+					if typeA.Local == "integer" && (!printInteger(left) || !printInteger(right)) {
+						return false, nil
+					}
+					cfg := printSettingsConfig{PrintSettingsOptions: DefaultPrintSettingsOptions(), context: budget.context}
+					numA, err := printParameterNumber(left, cfg)
+					if err != nil {
+						if errors.Is(err, ErrInvalid) {
+							return false, nil
+						}
+						return false, err
+					}
+					numB, err := printParameterNumber(right, cfg)
+					if err != nil {
+						if errors.Is(err, ErrInvalid) {
+							return false, nil
+						}
+						return false, err
+					}
+					if numA.Cmp(numB) != 0 {
+						return false, nil
+					}
+				}
+			default:
+				if a.Value.Text != b.Value.Text || a.Value.QName != b.Value.QName {
+					return false, nil
+				}
+			}
+		} else if a.Value.Text != b.Value.Text || a.Value.QName != b.Value.QName {
 			return false, nil
 		}
 	}

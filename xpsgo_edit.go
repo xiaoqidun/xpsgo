@@ -137,6 +137,15 @@ func (p *Package) MovePage(docIndex, pageIndex, targetDocIndex, targetPageIndex 
 	if p.hasDocumentStructure() {
 		return p.moveStoryPage(docIndex, pageIndex, targetDocIndex, targetPageIndex)
 	}
+	if p.hasDiscardControl() {
+		q := p.storyCopy()
+		q.movePage(docIndex, pageIndex, targetDocIndex, targetPageIndex)
+		if err := q.syncDiscardControl(); err != nil {
+			return err
+		}
+		p.commitStory(q)
+		return nil
+	}
 	p.movePage(docIndex, pageIndex, targetDocIndex, targetPageIndex)
 	return nil
 }
@@ -168,6 +177,15 @@ func (p *Package) DeletePage(docIndex, pageIndex int) error {
 	}
 	if p.hasDocumentStructure() {
 		return p.deleteStoryPage(docIndex, pageIndex)
+	}
+	if p.hasDiscardControl() {
+		q := p.storyCopy()
+		q.deletePage(docIndex, pageIndex)
+		if err := q.syncDiscardControl(); err != nil {
+			return err
+		}
+		p.commitStory(q)
+		return nil
 	}
 	p.deletePage(docIndex, pageIndex)
 	return nil
@@ -201,6 +219,15 @@ func (p *Package) MoveDocument(docIndex, position int) error {
 	}
 	if p.hasDocumentStructure() {
 		return p.moveStoryDocument(docIndex, position)
+	}
+	if p.hasDiscardControl() {
+		q := p.storyCopy()
+		q.moveDocument(docIndex, position)
+		if err := q.syncDiscardControl(); err != nil {
+			return err
+		}
+		p.commitStory(q)
+		return nil
 	}
 	p.moveDocument(docIndex, position)
 	return nil
@@ -236,6 +263,15 @@ func (p *Package) DeleteDocument(docIndex int) error {
 	}
 	if p.hasDocumentStructure() {
 		return p.deleteStoryDocument(docIndex)
+	}
+	if p.hasDiscardControl() {
+		q := p.storyCopy()
+		q.deleteDocument(docIndex)
+		if err := q.syncDiscardControl(); err != nil {
+			return err
+		}
+		p.commitStory(q)
+		return nil
 	}
 	p.deleteDocument(docIndex)
 	return nil
@@ -1489,6 +1525,117 @@ func parseRelationshipMarkup(source string, data []byte, limits Limits, ctx cont
 	return relations, nil
 }
 
+// hasDiscardControl 检查包根关系是否关联了当前方言的释放提示部件
+// 返回: bool 是否存在包级释放提示关联
+func (p *Package) hasDiscardControl() bool {
+	kind := formatNamespace(p.format) + "/discard-control"
+	for _, relation := range p.relations["/"] {
+		if relation.Type == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// syncDiscardControl 在页面或文档重排与删除后同步包级释放提示，更新移位过早的哨兵页并清理失效条目
+// 返回: error 释放提示解析、引用图、编码、编辑限制或预算错误
+func (p *Package) syncDiscardControl() error {
+	part, err := discardControlTarget(p.relations["/"], p.format)
+	if err != nil || part == "" {
+		return err
+	}
+	key := strings.ToLower(part)
+	raw, exists := p.parts[key]
+	if !exists {
+		return &PartError{Part: part, Err: fmt.Errorf("%w: missing discard control part", ErrInvalid)}
+	}
+	if !strings.EqualFold(raw.media, fixedContentType("discard-control")) {
+		return &PartError{Part: part, Err: fmt.Errorf("%w: discard control content type", ErrInvalid)}
+	}
+	control, err := readDiscardControl(raw.data, part, p.format, p.limits, nil)
+	if err != nil {
+		return &PartError{Part: part, Err: err}
+	}
+	if len(control.Hints) == 0 && control.Ignored == 0 {
+		return nil
+	}
+	updated := make([]DiscardHint, 0, len(control.Hints))
+	if p.pageCount > 0 {
+		view, err := p.editStoryReader(nil)
+		if err != nil {
+			return err
+		}
+		defer view.Close()
+		budget := resourceMergeBudget{bytes: p.limits.MaxPackageBytes, work: p.limits.MaxXMLNodes, seen: make(map[string]bool)}
+		graph, err := view.resourceReferenceGraphMode(&budget, false)
+		if err != nil {
+			return err
+		}
+		last := make(map[string]int)
+		uncertain := -1
+		pageIndex := make(map[string]int, len(view.pages))
+		for index, page := range view.pages {
+			pageKey := strings.ToLower(page.Part)
+			pageIndex[pageKey] = index
+			seen, err := graph.reachableFrom(map[string]bool{pageKey: true}, false)
+			if err != nil {
+				return err
+			}
+			for resKey := range seen {
+				last[resKey] = index
+				if graph.models[resKey] {
+					uncertain = index
+				}
+			}
+		}
+		for _, hint := range control.Hints {
+			targetKey := strings.ToLower(hint.Target)
+			if _, present := view.pkg.parts[targetKey]; !present {
+				continue
+			}
+			media, err := view.pkg.contentType(hint.Target)
+			if err != nil {
+				return err
+			}
+			sentinelKey := strings.ToLower(hint.SentinelPage)
+			curSentinel, sentinelExists := pageIndex[sentinelKey]
+			if !graphicResourceMedia(media) && !graph.models[targetKey] {
+				if sentinelExists {
+					updated = append(updated, hint)
+				}
+				continue
+			}
+			lastUse, used := last[targetKey]
+			if !used {
+				continue
+			}
+			minSentinel := lastUse + 1
+			if uncertain >= 0 && uncertain+1 > minSentinel {
+				minSentinel = uncertain + 1
+			}
+			if sentinelExists && curSentinel >= minSentinel {
+				updated = append(updated, hint)
+				continue
+			}
+			if minSentinel < len(view.pages) {
+				hint.SentinelPage = view.pages[minSentinel].Part
+				updated = append(updated, hint)
+			}
+		}
+	}
+	if control.Ignored == 0 && slices.Equal(control.Hints, updated) {
+		return nil
+	}
+	if err := p.editable(part); err != nil {
+		return err
+	}
+	var buffer bytes.Buffer
+	if _, err := EncodeDiscardControl(nil, &buffer, updated, &EncodeOptions{Format: p.format, Limits: p.limits, Part: part}); err != nil {
+		return err
+	}
+	return p.store(part, fixedContentType("discard-control"), buffer.Bytes())
+}
+
 // hasDocumentStructure 检查包内是否有任意固定文档关联了当前方言的文档结构
 // 返回: bool 是否存在文档结构关联
 func (p *Package) hasDocumentStructure() bool {
@@ -2495,6 +2642,9 @@ func (p *Package) moveStoryPage(document, index, target, position int) error {
 	if err := q.validateStoryEdit(nil); err != nil {
 		return err
 	}
+	if err := q.syncDiscardControl(); err != nil {
+		return err
+	}
 	p.commitStory(q)
 	return nil
 }
@@ -2537,6 +2687,9 @@ func (p *Package) moveStoryDocument(docIndex, position int) error {
 	if err := q.validateStoryEdit(nil); err != nil {
 		return err
 	}
+	if err := q.syncDiscardControl(); err != nil {
+		return err
+	}
 	p.commitStory(q)
 	return nil
 }
@@ -2577,6 +2730,9 @@ func (p *Package) deleteStoryDocument(docIndex int) error {
 		}
 	}
 	if err := q.validateStoryEdit(nil); err != nil {
+		return err
+	}
+	if err := q.syncDiscardControl(); err != nil {
 		return err
 	}
 	p.commitStory(q)
@@ -2627,6 +2783,9 @@ func (p *Package) deleteStoryPage(document, index int) error {
 		}
 	}
 	if err := q.validateStoryEdit(nil); err != nil {
+		return err
+	}
+	if err := q.syncDiscardControl(); err != nil {
 		return err
 	}
 	p.commitStory(q)
@@ -3101,14 +3260,15 @@ func (s *documentExtraction) part(item extractionPart) error {
 	if !markup {
 		return nil
 	}
+	tracker := newResourceMarkupScopeTracker(s.reader.format, false, s.context)
 	if _, err := decodeXMLVisit(value.data, s.output.limits, func(token xml.Token, node *xmlElement) error {
-		if _, start := token.(xml.StartElement); !start {
-			return nil
+		if _, start := token.(xml.StartElement); start {
+			if err := s.step(1); err != nil {
+				return err
+			}
 		}
-		if err := s.step(1); err != nil {
-			return err
-		}
-		return validateResourceMarkupElement(node, s.reader.format)
+		_, _, err := tracker.visit(token, node)
+		return err
 	}); err != nil {
 		return &PartError{Part: item.part, Err: err}
 	}

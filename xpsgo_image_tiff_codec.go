@@ -498,6 +498,9 @@ func (f *tiffFaxReader) line2(row []byte, width int, reference, changes []int) (
 			changes = tiffFaxToggleChange(changes, position)
 			black = !black
 		case tiffFaxUncompressed:
+			if !f.allowLiteral {
+				return nil, false, fmt.Errorf("%w: TIFF fax uncompressed mode disabled", ErrInvalid)
+			}
 			f.literal = true
 		case tiffFaxEnd:
 			if actions != 0 {
@@ -524,7 +527,7 @@ func faxStrip(dst, src []byte, width int, compression, fillOrder, options uint32
 		return fmt.Errorf("%w: TIFF fax options", ErrInvalid)
 	}
 	clear(dst)
-	f := tiffFaxReader{data: src, fillOrder: fillOrder, work: min(rasterMaxWork, uint64(len(src))*8+uint64(len(dst))*16+1024), allowLiteral: compression != 2}
+	f := tiffFaxReader{data: src, fillOrder: fillOrder, work: min(rasterMaxWork, uint64(len(src))*8+uint64(len(dst))*16+1024), allowLiteral: options&2 != 0}
 	reference, changes := make([]int, 2, width+3), make([]int, 0, width+3)
 	reference[0], reference[1] = width, width
 	for y := 0; y < len(dst)/rowBytes; y++ {
@@ -1404,7 +1407,10 @@ func normalizeTIFFJPEG(data []byte, tables bool, global tiffJPEGTable) (tiffJPEG
 			value.data = append(value.data, 0xff, 0xd9)
 			return value, nil
 		}
-		if marker == 0xd8 || marker == 0 || marker == 1 || marker >= 0xd0 && marker <= 0xd7 {
+		if marker == 1 {
+			continue
+		}
+		if marker == 0xd8 || marker == 0 || marker >= 0xd0 && marker <= 0xd7 {
 			return tiffJPEGTable{}, fmt.Errorf("%w: TIFF JPEG standalone marker", ErrInvalid)
 		}
 		if pos+2 > len(data) {
@@ -1454,7 +1460,10 @@ func normalizeTIFFJPEG(data []byte, tables bool, global tiffJPEGTable) (tiffJPEG
 			}
 		}
 		if marker == 0xdc {
-			return tiffJPEGTable{}, fmt.Errorf("%w: TIFF JPEG DNL marker", ErrInvalid)
+			if len(payload) != 2 || binary.BigEndian.Uint16(payload) == 0 {
+				return tiffJPEGTable{}, fmt.Errorf("%w: TIFF JPEG DNL marker", ErrInvalid)
+			}
+			return tiffJPEGTable{}, fmt.Errorf("%w: TIFF JPEG DNL marker", ErrUnsupported)
 		}
 		if marker != 0xdb && marker != 0xc4 && marker != 0xda && marker != 0xdd && marker != 0xc0 && marker != 0xc1 && marker != 0xc2 && marker != 0xc3 {
 			return tiffJPEGTable{}, fmt.Errorf("%w: TIFF JPEG process marker %x", ErrUnsupported, marker)

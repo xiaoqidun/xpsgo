@@ -220,7 +220,7 @@ func (r *Reader) renderPrint(ctx context.Context, pageIndex int, options *PrintR
 		return nil, err
 	}
 	settings.outputColor = outputColor.Mode
-	ticket, colorPlan, err := printColorPlanSettings(ctx, ticket, &configuration.Print.Settings)
+	cleaned, colorPlan, err := printColorPlanSettings(ctx, ticket, &configuration.Print.Settings)
 	if err != nil {
 		if device == nil && configuration.Print.IgnoreUnsupportedFeatures && errors.Is(err, ErrUnsupported) {
 			ticket = printStripColorPlanFeatures(ticket)
@@ -228,6 +228,8 @@ func (r *Reader) renderPrint(ctx context.Context, pageIndex int, options *PrintR
 		} else {
 			return nil, err
 		}
+	} else {
+		ticket = cleaned
 	}
 	if device == nil && (configuration.Color != nil || colorPlan != nil && !configuration.Print.IgnoreUnsupportedFeatures) {
 		return nil, fmt.Errorf("%w: print color requires explicit device output", ErrUnsupported)
@@ -777,6 +779,9 @@ func (r *printWatermarkRenderer) bitmapPaths(source *fontSource, glyph positione
 	if !present {
 		return nil, Point{}, false, fmt.Errorf("%w: watermark bitmap glyph %d is absent", ErrUnsupported, glyph.gid)
 	}
+	if decoded.mask == nil || decoded.mask.Rect.Empty() || decoded.metrics.width == 0 || decoded.metrics.height == 0 {
+		return nil, Point{}, false, nil
+	}
 	if !decoded.metrics.hasHorizontal {
 		return nil, Point{}, false, fmt.Errorf("%w: watermark bitmap has no horizontal bearing", ErrUnsupported)
 	}
@@ -942,7 +947,7 @@ func printStripColorPlanFeatures(settings *PrintSettings) *PrintSettings {
 	}
 	result := &PrintSettings{Version: settings.Version, Elements: make([]PrintSetting, 0, len(settings.Elements))}
 	for _, value := range settings.Elements {
-		if value.Name.Space == printKeywordsNS {
+		if printPublicKeywordSpace(value.Name.Space) {
 			switch value.Name.Local {
 			case "PageColorManagement", "PageDeviceColorSpaceUsage", "PageBlendColorSpace", "PageSourceColorProfile", "PageDestinationColorProfile", "PageICMRenderingIntent", "PageDeviceColorSpaceProfileURI":
 				continue
@@ -1032,7 +1037,7 @@ func (c *printResourceCollector) collect() ([]printResourceReference, error) {
 				path = nil
 				for j := range element.Children {
 					property := &element.Children[j]
-					if property.Kind == PrintSettingProperty && property.Name == (xml.Name{Space: printFrameworkNS, Local: "DefaultValue"}) {
+					if property.Kind == PrintSettingProperty && printFrameworkSpace(property.Name.Space) && property.Name.Local == "DefaultValue" {
 						path = []int{i, j, 0}
 					}
 				}
@@ -1053,9 +1058,8 @@ func (c *printResourceCollector) collect() ([]printResourceReference, error) {
 		}
 		if element.Kind == parameterKind {
 			for _, rule := range printResourceRules {
-				parameter := xml.Name{Space: printKeywordsNS, Local: rule.parameter}
-				if element.Name == parameter {
-					if err := c.parameter(parameter, rule.kind); err != nil {
+				if printPublicKeywordSpace(element.Name.Space) && element.Name.Local == rule.parameter {
+					if err := c.parameter(element.Name, rule.kind); err != nil {
 						return nil, err
 					}
 					break
@@ -1082,17 +1086,17 @@ func (c *printResourceCollector) features(element *PrintSetting, path []int) err
 	}
 	if element.Kind == PrintSettingFeature {
 		for _, rule := range printResourceRules {
-			if rule.feature == "" || element.Name != (xml.Name{Space: printKeywordsNS, Local: rule.feature}) {
+			if rule.feature == "" || !printPublicKeywordSpace(element.Name.Space) || element.Name.Local != rule.feature {
 				continue
 			}
 			for i := range element.Children {
 				option := &element.Children[i]
-				if option.Kind != PrintSettingOption || option.Name.Space != printKeywordsNS || !slices.Contains(rule.options, option.Name.Local) {
+				if option.Kind != PrintSettingOption || !printPublicKeywordSpace(option.Name.Space) || !slices.Contains(rule.options, option.Name.Local) {
 					continue
 				}
 				for j := range option.Children {
 					property := &option.Children[j]
-					if property.Kind != PrintSettingScoredProperty || property.Name != (xml.Name{Space: printKeywordsNS, Local: rule.property}) {
+					if property.Kind != PrintSettingScoredProperty || !printPublicKeywordSpace(property.Name.Space) || property.Name.Local != rule.property {
 						continue
 					}
 					for k := range property.Children {
