@@ -255,6 +255,128 @@ func (d *tiffDirectory) resolution() (Point, error) {
 	return Point{value[0], value[1]}, nil
 }
 
+// readTIFFImageInfo 仅解析TIFF首个IFD目录标签返回轻量图像元数据，不解码任何条带或图块像素
+// 入参: data 完整TIFF图像字节, part 部件包根URI, media 内容类型
+// 返回: *ImageInfo 视觉方向规范化后的图像头信息, error 目录、标签或能力错误
+func readTIFFImageInfo(data []byte, part, media string) (*ImageInfo, error) {
+	d, err := readTIFFDirectory(data)
+	if err != nil {
+		return nil, err
+	}
+	width, err := d.number(256, 0, true)
+	if err != nil {
+		return nil, err
+	}
+	height, err := d.number(257, 0, true)
+	if err != nil {
+		return nil, err
+	}
+	if width == 0 || height == 0 {
+		return nil, fmt.Errorf("%w: empty TIFF image", ErrInvalid)
+	}
+	if width > rasterMaxDimension || height > rasterMaxDimension {
+		return nil, fmt.Errorf("%w: TIFF image dimensions", ErrLimit)
+	}
+	orientation, err := d.number(274, 1, false)
+	if err != nil {
+		return nil, err
+	}
+	if orientation < 1 || orientation > 8 {
+		return nil, fmt.Errorf("%w: TIFF orientation", ErrInvalid)
+	}
+	if d.entry[262] == nil {
+		return nil, fmt.Errorf("%w: missing TIFF photometric interpretation", ErrInvalid)
+	}
+	photo, err := d.number(262, 0, false)
+	if err != nil {
+		return nil, err
+	}
+	if photo > 3 && photo != 5 && photo != 6 {
+		return nil, fmt.Errorf("%w: TIFF photometric interpretation %d", ErrUnsupported, photo)
+	}
+	channels, err := d.number(277, 1, false)
+	if err != nil {
+		return nil, err
+	}
+	base := uint32(1)
+	if photo == 2 || photo == 6 {
+		base = 3
+	} else if photo == 5 {
+		base = 4
+	}
+	if channels < base || channels > base+1 || photo == 3 && channels != 1 {
+		return nil, fmt.Errorf("%w: TIFF sample count", ErrUnsupported)
+	}
+	sampleFormat := uint32(1)
+	if d.entry[339] != nil {
+		field, _, e := d.field(339, int(channels), false)
+		if e != nil {
+			return nil, e
+		}
+		sampleFormat = uint32(d.order.Uint16(field))
+		if sampleFormat < 1 || sampleFormat > 3 {
+			return nil, fmt.Errorf("%w: TIFF sample format", ErrUnsupported)
+		}
+	}
+	bitDepth := uint32(1)
+	if d.entry[258] != nil {
+		field, _, e := d.field(258, int(channels), false)
+		if e != nil {
+			return nil, e
+		}
+		bitDepth = uint32(d.order.Uint16(field))
+	}
+	alpha := uint32(0)
+	if d.entry[338] != nil {
+		if channels != base+1 {
+			return nil, fmt.Errorf("%w: unexpected TIFF extra sample", ErrInvalid)
+		}
+		alpha, err = d.number(338, 0, false)
+		if err != nil {
+			return nil, err
+		}
+		if alpha > 2 {
+			return nil, fmt.Errorf("%w: TIFF alpha interpretation", ErrUnsupported)
+		}
+	} else if channels > base {
+		return nil, fmt.Errorf("%w: missing TIFF ExtraSamples", ErrInvalid)
+	}
+	dpi, err := d.resolution()
+	if err != nil {
+		return nil, err
+	}
+	colorSpace := ImageColorRGB
+	if photo <= 1 {
+		colorSpace = ImageColorGray
+	} else if photo == 5 {
+		colorSpace = ImageColorCMYK
+	}
+	depth := int(bitDepth)
+	if photo == 3 {
+		depth = 16
+	}
+	w, h := int(width), int(height)
+	dpiX, dpiY := dpi.X, dpi.Y
+	if orientation >= 5 && orientation <= 8 {
+		w, h = h, w
+		dpiX, dpiY = dpiY, dpiX
+	}
+	return &ImageInfo{
+		Part:          part,
+		ContentType:   media,
+		Width:         w,
+		Height:        h,
+		DPIX:          dpiX,
+		DPIY:          dpiY,
+		ColorSpace:    colorSpace,
+		HasAlpha:      alpha != 0,
+		BitDepth:      depth,
+		IsFloat:       sampleFormat == 3,
+		Orientation:   orientation,
+		HasICCProfile: d.entry[34675] != nil,
+	}, nil
+}
+
 // decodeTIFFImage 解码首个目录的条带或分块图像，保持16位颜色及独立透明度并按Tag 274规范化视觉方向
 // 入参: data 图像字节, maxPixels 剩余像素预算
 // 返回: *rasterImage 图像与分辨率, error 数据、能力或资源错误
@@ -770,7 +892,7 @@ func (d *tiffDirectory) sampleRange(tag uint16, channels int) ([]float64, error)
 
 // tiffOrientedPoint 按TIFF Tag 274定义将存储坐标映射到视觉方向坐标
 // 入参: x, y 存储坐标, w, h 存储宽高, orientation 方向编号2到8
-// 返回: dx, dy 视觉坐标
+// 返回: int 视觉横坐标, int 视觉纵坐标
 func tiffOrientedPoint(x, y, w, h int, orientation uint32) (int, int) {
 	switch orientation {
 	case 2:

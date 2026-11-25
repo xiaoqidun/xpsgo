@@ -24,31 +24,35 @@ import (
 	"strings"
 )
 
-// EncodeOptions 设置页面或释放提示编码的方言、部件名及资源上限，零值字段采用默认值
-// Format未指定时页面编码沿用Page.Format，缺省采用OpenXPS；Part仅用于EncodeDiscardControl自引用检查
-// MaxPartBytes、MaxXMLDepth与MaxXMLNodes分别约束输出字节、嵌套深度与模型展开工作量
+// EncodeOptions 设置页面、资源字典或释放提示编码的方言、部件名、紧凑输出及资源上限，零值字段采用默认值
+// Format未指定时页面编码沿用Page.Format，缺省采用OpenXPS；Part用于EncodeDiscardControl或EncodeResourceDictionary
+// Compact启用后连ContextColor实色画刷也按属性简写输出；MaxPartBytes、MaxXMLDepth与MaxXMLNodes分别约束输出字节、嵌套深度与模型展开工作量
 type EncodeOptions struct {
-	Format Format
-	Limits Limits
-	Part   string
+	Format  Format
+	Limits  Limits
+	Part    string
+	Compact bool
 }
 
-// pageEncoder 构造独立的固定页面标记，限制展开工作量、检测引用循环并隔离共享元素与VisualBrush内联命名冲突
+// pageEncoder 构造独立的固定页面或资源字典标记，限制展开工作量、检测引用循环并隔离共享元素与VisualBrush内联命名冲突
 type pageEncoder struct {
-	format        Format
-	ns            string
-	part          string
-	limits        Limits
-	ctx           context.Context
-	active        map[any]bool
-	elemCount     map[Element]int
-	mainElemCount map[Element]int
-	emittedName   map[Element]bool
-	inVisualBrush int
-	prescanWork   int
-	work          int
-	bytes         int64
-	scope         map[string]string
+	format          Format
+	ns              string
+	part            string
+	limits          Limits
+	compact         bool
+	ctx             context.Context
+	active          map[any]bool
+	elemCount       map[Element]int
+	mainElemCount   map[Element]int
+	emittedName     map[Element]bool
+	inVisualBrush   int
+	prescanWork     int
+	work            int
+	bytes           int64
+	scope           map[string]string
+	hasResourceKeys bool
+	hasRemoteDict   bool
 }
 
 // DefaultEncodeOptions 返回默认编码选项
@@ -72,6 +76,7 @@ func EncodePage(ctx context.Context, output io.Writer, page *Page, options *Enco
 			configuration.Format = options.Format
 		}
 		configuration.Limits = mergeLimits(configuration.Limits, options.Limits)
+		configuration.Compact = options.Compact
 	}
 	if configuration.Format == FormatUnknown {
 		configuration.Format = FormatOpenXPS
@@ -82,7 +87,7 @@ func EncodePage(ctx context.Context, output io.Writer, page *Page, options *Enco
 	if formatNamespace(configuration.Format) == "" {
 		return 0, fmt.Errorf("%w: invalid page format", ErrInvalid)
 	}
-	p := pageEncoder{format: configuration.Format, ns: formatNamespace(configuration.Format), part: page.Part, limits: configuration.Limits, ctx: ctx, active: make(map[any]bool), elemCount: make(map[Element]int), mainElemCount: make(map[Element]int), emittedName: make(map[Element]bool)}
+	p := pageEncoder{format: configuration.Format, ns: formatNamespace(configuration.Format), part: page.Part, limits: configuration.Limits, compact: configuration.Compact, ctx: ctx, active: make(map[any]bool), elemCount: make(map[Element]int), mainElemCount: make(map[Element]int), emittedName: make(map[Element]bool)}
 	p.scope = map[string]string{"": p.ns, "xml": xmlNamespace}
 	var err error
 	if p.part == "" {
@@ -92,6 +97,9 @@ func EncodePage(ctx context.Context, output io.Writer, page *Page, options *Enco
 	}
 	if err := p.prescanPage(page); err != nil {
 		return 0, err
+	}
+	if p.hasResourceKeys {
+		p.scope["r"] = p.ns + "/resourcedictionary-key"
 	}
 	root, err := p.page(page)
 	if err != nil {
@@ -107,11 +115,13 @@ func EncodePage(ctx context.Context, output io.Writer, page *Page, options *Enco
 	if part == "/" {
 		part = "/FixedPage.fpage"
 	}
-	graph, err := parseResourceGraph(part, root, p.format, p.limits, nil)
+	graph, err := parseResourceGraphMode(part, root, p.format, p.limits, nil, p.ctx, p.hasRemoteDict)
 	if err != nil {
 		return 0, err
 	}
-	if _, err := newSceneParser(p.format, graph).parse(root); err != nil {
+	parser := newSceneParser(p.format, graph)
+	parser.allowUnresolved = p.hasRemoteDict
+	if _, err := parser.parse(root); err != nil {
 		return 0, err
 	}
 	if _, err := collectRequiredResources(graph, p.format); err != nil {
@@ -145,16 +155,58 @@ func (p *pageEncoder) prescanStep(depth int) error {
 	return nil
 }
 
-// prescanPage 预扫描整页元素与VisualBrush指针引用计数，区分正文主树与画刷内联展开位置
+// prescanPage 预扫描整页资源字典、元素与VisualBrush指针引用计数，区分正文主树与画刷内联展开位置
 // 入参: value 页面模型
 // 返回: error 循环引用、复杂度或取消错误
 func (p *pageEncoder) prescanPage(value *Page) error {
 	if err := p.prescanStep(1); err != nil {
 		return err
 	}
+	if value.Resources != nil {
+		if err := p.prescanDictionary(value.Resources, 2); err != nil {
+			return err
+		}
+	}
 	for _, element := range value.Elements {
 		if err := p.prescanElement(element, 2, false); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// prescanDictionary 预扫描资源字典中的远程引用标志、内联键标志与嵌套元素循环
+// 入参: dict 资源字典, depth 当前深度
+// 返回: error 循环引用、复杂度或取消错误
+func (p *pageEncoder) prescanDictionary(dict *ResourceDictionary, depth int) error {
+	if dict == nil {
+		return nil
+	}
+	if p.active[dict] {
+		return fmt.Errorf("%w: cyclic resource dictionary", ErrInvalid)
+	}
+	if err := p.prescanStep(depth); err != nil {
+		return err
+	}
+	p.active[dict] = true
+	defer delete(p.active, dict)
+	if dict.Source != "" {
+		p.hasRemoteDict = true
+		return nil
+	}
+	if len(dict.Entries) != 0 {
+		p.hasResourceKeys = true
+	}
+	for _, entry := range dict.Entries {
+		switch typed := entry.Value.(type) {
+		case *Brush:
+			if err := p.prescanBrush(typed, depth+1); err != nil {
+				return err
+			}
+		case Element:
+			if err := p.prescanElement(typed, depth+1, true); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -201,6 +253,11 @@ func (p *pageEncoder) prescanElement(value Element, depth int, inBrush bool) err
 	}
 	switch typed := value.(type) {
 	case *Canvas:
+		if typed.Resources != nil {
+			if err := p.prescanDictionary(typed.Resources, depth+1); err != nil {
+				return err
+			}
+		}
 		for _, child := range typed.Elements {
 			if err := p.prescanElement(child, depth+1, inBrush); err != nil {
 				return err
@@ -333,6 +390,11 @@ func (p *pageEncoder) page(value *Page) (*xmlElement, error) {
 	if err := p.attr(root, "xmlns", p.ns); err != nil {
 		return nil, err
 	}
+	if p.hasResourceKeys {
+		if err := p.attribute(root, xml.Name{Space: xmlnsNamespace, Local: "r"}, p.ns+"/resourcedictionary-key"); err != nil {
+			return nil, err
+		}
+	}
 	for _, attr := range []struct{ name, value string }{{"Width", encodeNumber(value.Width)}, {"Height", encodeNumber(value.Height)}} {
 		if err := p.attr(root, attr.name, attr.value); err != nil {
 			return nil, err
@@ -368,6 +430,15 @@ func (p *pageEncoder) page(value *Page) (*xmlElement, error) {
 			return nil, err
 		}
 	}
+	if value.Resources != nil {
+		dictNode, err := p.resourceDictionary(value.Resources, 3, false)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.property(root, "Resources", dictNode, 2); err != nil {
+			return nil, err
+		}
+	}
 	for _, element := range value.Elements {
 		child, err := p.element(element, 2)
 		if err != nil {
@@ -376,6 +447,107 @@ func (p *pageEncoder) page(value *Page) (*xmlElement, error) {
 		root.Children = append(root.Children, child)
 	}
 	return root, nil
+}
+
+// resourceDictionary 编码页面内联字典、远程字典引用或独立远程资源字典节点
+// 入参: dict 资源字典模型, depth 节点深度, remoteRoot 是否为独立远程资源字典根元素
+// 返回: *xmlElement 资源字典节点, error 键名、类型、循环或预算错误
+func (p *pageEncoder) resourceDictionary(dict *ResourceDictionary, depth int, remoteRoot bool) (*xmlElement, error) {
+	if dict == nil {
+		return nil, fmt.Errorf("%w: nil resource dictionary", ErrInvalid)
+	}
+	if p.active[dict] {
+		return nil, fmt.Errorf("%w: cyclic resource dictionary", ErrInvalid)
+	}
+	p.active[dict] = true
+	defer delete(p.active, dict)
+	node, err := p.node("ResourceDictionary", depth)
+	if err != nil {
+		return nil, err
+	}
+	if remoteRoot {
+		if err := p.attr(node, "xmlns", p.ns); err != nil {
+			return nil, err
+		}
+		if len(dict.Entries) != 0 {
+			if err := p.attribute(node, xml.Name{Space: xmlnsNamespace, Local: "r"}, p.ns+"/resourcedictionary-key"); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if dict.Source != "" {
+		if remoteRoot || len(dict.Entries) != 0 {
+			return nil, fmt.Errorf("%w: resource dictionary Source conflicts with local entries or remote root", ErrInvalid)
+		}
+		source, err := p.reference("", dict.Source)
+		if err != nil {
+			return nil, err
+		}
+		p.hasRemoteDict = true
+		return node, p.attr(node, "Source", source)
+	}
+	seen := make(map[string]bool, len(dict.Entries))
+	keyAttr := xml.Name{Space: p.ns + "/resourcedictionary-key", Local: "Key"}
+	for _, entry := range dict.Entries {
+		if !fixedNamePattern(entry.Key) || seen[entry.Key] {
+			return nil, fmt.Errorf("%w: invalid or duplicate resource key %q", ErrInvalid, entry.Key)
+		}
+		seen[entry.Key] = true
+		var child *xmlElement
+		switch typed := entry.Value.(type) {
+		case *Brush:
+			if typed == nil || typed.ResourceKey != "" {
+				return nil, fmt.Errorf("%w: invalid brush resource definition %q", ErrInvalid, entry.Key)
+			}
+			child, err = p.brush(typed, depth+1)
+		case *Geometry:
+			if typed == nil || typed.ResourceKey != "" {
+				return nil, fmt.Errorf("%w: invalid geometry resource definition %q", ErrInvalid, entry.Key)
+			}
+			child, err = p.geometry(typed, depth+1)
+		case *Matrix:
+			if typed == nil || !geometryFillMatrixFinite(*typed) {
+				return nil, fmt.Errorf("%w: invalid matrix resource definition %q", ErrInvalid, entry.Key)
+			}
+			child, err = p.node("MatrixTransform", depth+1)
+			if err == nil {
+				err = p.attr(child, "Matrix", encodeMatrix(*typed))
+			}
+		case Matrix:
+			if !geometryFillMatrixFinite(typed) {
+				return nil, fmt.Errorf("%w: invalid matrix resource definition %q", ErrInvalid, entry.Key)
+			}
+			child, err = p.node("MatrixTransform", depth+1)
+			if err == nil {
+				err = p.attr(child, "Matrix", encodeMatrix(typed))
+			}
+		case *Canvas:
+			if typed == nil || typed.Name != "" {
+				return nil, fmt.Errorf("%w: visual resource definition cannot be nil or carry Name", ErrInvalid)
+			}
+			child, err = p.element(typed, depth+1)
+		case *Path:
+			if typed == nil || typed.Name != "" {
+				return nil, fmt.Errorf("%w: visual resource definition cannot be nil or carry Name", ErrInvalid)
+			}
+			child, err = p.element(typed, depth+1)
+		case *Glyphs:
+			if typed == nil || typed.Name != "" {
+				return nil, fmt.Errorf("%w: visual resource definition cannot be nil or carry Name", ErrInvalid)
+			}
+			child, err = p.element(typed, depth+1)
+		default:
+			return nil, fmt.Errorf("%w: unsupported resource definition value for %q", ErrInvalid, entry.Key)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if err := p.attribute(child, keyAttr, entry.Key); err != nil {
+			return nil, err
+		}
+		node.Children = append(node.Children, child)
+	}
+	return node, nil
 }
 
 // source 返回模型的有效来源部件，缺省时采用当前页面来源
@@ -514,6 +686,9 @@ func (p *pageEncoder) color(value Color, part string) (string, error) {
 			}
 			bytes[index] = uint8(code)
 		}
+		if bytes[0] == 0xff {
+			return fmt.Sprintf("#%02X%02X%02X", bytes[1], bytes[2], bytes[3]), nil
+		}
 		return fmt.Sprintf("#%02X%02X%02X%02X", bytes[0], bytes[1], bytes[2], bytes[3]), nil
 	}
 	prefix := "sc#"
@@ -547,7 +722,7 @@ func encodeDecimal(value float64) string {
 	return strconv.FormatFloat(value, 'f', -1, 64)
 }
 
-// brush 编码五类画刷的实际参数，视觉内容直接输出内联VisualBrush.Visual属性元素
+// brush 编码五类画刷的实际参数，支持StaticResource变换及视觉引用，内联视觉输出VisualBrush.Visual属性元素
 // 入参: value 画刷模型, depth 画刷节点深度
 // 返回: *xmlElement 画刷节点, error 属性、资源、循环或预算错误
 func (p *pageEncoder) brush(value *Brush, depth int) (*xmlElement, error) {
@@ -569,7 +744,17 @@ func (p *pageEncoder) brush(value *Brush, depth int) (*xmlElement, error) {
 			return nil, err
 		}
 	}
-	if value.Transform != nil {
+	if value.Transform != nil && value.TransformResource != "" {
+		return nil, fmt.Errorf("%w: conflicting brush transform and transform resource", ErrInvalid)
+	}
+	if value.TransformResource != "" {
+		if value.Kind == BrushSolidColor || !fixedNamePattern(value.TransformResource) {
+			return nil, fmt.Errorf("%w: brush transform resource", ErrInvalid)
+		}
+		if err := p.attr(node, "Transform", "{StaticResource "+value.TransformResource+"}"); err != nil {
+			return nil, err
+		}
+	} else if value.Transform != nil {
 		if value.Kind == BrushSolidColor || !geometryFillMatrixFinite(*value.Transform) {
 			return nil, fmt.Errorf("%w: brush matrix", ErrInvalid)
 		}
@@ -590,8 +775,13 @@ func (p *pageEncoder) brush(value *Brush, depth int) (*xmlElement, error) {
 	if value.TileMode > TileFlipXY {
 		return nil, fmt.Errorf("%w: tile brush mode", ErrInvalid)
 	}
-	for _, attr := range []struct{ name, value string }{{"Viewbox", encodeRect(value.Viewbox)}, {"Viewport", encodeRect(value.Viewport)}, {"ViewboxUnits", "Absolute"}, {"ViewportUnits", "Absolute"}, {"TileMode", []string{"None", "Tile", "FlipX", "FlipY", "FlipXY"}[value.TileMode]}} {
+	for _, attr := range []struct{ name, value string }{{"Viewbox", encodeRect(value.Viewbox)}, {"Viewport", encodeRect(value.Viewport)}, {"ViewboxUnits", "Absolute"}, {"ViewportUnits", "Absolute"}} {
 		if err := p.attr(node, attr.name, attr.value); err != nil {
+			return nil, err
+		}
+	}
+	if value.TileMode != TileNone {
+		if err := p.attr(node, "TileMode", []string{"None", "Tile", "FlipX", "FlipY", "FlipXY"}[value.TileMode]); err != nil {
 			return nil, err
 		}
 	}
@@ -609,6 +799,12 @@ func (p *pageEncoder) brush(value *Brush, depth int) (*xmlElement, error) {
 		}
 		return node, p.attr(node, "ImageSource", image)
 	}
+	if value.VisualReference != "" {
+		if value.Visual != nil || !fixedNamePattern(value.VisualReference) {
+			return nil, fmt.Errorf("%w: visual brush reference conflict or invalid key", ErrInvalid)
+		}
+		return node, p.attr(node, "Visual", "{StaticResource "+value.VisualReference+"}")
+	}
 	if contentProperties(value.Visual) == nil {
 		return nil, fmt.Errorf("%w: missing or unknown brush visual", ErrInvalid)
 	}
@@ -621,15 +817,52 @@ func (p *pageEncoder) brush(value *Brush, depth int) (*xmlElement, error) {
 	return node, p.property(node, "Visual", visual, depth+1)
 }
 
-// gradient 编码全部渐变参数与停靠点，保留停靠点顺序和重复、范围外偏移
+// brushProperty 按属性简写、StaticResource引用或属性元素形式编码画刷属性
+// 入参: node 属性所属节点, name 属性名, value 画刷模型, depth 所属节点深度
+// 返回: error 属性、颜色、引用或预算错误
+func (p *pageEncoder) brushProperty(node *xmlElement, name string, value *Brush, depth int) error {
+	if value == nil {
+		return nil
+	}
+	if value.ResourceKey != "" {
+		if !fixedNamePattern(value.ResourceKey) {
+			return fmt.Errorf("%w: invalid brush resource key %q", ErrInvalid, value.ResourceKey)
+		}
+		return p.attr(node, name, "{StaticResource "+value.ResourceKey+"}")
+	}
+	if name != "OpacityMask" && value.Kind == BrushSolidColor && value.Opacity == 1 && value.Transform == nil && value.TransformResource == "" {
+		if value.Color.Space == ColorSRGB || value.Color.Space == ColorScRGB || value.Color.Space == ColorContext && p.compact {
+			text, err := p.color(value.Color, value.Part)
+			if err != nil {
+				return err
+			}
+			return p.attr(node, name, text)
+		}
+	}
+	brush, err := p.brush(value, depth+2)
+	if err != nil {
+		return err
+	}
+	return p.property(node, name, brush, depth+1)
+}
+
+// gradient 编码渐变参数与停靠点，省略标准默认插值空间与延展方式并保留停靠点顺序
 // 入参: node 画刷节点, value 渐变模型, depth 节点深度
 // 返回: error 属性、颜色或预算错误
 func (p *pageEncoder) gradient(node *xmlElement, value *Brush, depth int) error {
 	if value.ColorInterpolationMode > ColorInterpolationScRGB || value.SpreadMethod > SpreadRepeat || len(value.Stops) < 2 {
 		return fmt.Errorf("%w: gradient model", ErrInvalid)
 	}
-	for _, attr := range []struct{ name, value string }{{"MappingMode", "Absolute"}, {"ColorInterpolationMode", []string{"SRgbLinearInterpolation", "ScRgbLinearInterpolation"}[value.ColorInterpolationMode]}, {"SpreadMethod", []string{"Pad", "Reflect", "Repeat"}[value.SpreadMethod]}} {
-		if err := p.attr(node, attr.name, attr.value); err != nil {
+	if err := p.attr(node, "MappingMode", "Absolute"); err != nil {
+		return err
+	}
+	if value.ColorInterpolationMode != ColorInterpolationSRGB {
+		if err := p.attr(node, "ColorInterpolationMode", []string{"SRgbLinearInterpolation", "ScRgbLinearInterpolation"}[value.ColorInterpolationMode]); err != nil {
+			return err
+		}
+	}
+	if value.SpreadMethod != SpreadPad {
+		if err := p.attr(node, "SpreadMethod", []string{"Pad", "Reflect", "Repeat"}[value.SpreadMethod]); err != nil {
 			return err
 		}
 	}
@@ -712,6 +945,15 @@ func (p *pageEncoder) element(value Element, depth int) (*xmlElement, error) {
 	if err != nil {
 		return nil, err
 	}
+	if canvas, ok := value.(*Canvas); ok && canvas.Resources != nil {
+		dictNode, err := p.resourceDictionary(canvas.Resources, depth+2, false)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.property(node, "Resources", dictNode, depth+1); err != nil {
+			return nil, err
+		}
+	}
 	if err := p.properties(node, value, properties, depth); err != nil {
 		return nil, err
 	}
@@ -781,7 +1023,17 @@ func (p *pageEncoder) properties(node *xmlElement, owner Element, value ElementP
 			return err
 		}
 	}
-	if value.RenderTransform != nil {
+	if value.RenderTransform != nil && value.RenderTransformResource != "" {
+		return fmt.Errorf("%w: conflicting element transform and transform resource", ErrInvalid)
+	}
+	if value.RenderTransformResource != "" {
+		if !fixedNamePattern(value.RenderTransformResource) {
+			return fmt.Errorf("%w: element transform resource", ErrInvalid)
+		}
+		if err := p.attr(node, "RenderTransform", "{StaticResource "+value.RenderTransformResource+"}"); err != nil {
+			return err
+		}
+	} else if value.RenderTransform != nil {
 		if !geometryFillMatrixFinite(*value.RenderTransform) {
 			return fmt.Errorf("%w: element matrix", ErrInvalid)
 		}
@@ -790,20 +1042,12 @@ func (p *pageEncoder) properties(node *xmlElement, owner Element, value ElementP
 		}
 	}
 	if value.Clip != nil {
-		geometry, err := p.geometry(value.Clip, depth+2)
-		if err != nil {
-			return err
-		}
-		if err := p.property(node, "Clip", geometry, depth+1); err != nil {
+		if err := p.geometryProperty(node, "Clip", value.Clip, depth); err != nil {
 			return err
 		}
 	}
 	if value.OpacityMask != nil {
-		brush, err := p.brush(value.OpacityMask, depth+2)
-		if err != nil {
-			return err
-		}
-		if err := p.property(node, "OpacityMask", brush, depth+1); err != nil {
+		if err := p.brushProperty(node, "OpacityMask", value.OpacityMask, depth); err != nil {
 			return err
 		}
 	}
@@ -823,27 +1067,86 @@ func (p *pageEncoder) property(node *xmlElement, name string, value *xmlElement,
 	return nil
 }
 
-// path 编码完整路径描边及绘制属性，无描边时省略零值描边数值参数
+// geometryProperty 按StaticResource引用、紧凑缩写属性或PathGeometry属性元素形式编码几何属性
+// 入参: node 所属元素节点, name 属性名, value 几何模型, depth 所属节点深度
+// 返回: error 几何、引用或预算错误
+func (p *pageEncoder) geometryProperty(node *xmlElement, name string, value *Geometry, depth int) error {
+	if value == nil {
+		return nil
+	}
+	if value.ResourceKey != "" {
+		if !fixedNamePattern(value.ResourceKey) {
+			return fmt.Errorf("%w: invalid geometry resource key %q", ErrInvalid, value.ResourceKey)
+		}
+		return p.attr(node, name, "{StaticResource "+value.ResourceKey+"}")
+	}
+	if value.FillRule > GeometryNonZero {
+		return fmt.Errorf("%w: geometry model", ErrInvalid)
+	}
+	if value.Transform == nil && value.TransformResource == "" && len(value.Figures) != 0 {
+		abbreviated := true
+		for _, figure := range value.Figures {
+			if err := p.step(depth); err != nil {
+				return err
+			}
+			abbreviated = abbreviated && figure.IsFilled
+			for _, segment := range figure.Segments {
+				if err := p.step(depth); err != nil {
+					return err
+				}
+				abbreviated = abbreviated && segment.IsStroked
+			}
+		}
+		if abbreviated {
+			text, err := p.geometryFigures(value.Figures, depth)
+			if err != nil {
+				return err
+			}
+			if value.FillRule == GeometryNonZero {
+				text = "F1 " + text
+			}
+			return p.attr(node, name, text)
+		}
+	}
+	geometry, err := p.geometry(value, depth+2)
+	if err != nil {
+		return err
+	}
+	return p.property(node, name, geometry, depth+1)
+}
+
+// path 编码路径描边、画刷及几何，省略标准默认描边属性并在无描边时省略零值描边参数
 // 入参: node 路径节点, value 路径模型, depth 节点深度
 // 返回: error 属性、几何或预算错误
 func (p *pageEncoder) path(node *xmlElement, value *Path, depth int) error {
-	if value.Stroke != nil || value.StrokeThickness != 0 {
+	if value.Stroke != nil && value.StrokeThickness != 1 || value.Stroke == nil && value.StrokeThickness != 0 && value.StrokeThickness != 1 {
 		if err := p.attr(node, "StrokeThickness", encodeNumber(value.StrokeThickness)); err != nil {
 			return err
 		}
 	}
-	if value.StrokeMiterLimit != 0 {
+	if value.StrokeMiterLimit != 0 && value.StrokeMiterLimit != 10 {
 		if err := p.attr(node, "StrokeMiterLimit", encodeNumber(value.StrokeMiterLimit)); err != nil {
 			return err
 		}
 	}
-	if value.Stroke != nil || value.StrokeDashOffset != 0 {
+	if value.StrokeDashOffset != 0 {
 		if err := p.attr(node, "StrokeDashOffset", encodeNumber(value.StrokeDashOffset)); err != nil {
 			return err
 		}
 	}
-	for _, attr := range []struct{ name, value string }{{"StrokeDashCap", string(value.StrokeDashCap)}, {"StrokeStartLineCap", string(value.StrokeStartLineCap)}, {"StrokeEndLineCap", string(value.StrokeEndLineCap)}, {"StrokeLineJoin", string(value.StrokeLineJoin)}, {"AutomationProperties.Name", value.AutomationName}, {"AutomationProperties.HelpText", value.AutomationHelpText}} {
-		if attr.value != "" {
+	for _, attr := range []struct {
+		name  string
+		value string
+		def   string
+	}{
+		{"StrokeDashCap", string(value.StrokeDashCap), string(LineCapFlat)},
+		{"StrokeStartLineCap", string(value.StrokeStartLineCap), string(LineCapFlat)},
+		{"StrokeEndLineCap", string(value.StrokeEndLineCap), string(LineCapFlat)},
+		{"StrokeLineJoin", string(value.StrokeLineJoin), string(LineJoinMiter)},
+		{"AutomationProperties.Name", value.AutomationName, ""},
+		{"AutomationProperties.HelpText", value.AutomationHelpText, ""},
+	} {
+		if attr.value != "" && attr.value != attr.def {
 			if err := p.attr(node, attr.name, attr.value); err != nil {
 				return err
 			}
@@ -873,29 +1176,19 @@ func (p *pageEncoder) path(node *xmlElement, value *Path, depth int) error {
 		name  string
 		value *Brush
 	}{{"Fill", value.Fill}, {"Stroke", value.Stroke}} {
-		if property.value != nil {
-			brush, err := p.brush(property.value, depth+2)
-			if err != nil {
-				return err
-			}
-			if err := p.property(node, property.name, brush, depth+1); err != nil {
-				return err
-			}
+		if err := p.brushProperty(node, property.name, property.value, depth); err != nil {
+			return err
 		}
 	}
 	if value.Data != nil {
-		geometry, err := p.geometry(value.Data, depth+2)
-		if err != nil {
-			return err
-		}
-		if err := p.property(node, "Data", geometry, depth+1); err != nil {
+		if err := p.geometryProperty(node, "Data", value.Data, depth); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// glyphs 编码字形簇、原始文字和定位信息，不从Unicode重新推断显式字形索引
+// glyphs 编码字形簇、原始文字和定位信息，省略标准默认属性且不从Unicode重新推断显式字形索引
 // 入参: node 字形节点, value 字形模型, depth 节点深度
 // 返回: error 字形、资源或预算错误
 func (p *pageEncoder) glyphs(node *xmlElement, value *Glyphs, depth int) error {
@@ -924,11 +1217,26 @@ func (p *pageEncoder) glyphs(node *xmlElement, value *Glyphs, depth int) error {
 	if present {
 		font += "#" + strconv.FormatUint(uint64(index), 10)
 	}
-	for _, attr := range []struct{ name, value string }{{"FontUri", font}, {"FontRenderingEmSize", encodeNumber(value.FontRenderingEmSize)}, {"OriginX", encodeNumber(value.Origin.X)}, {"OriginY", encodeNumber(value.Origin.Y)}, {"BidiLevel", strconv.Itoa(value.BidiLevel)}, {"IsSideways", strconv.FormatBool(value.IsSideways)}, {"StyleSimulations", string(value.StyleSimulations)}, {"CaretStops", value.CaretStops}} {
+	for _, attr := range []struct{ name, value string }{{"FontUri", font}, {"FontRenderingEmSize", encodeNumber(value.FontRenderingEmSize)}, {"OriginX", encodeNumber(value.Origin.X)}, {"OriginY", encodeNumber(value.Origin.Y)}, {"CaretStops", value.CaretStops}} {
 		if attr.value != "" {
 			if err := p.attr(node, attr.name, attr.value); err != nil {
 				return err
 			}
+		}
+	}
+	if value.BidiLevel != 0 {
+		if err := p.attr(node, "BidiLevel", strconv.Itoa(value.BidiLevel)); err != nil {
+			return err
+		}
+	}
+	if value.IsSideways {
+		if err := p.attr(node, "IsSideways", "true"); err != nil {
+			return err
+		}
+	}
+	if value.StyleSimulations != "" && value.StyleSimulations != StyleSimulationNone {
+		if err := p.attr(node, "StyleSimulations", string(value.StyleSimulations)); err != nil {
+			return err
 		}
 	}
 	for _, attr := range []struct{ name, value string }{{"UnicodeString", value.Text}, {"DeviceFontName", value.DeviceFontName}} {
@@ -948,11 +1256,7 @@ func (p *pageEncoder) glyphs(node *xmlElement, value *Glyphs, depth int) error {
 		}
 	}
 	if value.Fill != nil {
-		brush, err := p.brush(value.Fill, depth+2)
-		if err != nil {
-			return err
-		}
-		return p.property(node, "Fill", brush, depth+1)
+		return p.brushProperty(node, "Fill", value.Fill, depth)
 	}
 	return nil
 }
@@ -1027,7 +1331,17 @@ func (p *pageEncoder) geometry(value *Geometry, depth int) (*xmlElement, error) 
 			return nil, err
 		}
 	}
-	if value.Transform != nil {
+	if value.Transform != nil && value.TransformResource != "" {
+		return nil, fmt.Errorf("%w: conflicting geometry transform and transform resource", ErrInvalid)
+	}
+	if value.TransformResource != "" {
+		if !fixedNamePattern(value.TransformResource) {
+			return nil, fmt.Errorf("%w: geometry transform resource", ErrInvalid)
+		}
+		if err := p.attr(node, "Transform", "{StaticResource "+value.TransformResource+"}"); err != nil {
+			return nil, err
+		}
+	} else if value.Transform != nil {
 		if !geometryFillMatrixFinite(*value.Transform) {
 			return nil, fmt.Errorf("%w: geometry matrix", ErrInvalid)
 		}

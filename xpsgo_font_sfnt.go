@@ -57,6 +57,9 @@ const (
 	fontBitmapFlagVertical   = 0x02
 )
 
+// fontGlyphRunesLimit 限制单次GlyphRunes反向查询返回的最大Unicode码点数量，防止Format 13单组展开内存放大
+const fontGlyphRunesLimit = 1024
+
 // cffFontDict 保存字体字典、私有参数及显式矩阵，缺省矩阵由坐标转换层解释
 type cffFontDict struct {
 	dict    cffDict
@@ -85,24 +88,22 @@ type cffFontParser struct {
 	private map[[2]uint32]cffPrivate
 }
 
-// fontSource 持有共享的只读字体数据，字符映射、反向映射、轮廓和位图索引分别按需解析
+// fontSource 持有共享的只读字体数据，字符映射、轮廓和位图索引分别按需解析
 type fontSource struct {
-	face            *fontFace
-	metrics         *fontMetrics
-	cmapOnce        sync.Once
-	cmap            *fontCmap
-	cmapErr         error
-	reverseCmapOnce sync.Once
-	reverseCmap     map[uint16][]rune
-	outlineOnce     sync.Once
-	trueType        *trueTypeFont
-	cff             *cffFont
-	outlineErr      error
-	bitmapMutex     sync.Mutex
-	bitmapLoaded    bool
-	bitmaps         *fontBitmaps
-	bitmapErr       error
-	bitmapScale     fontSourceBitmapScale
+	face         *fontFace
+	metrics      *fontMetrics
+	cmapOnce     sync.Once
+	cmap         *fontCmap
+	cmapErr      error
+	outlineOnce  sync.Once
+	trueType     *trueTypeFont
+	cff          *cffFont
+	outlineErr   error
+	bitmapMutex  sync.Mutex
+	bitmapLoaded bool
+	bitmaps      *fontBitmaps
+	bitmapErr    error
+	bitmapScale  fontSourceBitmapScale
 }
 
 // fontSourceBitmapScale 保存单个字体访问器独立的EBSC懒加载状态
@@ -190,7 +191,6 @@ type fontBitmapMetrics struct {
 type fontBitmapLineMetrics struct {
 	ascender  int8
 	descender int8
-	widthMax  uint8
 }
 
 // fontBitmapEntry 保存已验证的数据区间及索引提供的固定度量
@@ -585,118 +585,131 @@ func (f *fontSource) glyphIndex(char rune) (uint16, error) {
 	return f.cmap.unicodeGlyph(char)
 }
 
-// loadReverseCmap 按需构建从字形编号到升序去重Unicode码点切片的反向映射表
-func (f *fontSource) loadReverseCmap() {
-	f.cmapOnce.Do(f.loadCmap)
-	if f.cmapErr != nil || f.cmap == nil {
-		return
-	}
-	f.reverseCmap = f.cmap.buildReverseMap()
-}
-
-// glyphRunes 返回源字体cmap中映射到指定非零字形编号的升序去重Unicode码点副本
+// glyphRunes 按需扫描源字体cmap中映射到指定非零字形编号的升序去重Unicode码点并受条目上限约束
 // 入参: gid 字形编号
 // 返回: []rune 升序去重Unicode码点切片，无映射或无cmap时返回nil
 func (f *fontSource) glyphRunes(gid uint16) []rune {
 	if f == nil || f.metrics == nil || gid == 0 || gid >= f.metrics.numGlyphs {
 		return nil
 	}
-	f.reverseCmapOnce.Do(f.loadReverseCmap)
-	list := f.reverseCmap[gid]
-	if len(list) == 0 {
+	f.cmapOnce.Do(f.loadCmap)
+	if f.cmapErr != nil || f.cmap == nil {
 		return nil
 	}
-	return slices.Clone(list)
+	return f.cmap.runesForGlyph(gid, fontGlyphRunesLimit)
 }
 
-// buildReverseMap 按当前选中cmap的平台、编码与子表格式枚举全部非零字形映射并生成升序去重反向索引
-// 返回: map[uint16][]rune 字形编号到升序去重Unicode码点的只读映射
-func (c *fontCmap) buildReverseMap() map[uint16][]rune {
-	if c == nil || len(c.data) < 2 || c.numGlyphs == 0 {
+// runesForGlyph 针对单个目标字形按需扫描选中的cmap子表并返回有界升序去重Unicode码点列表
+// 入参: target 目标非零字形编号, limit 返回码点条数上限
+// 返回: []rune 升序去重Unicode码点列表，无匹配时返回nil
+func (c *fontCmap) runesForGlyph(target uint16, limit int) []rune {
+	if c == nil || len(c.data) < 2 || c.numGlyphs == 0 || target == 0 || uint32(target) >= c.numGlyphs || limit <= 0 {
 		return nil
 	}
-	reverse := make(map[uint16][]rune)
-	add := func(gid uint16, r rune) {
-		if gid == 0 || uint32(gid) >= c.numGlyphs || !utf8.ValidRune(r) {
-			return
+	var result []rune
+	collectLimit := limit
+	if c.platform == 3 && c.encoding == 0 {
+		collectLimit = limit * 2
+	}
+	add := func(r rune) bool {
+		if !utf8.ValidRune(r) {
+			return true
 		}
-		reverse[gid] = append(reverse[gid], r)
+		result = append(result, r)
+		return len(result) < collectLimit
 	}
 	switch {
 	case c.platform == 3 && c.encoding >= 2 && c.encoding <= 5:
-		for r := rune(0); r < 0x80; r++ {
-			add(c.lookup(uint32(r)), r)
+		done := false
+		for r := rune(0); r < 0x80 && !done; r++ {
+			if c.lookup(uint32(r)) == target && !add(r) {
+				done = true
+			}
 		}
 		for _, rg := range fontCmapLegacyTables[c.encoding-2].load() {
+			if done {
+				break
+			}
 			for u := uint32(rg.first); u <= uint32(rg.last); u++ {
-				add(c.lookup(uint32(rg.code)+(u-uint32(rg.first))), rune(u))
+				if c.lookup(uint32(rg.code)+(u-uint32(rg.first))) == target && !add(rune(u)) {
+					done = true
+					break
+				}
 			}
 		}
 	case c.platform == 1 && c.encoding == 0:
 		for code := uint32(0); code < 256; code++ {
+			if c.lookup(code) != target {
+				continue
+			}
 			r := rune(code)
 			if code >= 0x80 {
 				r = fontCmapMacRoman[code-0x80]
 			}
-			add(c.lookup(code), r)
+			if !add(r) {
+				break
+			}
 		}
 	case c.platform == 0 || c.platform == 3 && (c.encoding == 0 || c.encoding == 1 || c.encoding == 10):
 		symbol := c.platform == 3 && c.encoding == 0
-		emit := func(code uint32, gid uint16) {
-			if gid == 0 || uint32(gid) >= c.numGlyphs {
-				return
-			}
+		emit := func(code uint32) bool {
 			if c.format == 8 && !symbol {
 				if code <= 0xffff {
 					if !c.is32(0) && !c.is32(code) {
-						add(gid, rune(code))
+						return add(rune(code))
 					}
-					return
+					return true
 				}
 				if c.is32(code >> 16) {
 					r := utf16.DecodeRune(rune(code>>16), rune(code&0xffff))
 					if r != utf8.RuneError && r > 0xffff {
-						add(gid, r)
+						return add(r)
 					}
 				}
-				return
+				return true
 			}
 			if code <= utf8.MaxRune {
-				add(gid, rune(code))
+				if !add(rune(code)) {
+					return false
+				}
 			}
 			if symbol && code >= 0xf020 && code <= 0xf0ff && c.lookup(code-0xf000) == 0 {
-				add(gid, rune(code-0xf000))
+				if !add(rune(code - 0xf000)) {
+					return false
+				}
 			}
+			return true
 		}
-		c.walkRawMappings(emit, c.format == 8 && !symbol)
+		c.walkMappingsForGlyph(target, emit, c.format == 8 && !symbol)
 	}
-	if len(reverse) == 0 {
+	if len(result) == 0 {
 		return nil
 	}
-	for gid, list := range reverse {
-		slices.Sort(list)
-		reverse[gid] = slices.Compact(list)
+	slices.Sort(result)
+	result = slices.Compact(result)
+	if len(result) > limit {
+		result = result[:limit]
 	}
-	return reverse
+	return result
 }
 
-// walkRawMappings 按子表原生格式枚举所有有效编码到非零字形编号的原始映射
-// 入参: emit 映射回调, utf16Pairs 是否允许遍历Format 8的高低代理对编码
-func (c *fontCmap) walkRawMappings(emit func(uint32, uint16), utf16Pairs bool) {
+// walkMappingsForGlyph 按子表原生结构定向扫描映射到目标字形编号的编码，避免Format 13全范围展开
+// 入参: target 目标非零字形编号, emit 编码回调返回false时终止扫描, utf16Pairs 是否解析Format 8代理对
+func (c *fontCmap) walkMappingsForGlyph(target uint16, emit func(uint32) bool, utf16Pairs bool) {
 	d := c.data
 	switch c.format {
 	case 0:
 		for code := uint32(0); code < 256; code++ {
-			if gid := uint16(d[6+code]); gid != 0 {
-				emit(code, gid)
+			if uint16(d[6+code]) == target && !emit(code) {
+				return
 			}
 		}
 	case 2:
 		for hi := uint32(0); hi < 256; hi++ {
 			key := uint32(binary.BigEndian.Uint16(d[6+2*hi:]))
 			if key == 0 {
-				if gid := c.lookup(hi); gid != 0 {
-					emit(hi, gid)
+				if c.lookup(hi) == target && !emit(hi) {
+					return
 				}
 				continue
 			}
@@ -709,8 +722,8 @@ func (c *fontCmap) walkRawMappings(emit func(uint32, uint16), utf16Pairs bool) {
 				gid := binary.BigEndian.Uint16(d[pos+6+offset+2*i:])
 				if gid != 0 {
 					gid += delta
-					if gid != 0 {
-						emit((hi<<8)|(first+i), gid)
+					if gid == target && !emit((hi<<8)|(first+i)) {
+						return
 					}
 				}
 			}
@@ -722,18 +735,20 @@ func (c *fontCmap) walkRawMappings(emit func(uint32, uint16), utf16Pairs bool) {
 			delta := binary.BigEndian.Uint16(d[16+4*c.count+2*i:])
 			word := 16 + 6*c.count + 2*i
 			offset := uint32(binary.BigEndian.Uint16(d[word:]))
-			for code := start; code <= end; code++ {
-				var gid uint16
-				if offset == 0 {
-					gid = uint16(code) + delta
-				} else {
-					gid = binary.BigEndian.Uint16(d[word+offset+2*(code-start):])
-					if gid != 0 {
-						gid += delta
-					}
+			if offset == 0 {
+				code := uint32(target - delta)
+				if code >= start && code <= end && !emit(code) {
+					return
 				}
+				continue
+			}
+			for code := start; code <= end; code++ {
+				gid := binary.BigEndian.Uint16(d[word+offset+2*(code-start):])
 				if gid != 0 {
-					emit(code, gid)
+					gid += delta
+					if gid == target && !emit(code) {
+						return
+					}
 				}
 			}
 		}
@@ -749,67 +764,50 @@ func (c *fontCmap) walkRawMappings(emit func(uint32, uint16), utf16Pairs bool) {
 			if code > utf8.MaxRune {
 				break
 			}
-			if gid := binary.BigEndian.Uint16(d[uint64(c.arrayOffset)+2*uint64(i):]); gid != 0 {
-				emit(uint32(code), gid)
+			if binary.BigEndian.Uint16(d[uint64(c.arrayOffset)+2*uint64(i):]) == target && !emit(uint32(code)) {
+				return
 			}
 		}
 	case 8, 12, 13:
+		target32 := uint32(target)
 		for i := uint32(0); i < c.count; i++ {
 			pos := uint64(c.arrayOffset) + 12*uint64(i)
 			start := binary.BigEndian.Uint32(d[pos:])
 			end := binary.BigEndian.Uint32(d[pos+4:])
 			base := binary.BigEndian.Uint32(d[pos+8:])
-			if c.format == 8 && utf16Pairs {
-				if start <= 0xffff {
-					last := min(end, 0xffff)
-					for code := start; code <= last; code++ {
-						gid := uint16(base + code - start)
-						if gid != 0 {
-							emit(code, gid)
-						}
-					}
+			if c.format == 13 {
+				if base != target32 {
+					continue
 				}
-				if end >= 0xd800dc00 && start <= 0xdbffdfff {
-					loBound := max(start, 0xd800dc00)
-					hiBound := min(end, 0xdbffdfff)
-					for high := loBound >> 16; high <= hiBound>>16; high++ {
-						if !c.is32(high) {
-							continue
-						}
-						loStart, loEnd := uint32(0xdc00), uint32(0xdfff)
-						if high == loBound>>16 {
-							loStart = max(loStart, loBound&0xffff)
-						}
-						if high == hiBound>>16 {
-							loEnd = min(loEnd, hiBound&0xffff)
-						}
-						for low := loStart; low <= loEnd; low++ {
-							code := (high << 16) | low
-							gid := uint16(base + code - start)
-							if gid != 0 {
-								emit(code, gid)
-							}
-						}
+				if start > utf8.MaxRune {
+					break
+				}
+				last := min(end, uint32(utf8.MaxRune))
+				for code := start; code <= last; code++ {
+					if code >= 0xd800 && code <= 0xdfff {
+						code = 0xdfff
+						continue
+					}
+					if !emit(code) {
+						return
 					}
 				}
 				continue
 			}
-			if start > utf8.MaxRune {
-				break
+			if target32 < base || uint64(target32)-uint64(base) > uint64(end)-uint64(start) {
+				continue
 			}
-			last := min(end, uint32(utf8.MaxRune))
-			for code := start; code <= last; code++ {
-				if code >= 0xd800 && code <= 0xdfff {
-					code = 0xdfff
-					continue
+			code := start + (target32 - base)
+			if c.format == 8 && utf16Pairs {
+				if code <= 0xffff || (code >= 0xd800dc00 && code <= 0xdbffdfff && c.is32(code>>16)) {
+					if !emit(code) {
+						return
+					}
 				}
-				gid := uint16(base)
-				if c.format != 13 {
-					gid = uint16(base + code - start)
-				}
-				if gid != 0 {
-					emit(code, gid)
-				}
+				continue
+			}
+			if code <= utf8.MaxRune && !(code >= 0xd800 && code <= 0xdfff) && !emit(code) {
+				return
 			}
 		}
 	}
@@ -1003,14 +1001,28 @@ func (f *fontSource) glyphBitmapOutline(gid uint16, ppem uint16, vertical bool) 
 	unitsY := float64(f.metrics.unitsPerEm) / float64(selection.ppemY)
 	bearingX := math.Round(float64(axis.bearingX) * selection.scaleX)
 	bearingY := math.Round(float64(axis.bearingY) * selection.scaleY)
+	var originOffset Point
 	if useVertical {
 		bearingY = -bearingY
+		var top float64
+		if f.metrics.needsGlyphYMax() {
+			if yMax, yErr := f.glyphYMax(gid); yErr == nil {
+				top = yMax
+			} else if !errors.Is(yErr, ErrUnsupported) {
+				return nil, yErr
+			}
+		}
+		vOrigin, vErr := f.metrics.verticalOrigin(gid, top)
+		if vErr != nil {
+			return nil, vErr
+		}
+		originOffset = vOrigin
 	}
 	designX := func(px int) float64 {
-		return (bearingX + float64(px)*selection.scaleX) * unitsX
+		return originOffset.X + (bearingX+float64(px)*selection.scaleX)*unitsX
 	}
 	designY := func(py int) float64 {
-		return (bearingY - float64(py)*selection.scaleY) * unitsY
+		return originOffset.Y + (bearingY-float64(py)*selection.scaleY)*unitsY
 	}
 	return fontBitmapMaskToGeometry(decoded.mask, designX, designY)
 }
@@ -1073,7 +1085,7 @@ func (f *fontSource) selectBitmapOutlineStrike(ppem uint16, vertical bool) (font
 	return fontBitmapSelection{strike: best, ppemX: strike.ppemX, ppemY: strike.ppemY, scaleX: 1, scaleY: 1}, nil
 }
 
-// fontBitmapMaskToGeometry 将位图掩码中所有非零像素按水平行程及垂直相同区间合并导出为闭合矢量几何
+// fontBitmapMaskToGeometry 将位图掩码中覆盖值不小于128的像素按水平行程及垂直相同区间合并导出为闭合矢量几何
 // 入参: mask 位图覆盖掩码, designX 源像素横坐标到设计单位映射, designY 源像素纵坐标到设计单位映射
 // 返回: *Geometry 设计单位闭合矢量几何，全空掩码返回空Geometry, error 坐标溢出错误
 func fontBitmapMaskToGeometry(mask *image.Alpha, designX, designY func(int) float64) (*Geometry, error) {
@@ -1085,12 +1097,12 @@ func fontBitmapMaskToGeometry(mask *image.Alpha, designX, designY func(int) floa
 	for y := mask.Rect.Min.Y; y < mask.Rect.Max.Y; y++ {
 		current := make(map[[2]int]bool)
 		for x := mask.Rect.Min.X; x < mask.Rect.Max.X; {
-			if mask.AlphaAt(x, y).A == 0 {
+			if mask.AlphaAt(x, y).A < 128 {
 				x++
 				continue
 			}
 			end := x + 1
-			for end < mask.Rect.Max.X && mask.AlphaAt(end, y).A != 0 {
+			for end < mask.Rect.Max.X && mask.AlphaAt(end, y).A >= 128 {
 				end++
 			}
 			span := [2]int{x, end}
@@ -1914,7 +1926,7 @@ func parseFontBitmapsWithWork(face *fontFace, numGlyphs uint32, charge func(uint
 // 入参: data 行度量记录
 // 返回: fontBitmapLineMetrics 核心行度量
 func parseBitmapLineMetrics(data []byte) fontBitmapLineMetrics {
-	return fontBitmapLineMetrics{ascender: int8(data[0]), descender: int8(data[1]), widthMax: data[2]}
+	return fontBitmapLineMetrics{ascender: int8(data[0]), descender: int8(data[1])}
 }
 
 // parseBitmapBigMetrics 读取已验证长度的八字节横竖字形度量

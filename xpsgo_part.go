@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -800,20 +801,97 @@ func requiredColorAttribute(element, attribute string) bool {
 	return (element == "SolidColorBrush" || element == "GradientStop") && attribute == "Color" || (element == "Path" || element == "Glyphs") && attribute == "Fill" || element == "Path" && attribute == "Stroke"
 }
 
-// requiredResourceMedia 按双格式最终规范核对被访问资源的媒体类型，忽略普通部件的合法MIME参数
+// CanonicalResourceKey 生成部件与可选片段的规范化去重键，部件路径统一规范为小写OPC名称
+// 入参: part 部件URI, fragment 可选片段标识
+// 返回: string 用于跨页资源复用的规范化去重键
+func CanonicalResourceKey(part string, fragment string) string {
+	trimmed := strings.TrimSpace(part)
+	if trimmed != "" {
+		if canonical, err := opcPartName(trimmed); err == nil {
+			trimmed = canonical
+		} else if canonical, err := resolvePart("/", trimmed); err == nil {
+			trimmed = canonical
+		}
+	}
+	key := strings.ToLower(trimmed)
+	frag := strings.TrimPrefix(strings.TrimSpace(fragment), "#")
+	if frag != "" {
+		return key + "#" + frag
+	}
+	return key
+}
+
+// standardXPSContentType 按ECMA-388表D-3/D-4与XPS 1.0表I-3/I-4判断媒体类型是否禁止携带MIME参数
+// 入参: format 文档格式, baseMedia 不含参数的主子媒体类型
+// 返回: bool 是否属于标准表内禁参媒体类型
+func standardXPSContentType(format Format, baseMedia string) bool {
+	base := strings.ToLower(strings.TrimSpace(baseMedia))
+	if base == "" || strings.Contains(base, ";") {
+		return false
+	}
+	switch base {
+	case opcCoreType,
+		opcCertificateType,
+		opcSignatureOriginType,
+		opcSignatureType,
+		opcRelsType,
+		fixedContentType("signaturedefinitions"),
+		fixedContentType("fixeddocumentsequence"),
+		fixedContentType("fixeddocument"),
+		fixedContentType("fixedpage"),
+		fixedContentType("discard-control"),
+		fixedContentType("documentstructure"),
+		fixedContentType("storyfragments"),
+		resourceDictionaryContentType,
+		"application/vnd.ms-opentype",
+		"application/vnd.ms-package.obfuscated-opentype",
+		"application/vnd.ms-color.iccprofile",
+		"image/jpeg",
+		"image/png",
+		"image/tiff",
+		"image/vnd.ms-photo":
+		return true
+	case "model/x3d+xml", "model/x3d+binary":
+		return format != FormatXPS
+	case printTicketType:
+		return format == FormatXPS
+	}
+	return false
+}
+
+// matchStandardContentType 依据方言标准表校验媒体类型匹配，表内类型禁止任何MIME参数，非表内类型按OPC允许合法参数
+// 入参: format 文档格式, media 实际媒体类型字符串, expected 期望的无参数主子媒体类型
+// 返回: bool 是否匹配期望的媒体类型
+func matchStandardContentType(format Format, media, expected string) bool {
+	if expected == "" {
+		return false
+	}
+	if standardXPSContentType(format, expected) {
+		return !strings.Contains(media, ";") && strings.EqualFold(media, expected)
+	}
+	if !strings.Contains(media, ";") {
+		return strings.EqualFold(media, expected)
+	}
+	parsed, _, err := mime.ParseMediaType(media)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed, expected)
+}
+
+// requiredResourceMedia 按双格式最终规范严格核对被访问资源的媒体类型，表内标准类型禁止MIME参数
 // 入参: kind 资源种类, media 内容类型
 // 返回: bool 类型是否符合用途
 func requiredResourceMedia(kind requiredResourceKind, media string) bool {
-	base := opcMediaTypeBase(media)
 	switch kind {
 	case requiredFont:
-		return strings.EqualFold(base, "application/vnd.ms-opentype") || strings.EqualFold(base, "application/vnd.ms-package.obfuscated-opentype")
+		return matchStandardContentType(FormatOpenXPS, media, "application/vnd.ms-opentype") || matchStandardContentType(FormatOpenXPS, media, "application/vnd.ms-package.obfuscated-opentype")
 	case requiredImage:
-		return strings.EqualFold(base, "image/jpeg") || strings.EqualFold(base, "image/png") || strings.EqualFold(base, "image/tiff") || strings.EqualFold(base, "image/vnd.ms-photo")
+		return matchStandardContentType(FormatOpenXPS, media, "image/jpeg") || matchStandardContentType(FormatOpenXPS, media, "image/png") || matchStandardContentType(FormatOpenXPS, media, "image/tiff") || matchStandardContentType(FormatOpenXPS, media, "image/vnd.ms-photo")
 	case requiredProfile:
-		return strings.EqualFold(base, "application/vnd.ms-color.iccprofile")
+		return matchStandardContentType(FormatOpenXPS, media, "application/vnd.ms-color.iccprofile")
 	case requiredDictionary:
-		return strings.EqualFold(base, resourceDictionaryContentType)
+		return matchStandardContentType(FormatOpenXPS, media, resourceDictionaryContentType)
 	case requiredModel:
 		model, err := resourceModelMedia(media)
 		return model && err == nil

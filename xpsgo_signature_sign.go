@@ -45,20 +45,24 @@ import (
 // signatureDefinitionNumber 匹配xs:double的有限数值词法，不套用固定页面实数的额外限制
 var signatureDefinitionNumber = regexp.MustCompile(`^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$`)
 
-// SignatureSignOptions 设置签署标识、声明时间、算法、规范化与可选覆盖，Hash缺省时按密钥类型自动选择
+// SignatureSignOptions 设置签署标识、请求绑定、声明时间、算法、规范化与可选覆盖，Hash缺省时按密钥类型自动选择
+// SpotID非空时须匹配文档SignatureDefinitions中的请求标识并自动用作Signature.Id，若同时提供ID须一致
 // PSS非nil且签名器为RSA时采用RSASSA-PSS；SeparateCertificate为true时证书写入独立部件并建立证书关系
+// SignCertificateParts在SeparateCertificate为true时自动将新建独立证书部件及证书关系纳入签名清单
 // ProtectSignatures按类型组覆盖已有及本次签名关系；存在MCE或签署票据时须提供Validate校验原始内容
 type SignatureSignOptions struct {
-	ID                  string
-	Time                time.Time
-	Hash                crypto.Hash
-	PSS                 *rsa.PSSOptions
-	Canonicalization    string
-	InclusiveNamespaces []string
-	SeparateCertificate bool
-	Parts               []string
-	ProtectSignatures   bool
-	Validate            func(context.Context, PartInfo, []byte) error
+	ID                   string
+	SpotID               string
+	Time                 time.Time
+	Hash                 crypto.Hash
+	PSS                  *rsa.PSSOptions
+	Canonicalization     string
+	InclusiveNamespaces  []string
+	SeparateCertificate  bool
+	SignCertificateParts bool
+	Parts                []string
+	ProtectSignatures    bool
+	Validate             func(context.Context, PartInfo, []byte) error
 }
 
 // SignatureDefinitionPart 保存签署请求及引用它的固定文档，不表示已经存在真实签名
@@ -107,10 +111,24 @@ func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates [
 	if options != nil {
 		configuration = *options
 		configuration.InclusiveNamespaces = slices.Clone(options.InclusiveNamespaces)
+		configuration.Parts = slices.Clone(options.Parts)
 		if options.PSS != nil {
 			pssCopy := *options.PSS
 			configuration.PSS = &pssCopy
 		}
+	}
+	spotID := strings.Trim(configuration.SpotID, " \t\r\n")
+	if configuration.SpotID != "" {
+		if int64(len(spotID)) > p.limits.MaxMetadataBytes {
+			return PartInfo{}, fmt.Errorf("%w: signing spot ID byte budget", ErrLimit)
+		}
+		if !xmlNCName(spotID) || spotID == "idPackageObject" || spotID == "idSignatureTime" {
+			return PartInfo{}, fmt.Errorf("%w: signing spot ID", ErrInvalid)
+		}
+		if trimmedID := strings.Trim(configuration.ID, " \t\r\n"); trimmedID != "" && trimmedID != spotID {
+			return PartInfo{}, fmt.Errorf("%w: signing ID conflicts with SpotID", ErrInvalid)
+		}
+		configuration.ID = spotID
 	}
 	if configuration.Canonicalization == "" {
 		configuration.Canonicalization = signatureCanonical
@@ -147,6 +165,9 @@ func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates [
 	}
 	defer reader.Close()
 	origin, err := signatureSigningOrigin(reader, ctx)
+	if err == nil && spotID != "" {
+		err = signatureSigningSpot(reader, spotID, ctx)
+	}
 	if err == nil {
 		err = signatureSigningMutableXML(reader, origin, configuration.Validate, ctx)
 	}
@@ -223,7 +244,10 @@ func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates [
 	if err := q.signingParts(reader, origin, part, certParts, ctx); err != nil {
 		return PartInfo{}, err
 	}
-	references, graph, err := signatureSigningReferences(reader, part, configuration, ctx)
+	if configuration.SeparateCertificate && configuration.SignCertificateParts && len(certParts) != 0 {
+		configuration.Parts = append(configuration.Parts, certParts...)
+	}
+	references, graph, err := signatureSigningReferences(reader, configuration, ctx)
 	if err != nil {
 		return PartInfo{}, err
 	}
@@ -239,25 +263,17 @@ func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates [
 		return PartInfo{}, err
 	}
 	defer final.Close()
-	info, err := final.ReadSignature(ctx, part)
-	if err != nil {
-		return PartInfo{}, err
-	}
-	coverage, err := final.SignatureCoverage(ctx, part)
-	if err != nil {
-		return PartInfo{}, err
-	}
-	if !coverage.Complete {
-		return PartInfo{}, fmt.Errorf("%w: generated signature coverage", ErrInvalid)
-	}
 	verification, err := final.VerifySignature(ctx, part, &SignatureVerifyOptions{PublicKey: public})
 	if err != nil {
 		return PartInfo{}, err
 	}
+	if verification.Coverage == nil || !verification.Coverage.Complete {
+		return PartInfo{}, fmt.Errorf("%w: generated signature coverage", ErrInvalid)
+	}
 	if verification.SignatureError != nil {
 		return PartInfo{}, verification.SignatureError
 	}
-	if !verification.SignatureVerified || verification.Coverage == nil || !verification.Coverage.Complete {
+	if !verification.SignatureVerified {
 		return PartInfo{}, fmt.Errorf("%w: generated signature verification", ErrSignature)
 	}
 	if err := ctx.Err(); err != nil {
@@ -265,7 +281,7 @@ func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates [
 	}
 	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
 	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
-	return info.Part, nil
+	return verification.Part, nil
 }
 
 // signingParts 向私有快照补入待签署部件、独立证书部件与签名源关系供覆盖清单及摘要计算使用
@@ -462,6 +478,75 @@ func signatureSigningCertificates(input []*x509.Certificate, public crypto.Publi
 	return result, nil
 }
 
+// signatureSigningSpot 校验SpotID已在当前包的固定文档SignatureDefinitions中定义
+// 入参: reader 当前候选快照, spotID 已规范化的签署请求标识, ctx 取消Context
+// 返回: error 请求缺失、关联、模式、资源或取消错误
+func signatureSigningSpot(reader *Reader, spotID string, ctx context.Context) error {
+	parts, err := reader.SignatureDefinitions(ctx)
+	if err != nil {
+		return err
+	}
+	for _, part := range parts {
+		for _, definition := range part.Definitions {
+			if definition.ID == spotID {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("%w: signature spot ID %q is not defined in document SignatureDefinitions", ErrInvalid, spotID)
+}
+
+// AddSignatureDefinitions 将签署请求编码为独立部件并关联至指定固定文档，自动避开已有路径并校验全局SpotID唯一
+// 失败时不修改包状态，不自动创建数字签名
+// 入参: ctx 取消Context，nil采用Background, docIndex 从零开始的固定文档序号, definitions 非空签署请求列表
+// 返回: PartInfo 新建的签名定义部件信息，失败为零值, error 序号、模型、重复标识、资源或取消错误
+func (p *Package) AddSignatureDefinitions(ctx context.Context, docIndex int, definitions []SignatureDefinition) (PartInfo, error) {
+	ctx = normalizeContext(ctx)
+	if err := p.lock(); err != nil {
+		return PartInfo{}, err
+	}
+	defer p.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return PartInfo{}, err
+	}
+	if docIndex < 0 || docIndex >= len(p.documents) || len(definitions) == 0 {
+		return PartInfo{}, fmt.Errorf("%w: signature definition document index or empty requests", ErrInvalid)
+	}
+	var encoded bytes.Buffer
+	if _, err := EncodeSignatureDefinitions(ctx, &encoded, definitions, &EncodeOptions{Format: p.format, Limits: p.limits}); err != nil {
+		return PartInfo{}, err
+	}
+	q := p.signingCopy()
+	part, err := q.newName("/Metadata/SignatureDefinitions_%d.xml", ctx)
+	if err != nil {
+		return PartInfo{}, err
+	}
+	media := fixedContentType("signaturedefinitions")
+	if err := q.store(part, media, encoded.Bytes()); err != nil {
+		return PartInfo{}, err
+	}
+	q.commitName("/Metadata/SignatureDefinitions_%d.xml", part)
+	source := q.documents[docIndex].Part
+	key := strings.ToLower(source)
+	relations := slices.Clone(q.relations[key])
+	nextID := createdRelationshipIDs(append(slices.Clone(relations), q.originalRels[key]...))
+	relations = append(relations, Relationship{ID: nextID(), Type: formatNamespace(q.format) + "/signature-definitions", Target: part, TargetMode: TargetModeInternal})
+	if err := q.setRelationships(source, relations); err != nil {
+		return PartInfo{}, err
+	}
+	view, err := q.reader(ctx)
+	if err != nil {
+		return PartInfo{}, err
+	}
+	_ = view.Close()
+	if err := ctx.Err(); err != nil {
+		return PartInfo{}, err
+	}
+	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
+	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
+	return PartInfo{Name: part, ContentType: media, Size: int64(encoded.Len())}, nil
+}
+
 // signatureSigningOrigin 检查原有签名关联并返回唯一签名源，不改写或移除已有签名
 // 入参: reader 当前候选快照, ctx 取消Context
 // 返回: string 原有签名源URI，无签名源时为空, error 关联、资源或取消错误
@@ -498,6 +583,7 @@ func encodeDocumentSignature(options SignatureSignOptions, certificates [][]byte
 	canonicalization := signatureSigningCanonicalNode("CanonicalizationMethod", options.Canonicalization, options.InclusiveNamespaces)
 	signatureMethod := signatureSigningMethodNode(method, pss)
 	objectReference := signatureSigningNode("Reference", "URI", "#"+url.PathEscape("idPackageObject"))
+	objectReference.Attr = append(objectReference.Attr, xml.Attr{Name: xml.Name{Local: "Type"}, Value: xmlSignatureNamespace + "Object"})
 	objectReference.Children = []*xmlElement{signatureSigningTransforms([]SignatureTransform{{Algorithm: options.Canonicalization, InclusiveNamespaces: options.InclusiveNamespaces}}), signatureSigningNode("DigestMethod", "Algorithm", digest), signatureSigningText("DigestValue", "AA==")}
 	info.Children = []*xmlElement{canonicalization, signatureMethod, objectReference}
 	value := signatureSigningText("SignatureValue", "AA==")
@@ -751,10 +837,10 @@ func signatureSigningTransforms(transforms []SignatureTransform) *xmlElement {
 	return root
 }
 
-// signatureSigningReferences 生成单次签署的完整覆盖引用清单并校验可选额外部件及会签目标
-// 入参: reader 候选快照, selfPart 当前待签署部件URI, options 签署选项, ctx 取消Context
+// signatureSigningReferences 生成单次签署的完整覆盖引用清单并校验可选额外部件
+// 入参: reader 候选快照, options 签署选项, ctx 取消Context
 // 返回: []SignatureReference 有序引用, *signaturePartGraph 私有累计读取预算, error 策略、目标、资源或取消错误
-func signatureSigningReferences(reader *Reader, selfPart string, options SignatureSignOptions, ctx context.Context) ([]SignatureReference, *signaturePartGraph, error) {
+func signatureSigningReferences(reader *Reader, options SignatureSignOptions, ctx context.Context) ([]SignatureReference, *signaturePartGraph, error) {
 	g := &signaturePartGraph{context: ctx, remaining: reader.limits.MaxPackageBytes}
 	pkg := *reader.pkg
 	pkg.beforeRead, g.pkg = g.readAllowance, &pkg
@@ -762,7 +848,7 @@ func signatureSigningReferences(reader *Reader, selfPart string, options Signatu
 		graph: g, format: reader.format, owners: make(map[string]string), parts: make(map[string]bool), required: make(map[string]bool),
 		relations: make(map[signatureCoverageKey]SignatureRelationship), modes: make(map[signatureCoverageKey]int), targets: make(map[signatureCoverageKey]string), bySource: make(map[string][]Relationship),
 	}
-	if err := c.collect(reader, selfPart); err != nil {
+	if err := c.collect(reader); err != nil {
 		return nil, nil, err
 	}
 	if len(options.Parts) > reader.limits.MaxPartCount {

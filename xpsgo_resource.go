@@ -46,6 +46,7 @@ type resourceDefinition struct {
 type resourceScope struct {
 	Parent  *resourceScope
 	Entries map[string]*resourceDefinition
+	remote  bool
 }
 
 // resourceGraph 保存按定义顺序绑定的资源引用和部件来源
@@ -63,13 +64,14 @@ type resourceLoader func(part string) (*xmlElement, error)
 
 // resourceParser 保存单页资源图的解析状态与累计限制
 type resourceParser struct {
-	format  Format
-	limits  Limits
-	context context.Context
-	load    resourceLoader
-	graph   *resourceGraph
-	remote  map[string]*resourceScope
-	nodes   int
+	format     Format
+	limits     Limits
+	context    context.Context
+	load       resourceLoader
+	graph      *resourceGraph
+	remote     map[string]*resourceScope
+	nodes      int
+	skipRemote bool
 }
 
 // resourceModelContext 保存原始画刷的逻辑父节点及所在Path，不跨兼容分支继承兄弟状态
@@ -96,11 +98,12 @@ type resourceReachability struct {
 	parts  []string
 }
 
-// OptimizationOptions 设置资源优化的扫描字节、遍历、比对及重写工作上限，零值采用包上限
-// 快照校验及字体使用预检沿用阅读器上限
+// OptimizationOptions 设置资源优化的扫描字节、遍历、比对、重写工作上限及紧凑字体字形重映射，零值采用包上限
+// 快照校验及字体使用预检沿用阅读器上限，CompactGIDs仅作用于Package.SubsetFonts
 type OptimizationOptions struct {
-	MaxBytes int64
-	MaxWork  int
+	MaxBytes    int64
+	MaxWork     int
+	CompactGIDs bool
 }
 
 // ResourceOptimization 记录字体子集化或图像重压缩前后的逻辑字节数及替换状态
@@ -190,6 +193,13 @@ func parseResourceGraph(part string, root *xmlElement, format Format, limits Lim
 // 入参: part 页面URI, root 预处理页面, format 格式, limits 单页资源图上限, load 字典读取器, ctx 取消Context
 // 返回: *resourceGraph 独立资源图, error 结构、引用、预算或取消错误
 func parseResourceGraphContext(part string, root *xmlElement, format Format, limits Limits, load resourceLoader, ctx context.Context) (*resourceGraph, error) {
+	return parseResourceGraphMode(part, root, format, limits, load, ctx, false)
+}
+
+// parseResourceGraphMode 按可选跳过远程字典模式建立单页资源图，skipRemote为真时仅校验远程字典Source与本地可解析绑定
+// 入参: part 页面URI, root 预处理页面, format 格式, limits 单页资源图上限, load 字典读取器, ctx 取消Context, skipRemote 是否跳过未加载的远程字典
+// 返回: *resourceGraph 独立资源图, error 结构、引用、预算或取消错误
+func parseResourceGraphMode(part string, root *xmlElement, format Format, limits Limits, load resourceLoader, ctx context.Context, skipRemote bool) (*resourceGraph, error) {
 	if formatNamespace(format) == "" || limits.MaxXMLNodes < 1 || limits.MaxXMLDepth < 1 || limits.MaxPartCount < 1 {
 		return nil, fmt.Errorf("%w: invalid resource parser configuration", ErrInvalid)
 	}
@@ -201,7 +211,7 @@ func parseResourceGraphContext(part string, root *xmlElement, format Format, lim
 		return nil, fmt.Errorf("%w: resource graph requires a FixedPage", ErrInvalid)
 	}
 	p := &resourceParser{
-		format: format, limits: limits, load: load, context: ctx,
+		format: format, limits: limits, load: load, context: ctx, skipRemote: skipRemote,
 		graph:  &resourceGraph{PagePart: canonical, Bindings: make(map[*xmlElement]map[string]*resourceDefinition), Parts: make(map[*xmlElement]string)},
 		remote: make(map[string]*resourceScope),
 	}
@@ -221,6 +231,17 @@ func (s *resourceScope) lookup(key string) *resourceDefinition {
 		}
 	}
 	return nil
+}
+
+// hasRemote 判断当前作用域链上是否存在未加载的远程资源字典占位作用域
+// 返回: bool 是否含远程字典作用域
+func (s *resourceScope) hasRemote() bool {
+	for current := s; current != nil; current = current.Parent {
+		if current.remote {
+			return true
+		}
+	}
+	return false
 }
 
 // enter 校验节点的基础结构并累计页面和远程字典的处理量
@@ -295,7 +316,13 @@ func (p *resourceParser) walk(node *xmlElement, part string, scope *resourceScop
 			continue
 		}
 		value := scope.lookup(key)
-		if value == nil || resourceKind(value.Kind) != expected {
+		if value == nil {
+			if p.skipRemote && scope.hasRemote() {
+				continue
+			}
+			return resourceError(part, node, "unresolved or incompatible resource "+key+" for "+attr.Name.Local)
+		}
+		if resourceKind(value.Kind) != expected {
 			return resourceError(part, node, "unresolved or incompatible resource "+key+" for "+attr.Name.Local)
 		}
 		if p.graph.Bindings[node] == nil {
@@ -370,6 +397,17 @@ func (p *resourceParser) dictionary(node *xmlElement, part string, parent *resou
 		target, err := resolvePart(part, strings.Trim(source, " \t\r\n"))
 		if err != nil {
 			return nil, &PartError{Part: part, Element: node.Name.Local, Err: err}
+		}
+		if p.skipRemote {
+			key := strings.ToLower(target)
+			if p.remote[key] == nil {
+				if len(p.graph.RemoteParts) >= p.limits.MaxPartCount || depth+1 > p.limits.MaxXMLDepth {
+					return nil, &PartError{Part: target, Err: fmt.Errorf("%w: remote dictionary count or depth", ErrLimit)}
+				}
+				p.graph.RemoteParts = append(p.graph.RemoteParts, target)
+				p.remote[key] = &resourceScope{remote: true}
+			}
+			return &resourceScope{Parent: parent, remote: true}, nil
 		}
 		loaded, err := p.loadRemote(target, depth+1)
 		if err != nil {
@@ -809,7 +847,7 @@ func resourceAttributeReferences(node *xmlElement, attribute xml.Attr) ([]resour
 		if profile == "" {
 			return []resourceAttributeReference{{xmlAttributeRange{start, start + len(trimmed)}, uri, requiredImage}}, nil
 		}
-		start = len("{ColorConvertedBitmap")
+		start += len("{ColorConvertedBitmap")
 		start += len(value[start:]) - len(strings.TrimLeft(value[start:], " \t\r\n"))
 		end := start + len(uri)
 		profileStart := end + len(value[end:]) - len(strings.TrimLeft(value[end:], " \t\r\n"))

@@ -1661,10 +1661,18 @@ func (s *visualBrushFilter) releaseFilter() {
 }
 
 // RenderBrushTile 隔离光栅化VisualBrush、ImageBrush或渐变画刷的单个Viewport瓦片到透明背景画布
-// 按options.DPI（默认96）将物理Viewport换算为整数像素尺寸，返回瓦片图像与对应物理Viewport矩形
+// 综合options.DPI（默认96）、options.Transform与平铺画刷Transform的两轴线性尺度确定像素分辨率，渐变画刷保留Transform
 // 入参: ctx 取消Context，nil采用Background, brush 待光栅化画刷, options 绘制参数，nil采用96DPI透明默认配置
-// 返回: *image.NRGBA 透明背景单瓦片图像, Rect 瓦片在画刷局部坐标系中的物理Viewport矩形, error 参数、画刷、资源、预算或取消错误
+// 返回: *image.NRGBA 透明背景单瓦片图像, Rect 瓦片物理范围矩形, error 参数、画刷、资源、预算或取消错误
 func (r *Reader) RenderBrushTile(ctx context.Context, brush *Brush, options *RenderOptions) (*image.NRGBA, Rect, error) {
+	return r.RenderBrushTileWithState(ctx, brush, "", WalkState{Opacity: 1, Matrix: IdentityMatrix()}, options)
+}
+
+// RenderBrushTileWithState 在指定图形与打印色彩状态下隔离光栅化单个画刷瓦片到透明背景画布
+// 综合options.DPI、options.Transform、state.Matrix与平铺画刷Transform两轴线性尺度计算像素尺寸，并透传PrintColor、PrintColorPlan与Negative
+// 入参: ctx 取消Context，nil采用Background, brush 待光栅化画刷, basePart 相对资源解析基准部件，空值回退brush.Part与state.PagePart, state 图形与打印色彩状态, options 绘制参数，nil采用96DPI透明默认配置
+// 返回: *image.NRGBA 透明背景单瓦片图像, Rect 瓦片物理范围矩形, error 参数、画刷、资源、预算或取消错误
+func (r *Reader) RenderBrushTileWithState(ctx context.Context, brush *Brush, basePart string, state WalkState, options *RenderOptions) (*image.NRGBA, Rect, error) {
 	ctx = normalizeContext(ctx)
 	if err := checkContext(ctx); err != nil {
 		return nil, Rect{}, err
@@ -1676,6 +1684,26 @@ func (r *Reader) RenderBrushTile(ctx context.Context, brush *Brush, options *Ren
 	if brush == nil || !geometryFinite(brush.Opacity) || brush.Opacity < 0 || brush.Opacity > 1 {
 		return nil, Rect{}, fmt.Errorf("%w: brush tile source", ErrInvalid)
 	}
+	if state.EdgeMode != "" && state.EdgeMode != EdgeModeAliased {
+		return nil, Rect{}, fmt.Errorf("%w: brush tile edge mode", ErrInvalid)
+	}
+	if err := validatePrintColor(state.PrintColor); err != nil {
+		return nil, Rect{}, err
+	}
+	effectivePart := brush.Part
+	if effectivePart == "" {
+		effectivePart = basePart
+	}
+	if effectivePart == "" {
+		effectivePart = state.PagePart
+	}
+	if effectivePart != "" {
+		var err error
+		effectivePart, err = opcPartName(effectivePart)
+		if err != nil {
+			return nil, Rect{}, err
+		}
+	}
 	configuration := RenderOptions{}
 	if options != nil {
 		configuration = *options
@@ -1685,6 +1713,7 @@ func (r *Reader) RenderBrushTile(ctx context.Context, brush *Brush, options *Ren
 	if err != nil {
 		return nil, Rect{}, err
 	}
+	settings.outputColor = state.PrintColor.Mode
 	viewport, err := brushTileViewport(brush)
 	if err != nil {
 		return nil, Rect{}, err
@@ -1692,12 +1721,40 @@ func (r *Reader) RenderBrushTile(ctx context.Context, brush *Brush, options *Ren
 	if viewport.Width == 0 || viewport.Height == 0 || brush.Opacity == 0 {
 		return image.NewNRGBA(image.Rectangle{}), viewport, nil
 	}
+	scaleMatrix := IdentityMatrix()
+	if configuration.Transform != nil {
+		scaleMatrix = strokePathCompose(scaleMatrix, *configuration.Transform)
+	}
+	if state.Matrix != (Matrix{}) {
+		if !geometryFillMatrixFinite(state.Matrix) {
+			return nil, Rect{}, fmt.Errorf("%w: brush tile state matrix", ErrInvalid)
+		}
+		scaleMatrix = strokePathCompose(scaleMatrix, state.Matrix)
+	}
+	isTileBrush := brush.Kind == BrushVisual || brush.Kind == BrushImage
+	if isTileBrush && brush.Transform != nil {
+		if !geometryFillMatrixFinite(*brush.Transform) {
+			return nil, Rect{}, fmt.Errorf("%w: brush tile transform", ErrInvalid)
+		}
+		scaleMatrix = strokePathCompose(scaleMatrix, *brush.Transform)
+	}
+	if !geometryFillMatrixFinite(scaleMatrix) {
+		return nil, Rect{}, fmt.Errorf("%w: brush tile scale range", ErrLimit)
+	}
+	axisX := math.Hypot(scaleMatrix.A, scaleMatrix.B)
+	axisY := math.Hypot(scaleMatrix.C, scaleMatrix.D)
+	if !geometryFinite(axisX, axisY) {
+		return nil, Rect{}, fmt.Errorf("%w: brush tile scale range", ErrLimit)
+	}
+	if axisX == 0 || axisY == 0 {
+		return image.NewNRGBA(image.Rectangle{}), viewport, nil
+	}
 	dpi := configuration.DPI
 	if dpi == 0 {
 		dpi = 96
 	}
 	scale := dpi / 96
-	rawW, rawH := viewport.Width*scale, viewport.Height*scale
+	rawW, rawH := viewport.Width*scale*axisX, viewport.Height*scale*axisY
 	if !geometryFinite(rawW, rawH) || rawW > float64(rasterMaxDimension) || rawH > float64(rasterMaxDimension) {
 		return nil, Rect{}, fmt.Errorf("%w: brush tile pixel dimensions", ErrLimit)
 	}
@@ -1710,14 +1767,37 @@ func (r *Reader) RenderBrushTile(ctx context.Context, brush *Brush, options *Ren
 		return nil, Rect{}, fmt.Errorf("%w: brush tile mapping range", ErrLimit)
 	}
 	tileBrush := *brush
-	tileBrush.Transform = nil
-	tileBrush.TileMode = TileNone
-	tilePath := &Path{
-		ElementProperties: ElementProperties{Part: brush.Part, Opacity: 1},
+	if tileBrush.Part == "" {
+		tileBrush.Part = effectivePart
+	}
+	if isTileBrush {
+		tileBrush.Transform = nil
+		tileBrush.TileMode = TileNone
+	}
+	var root Element = &Path{
+		ElementProperties: ElementProperties{Part: effectivePart, Opacity: 1},
 		Data:              renderBoxGeometry(viewport),
 		Fill:              &tileBrush,
 	}
-	output, err := r.renderLoadedElements([]Element{tilePath}, tileTransform, image.Rect(0, 0, pixelW, pixelH), settings)
+	if state.EdgeMode == EdgeModeAliased {
+		root = &Canvas{ElementProperties: ElementProperties{Part: effectivePart, Opacity: 1}, EdgeMode: EdgeModeAliased, Elements: []Element{root}}
+	}
+	if state.Negative {
+		negCanvas := &Canvas{ElementProperties: ElementProperties{Part: effectivePart, Opacity: 1}, Elements: []Element{root}}
+		settings.negative = map[*Canvas]bool{negCanvas: true}
+		root = negCanvas
+	}
+	var output *image.NRGBA
+	bounds := image.Rect(0, 0, pixelW, pixelH)
+	if state.PrintColorPlan != nil {
+		planCanvas := &Canvas{ElementProperties: ElementProperties{Part: effectivePart, Opacity: 1}, Elements: []Element{root}}
+		if err := attachPrintColorPlanPreview(ctx, &settings, configuration, planCanvas, state.PrintColorPlan); err != nil {
+			return nil, Rect{}, err
+		}
+		output, err = r.renderLoadedElementsPrintPreview([]Element{planCanvas}, tileTransform, bounds, settings)
+	} else {
+		output, err = r.renderLoadedElements([]Element{root}, tileTransform, bounds, settings)
+	}
 	if err != nil {
 		return nil, Rect{}, err
 	}
@@ -1727,9 +1807,9 @@ func (r *Reader) RenderBrushTile(ctx context.Context, brush *Brush, options *Ren
 	return output, viewport, nil
 }
 
-// brushTileViewport 校验画刷属性并确定单瓦片在画刷局部坐标系下的物理Viewport范围
+// brushTileViewport 校验画刷属性并确定单瓦片物理范围，渐变画刷在缺省Viewport时结合Transform计算精确采样域
 // 入参: brush 源画刷
-// 返回: Rect 物理Viewport矩形, error 画刷参数或不支持种类错误
+// 返回: Rect 物理采样范围矩形, error 画刷参数或不支持种类错误
 func brushTileViewport(brush *Brush) (Rect, error) {
 	switch brush.Kind {
 	case BrushVisual:
@@ -1756,14 +1836,29 @@ func brushTileViewport(brush *Brush) (Rect, error) {
 		if !geometryFinite(brush.StartPoint.X, brush.StartPoint.Y, brush.EndPoint.X, brush.EndPoint.Y) {
 			return Rect{}, fmt.Errorf("%w: linear gradient brush points", ErrInvalid)
 		}
+		if brush.Transform != nil && !geometryFillMatrixFinite(*brush.Transform) {
+			return Rect{}, fmt.Errorf("%w: linear gradient brush transform", ErrInvalid)
+		}
 		if brush.Viewport != (Rect{}) {
 			if !geometryFinite(brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height, brush.Viewport.X+brush.Viewport.Width, brush.Viewport.Y+brush.Viewport.Height) || brush.Viewport.Width < 0 || brush.Viewport.Height < 0 {
 				return Rect{}, fmt.Errorf("%w: gradient brush viewport", ErrInvalid)
 			}
 			return brush.Viewport, nil
 		}
-		minX, maxX := min(brush.StartPoint.X, brush.EndPoint.X), max(brush.StartPoint.X, brush.EndPoint.X)
-		minY, maxY := min(brush.StartPoint.Y, brush.EndPoint.Y), max(brush.StartPoint.Y, brush.EndPoint.Y)
+		start, end := brush.StartPoint, brush.EndPoint
+		if brush.Transform != nil {
+			var err error
+			start, err = geometryFillPoint(*brush.Transform, start)
+			if err != nil {
+				return Rect{}, err
+			}
+			end, err = geometryFillPoint(*brush.Transform, end)
+			if err != nil {
+				return Rect{}, err
+			}
+		}
+		minX, maxX := min(start.X, end.X), max(start.X, end.X)
+		minY, maxY := min(start.Y, end.Y), max(start.Y, end.Y)
 		w, h := maxX-minX, maxY-minY
 		if !geometryFinite(w, h) {
 			return Rect{}, fmt.Errorf("%w: linear gradient viewport range", ErrLimit)
@@ -1779,16 +1874,38 @@ func brushTileViewport(brush *Brush) (Rect, error) {
 		if !geometryFinite(brush.Center.X, brush.Center.Y, brush.GradientOrigin.X, brush.GradientOrigin.Y, brush.RadiusX, brush.RadiusY) || brush.RadiusX < 0 || brush.RadiusY < 0 {
 			return Rect{}, fmt.Errorf("%w: radial gradient brush geometry", ErrInvalid)
 		}
+		if brush.Transform != nil && !geometryFillMatrixFinite(*brush.Transform) {
+			return Rect{}, fmt.Errorf("%w: radial gradient brush transform", ErrInvalid)
+		}
 		if brush.Viewport != (Rect{}) {
 			if !geometryFinite(brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height, brush.Viewport.X+brush.Viewport.Width, brush.Viewport.Y+brush.Viewport.Height) || brush.Viewport.Width < 0 || brush.Viewport.Height < 0 {
 				return Rect{}, fmt.Errorf("%w: gradient brush viewport", ErrInvalid)
 			}
 			return brush.Viewport, nil
 		}
-		minX := min(brush.Center.X-brush.RadiusX, brush.GradientOrigin.X)
-		maxX := max(brush.Center.X+brush.RadiusX, brush.GradientOrigin.X)
-		minY := min(brush.Center.Y-brush.RadiusY, brush.GradientOrigin.Y)
-		maxY := max(brush.Center.Y+brush.RadiusY, brush.GradientOrigin.Y)
+		center, origin := brush.Center, brush.GradientOrigin
+		rx, ry := brush.RadiusX, brush.RadiusY
+		if brush.Transform != nil {
+			m := *brush.Transform
+			var err error
+			center, err = geometryFillPoint(m, center)
+			if err != nil {
+				return Rect{}, err
+			}
+			origin, err = geometryFillPoint(m, origin)
+			if err != nil {
+				return Rect{}, err
+			}
+			rx = math.Hypot(m.A*brush.RadiusX, m.C*brush.RadiusY)
+			ry = math.Hypot(m.B*brush.RadiusX, m.D*brush.RadiusY)
+			if !geometryFinite(rx, ry) {
+				return Rect{}, fmt.Errorf("%w: radial gradient viewport range", ErrLimit)
+			}
+		}
+		minX := min(center.X-rx, origin.X)
+		maxX := max(center.X+rx, origin.X)
+		minY := min(center.Y-ry, origin.Y)
+		maxY := max(center.Y+ry, origin.Y)
 		w, h := maxX-minX, maxY-minY
 		if !geometryFinite(w, h) {
 			return Rect{}, fmt.Errorf("%w: radial gradient viewport range", ErrLimit)

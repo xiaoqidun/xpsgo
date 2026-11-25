@@ -31,6 +31,8 @@ import (
 	"math"
 	"slices"
 	"strings"
+
+	"github.com/xiaoqidun/jxrgo"
 )
 
 const (
@@ -68,13 +70,31 @@ type ImageCICP struct {
 	FullRange bool
 }
 
-// ImageConvertOptions 设置图像色彩管理导出的外挂ICC配置、渲染意图、HDR峰值、打印色彩策略及预算上限
+// ImageInfo 保存从PNG、JPEG、TIFF或JPEG XR文件头提取的轻量元数据，不含解码像素缓冲
+type ImageInfo struct {
+	Part          string
+	ContentType   string
+	Width         int
+	Height        int
+	DPIX          float64
+	DPIY          float64
+	ColorSpace    ImageColorSpace
+	HasAlpha      bool
+	BitDepth      int
+	IsFloat       bool
+	Orientation   uint32
+	HasICCProfile bool
+	HasCICP       bool
+}
+
+// ImageConvertOptions 设置图像色彩管理导出的外挂ICC配置、渲染意图、HDR峰值、背景合成色、打印色彩策略及预算上限
 type ImageConvertOptions struct {
 	Profile     []byte
 	Intent      RenderingIntent
 	HDRPeakNits float64
 	ColorMode   PrintColorMode
 	Negative    bool
+	Background  color.Color
 	Limits      Limits
 }
 
@@ -430,6 +450,157 @@ func DefaultImageOptions() ImageOptions {
 	return ImageOptions{MaxBytes: DefaultLimits().MaxPartBytes, MaxPixels: 1 << 24}
 }
 
+// ImageInfo 仅解析PNG、JPEG、TIFF或JPEG XR文件头返回尺寸、分辨率、色彩空间、位深、方向与ICC/CICP标记，完全不解码像素
+// 入参: ctx 取消Context，nil采用Background, part 图像部件包根URI
+// 返回: *ImageInfo 轻量图像头元数据, error 状态、媒体类型、文件头、预算或取消错误
+func (r *Reader) ImageInfo(ctx context.Context, part string) (*ImageInfo, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := r.readLock(); err != nil {
+		return nil, err
+	}
+	defer r.mu.RUnlock()
+	canonical, err := opcPartName(part)
+	if err != nil {
+		return nil, err
+	}
+	media, err := r.pkg.contentType(canonical)
+	if err != nil {
+		return nil, &PartError{Part: canonical, Err: err}
+	}
+	if !requiredResourceMedia(requiredImage, media) {
+		return nil, &PartError{Part: canonical, Err: fmt.Errorf("%w: unexpected image content type %q", ErrInvalid, media)}
+	}
+	key := strings.ToLower(canonical)
+	switch strings.ToLower(media) {
+	case "image/png":
+		stream, err := r.pkg.openPartStream(ctx, key, PartReadOptions{MaxBytes: r.limits.MaxPartBytes})
+		if err != nil {
+			return nil, &PartError{Part: canonical, Err: err}
+		}
+		defer stream.Close()
+		info, err := readPNGImageInfo(ctx, stream, canonical, media, r.limits.MaxPartBytes)
+		if err != nil {
+			return nil, &PartError{Part: canonical, Err: err}
+		}
+		return info, nil
+	case "image/jpeg":
+		stream, err := r.pkg.openPartStream(ctx, key, PartReadOptions{MaxBytes: r.limits.MaxPartBytes})
+		if err != nil {
+			return nil, &PartError{Part: canonical, Err: err}
+		}
+		defer stream.Close()
+		info, err := readJPEGImageInfo(ctx, stream, canonical, media)
+		if err != nil {
+			return nil, &PartError{Part: canonical, Err: err}
+		}
+		return info, nil
+	case "image/tiff":
+		data, err := r.pkg.readItemsContext(ctx, key, r.limits.MaxPartBytes)
+		if err != nil {
+			return nil, &PartError{Part: canonical, Err: err}
+		}
+		info, err := readTIFFImageInfo(data, canonical, media)
+		if err != nil {
+			return nil, &PartError{Part: canonical, Err: err}
+		}
+		return info, nil
+	case "image/vnd.ms-photo":
+		data, err := r.pkg.readItemsContext(ctx, key, r.limits.MaxPartBytes)
+		if err != nil {
+			return nil, &PartError{Part: canonical, Err: err}
+		}
+		info, err := readJXRImageInfo(ctx, data, canonical, media, uint64(r.limits.MaxPartBytes))
+		if err != nil {
+			return nil, &PartError{Part: canonical, Err: err}
+		}
+		return info, nil
+	default:
+		return nil, &PartError{Part: canonical, Err: fmt.Errorf("%w: unexpected image content type %q", ErrInvalid, media)}
+	}
+}
+
+// DecodeImageRows 按行流式解码并色彩管理导出包内图像为八位非预乘sRGB行字节，JPEG XR优先走条带级流式转换
+// 回调按y从0到Height-1递增接收Width*4字节行切片，缓冲在行间复用，调用方不得跨回调长期持有切片
+// 入参: ctx 取消Context，nil采用Background, part 图像部件包根URI, options 图像解码选项，nil采用默认值, convert 色彩转换选项，nil采用默认值, fn 逐行消费回调
+// 返回: error 状态、参数、媒体类型、解码、色彩、回调或取消错误
+func (r *Reader) DecodeImageRows(ctx context.Context, part string, options *ImageOptions, convert *ImageConvertOptions, fn func(y int, nrgba []byte) error) error {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if fn == nil {
+		return fmt.Errorf("%w: nil image row consumer", ErrInvalid)
+	}
+	cfg, maxConvertBytes, err := validateImageConvertOptions(convert)
+	if err != nil {
+		return err
+	}
+	if err := r.readLock(); err != nil {
+		return err
+	}
+	imgCfg := DefaultImageOptions()
+	if options != nil {
+		if options.MaxBytes != 0 {
+			imgCfg.MaxBytes = options.MaxBytes
+		}
+		if options.MaxPixels != 0 {
+			imgCfg.MaxPixels = options.MaxPixels
+		}
+	}
+	if imgCfg.MaxBytes < 1 {
+		r.mu.RUnlock()
+		return fmt.Errorf("%w: image byte limit", ErrInvalid)
+	}
+	canonical, err := opcPartName(part)
+	if err != nil {
+		r.mu.RUnlock()
+		return err
+	}
+	media, err := r.pkg.contentType(canonical)
+	if err != nil {
+		r.mu.RUnlock()
+		return &PartError{Part: canonical, Err: err}
+	}
+	if !requiredResourceMedia(requiredImage, media) {
+		r.mu.RUnlock()
+		return &PartError{Part: canonical, Err: fmt.Errorf("%w: unexpected image content type %q", ErrInvalid, media)}
+	}
+	data, err := r.pkg.readItemsContext(ctx, strings.ToLower(canonical), min(imgCfg.MaxBytes, r.limits.MaxPartBytes))
+	r.mu.RUnlock()
+	if err != nil {
+		return &PartError{Part: canonical, Err: err}
+	}
+	if strings.EqualFold(media, "image/vnd.ms-photo") {
+		var callbackErr error
+		rowFn := func(y int, nrgba []byte) error {
+			if err := fn(y, nrgba); err != nil {
+				callbackErr = err
+				return err
+			}
+			return nil
+		}
+		handled, jxrErr := decodeJXRImageRows(ctx, data, imgCfg.MaxPixels, min(uint64(imgCfg.MaxBytes), maxConvertBytes), cfg, rowFn)
+		if callbackErr != nil {
+			return callbackErr
+		}
+		if handled || jxrErr != nil {
+			if jxrErr != nil {
+				return &PartError{Part: canonical, Err: jxrErr}
+			}
+			return nil
+		}
+	}
+	source, err := decodeRasterImageWithMemory(ctx, data, media, imgCfg.MaxPixels, uint64(imgCfg.MaxBytes))
+	if err != nil {
+		return &PartError{Part: canonical, Err: err}
+	}
+	res := &ImageResource{Part: canonical, ContentType: media, Resolution: source.dpi, Data: data, source: source}
+	return res.exportRowsNRGBA(ctx, cfg, maxConvertBytes, fn)
+}
+
 // Image 读取指定包内图像部件并保留源样本与内嵌ICC，不应用关联ICC颜色转换
 // 读取和解码边界检查ctx取消信号及options字节与像素容量上限
 // 入参: ctx 取消Context，nil采用Background, part 图像部件的包根URI, options 图像参数，nil采用默认值
@@ -686,7 +857,7 @@ func (r *ImageResource) HDRPeakNits() float64 {
 }
 
 // ToNRGBA 按完整色彩管理管线将已方向纠正的源图像导出为八位非预乘sRGB图像，并发安全且不修改原资源
-// 支持外挂ICC覆盖、内嵌ICC、CICP、PNG gAMA/cHRM、BT.2446色调映射以及打印负片与灰度黑白模式
+// 支持外挂ICC覆盖、内嵌ICC、CICP、PNG gAMA/cHRM、BT.2446色调映射、背景合成以及打印负片与灰度黑白模式
 // 入参: ctx 取消Context，nil采用Background, opts 转换选项，nil采用默认值
 // 返回: *image.NRGBA 独立八位非预乘图像, error 参数、配置、预算、转换或取消错误
 func (r *ImageResource) ToNRGBA(ctx context.Context, opts *ImageConvertOptions) (*image.NRGBA, error) {
@@ -695,11 +866,26 @@ func (r *ImageResource) ToNRGBA(ctx context.Context, opts *ImageConvertOptions) 
 	if err != nil {
 		return nil, err
 	}
+	out := image.NewNRGBA(bounds)
+	width := bounds.Dx()
+	if handled, err := r.convertJXRDisplayRows(ctx, bounds, cfg, false, func(y int) []byte {
+		rowOff := (y - bounds.Min.Y) * out.Stride
+		return out.Pix[rowOff : rowOff+width*4]
+	}, nil); handled || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
 	sampler, err := prepareImageConvertSampler(r, cfg, maxBytes)
 	if err != nil {
 		return nil, err
 	}
-	out := image.NewNRGBA(bounds)
+	var bgLinear [3]float64
+	hasBG := cfg.Background != nil
+	if hasBG {
+		bgLinear, _ = imageConvertBackground(cfg.Background)
+	}
 	var jxrCache jxrRowCache
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		if err := checkContext(ctx); err != nil {
@@ -716,7 +902,7 @@ func (r *ImageResource) ToNRGBA(ctx context.Context, opts *ImageConvertOptions) 
 			if err != nil {
 				return nil, err
 			}
-			lin, alpha, err := imageConvertLinearPixel(c, sampler.toneMapPeak, cfg.Negative, cfg.ColorMode)
+			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode)
 			if err != nil {
 				return nil, err
 			}
@@ -743,11 +929,26 @@ func (r *ImageResource) ToNRGBA64(ctx context.Context, opts *ImageConvertOptions
 	if err != nil {
 		return nil, err
 	}
+	out := image.NewNRGBA64(bounds)
+	width := bounds.Dx()
+	if handled, err := r.convertJXRDisplayRows(ctx, bounds, cfg, true, func(y int) []byte {
+		rowOff := (y - bounds.Min.Y) * out.Stride
+		return out.Pix[rowOff : rowOff+width*8]
+	}, nil); handled || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
 	sampler, err := prepareImageConvertSampler(r, cfg, maxBytes)
 	if err != nil {
 		return nil, err
 	}
-	out := image.NewNRGBA64(bounds)
+	var bgLinear [3]float64
+	hasBG := cfg.Background != nil
+	if hasBG {
+		bgLinear, _ = imageConvertBackground(cfg.Background)
+	}
 	var jxrCache jxrRowCache
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		if err := checkContext(ctx); err != nil {
@@ -764,7 +965,7 @@ func (r *ImageResource) ToNRGBA64(ctx context.Context, opts *ImageConvertOptions
 			if err != nil {
 				return nil, err
 			}
-			lin, alpha, err := imageConvertLinearPixel(c, sampler.toneMapPeak, cfg.Negative, cfg.ColorMode)
+			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode)
 			if err != nil {
 				return nil, err
 			}
@@ -784,7 +985,7 @@ func (r *ImageResource) ToNRGBA64(ctx context.Context, opts *ImageConvertOptions
 
 // ToCMYK 将已方向纠正的源图像导出为八位CMYK图像，并发安全且不修改原资源
 // 当源为CMYK且无外挂非CMYK配置、未启用反相及灰度单色模式时直接无损导出并附带对应CMYK ICC副本，否则经sRGB换算并返回nil配置
-// 经sRGB换算时全透明像素输出CMYK零值（0,0,0,0）
+// 未指定Background时全透明像素输出CMYK零值（0,0,0,0），指定Background时按透明度合成背景色
 // 入参: ctx 取消Context，nil采用Background, opts 转换选项，nil采用默认值
 // 返回: *image.CMYK 独立八位CMYK图像, []byte 对应CMYK ICC副本或nil, error 参数、配置、预算、转换或取消错误
 func (r *ImageResource) ToCMYK(ctx context.Context, opts *ImageConvertOptions) (*image.CMYK, []byte, error) {
@@ -826,7 +1027,7 @@ func (r *ImageResource) ToCMYK(ctx context.Context, opts *ImageConvertOptions) (
 		}
 	}
 	if direct {
-		out, err := exportDirectCMYK(ctx, r.source, bounds)
+		out, err := exportDirectCMYK(ctx, r.source, bounds, cfg.Background)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -835,6 +1036,11 @@ func (r *ImageResource) ToCMYK(ctx context.Context, opts *ImageConvertOptions) (
 	sampler, err := prepareImageConvertSampler(r, cfg, maxBytes)
 	if err != nil {
 		return nil, nil, err
+	}
+	var bgLinear [3]float64
+	hasBG := cfg.Background != nil
+	if hasBG {
+		bgLinear, _ = imageConvertBackground(cfg.Background)
 	}
 	out := image.NewCMYK(bounds)
 	var jxrCache jxrRowCache
@@ -853,7 +1059,7 @@ func (r *ImageResource) ToCMYK(ctx context.Context, opts *ImageConvertOptions) (
 			if err != nil {
 				return nil, nil, err
 			}
-			lin, alpha, err := imageConvertLinearPixel(c, sampler.toneMapPeak, cfg.Negative, cfg.ColorMode)
+			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -872,7 +1078,7 @@ func (r *ImageResource) ToCMYK(ctx context.Context, opts *ImageConvertOptions) (
 }
 
 // ToGray 按完整色彩管理管线与BT.709亮度规则导出已方向纠正的八位灰度图像，并发安全且不修改原资源
-// 支持原生单通道灰度、外挂与内嵌ICC、CICP、BT.2446色调映射、负片反相及黑白单色阈值模式，全透明像素输出灰度零值（Y=0）
+// 支持原生单通道灰度、外挂与内嵌ICC、CICP、BT.2446色调映射、背景合成、负片反相及黑白单色阈值模式
 // 入参: ctx 取消Context，nil采用Background, opts 转换选项，nil采用默认值
 // 返回: *image.Gray 独立八位灰度图像, error 参数、配置、预算、转换或取消错误
 func (r *ImageResource) ToGray(ctx context.Context, opts *ImageConvertOptions) (*image.Gray, error) {
@@ -884,6 +1090,11 @@ func (r *ImageResource) ToGray(ctx context.Context, opts *ImageConvertOptions) (
 	sampler, err := prepareImageConvertSampler(r, cfg, maxBytes)
 	if err != nil {
 		return nil, err
+	}
+	var bgLinear [3]float64
+	hasBG := cfg.Background != nil
+	if hasBG {
+		bgLinear, _ = imageConvertBackground(cfg.Background)
 	}
 	out := image.NewGray(bounds)
 	var jxrCache jxrRowCache
@@ -902,7 +1113,7 @@ func (r *ImageResource) ToGray(ctx context.Context, opts *ImageConvertOptions) (
 			if err != nil {
 				return nil, err
 			}
-			lin, alpha, err := imageConvertLinearPixel(c, sampler.toneMapPeak, cfg.Negative, cfg.ColorMode)
+			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode)
 			if err != nil {
 				return nil, err
 			}
@@ -916,6 +1127,108 @@ func (r *ImageResource) ToGray(ctx context.Context, opts *ImageConvertOptions) (
 	return out, checkContext(ctx)
 }
 
+// AlphaMask 独立导出已方向纠正源图像的八位透明度蒙版，无透明度通道时全图填充255
+// 入参: ctx 取消Context，nil采用Background
+// 返回: *image.Gray 独立八位Alpha通道图像, error 空资源、预算、读取或取消错误
+func (r *ImageResource) AlphaMask(ctx context.Context) (*image.Gray, error) {
+	ctx = normalizeContext(ctx)
+	_, bounds, _, err := imageConvertValidate(ctx, r, nil, 1)
+	if err != nil {
+		return nil, err
+	}
+	mask := image.NewGray(bounds)
+	width := bounds.Dx()
+	if !r.HasAlpha() {
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+			rowOff := (y - bounds.Min.Y) * mask.Stride
+			for x := range width {
+				mask.Pix[rowOff+x] = 255
+			}
+		}
+		return mask, checkContext(ctx)
+	}
+	source := r.source
+	if source.jxr != nil {
+		alphaRow := make([]float64, width)
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+			if err := source.jxr.readAlphaRow(y, alphaRow); err != nil {
+				return nil, err
+			}
+			rowOff := (y - bounds.Min.Y) * mask.Stride
+			for x := range width {
+				mask.Pix[rowOff+x] = colorQuantize8(alphaRow[x])
+			}
+		}
+		return mask, checkContext(ctx)
+	}
+	if native := source.native; native != nil {
+		stride := native.channels + 1
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+			rowOff := (y - bounds.Min.Y) * mask.Stride
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				at := ((y-native.bounds.Min.Y)*native.bounds.Dx() + x - native.bounds.Min.X) * stride
+				if native.floating != nil {
+					v := native.floating[at+native.channels]
+					if !geometryFinite(v) {
+						return nil, fmt.Errorf("%w: non-finite alpha sample", ErrUnsupported)
+					}
+					mask.Pix[rowOff+x-bounds.Min.X] = colorQuantize8(colorClamp(v))
+				} else {
+					mask.Pix[rowOff+x-bounds.Min.X] = colorQuantize8(float64(native.values[at+native.channels]) / 65535)
+				}
+			}
+		}
+		return mask, checkContext(ctx)
+	}
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		rowOff := (y - bounds.Min.Y) * mask.Stride
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			px := imagePixel(source.pixels, x, y)
+			mask.Pix[rowOff+x-bounds.Min.X] = colorQuantize8(float64(px.A) / 65535)
+		}
+	}
+	return mask, checkContext(ctx)
+}
+
+// validateImageConvertOptions 规范化并校验色彩转换选项及预算上限
+// 入参: opts 可选转换选项
+// 返回: ImageConvertOptions 规范化选项, uint64 有效内存字节上限, error 选项或预算错误
+func validateImageConvertOptions(opts *ImageConvertOptions) (ImageConvertOptions, uint64, error) {
+	var cfg ImageConvertOptions
+	if opts != nil {
+		cfg = *opts
+	}
+	if cfg.Intent > IntentAbsoluteColorimetric || cfg.ColorMode > PrintColorMonochrome || !geometryFinite(cfg.HDRPeakNits) || cfg.HDRPeakNits < 0 {
+		return ImageConvertOptions{}, 0, fmt.Errorf("%w: image convert options", ErrInvalid)
+	}
+	if cfg.Limits.MaxPartBytes < 0 || cfg.Limits.MaxPackageBytes < 0 || cfg.Limits.MaxMetadataBytes < 0 || cfg.Limits.MaxPartCount < 0 || cfg.Limits.MaxXMLDepth < 0 || cfg.Limits.MaxXMLNodes < 0 || cfg.Limits.MaxXMLBindings < 0 || cfg.Limits.MaxPageCount < 0 {
+		return ImageConvertOptions{}, 0, fmt.Errorf("%w: negative image convert limits", ErrInvalid)
+	}
+	maxBytes := uint64(DefaultLimits().MaxPartBytes)
+	if cfg.Limits.MaxPartBytes > 0 {
+		maxBytes = uint64(cfg.Limits.MaxPartBytes)
+	}
+	if cfg.Limits.MaxPackageBytes > 0 && uint64(cfg.Limits.MaxPackageBytes) < maxBytes {
+		maxBytes = uint64(cfg.Limits.MaxPackageBytes)
+	}
+	if uint64(len(cfg.Profile)) > maxBytes {
+		return ImageConvertOptions{}, 0, fmt.Errorf("%w: image convert profile budget", ErrLimit)
+	}
+	return cfg, maxBytes, nil
+}
+
 // imageConvertValidate 校验图像导出参数、取消状态及输出缓冲与外挂配置的内存预算上限
 // 入参: ctx 已规范化取消Context, r 图像资源, opts 可选转换选项, bytesPerPixel 单像素输出字节数
 // 返回: ImageConvertOptions 规范化选项, image.Rectangle 图像范围, uint64 有效内存字节预算, error 参数、资源或取消错误
@@ -926,25 +1239,9 @@ func imageConvertValidate(ctx context.Context, r *ImageResource, opts *ImageConv
 	if r == nil || r.source == nil || r.source.bounds().Empty() {
 		return ImageConvertOptions{}, image.Rectangle{}, 0, fmt.Errorf("%w: empty image resource", ErrInvalid)
 	}
-	var cfg ImageConvertOptions
-	if opts != nil {
-		cfg = *opts
-	}
-	if cfg.Intent > IntentAbsoluteColorimetric || cfg.ColorMode > PrintColorMonochrome || !geometryFinite(cfg.HDRPeakNits) || cfg.HDRPeakNits < 0 {
-		return ImageConvertOptions{}, image.Rectangle{}, 0, fmt.Errorf("%w: image convert options", ErrInvalid)
-	}
-	if cfg.Limits.MaxPartBytes < 0 || cfg.Limits.MaxPackageBytes < 0 || cfg.Limits.MaxMetadataBytes < 0 || cfg.Limits.MaxPartCount < 0 || cfg.Limits.MaxXMLDepth < 0 || cfg.Limits.MaxXMLNodes < 0 || cfg.Limits.MaxXMLBindings < 0 || cfg.Limits.MaxPageCount < 0 {
-		return ImageConvertOptions{}, image.Rectangle{}, 0, fmt.Errorf("%w: negative image convert limits", ErrInvalid)
-	}
-	maxBytes := uint64(DefaultLimits().MaxPartBytes)
-	if cfg.Limits.MaxPartBytes > 0 {
-		maxBytes = uint64(cfg.Limits.MaxPartBytes)
-	}
-	if cfg.Limits.MaxPackageBytes > 0 && uint64(cfg.Limits.MaxPackageBytes) < maxBytes {
-		maxBytes = uint64(cfg.Limits.MaxPackageBytes)
-	}
-	if uint64(len(cfg.Profile)) > maxBytes {
-		return ImageConvertOptions{}, image.Rectangle{}, 0, fmt.Errorf("%w: image convert profile budget", ErrLimit)
+	cfg, maxBytes, err := validateImageConvertOptions(opts)
+	if err != nil {
+		return ImageConvertOptions{}, image.Rectangle{}, 0, err
 	}
 	bounds := r.source.bounds()
 	w, h := bounds.Dx(), bounds.Dy()
@@ -956,6 +1253,554 @@ func imageConvertValidate(ctx context.Context, r *ImageResource, opts *ImageConv
 		return ImageConvertOptions{}, image.Rectangle{}, 0, fmt.Errorf("%w: image convert memory budget", ErrLimit)
 	}
 	return cfg, bounds, maxBytes, nil
+}
+
+// imageConvertBackground 将可选背景色换算为非预乘线性sRGB三分量与八位CMYK四分量
+// 入参: bg 背景色
+// 返回: [3]float64 线性sRGB背景色, [4]uint8 八位CMYK背景色
+func imageConvertBackground(bg color.Color) ([3]float64, [4]uint8) {
+	nrgba := color.NRGBAModel.Convert(bg).(color.NRGBA)
+	lin := [3]float64{
+		renderSRGBToLinear(float64(nrgba.R) / 255),
+		renderSRGBToLinear(float64(nrgba.G) / 255),
+		renderSRGBToLinear(float64(nrgba.B) / 255),
+	}
+	if cmyk, ok := bg.(color.CMYK); ok {
+		return lin, [4]uint8{cmyk.C, cmyk.M, cmyk.Y, cmyk.K}
+	}
+	c, m, y, k := color.RGBToCMYK(nrgba.R, nrgba.G, nrgba.B)
+	return lin, [4]uint8{c, m, y, k}
+}
+
+// imageConvertLinearPixelWithBG 对线性scRGB预乘像素执行色调映射、可选背景合成、反相与灰度黑白转换
+// 入参: c 线性scRGB预乘像素, toneMapPeak HDR色调映射峰值亮度, hasBG 是否启用背景合成, bgLinear 线性sRGB背景色, negative 是否反相, mode 打印输出色彩模式
+// 返回: [3]float64 最终非预乘线性RGB分量, float64 最终归一化透明度, error 数值范围错误
+func imageConvertLinearPixelWithBG(c renderColor, toneMapPeak float64, hasBG bool, bgLinear [3]float64, negative bool, mode PrintColorMode) ([3]float64, float64, error) {
+	if c.a == 0 {
+		if !hasBG {
+			return [3]float64{}, 0, nil
+		}
+		lin, _, err := applyPrintLinearColor(bgLinear, negative, mode)
+		if err != nil {
+			return [3]float64{}, 0, err
+		}
+		return lin, 1, nil
+	}
+	lin := [3]float64{c.r / c.a, c.g / c.a, c.b / c.a}
+	if toneMapPeak > 0 {
+		lin = renderBT2446MethodA(lin, toneMapPeak)
+	}
+	alpha := colorClamp(c.a)
+	if hasBG {
+		inv := 1 - alpha
+		lin[0] = lin[0]*alpha + bgLinear[0]*inv
+		lin[1] = lin[1]*alpha + bgLinear[1]*inv
+		lin[2] = lin[2]*alpha + bgLinear[2]*inv
+		alpha = 1
+	}
+	lin, _, err := applyPrintLinearColor(lin, negative, mode)
+	if err != nil {
+		return [3]float64{}, 0, err
+	}
+	return lin, alpha, nil
+}
+
+// zeroTransparentNRGBARow 将八位NRGBA行中全透明像素的RGB分量清零，与透明黑契约对齐
+// 入参: row 长度为4*width的八位NRGBA行切片
+func zeroTransparentNRGBARow(row []byte) {
+	for i := 0; i+3 < len(row); i += 4 {
+		if row[i+3] == 0 {
+			row[i], row[i+1], row[i+2] = 0, 0, 0
+		}
+	}
+}
+
+// zeroTransparentNRGBA64Row 将大端十六位NRGBA64行中全透明像素的RGB分量清零
+// 入参: row 长度为8*width的十六位NRGBA64行切片
+func zeroTransparentNRGBA64Row(row []byte) {
+	for i := 0; i+7 < len(row); i += 8 {
+		if row[i+6] == 0 && row[i+7] == 0 {
+			clear(row[i : i+6])
+		}
+	}
+}
+
+// convertJXRDisplayRows 使用JXRGo原生色彩转换器逐行导出八位或十六位NRGBA行，不适用时返回false由上层回退
+// 入参: ctx 已规范化取消Context, bounds 图像范围, cfg 已校验转换选项, wide 是否导出十六位NRGBA64, rowDst 返回第y行目标写入切片的回调, onRow 单行写完后的可选回调
+// 返回: bool 是否已由JXRGo原生路径完成转换, error 转换、回调或取消错误
+func (r *ImageResource) convertJXRDisplayRows(ctx context.Context, bounds image.Rectangle, cfg ImageConvertOptions, wide bool, rowDst func(y int) []byte, onRow func(y int, row []byte) error) (bool, error) {
+	if r.source.jxr == nil {
+		return false, nil
+	}
+	jxr := r.source.jxr
+	conv, usable, err := jxrDisplayConverter(ctx, jxr.info, cfg, jxr.limits)
+	if err != nil || !usable {
+		return false, err
+	}
+	width := bounds.Dx()
+	toneMapPeak := jxrExtraToneMapPeak(jxr.info, cfg)
+	hasBG := cfg.Background != nil
+	var bgLinear [3]float64
+	if hasBG {
+		bgLinear, _ = imageConvertBackground(cfg.Background)
+	}
+	fast := !hasBG && !cfg.Negative && cfg.ColorMode == PrintColorOriginal && toneMapPeak == 0
+	var linRow []float64
+	if !fast {
+		linRow = make([]float64, width*4)
+	}
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		if err := checkContext(ctx); err != nil {
+			return true, err
+		}
+		dstRow := rowDst(y)
+		if fast {
+			if wide {
+				if err := conv.ConvertRowNRGBA64(ctx, jxr.raster, y, dstRow); err != nil {
+					return true, jxrImageError(err)
+				}
+				if jxr.alpha {
+					zeroTransparentNRGBA64Row(dstRow)
+				}
+			} else {
+				if err := conv.ConvertRowNRGBA(ctx, jxr.raster, y, dstRow); err != nil {
+					return true, jxrImageError(err)
+				}
+				if jxr.alpha {
+					zeroTransparentNRGBARow(dstRow)
+				}
+			}
+		} else {
+			if err := conv.ConvertRowLinear(ctx, jxr.raster, y, linRow); err != nil {
+				return true, jxrImageError(err)
+			}
+			if wide {
+				err = finishLinearRowToNRGBA64(linRow, width, toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode, dstRow)
+			} else {
+				err = finishLinearRowToNRGBA(linRow, width, toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode, dstRow)
+			}
+			if err != nil {
+				return true, err
+			}
+		}
+		if onRow != nil {
+			if err := onRow(y-bounds.Min.Y, dstRow); err != nil {
+				return true, err
+			}
+		}
+	}
+	return true, checkContext(ctx)
+}
+
+// finishLinearPixel 对单像素非预乘线性RGBA执行有限性检查、色调映射、背景合成及打印色彩转换
+// 入参: r, g, b, a 非预乘线性RGBA分量, toneMapPeak 额外BT.2446峰值亮度，零禁用, hasBG 是否启用背景合成, bgLinear 线性背景色, negative 是否反相, mode 打印色彩模式
+// 返回: [3]float64 输出线性RGB分量, float64 输出归一化透明度, error 非有限像素或数值范围错误
+func finishLinearPixel(r, g, b, a, toneMapPeak float64, hasBG bool, bgLinear [3]float64, negative bool, mode PrintColorMode) ([3]float64, float64, error) {
+	if !geometryFinite(r, g, b, a) {
+		return [3]float64{}, 0, fmt.Errorf("%w: non-finite linear image pixel", ErrUnsupported)
+	}
+	alpha := colorClamp(a)
+	lin := [3]float64{r, g, b}
+	if alpha == 0 {
+		if !hasBG {
+			return [3]float64{}, 0, nil
+		}
+		lin, alpha = bgLinear, 1
+	} else {
+		if toneMapPeak > 0 {
+			lin = renderBT2446MethodA(lin, toneMapPeak)
+		}
+		if hasBG {
+			inv := 1 - alpha
+			lin[0] = lin[0]*alpha + bgLinear[0]*inv
+			lin[1] = lin[1]*alpha + bgLinear[1]*inv
+			lin[2] = lin[2]*alpha + bgLinear[2]*inv
+			alpha = 1
+		}
+	}
+	outLin, _, err := applyPrintLinearColor(lin, negative, mode)
+	if err != nil {
+		return [3]float64{}, 0, err
+	}
+	return outLin, alpha, nil
+}
+
+// finishLinearRowToNRGBA 将单行非预乘线性scRGB与Alpha执行可选色调映射、背景合成、反相与打印模式转换并写入八位NRGBA行
+// 入参: src 长度为4*width的线性RGBA浮点行, width 像素宽度, toneMapPeak 额外BT.2446峰值亮度，零禁用, hasBG 是否启用背景合成, bgLinear 线性背景色, negative 是否反相, mode 打印色彩模式, dst 目标八位NRGBA行
+// 返回: error 数值范围错误
+func finishLinearRowToNRGBA(src []float64, width int, toneMapPeak float64, hasBG bool, bgLinear [3]float64, negative bool, mode PrintColorMode, dst []byte) error {
+	for x := range width {
+		at := x * 4
+		outLin, alpha, err := finishLinearPixel(src[at], src[at+1], src[at+2], src[at+3], toneMapPeak, hasBG, bgLinear, negative, mode)
+		if err != nil {
+			return err
+		}
+		a8 := colorQuantize8(alpha)
+		if a8 == 0 {
+			dst[at], dst[at+1], dst[at+2], dst[at+3] = 0, 0, 0, 0
+			continue
+		}
+		dst[at] = colorQuantize8(renderLinearToSRGB(colorClamp(outLin[0])))
+		dst[at+1] = colorQuantize8(renderLinearToSRGB(colorClamp(outLin[1])))
+		dst[at+2] = colorQuantize8(renderLinearToSRGB(colorClamp(outLin[2])))
+		dst[at+3] = a8
+	}
+	return nil
+}
+
+// finishLinearRowToNRGBA64 将单行非预乘线性scRGB与Alpha执行可选色调映射、背景合成、反相与打印模式转换并写入十六位大端NRGBA64行
+// 入参: src 长度为4*width的线性RGBA浮点行, width 像素宽度, toneMapPeak 额外BT.2446峰值亮度，零禁用, hasBG 是否启用背景合成, bgLinear 线性背景色, negative 是否反相, mode 打印色彩模式, dst 目标十六位NRGBA64行
+// 返回: error 数值范围错误
+func finishLinearRowToNRGBA64(src []float64, width int, toneMapPeak float64, hasBG bool, bgLinear [3]float64, negative bool, mode PrintColorMode, dst []byte) error {
+	for x := range width {
+		at := x * 4
+		outOff := x * 8
+		outLin, alpha, err := finishLinearPixel(src[at], src[at+1], src[at+2], src[at+3], toneMapPeak, hasBG, bgLinear, negative, mode)
+		if err != nil {
+			return err
+		}
+		a16 := colorQuantize16(alpha)
+		if a16 == 0 {
+			clear(dst[outOff : outOff+8])
+			continue
+		}
+		binary.BigEndian.PutUint16(dst[outOff:], colorQuantize16(renderLinearToSRGB(colorClamp(outLin[0]))))
+		binary.BigEndian.PutUint16(dst[outOff+2:], colorQuantize16(renderLinearToSRGB(colorClamp(outLin[1]))))
+		binary.BigEndian.PutUint16(dst[outOff+4:], colorQuantize16(renderLinearToSRGB(colorClamp(outLin[2]))))
+		binary.BigEndian.PutUint16(dst[outOff+6:], a16)
+	}
+	return nil
+}
+
+// exportRowsNRGBA 使用单行缓冲将已解码图像逐行色彩管理后回调给调用方，无需分配整帧NRGBA输出
+// 入参: ctx 已规范化取消Context, cfg 已校验转换选项, maxBytes 内存字节预算, fn 逐行回调
+// 返回: error 采样、转换、回调或取消错误
+func (r *ImageResource) exportRowsNRGBA(ctx context.Context, cfg ImageConvertOptions, maxBytes uint64, fn func(y int, nrgba []byte) error) error {
+	bounds := r.source.bounds()
+	width := bounds.Dx()
+	rowBuf := make([]byte, width*4)
+	if handled, err := r.convertJXRDisplayRows(ctx, bounds, cfg, false, func(int) []byte { return rowBuf }, fn); handled || err != nil {
+		return err
+	}
+	var bgLinear [3]float64
+	hasBG := cfg.Background != nil
+	if hasBG {
+		bgLinear, _ = imageConvertBackground(cfg.Background)
+	}
+	sampler, err := prepareImageConvertSampler(r, cfg, maxBytes)
+	if err != nil {
+		return err
+	}
+	var jxrCache jxrRowCache
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		clear(rowBuf)
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			if (x-bounds.Min.X)&1023 == 0 {
+				if err := checkContext(ctx); err != nil {
+					return err
+				}
+			}
+			c, err := sampler.pixelColorWithCache(x, y, &jxrCache)
+			if err != nil {
+				return err
+			}
+			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode)
+			if err != nil {
+				return err
+			}
+			a8 := colorQuantize8(alpha)
+			if a8 == 0 {
+				continue
+			}
+			off := (x - bounds.Min.X) * 4
+			rowBuf[off] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[0])))
+			rowBuf[off+1] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[1])))
+			rowBuf[off+2] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[2])))
+			rowBuf[off+3] = a8
+		}
+		if err := fn(y-bounds.Min.Y, rowBuf); err != nil {
+			return err
+		}
+	}
+	return checkContext(ctx)
+}
+
+// readPNGImageInfo 仅流式读取PNG在首个IDAT之前的头部元数据块，不解压像素数据
+// 入参: ctx 已规范化取消Context, stream 只读流, part 部件包根URI, media 内容类型, maxBytes 单块字节上限
+// 返回: *ImageInfo 轻量图像头元数据, error 签名、块结构、CRC、预算或取消错误
+func readPNGImageInfo(ctx context.Context, stream io.Reader, part, media string, maxBytes int64) (*ImageInfo, error) {
+	var sig [8]byte
+	if _, err := io.ReadFull(stream, sig[:]); err != nil {
+		return nil, fmt.Errorf("%w: PNG signature", ErrInvalid)
+	}
+	if !bytes.Equal(sig[:], []byte("\x89PNG\r\n\x1a\n")) {
+		return nil, fmt.Errorf("%w: PNG signature", ErrInvalid)
+	}
+	info := &ImageInfo{Part: part, ContentType: media, DPIX: 96, DPIY: 96, Orientation: 1}
+	hasIHDR := false
+	var header [8]byte
+	var crcBuf [4]byte
+	for {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		if _, err := io.ReadFull(stream, header[:]); err != nil {
+			return nil, fmt.Errorf("%w: truncated PNG chunk", ErrInvalid)
+		}
+		size := uint64(binary.BigEndian.Uint32(header[:4]))
+		kind := string(header[4:8])
+		if !hasIHDR && kind != "IHDR" {
+			return nil, fmt.Errorf("%w: PNG header placement", ErrInvalid)
+		}
+		switch kind {
+		case "IHDR":
+			if hasIHDR || size != 13 {
+				return nil, fmt.Errorf("%w: PNG header placement", ErrInvalid)
+			}
+			var payload [13]byte
+			if _, err := io.ReadFull(stream, payload[:]); err != nil {
+				return nil, fmt.Errorf("%w: truncated PNG IHDR", ErrInvalid)
+			}
+			if _, err := io.ReadFull(stream, crcBuf[:]); err != nil {
+				return nil, fmt.Errorf("%w: truncated PNG CRC", ErrInvalid)
+			}
+			h := crc32.NewIEEE()
+			_, _ = h.Write(header[4:8])
+			_, _ = h.Write(payload[:])
+			if h.Sum32() != binary.BigEndian.Uint32(crcBuf[:]) {
+				return nil, fmt.Errorf("%w: PNG chunk checksum", ErrInvalid)
+			}
+			w := binary.BigEndian.Uint32(payload[0:4])
+			ht := binary.BigEndian.Uint32(payload[4:8])
+			if w == 0 || ht == 0 {
+				return nil, fmt.Errorf("%w: empty PNG image", ErrInvalid)
+			}
+			if w > rasterMaxDimension || ht > rasterMaxDimension {
+				return nil, fmt.Errorf("%w: PNG image dimensions", ErrLimit)
+			}
+			info.Width, info.Height = int(w), int(ht)
+			info.BitDepth = int(payload[8])
+			info.ColorSpace = ImageColorRGB
+			switch payload[9] {
+			case 0:
+				info.ColorSpace = ImageColorGray
+			case 2:
+				info.ColorSpace = ImageColorRGB
+			case 3:
+				info.ColorSpace = ImageColorRGB
+				info.BitDepth = 8
+			case 4:
+				info.ColorSpace = ImageColorGray
+				info.HasAlpha = true
+			case 6:
+				info.ColorSpace = ImageColorRGB
+				info.HasAlpha = true
+			default:
+				return nil, fmt.Errorf("%w: PNG color type %d", ErrInvalid, payload[9])
+			}
+			hasIHDR = true
+		case "pHYs":
+			if size != 9 {
+				return nil, fmt.Errorf("%w: PNG physical dimensions", ErrInvalid)
+			}
+			var payload [9]byte
+			if _, err := io.ReadFull(stream, payload[:]); err != nil {
+				return nil, fmt.Errorf("%w: truncated PNG pHYs", ErrInvalid)
+			}
+			if _, err := io.ReadFull(stream, crcBuf[:]); err != nil {
+				return nil, fmt.Errorf("%w: truncated PNG CRC", ErrInvalid)
+			}
+			h := crc32.NewIEEE()
+			_, _ = h.Write(header[4:8])
+			_, _ = h.Write(payload[:])
+			if h.Sum32() != binary.BigEndian.Uint32(crcBuf[:]) {
+				return nil, fmt.Errorf("%w: PNG chunk checksum", ErrInvalid)
+			}
+			if payload[8] > 1 {
+				return nil, fmt.Errorf("%w: PNG physical dimensions", ErrInvalid)
+			}
+			x, y := binary.BigEndian.Uint32(payload[0:4]), binary.BigEndian.Uint32(payload[4:8])
+			if payload[8] == 1 {
+				if x == 0 || y == 0 {
+					return nil, fmt.Errorf("%w: zero PNG resolution", ErrInvalid)
+				}
+				info.DPIX, info.DPIY = float64(x)*0.0254, float64(y)*0.0254
+			} else if x != 0 && y != 0 {
+				info.DPIX, info.DPIY = 96, 96*(float64(y)/float64(x))
+			}
+		case "tRNS":
+			info.HasAlpha = true
+			if _, err := io.CopyN(io.Discard, stream, int64(size)+4); err != nil {
+				return nil, fmt.Errorf("%w: truncated PNG tRNS", ErrInvalid)
+			}
+		case "iCCP":
+			info.HasICCProfile = true
+			if _, err := io.CopyN(io.Discard, stream, int64(size)+4); err != nil {
+				return nil, fmt.Errorf("%w: truncated PNG iCCP", ErrInvalid)
+			}
+		case "cICP":
+			if size != 4 {
+				return nil, fmt.Errorf("%w: PNG cICP chunk", ErrInvalid)
+			}
+			info.HasCICP = true
+			if _, err := io.CopyN(io.Discard, stream, int64(size)+4); err != nil {
+				return nil, fmt.Errorf("%w: truncated PNG cICP", ErrInvalid)
+			}
+		case "IDAT":
+			return info, checkContext(ctx)
+		case "IEND":
+			return nil, fmt.Errorf("%w: PNG missing IDAT", ErrInvalid)
+		default:
+			if maxBytes > 0 && size > uint64(maxBytes) {
+				return nil, fmt.Errorf("%w: PNG chunk size", ErrLimit)
+			}
+			if _, err := io.CopyN(io.Discard, stream, int64(size)+4); err != nil {
+				return nil, fmt.Errorf("%w: truncated PNG chunk payload", ErrInvalid)
+			}
+		}
+	}
+}
+
+// readJPEGImageInfo 仅流式扫描JPEG标记段至首个SOS或EOI即停止，不解码熵编码图像流
+// 入参: ctx 已规范化取消Context, stream 只读流, part 部件包根URI, media 内容类型
+// 返回: *ImageInfo 视觉方向规范化后的图像头元数据, error 标记、元数据或取消错误
+func readJPEGImageInfo(ctx context.Context, stream io.Reader, part, media string) (*ImageInfo, error) {
+	var soi [2]byte
+	if _, err := io.ReadFull(stream, soi[:]); err != nil || soi[0] != 0xff || soi[1] != 0xd8 {
+		return nil, fmt.Errorf("%w: JPEG signature", ErrInvalid)
+	}
+	info := &ImageInfo{Part: part, ContentType: media, DPIX: 96, DPIY: 96, Orientation: 1}
+	hasFrame := false
+	var exifDPI Point
+	hasExif, exifAbsolute, jfifAbsolute, hasOrient := false, false, false, false
+	var single [1]byte
+	var lengthBuf [2]byte
+	for {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		if _, err := io.ReadFull(stream, single[:]); err != nil {
+			return nil, fmt.Errorf("%w: truncated JPEG", ErrInvalid)
+		}
+		if single[0] != 0xff {
+			return nil, fmt.Errorf("%w: JPEG marker", ErrInvalid)
+		}
+		for single[0] == 0xff {
+			if _, err := io.ReadFull(stream, single[:]); err != nil {
+				return nil, fmt.Errorf("%w: truncated JPEG marker", ErrInvalid)
+			}
+		}
+		marker := single[0]
+		if marker == 0xd9 || marker == 0xda {
+			break
+		}
+		if marker == 0x01 || marker >= 0xd0 && marker <= 0xd7 {
+			continue
+		}
+		if _, err := io.ReadFull(stream, lengthBuf[:]); err != nil {
+			return nil, fmt.Errorf("%w: truncated JPEG marker length", ErrInvalid)
+		}
+		size := int(binary.BigEndian.Uint16(lengthBuf[:]))
+		if size < 2 {
+			return nil, fmt.Errorf("%w: JPEG marker length", ErrInvalid)
+		}
+		payloadLen := size - 2
+		needPayload := marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc || marker == 0xe0 || marker == 0xe1 || marker == 0xe2
+		if !needPayload {
+			if _, err := io.CopyN(io.Discard, stream, int64(payloadLen)); err != nil {
+				return nil, fmt.Errorf("%w: truncated JPEG segment", ErrInvalid)
+			}
+			continue
+		}
+		payload := make([]byte, payloadLen)
+		if _, err := io.ReadFull(stream, payload); err != nil {
+			return nil, fmt.Errorf("%w: truncated JPEG segment", ErrInvalid)
+		}
+		switch {
+		case marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc:
+			if len(payload) < 6 || hasFrame {
+				return nil, fmt.Errorf("%w: JPEG frame metadata", ErrInvalid)
+			}
+			h := int(binary.BigEndian.Uint16(payload[1:3]))
+			w := int(binary.BigEndian.Uint16(payload[3:5]))
+			if w == 0 || h == 0 {
+				return nil, fmt.Errorf("%w: empty JPEG image", ErrInvalid)
+			}
+			if w > rasterMaxDimension || h > rasterMaxDimension {
+				return nil, fmt.Errorf("%w: JPEG image dimensions", ErrLimit)
+			}
+			info.Width, info.Height = w, h
+			info.BitDepth = int(payload[0])
+			switch payload[5] {
+			case 0:
+				return nil, fmt.Errorf("%w: JPEG frame component count", ErrInvalid)
+			case 1:
+				info.ColorSpace = ImageColorGray
+			case 3:
+				info.ColorSpace = ImageColorRGB
+			case 4:
+				info.ColorSpace = ImageColorCMYK
+			default:
+				info.ColorSpace = ImageColorMultiChannel
+			}
+			hasFrame = true
+		case marker == 0xe0 && bytes.HasPrefix(payload, []byte("JFIF\x00")):
+			if len(payload) < 14 {
+				return nil, fmt.Errorf("%w: truncated JFIF", ErrInvalid)
+			}
+			unit, x, y := payload[7], binary.BigEndian.Uint16(payload[8:]), binary.BigEndian.Uint16(payload[10:])
+			if unit > 2 || x == 0 || y == 0 {
+				return nil, fmt.Errorf("%w: JFIF density", ErrInvalid)
+			}
+			if unit == 0 {
+				info.DPIX, info.DPIY = 96, 96*(float64(y)/float64(x))
+				jfifAbsolute = false
+			} else {
+				factor := 1.0
+				if unit == 2 {
+					factor = 2.54
+				}
+				info.DPIX, info.DPIY = float64(x)*factor, float64(y)*factor
+				jfifAbsolute = true
+			}
+		case marker == 0xe1 && bytes.HasPrefix(payload, []byte("Exif\x00\x00")):
+			value, present, absolute, orientation, hasOrientation, err := exifImageMetadata(payload[6:])
+			if err != nil {
+				return nil, err
+			}
+			if present {
+				if hasExif && (exifDPI != value || exifAbsolute != absolute) {
+					return nil, fmt.Errorf("%w: conflicting EXIF resolution", ErrInvalid)
+				}
+				exifDPI, hasExif, exifAbsolute = value, true, absolute
+			}
+			if hasOrientation {
+				if hasOrient && info.Orientation != orientation {
+					return nil, fmt.Errorf("%w: conflicting EXIF orientation", ErrInvalid)
+				}
+				info.Orientation, hasOrient = orientation, true
+			}
+		case marker == 0xe2 && bytes.HasPrefix(payload, []byte("ICC_PROFILE\x00")):
+			if len(payload) <= 14 {
+				return nil, fmt.Errorf("%w: JPEG ICC fragment header", ErrInvalid)
+			}
+			info.HasICCProfile = true
+		}
+	}
+	if !hasFrame {
+		return nil, fmt.Errorf("%w: missing JPEG frame header", ErrInvalid)
+	}
+	if hasExif && (exifAbsolute || !jfifAbsolute) {
+		info.DPIX, info.DPIY = exifDPI.X, exifDPI.Y
+	}
+	if info.Orientation >= 5 && info.Orientation <= 8 {
+		info.Width, info.Height = info.Height, info.Width
+		info.DPIX, info.DPIY = info.DPIY, info.DPIX
+	}
+	return info, checkContext(ctx)
 }
 
 // imageEmbeddedProfileBytes 在预算内提取源图像内嵌ICC的未压缩字节视图，不修改源图像状态
@@ -1042,30 +1887,41 @@ func prepareImageConvertSampler(r *ImageResource, cfg ImageConvertOptions, maxBy
 	return newImageSampler(&brush, &view, IdentityMatrix(), renderScRGB, false, cfg.Intent, cfg.HDRPeakNits)
 }
 
-// imageConvertLinearPixel 将采样得到的线性scRGB预乘颜色执行BT.2446色调映射、反相及灰度单色转换
-// 入参: c 线性scRGB预乘像素, toneMapPeak HDR色调映射峰值亮度, negative 是否启用负片反相, mode 打印输出色彩模式
-// 返回: [3]float64 非预乘线性RGB分量, float64 归一化透明度, error 数值范围错误
-func imageConvertLinearPixel(c renderColor, toneMapPeak float64, negative bool, mode PrintColorMode) ([3]float64, float64, error) {
-	if c.a == 0 {
-		return [3]float64{}, 0, nil
-	}
-	lin := [3]float64{c.r / c.a, c.g / c.a, c.b / c.a}
-	if toneMapPeak > 0 {
-		lin = renderBT2446MethodA(lin, toneMapPeak)
-	}
-	lin, _, err := applyPrintLinearColor(lin, negative, mode)
-	if err != nil {
-		return [3]float64{}, 0, err
-	}
-	return lin, colorClamp(c.a), nil
-}
-
-// exportDirectCMYK 直接无损导出已方向纠正的原生CMYK样本为八位CMYK图像，并发安全且检查取消信号
-// 入参: ctx 已规范化取消Context, source 只读CMYK栅格图像, bounds 图像范围
+// exportDirectCMYK 直接无损导出已方向纠正的原生CMYK样本为八位CMYK图像，支持JXR整数行快路径、透明清零与背景合成
+// 入参: ctx 已规范化取消Context, source 只读CMYK栅格图像, bounds 图像范围, background 可选合成背景色
 // 返回: *image.CMYK 独立八位CMYK图像, error 采样、数值或取消错误
-func exportDirectCMYK(ctx context.Context, source *rasterImage, bounds image.Rectangle) (*image.CMYK, error) {
+func exportDirectCMYK(ctx context.Context, source *rasterImage, bounds image.Rectangle, background color.Color) (*image.CMYK, error) {
 	out := image.NewCMYK(bounds)
 	width := bounds.Dx()
+	hasBG := background != nil
+	var bgCMYK [4]uint8
+	if hasBG {
+		_, bgCMYK = imageConvertBackground(background)
+	}
+	blendCMYK := func(dst []byte, c, m, y, k, alpha uint8) {
+		if alpha == 255 {
+			dst[0], dst[1], dst[2], dst[3] = c, m, y, k
+			return
+		}
+		if alpha == 0 {
+			if hasBG {
+				dst[0], dst[1], dst[2], dst[3] = bgCMYK[0], bgCMYK[1], bgCMYK[2], bgCMYK[3]
+			} else {
+				dst[0], dst[1], dst[2], dst[3] = 0, 0, 0, 0
+			}
+			return
+		}
+		if !hasBG {
+			dst[0], dst[1], dst[2], dst[3] = c, m, y, k
+			return
+		}
+		a := float64(alpha) / 255
+		inv := 1 - a
+		dst[0] = colorQuantize8((float64(c)*a + float64(bgCMYK[0])*inv) / 255)
+		dst[1] = colorQuantize8((float64(m)*a + float64(bgCMYK[1])*inv) / 255)
+		dst[2] = colorQuantize8((float64(y)*a + float64(bgCMYK[2])*inv) / 255)
+		dst[3] = colorQuantize8((float64(k)*a + float64(bgCMYK[3])*inv) / 255)
+	}
 	if src, ok := source.pixels.(*image.CMYK); ok {
 		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 			if err := checkContext(ctx); err != nil {
@@ -1078,6 +1934,49 @@ func exportDirectCMYK(ctx context.Context, source *rasterImage, bounds image.Rec
 		return out, checkContext(ctx)
 	}
 	if source.jxr != nil {
+		if !source.jxr.alpha {
+			fastOK := true
+			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+				if err := checkContext(ctx); err != nil {
+					return nil, err
+				}
+				rowOff := (y - bounds.Min.Y) * out.Stride
+				if err := source.jxr.raster.ReadRowCMYK(y, out.Pix[rowOff:rowOff+width*4]); err != nil {
+					if y == bounds.Min.Y && errors.Is(err, jxrgo.ErrUnsupported) {
+						fastOK = false
+						break
+					}
+					return nil, jxrImageError(err)
+				}
+			}
+			if fastOK {
+				return out, checkContext(ctx)
+			}
+		} else {
+			fastOK := true
+			cmykRow := make([]byte, width*4)
+			alphaRow := make([]byte, width)
+			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+				if err := checkContext(ctx); err != nil {
+					return nil, err
+				}
+				if err := source.jxr.raster.ReadRowCMYKAlpha(y, cmykRow, alphaRow); err != nil {
+					if y == bounds.Min.Y && errors.Is(err, jxrgo.ErrUnsupported) {
+						fastOK = false
+						break
+					}
+					return nil, jxrImageError(err)
+				}
+				rowOff := (y - bounds.Min.Y) * out.Stride
+				for x := range width {
+					at := x * 4
+					blendCMYK(out.Pix[rowOff+at:rowOff+at+4], cmykRow[at], cmykRow[at+1], cmykRow[at+2], cmykRow[at+3], alphaRow[x])
+				}
+			}
+			if fastOK {
+				return out, checkContext(ctx)
+			}
+		}
 		var jxrCache jxrRowCache
 		var components [iccMaxChannels]float64
 		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
@@ -1091,16 +1990,21 @@ func exportDirectCMYK(ctx context.Context, source *rasterImage, bounds image.Rec
 						return nil, err
 					}
 				}
-				if _, err := jxrCache.sample(source.jxr, x, y, components[:], jxrSampleNative, jxrLinearKey{}); err != nil {
+				alpha, err := jxrCache.sample(source.jxr, x, y, components[:], jxrSampleNative, jxrLinearKey{})
+				if err != nil {
 					return nil, err
 				}
-				off := rowOff + (x-bounds.Min.X)*4
 				for ch := range 4 {
 					if !geometryFinite(components[ch]) {
 						return nil, fmt.Errorf("%w: non-finite CMYK sample", ErrUnsupported)
 					}
-					out.Pix[off+ch] = colorQuantize8(components[ch])
 				}
+				off := rowOff + (x-bounds.Min.X)*4
+				a8 := uint8(255)
+				if source.jxr.alpha {
+					a8 = colorQuantize8(colorClamp(alpha))
+				}
+				blendCMYK(out.Pix[off:off+4], colorQuantize8(components[0]), colorQuantize8(components[1]), colorQuantize8(components[2]), colorQuantize8(components[3]), a8)
 			}
 		}
 		return out, checkContext(ctx)
@@ -1123,18 +2027,36 @@ func exportDirectCMYK(ctx context.Context, source *rasterImage, bounds image.Rec
 				}
 				at := ((y-native.bounds.Min.Y)*native.bounds.Dx() + x - native.bounds.Min.X) * stride
 				off := rowOff + (x-bounds.Min.X)*4
+				a8 := uint8(255)
 				if native.floating != nil {
+					if native.alpha {
+						av := native.floating[at+native.channels]
+						if !geometryFinite(av) {
+							return nil, fmt.Errorf("%w: non-finite CMYK alpha", ErrUnsupported)
+						}
+						a8 = colorQuantize8(colorClamp(av))
+					}
+					var c4 [4]uint8
 					for ch := range 4 {
 						v := native.floating[at+ch]
 						if !geometryFinite(v) {
 							return nil, fmt.Errorf("%w: non-finite CMYK sample", ErrUnsupported)
 						}
-						out.Pix[off+ch] = colorQuantize8(v)
+						c4[ch] = colorQuantize8(v)
 					}
+					blendCMYK(out.Pix[off:off+4], c4[0], c4[1], c4[2], c4[3], a8)
 				} else {
-					for ch := range 4 {
-						out.Pix[off+ch] = colorQuantize8(float64(native.values[at+ch]) / 65535)
+					if native.alpha {
+						a8 = colorQuantize8(float64(native.values[at+native.channels]) / 65535)
 					}
+					blendCMYK(
+						out.Pix[off:off+4],
+						colorQuantize8(float64(native.values[at])/65535),
+						colorQuantize8(float64(native.values[at+1])/65535),
+						colorQuantize8(float64(native.values[at+2])/65535),
+						colorQuantize8(float64(native.values[at+3])/65535),
+						a8,
+					)
 				}
 			}
 		}
@@ -2295,7 +3217,7 @@ func resolveLosslessJPEGColor(components int, ids [4]byte, jfif, adobe bool, tra
 
 // losslessYCbCrToRGB16 按ITU-T T.871将十六位归一化YCbCr分量转换为十六位RGB分量
 // 入参: y, cb, cr 归一化十六位分量, mid 对应采样精度的零色度中点
-// 返回: r, g, b 钳位并四舍五入后的十六位RGB分量
+// 返回: uint16 红色分量, uint16 绿色分量, uint16 蓝色分量
 func losslessYCbCrToRGB16(y, cb, cr uint16, mid float64) (uint16, uint16, uint16) {
 	yf := float64(y)
 	cbf := float64(cb) - mid

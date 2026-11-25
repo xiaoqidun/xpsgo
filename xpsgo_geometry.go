@@ -82,10 +82,13 @@ type GeometryFigure struct {
 }
 
 // Geometry 表示统一的局部坐标路径几何，Transform为nil时表示单位变换
+// ResourceKey非空时在写侧编码为StaticResource引用，TransformResource表示变换矩阵静态资源键
 type Geometry struct {
-	FillRule  GeometryFillRule
-	Figures   []GeometryFigure
-	Transform *Matrix
+	ResourceKey       string
+	FillRule          GeometryFillRule
+	Figures           []GeometryFigure
+	Transform         *Matrix
+	TransformResource string
 }
 
 // GeometrySyntaxError 记录几何或矩阵语法错误的零基字节偏移及原因

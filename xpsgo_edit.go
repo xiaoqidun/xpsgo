@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -103,11 +104,11 @@ func (p *Package) SetPage(ctx context.Context, docIndex, pageIndex int, page *Pa
 	}
 	if p.hasDiscardControl() {
 		q := p.storyCopy()
-		targets, err := q.storePage(&value, ctx)
+		targets, err := q.storePage(&value, docIndex, pageIndex, ctx)
 		if err != nil {
 			return err
 		}
-		q.documents[docIndex].Pages[pageIndex] = PageReference{Part: part, LinkTargets: targets}
+		q.documents[docIndex].Pages[pageIndex] = PageReference{Part: part, Width: value.Width, Height: value.Height, LinkTargets: targets}
 		q.dirty[strings.ToLower(q.documents[docIndex].Part)] = true
 		if err := q.syncDiscardControl(); err != nil {
 			return err
@@ -115,11 +116,11 @@ func (p *Package) SetPage(ctx context.Context, docIndex, pageIndex int, page *Pa
 		p.commitStory(q)
 		return nil
 	}
-	targets, err := p.storePage(&value, ctx)
+	targets, err := p.storePage(&value, docIndex, pageIndex, ctx)
 	if err != nil {
 		return err
 	}
-	p.documents[docIndex].Pages[pageIndex] = PageReference{Part: part, LinkTargets: targets}
+	p.documents[docIndex].Pages[pageIndex] = PageReference{Part: part, Width: value.Width, Height: value.Height, LinkTargets: targets}
 	p.dirty[strings.ToLower(p.documents[docIndex].Part)] = true
 	return nil
 }
@@ -437,6 +438,82 @@ func (p *Package) SetPrintTicket(source, part string) error {
 	return p.setRelationships(canonical, relations)
 }
 
+// SetPrintTicketSettings 编码Framework打印票据、分配唯一部件存入包中并建立与目标部件的打印票据关系
+// 入参: ctx 取消Context，nil采用Background, targetPart 源部件URI，空字符串表示文档序列, settings 打印设置模型
+// 返回: string 写入的打印票据部件URI, error 来源、编码、编辑许可、预算或取消错误
+func (p *Package) SetPrintTicketSettings(ctx context.Context, targetPart string, settings *PrintSettings) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	if settings == nil {
+		return "", fmt.Errorf("%w: nil print settings", ErrInvalid)
+	}
+	if err := p.lock(); err != nil {
+		return "", err
+	}
+	defer p.mu.Unlock()
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	source := targetPart
+	if source == "" {
+		source = p.sequence
+	}
+	canonical, err := opcPartName(source)
+	if err != nil {
+		return "", err
+	}
+	if p.printTicketScope(canonical) == PrintScopeUnknown {
+		return "", fmt.Errorf("%w: print ticket source", ErrInvalid)
+	}
+	var buf bytes.Buffer
+	if _, err := EncodePrintSettings(ctx, &buf, settings, &PrintSettingsOptions{Limits: p.limits}); err != nil {
+		return "", err
+	}
+	q := p.signingCopy()
+	const pattern = "/Metadata/PrintTicket%d.xml"
+	part, err := q.newName(pattern, ctx)
+	if err != nil {
+		return "", err
+	}
+	if err := q.editable(canonical, part); err != nil {
+		return "", err
+	}
+	if err := q.storePart(part, printTicketType, buf.Bytes(), false); err != nil {
+		return "", err
+	}
+	key := strings.ToLower(canonical)
+	relations := slices.Clone(q.relations[key])
+	if _, err := printTicketTarget(canonical, relations, q.format); err != nil {
+		return "", err
+	}
+	kind := formatNamespace(q.format) + "/printticket"
+	index := -1
+	for i, relation := range relations {
+		if relation.Type == kind {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		nextID := createdRelationshipIDs(append(slices.Clone(relations), q.originalRels[key]...))
+		relations = append(relations, Relationship{ID: nextID(), Type: kind, Target: part, TargetMode: TargetModeInternal})
+	} else {
+		relations[index].Target, relations[index].TargetMode = part, TargetModeInternal
+	}
+	if err := q.setRelationships(canonical, relations); err != nil {
+		return "", err
+	}
+	q.commitName(pattern, part)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
+	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
+	return part, nil
+}
+
 // printTicketScope 查找当前模型中的票据关联层级，不依赖尚未生成的布局XML
 // 入参: source 已规范化源部件
 // 返回: PrintScope 关联层级，非模型部件返回Unknown
@@ -532,7 +609,8 @@ func (p *Package) SetThumbnail(ctx context.Context, source, part string) error {
 			return err
 		}
 		source = canonical
-		if p.printTicketScope(source) != PrintScopePage {
+		scope := p.printTicketScope(source)
+		if scope != PrintScopePage {
 			return fmt.Errorf("%w: thumbnail source is not a fixed page", ErrInvalid)
 		}
 	}
@@ -577,6 +655,454 @@ func (p *Package) SetThumbnail(ctx context.Context, source, part string) error {
 	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
 	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
 	return nil
+}
+
+// SetThumbnailImage 校验JPEG或PNG缩略图图像、存入包中并绑定至包根或固定页面
+// 入参: ctx 取消Context，nil采用Background, targetPart 来源部件，空值或/表示包根, data 原始JPEG或PNG图像字节
+// 返回: string 写入的缩略图部件URI, error 来源、图像格式、解码、预算或取消错误
+func (p *Package) SetThumbnailImage(ctx context.Context, targetPart string, data []byte) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	if len(data) == 0 {
+		return "", fmt.Errorf("%w: empty thumbnail image data", ErrInvalid)
+	}
+	if err := p.lock(); err != nil {
+		return "", err
+	}
+	defer p.mu.Unlock()
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	source := targetPart
+	if source == "" {
+		source = "/"
+	}
+	if source != "/" {
+		canonical, err := opcPartName(source)
+		if err != nil {
+			return "", err
+		}
+		source = canonical
+		scope := p.printTicketScope(source)
+		if scope != PrintScopePage {
+			return "", fmt.Errorf("%w: thumbnail source is not a valid thumbnail target", ErrInvalid)
+		}
+	}
+	media, ext, err := detectImageFormat(data)
+	if err != nil || !thumbnailMedia(media) {
+		return "", fmt.Errorf("%w: thumbnail requires JPEG or PNG image", ErrInvalid)
+	}
+	if int64(len(data)) > p.limits.MaxPartBytes {
+		return "", fmt.Errorf("%w: thumbnail byte budget", ErrLimit)
+	}
+	if _, err := decodeRasterImageContext(ctx, data, media, p.maxImagePixels); err != nil {
+		return "", err
+	}
+	q := p.signingCopy()
+	pattern := "/Metadata/Thumbnail%d." + ext
+	part, err := q.newName(pattern, ctx)
+	if err != nil {
+		return "", err
+	}
+	if err := q.editable(part); err != nil {
+		return "", err
+	}
+	if err := q.storePart(part, media, data, false); err != nil {
+		return "", err
+	}
+	key := strings.ToLower(source)
+	relations := slices.Clone(q.relations[key])
+	id := ""
+	retained := make([]Relationship, 0, len(relations)+1)
+	for _, relation := range relations {
+		if relation.Type != thumbnailRelationship {
+			retained = append(retained, relation)
+		} else if id == "" {
+			id = relation.ID
+		}
+	}
+	if id == "" {
+		id = createdRelationshipIDs(append(slices.Clone(relations), q.originalRels[key]...))()
+	}
+	retained = append(retained, Relationship{ID: id, Type: thumbnailRelationship, Target: part, TargetMode: TargetModeInternal})
+	if err := q.setRelationships(source, retained); err != nil {
+		return "", err
+	}
+	q.commitName(pattern, part)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
+	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
+	return part, nil
+}
+
+// Validate 对当前待写包执行批量非短路预检，一次性收集结构、内容类型、关系、页面、字体、图像、ICC、导航、票据、缩略图、释放提示及故事结构中的全部问题
+// 仅在接收器非法或ctx取消时返回非nil错误；合法包返回nil诊断切片与nil错误
+// 入参: ctx 取消Context，nil采用Background
+// 返回: []Diagnostic 检出的全部结构化诊断信息, error 接收器非法或取消错误
+func (p *Package) Validate(ctx context.Context) ([]Diagnostic, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := p.lock(); err != nil {
+		return nil, err
+	}
+	snap := p.snapshot()
+	p.mu.Unlock()
+	return snap.validateBatch(ctx)
+}
+
+// appendValidationError 将底层错误拆解并追加至诊断切片，遇取消错误时立即上抛
+// 入参: list 诊断切片指针, part 默认部件URI, element 默认元素名, attr 默认属性名, err 待记录错误
+// 返回: error 若为ctx取消错误则返回该取消错误
+func appendValidationError(list *[]Diagnostic, part, element, attr string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	var partErr *PartError
+	if errors.As(err, &partErr) {
+		if partErr.Part != "" {
+			part = partErr.Part
+		}
+		if partErr.Element != "" {
+			element = partErr.Element
+		}
+	}
+	*list = append(*list, Diagnostic{Part: part, Element: element, Attribute: attr, Message: err.Error()})
+	return nil
+}
+
+// validateBatch 在独立快照上执行批量非短路预检并收集所有可检测问题
+// 入参: ctx 已规范化取消Context
+// 返回: []Diagnostic 诊断列表, error 取消错误
+func (p *Package) validateBatch(ctx context.Context) ([]Diagnostic, error) {
+	var diagnostics []Diagnostic
+	if len(p.documents) == 0 {
+		diagnostics = append(diagnostics, Diagnostic{Part: p.sequence, Element: "FixedDocumentSequence", Message: "package needs at least one document"})
+	}
+	var totalBytes int64
+	for _, key := range slices.Sorted(maps.Keys(p.parts)) {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		part := p.parts[key]
+		if err := appendValidationError(&diagnostics, part.name, "", "ContentType", validatePackageMediaForFormat(p.format, part.media)); err != nil {
+			return nil, err
+		}
+		if int64(len(part.data)) > p.limits.MaxPartBytes {
+			diagnostics = append(diagnostics, Diagnostic{Part: part.name, Message: "part exceeds MaxPartBytes"})
+		}
+		totalBytes += int64(len(part.data))
+	}
+	if totalBytes > p.limits.MaxPackageBytes {
+		diagnostics = append(diagnostics, Diagnostic{Part: "/", Message: "package exceeds MaxPackageBytes"})
+	}
+	pkg := p.partReader()
+	sequence := createdNode(formatNamespace(p.format), "FixedDocumentSequence")
+	var allPages []PageReference
+	for docIdx, document := range p.documents {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		if len(document.Pages) == 0 {
+			diagnostics = append(diagnostics, Diagnostic{Part: document.Part, Element: "FixedDocument", Message: fmt.Sprintf("document %d has no pages", docIdx)})
+		}
+		reference := createdNode(formatNamespace(p.format), "DocumentReference")
+		if documentSource, err := relativePart(p.sequence, document.Part); err != nil {
+			if err := appendValidationError(&diagnostics, p.sequence, "DocumentReference", "Source", err); err != nil {
+				return nil, err
+			}
+		} else {
+			reference.Attr = []xml.Attr{{Name: xml.Name{Local: "Source"}, Value: documentSource}}
+			sequence.Children = append(sequence.Children, reference)
+		}
+		docRoot := createdNode(formatNamespace(p.format), "FixedDocument")
+		docTargets := make(map[string]string)
+		for _, pageRef := range document.Pages {
+			allPages = append(allPages, pageRef)
+			child := createdNode(formatNamespace(p.format), "PageContent")
+			if pageSource, err := relativePart(document.Part, pageRef.Part); err != nil {
+				if err := appendValidationError(&diagnostics, document.Part, "PageContent", "Source", err); err != nil {
+					return nil, err
+				}
+			} else {
+				child.Attr = []xml.Attr{{Name: xml.Name{Local: "Source"}, Value: pageSource}}
+			}
+			if pageRef.Width > 0 {
+				child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Local: "Width"}, Value: encodeNumber(pageRef.Width)})
+			}
+			if pageRef.Height > 0 {
+				child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Local: "Height"}, Value: encodeNumber(pageRef.Height)})
+			}
+			if len(pageRef.LinkTargets) != 0 {
+				container := createdNode(formatNamespace(p.format), "PageContent.LinkTargets")
+				pageSeen := make(map[string]bool, len(pageRef.LinkTargets))
+				for _, target := range pageRef.LinkTargets {
+					if pageSeen[target] {
+						diagnostics = append(diagnostics, Diagnostic{Part: document.Part, Element: "LinkTarget", Attribute: "Name", Message: fmt.Sprintf("duplicate LinkTarget %q on page %s", target, pageRef.Part)})
+					}
+					pageSeen[target] = true
+					if p.format == FormatXPS {
+						if prev, exists := docTargets[target]; exists {
+							diagnostics = append(diagnostics, Diagnostic{Part: document.Part, Element: "LinkTarget", Attribute: "Name", Message: fmt.Sprintf("duplicate XPS LinkTarget %q on pages %s and %s", target, prev, pageRef.Part)})
+						} else {
+							docTargets[target] = pageRef.Part
+						}
+					}
+					node := createdNode(formatNamespace(p.format), "LinkTarget")
+					node.Attr = []xml.Attr{{Name: xml.Name{Local: "Name"}, Value: target}}
+					container.Children = append(container.Children, node)
+				}
+				child.Children = []*xmlElement{container}
+			}
+			docRoot.Children = append(docRoot.Children, child)
+		}
+		if _, present := p.original[strings.ToLower(document.Part)]; !present || p.dirty[strings.ToLower(document.Part)] {
+			if data, err := createdMarkup(docRoot, p.limits, ctx); err != nil {
+				if err := appendValidationError(&diagnostics, document.Part, "FixedDocument", "", err); err != nil {
+					return nil, err
+				}
+			} else {
+				createdPut(pkg, document.Part, fixedContentType("fixeddocument"), data)
+			}
+		}
+	}
+	if _, present := p.original[strings.ToLower(p.sequence)]; !present || p.dirty[strings.ToLower(p.sequence)] {
+		if data, err := createdMarkup(sequence, p.limits, ctx); err != nil {
+			if err := appendValidationError(&diagnostics, p.sequence, "FixedDocumentSequence", "", err); err != nil {
+				return nil, err
+			}
+		} else {
+			createdPut(pkg, p.sequence, fixedContentType("fixeddocumentsequence"), data)
+		}
+	}
+	for _, source := range slices.Sorted(maps.Keys(p.relations)) {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		sourceName := p.relationSourceName(pkg, source)
+		if source == "/" {
+			rootRels := []Relationship{{Type: formatNamespace(p.format) + "/fixedrepresentation", Target: p.sequence, TargetMode: TargetModeInternal}}
+			if err := appendValidationError(&diagnostics, createdRelationshipPart("/"), "Relationships", "", p.composeRelationships(pkg, "/", rootRels, ctx)); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err := appendValidationError(&diagnostics, createdRelationshipPart(sourceName), "Relationships", "", p.composeRelationships(pkg, sourceName, nil, ctx)); err != nil {
+			return nil, err
+		}
+	}
+	if _, exists := p.relations["/"]; !exists {
+		rootRels := []Relationship{{Type: formatNamespace(p.format) + "/fixedrepresentation", Target: p.sequence, TargetMode: TargetModeInternal}}
+		if err := appendValidationError(&diagnostics, createdRelationshipPart("/"), "Relationships", "", p.composeRelationships(pkg, "/", rootRels, ctx)); err != nil {
+			return nil, err
+		}
+	}
+	r := &Reader{pkg: pkg, format: p.format, limits: p.limits, sequence: p.sequence, documents: p.documents, pages: allPages}
+	if _, err := r.CoreProperties(ctx); err != nil {
+		if err := appendValidationError(&diagnostics, "/", "CoreProperties", "", err); err != nil {
+			return nil, err
+		}
+	}
+	navigation, err := newCreatedNavigation(r, ctx)
+	if err != nil {
+		return nil, err
+	}
+	fonts := fontCache{pkg: pkg, data: make(map[string][]byte), faces: make(map[fontCacheKey]*fontSource), remaining: p.limits.MaxPackageBytes, maxFaces: p.limits.MaxPartCount}
+	checkedResources := make(map[string]bool)
+	profileChannels := make(map[string]uint32)
+	for _, pageRef := range allPages {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		root, err := r.readFixedPart(pageRef.Part, "fixedpage", "FixedPage")
+		if err != nil {
+			if err := appendValidationError(&diagnostics, pageRef.Part, "FixedPage", "", err); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err := appendValidationError(&diagnostics, pageRef.Part, "FixedPage", "", validateFixedStructure(root, p.format)); err != nil {
+			return nil, err
+		}
+		if err := appendValidationError(&diagnostics, pageRef.Part, "FixedPage", "", validateFixedNames(root, p.format)); err != nil {
+			return nil, err
+		}
+		if len(pageRef.LinkTargets) != 0 {
+			pageNames := make(map[string]bool)
+			for _, name := range createdPageTargets(root) {
+				pageNames[name] = true
+			}
+			for _, target := range pageRef.LinkTargets {
+				if !pageNames[target] {
+					diagnostics = append(diagnostics, Diagnostic{Part: pageRef.Part, Element: "LinkTarget", Attribute: "Name", Message: fmt.Sprintf("LinkTarget %q is absent from page", target)})
+				}
+			}
+		}
+		graph, err := parseResourceGraphContext(pageRef.Part, root, p.format, p.limits, func(part string) (*xmlElement, error) { return r.readResourceDictionaryLoader(part, nil, ctx) }, ctx)
+		if err != nil {
+			if err := appendValidationError(&diagnostics, pageRef.Part, "FixedPage", "", err); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if _, err := newSceneParser(p.format, graph).parse(root); err != nil {
+			if err := appendValidationError(&diagnostics, pageRef.Part, "FixedPage", "", err); err != nil {
+				return nil, err
+			}
+		}
+		for _, node := range graph.Nodes {
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+			if node.Name.Local != "Canvas" && node.Name.Local != "Path" && node.Name.Local != "Glyphs" {
+				continue
+			}
+			if target, present := node.attribute("FixedPage.NavigateUri"); present {
+				if err := navigation.target(pageRef.Part, target); err != nil {
+					if err := appendValidationError(&diagnostics, graph.Parts[node], node.Name.Local, "FixedPage.NavigateUri", err); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+		if err := p.validatePageResourcesBatch(ctx, pkg, &fonts, graph, checkedResources, profileChannels, &diagnostics); err != nil {
+			return nil, err
+		}
+	}
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := appendValidationError(&diagnostics, "/", "RequiredResource", "", r.validateRequiredResourceLinks(ctx)); err != nil {
+		return nil, err
+	}
+	if err := appendValidationError(&diagnostics, "/", "PrintTicket", "", r.validatePrintTicketLinks(ctx)); err != nil {
+		return nil, err
+	}
+	if err := appendValidationError(&diagnostics, "/", "SignatureDefinitions", "", r.validateSignatureDefinitionLinks(ctx)); err != nil {
+		return nil, err
+	}
+	if err := appendValidationError(&diagnostics, "/", "Thumbnail", "", p.validateThumbnailLinks(r, ctx)); err != nil {
+		return nil, err
+	}
+	if control, err := r.DiscardControl(ctx); err != nil {
+		if err := appendValidationError(&diagnostics, "/", "DiscardControl", "", err); err != nil {
+			return nil, err
+		}
+	} else if control != nil {
+		if control.Ignored != 0 {
+			diagnostics = append(diagnostics, Diagnostic{Part: control.Part.Name, Element: "DiscardControl", Message: "invalid discard reference"})
+		}
+		for _, hint := range control.Hints {
+			if _, exists := pkg.parts[strings.ToLower(hint.Target)]; !exists {
+				diagnostics = append(diagnostics, Diagnostic{Part: control.Part.Name, Element: "Discard", Attribute: "Target", Message: fmt.Sprintf("discard target %s is absent", hint.Target)})
+			}
+		}
+		if len(control.Hints) != 0 {
+			if err := appendValidationError(&diagnostics, control.Part.Name, "DiscardControl", "", r.validateDiscardLifetime(control, ctx)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := appendValidationError(&diagnostics, "/", "DocumentStructure", "", r.validateStoryLinks(ctx)); err != nil {
+		return nil, err
+	}
+	return diagnostics, checkContext(ctx)
+}
+
+// validatePageResourcesBatch 非短路检查单页资源图中的全部字体、图像、ICC配置及上下文颜色通道匹配
+// 入参: ctx 取消Context, pkg 快照读取器, fonts 字体缓存, graph 页面资源图, checked 已检查资源集合, channels 配置文件通道数缓存, diagnostics 诊断收集切片
+// 返回: error 取消错误
+func (p *Package) validatePageResourcesBatch(ctx context.Context, pkg *packageReader, fonts *fontCache, graph *resourceGraph, checked map[string]bool, channels map[string]uint32, diagnostics *[]Diagnostic) error {
+	if _, err := validateCreatedFonts(fonts, graph, p.format, ctx); err != nil {
+		if cancelErr := appendValidationError(diagnostics, graph.PagePart, "Glyphs", "FontUri", err); cancelErr != nil {
+			return cancelErr
+		}
+	}
+	resources, err := collectRequiredResources(graph, p.format)
+	if err != nil {
+		return appendValidationError(diagnostics, graph.PagePart, "", "", err)
+	}
+	for _, resource := range resources {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		if resource.Kind != requiredImage && resource.Kind != requiredProfile {
+			continue
+		}
+		key := fmt.Sprintf("%d:%s", resource.Kind, strings.ToLower(resource.Part))
+		if checked[key] {
+			continue
+		}
+		checked[key] = true
+		data, err := pkg.readPart(resource.Part)
+		if err != nil {
+			if cancelErr := appendValidationError(diagnostics, resource.Part, resource.Element, resource.Attribute, err); cancelErr != nil {
+				return cancelErr
+			}
+			continue
+		}
+		if resource.Kind == requiredProfile {
+			profile, err := validateCreatedICCProfile(data, ctx)
+			if err != nil {
+				if cancelErr := appendValidationError(diagnostics, resource.Part, resource.Element, resource.Attribute, err); cancelErr != nil {
+					return cancelErr
+				}
+				continue
+			}
+			count := uint32(profile.channels)
+			if profile.class == "nmcl" {
+				count = uint32(profile.tag("ncl2")[12])<<24 | uint32(profile.tag("ncl2")[13])<<16 | uint32(profile.tag("ncl2")[14])<<8 | uint32(profile.tag("ncl2")[15])
+			}
+			channels[strings.ToLower(resource.Part)] = count
+		} else {
+			media, mediaErr := pkg.contentType(resource.Part)
+			if mediaErr != nil {
+				if cancelErr := appendValidationError(diagnostics, resource.Part, resource.Element, resource.Attribute, mediaErr); cancelErr != nil {
+					return cancelErr
+				}
+				continue
+			}
+			img, err := decodeRasterImageContext(ctx, data, media, p.maxImagePixels)
+			if err != nil {
+				if cancelErr := appendValidationError(diagnostics, resource.Part, resource.Element, resource.Attribute, err); cancelErr != nil {
+					return cancelErr
+				}
+				continue
+			}
+			if len(img.profile) != 0 {
+				raw := img.profile
+				if img.profileCompressed {
+					raw, err = inflatePNGProfile(raw, p.limits.MaxMetadataBytes)
+				}
+				if err == nil {
+					var parsed *iccProfile
+					parsed, err = validateCreatedICCProfile(raw, ctx)
+					if err == nil && (parsed.class == "link" || parsed.class == "abst") {
+						err = fmt.Errorf("%w: ICC profile class cannot be embedded in an image", ErrInvalid)
+					}
+				}
+				if err != nil {
+					if cancelErr := appendValidationError(diagnostics, resource.Part, resource.Element, resource.Attribute, err); cancelErr != nil {
+						return cancelErr
+					}
+				}
+			}
+		}
+	}
+	if err := validateCreatedContextColors(graph, channels, ctx); err != nil {
+		if cancelErr := appendValidationError(diagnostics, graph.PagePart, "", "Color", err); cancelErr != nil {
+			return cancelErr
+		}
+	}
+	return checkContext(ctx)
 }
 
 // SetDiscardControl 编码并关联包级释放提示，传入nil时移除包根释放提示关联
@@ -1955,11 +2481,11 @@ func (p *Package) setStoryPage(document, index int, page *Page, ctx context.Cont
 		return err
 	}
 	q := p.storyCopy()
-	targets, err := q.storePage(page, ctx)
+	targets, err := q.storePage(page, document, index, ctx)
 	if err != nil {
 		return err
 	}
-	q.documents[document].Pages[index] = PageReference{Part: page.Part, LinkTargets: targets}
+	q.documents[document].Pages[index] = PageReference{Part: page.Part, Width: page.Width, Height: page.Height, LinkTargets: targets}
 	q.dirty[strings.ToLower(q.documents[document].Part)] = true
 	if err := q.validateStoryEdit(ctx); err != nil {
 		return err

@@ -371,7 +371,15 @@ func (c *compositionFontCheck) parse(part packagePart, whole bool) (*composition
 		}
 	}
 	result := &compositionFontMarkup{}
-	tracker := newResourceMarkupScopeTracker(c.source.format, c.source.format == FormatOpenXPS, c.budget.context)
+	selectAlt := false
+	if index == nil {
+		var err error
+		selectAlt, err = compositionCanProjectTargetChoices(part, c.source.format, c.source.targetFormat, c.budget)
+		if err != nil {
+			return nil, &PartError{Part: part.name, Err: err}
+		}
+	}
+	tracker := newResourceMarkupScopeTrackerWithAlternate(c.source.format, c.source.format == FormatOpenXPS, selectAlt, c.budget.context)
 	visit := func(token xml.Token, node *xmlElement) error {
 		if err := c.budget.step(1); err != nil {
 			return err
@@ -2337,7 +2345,7 @@ func compositionPrintRepresentable(node *xmlElement, version uint32, capabilitie
 				allowed = true
 			case inlineCapable && attribute.Name == (xml.Name{Space: xsiNamespace, Local: "type"}):
 				allowed = true
-			case kind == PrintSettingOption && attribute.Name == (xml.Name{Space: printFramework2NS, Local: "default"}):
+			case capabilities && kind == PrintSettingOption && attribute.Name == (xml.Name{Space: printFramework2NS, Local: "default"}):
 				allowed = true
 			case capabilities && kind == PrintSettingOption && (attribute.Name == (xml.Name{Local: "constrained"}) || attribute.Name == (xml.Name{Space: printFramework2NS, Local: "constrained"})):
 				allowed = true

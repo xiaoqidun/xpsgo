@@ -750,25 +750,8 @@ func (source *jxrImage) readRow(y int, buf *jxrRowBuffer) error {
 		} else {
 			buf.alpha = buf.alpha[:width]
 		}
-		alphaRow := buf.alpha[:width]
-		alphaComp := source.components[source.channels]
-		alphaInfo := alphaComp.Info()
-		if source.ycc && (alphaInfo.XStep != 1 || alphaInfo.YStep != 1 || alphaInfo.Bounds != source.bounds) {
-			for x := range width {
-				v, err := jxrSampleComponent(alphaComp, source.bounds.Min.X+x, y, source.bounds)
-				if err != nil {
-					return err
-				}
-				alphaRow[x] = v
-			}
-		} else if err := alphaComp.ReadRow(y, alphaRow); err != nil {
-			return jxrImageError(err)
-		}
-		for x, value := range alphaRow {
-			if !geometryFinite(value) {
-				return fmt.Errorf("%w: JPEG XR non-finite alpha", ErrUnsupported)
-			}
-			alphaRow[x] = colorClamp(value)
+		if err := source.readAlphaRow(y, buf.alpha); err != nil {
+			return err
 		}
 	}
 	premultiplied := source.premultiplied && source.alpha
@@ -967,4 +950,302 @@ func jxrImageError(err error) error {
 		return err
 	}
 	return fmt.Errorf("%w: JPEG XR: %w", category, err)
+}
+
+// readJXRImageInfo 仅解析JPEG XR容器主图文件头元数据，不触发任何图像解码或像素分配
+// 入参: ctx 已规范化取消Context, data JPEG XR字节数据, part 部件包根URI, media 内容类型, maxBytes 字节上限
+// 返回: *ImageInfo 主图视觉头元数据, error 容器、目录、预算或取消错误
+func readJXRImageInfo(ctx context.Context, data []byte, part, media string, maxBytes uint64) (*ImageInfo, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if maxBytes > 0 && uint64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%w: JPEG XR input byte budget", ErrLimit)
+	}
+	limits := jxrgo.Limits{MaxInputBytes: uint64(max(1, len(data))), MaxPixels: uint64(rasterMaxDimension) * uint64(rasterMaxDimension), MaxMemoryBytes: jxrDecodeMemoryLimit(uint64(len(data)), 1<<24, maxBytes)}
+	decoder, err := jxrgo.NewDecoderAt(ctx, bytes.NewReader(data), int64(len(data)), &jxrgo.DecodeOptions{Workers: 1, Limits: limits})
+	if err != nil {
+		return nil, jxrImageError(err)
+	}
+	defer decoder.Close()
+	if decoder.Info().Format != jxrgo.FormatJXR {
+		return nil, fmt.Errorf("%w: JPEG XR requires a file container", ErrInvalid)
+	}
+	_, info, err := selectJXRPrimaryImage(ctx, decoder)
+	if err != nil {
+		return nil, err
+	}
+	dpiX, dpiY := info.Resolution.X, info.Resolution.Y
+	if !geometryFinite(dpiX, dpiY) || dpiX <= 0 || dpiY <= 0 {
+		dpiX, dpiY = 96, 96
+	}
+	bitDepth := 0
+	if len(info.Components) > 0 {
+		bitDepth = int(info.Components[0].Precision)
+	}
+	return &ImageInfo{
+		Part:          part,
+		ContentType:   media,
+		Width:         info.Bounds.Dx(),
+		Height:        info.Bounds.Dy(),
+		DPIX:          dpiX,
+		DPIY:          dpiY,
+		ColorSpace:    jxrImageColorSpace(info.ColorSpace),
+		HasAlpha:      info.Alpha,
+		BitDepth:      bitDepth,
+		IsFloat:       jxrIsFloating(info),
+		Orientation:   jxrEXIFOrientation(info.Orientation),
+		HasICCProfile: len(info.ICCProfile) > 0,
+		HasCICP:       info.ColorEncoding != nil,
+	}, nil
+}
+
+// jxrExtraToneMapPeak 返回无CICP线性扩展JPEG XR在显式指定HDRPeakNits时需额外施加的BT.2446峰值亮度
+// 入参: info JPEG XR图像元数据, cfg 色彩转换选项
+// 返回: float64 需额外色调映射的峰值亮度，零表示无需额外映射
+func jxrExtraToneMapPeak(info jxrgo.Info, cfg ImageConvertOptions) float64 {
+	if info.Linear && info.ColorEncoding == nil && cfg.HDRPeakNits > 0 {
+		return cfg.HDRPeakNits
+	}
+	return 0
+}
+
+// jxrDisplayConverter 按转换选项构造可复用的JXRGo ColorConverter，外挂ICC、命名色表或不支持格式返回false以回退
+// 入参: ctx 已规范化取消Context, info JPEG XR图像元数据, cfg 已校验转换选项, limits JXRGo资源限制
+// 返回: *jxrgo.ColorConverter 色彩转换器, bool 是否适用JXRGo原生转换管线, error ICC解析或参数错误
+func jxrDisplayConverter(ctx context.Context, info jxrgo.Info, cfg ImageConvertOptions, limits jxrgo.Limits) (*jxrgo.ColorConverter, bool, error) {
+	if len(cfg.Profile) > 0 {
+		return nil, false, nil
+	}
+	hasEmbeddedICC := len(info.ICCProfile) > 0
+	intent := jxrIntentFromRender(cfg.Intent)
+	if hasEmbeddedICC {
+		parsed, err := parseICCProfile(info.ICCProfile)
+		if err != nil {
+			return nil, false, err
+		}
+		if parsed.class == "nmcl" {
+			return nil, false, nil
+		}
+		if cfg.Intent == IntentDefault {
+			intent = jxrIntentFromICC(imageICCIntent(parsed))
+		}
+	} else if info.ColorSpace == jxrgo.ColorMultiChannel {
+		return nil, false, nil
+	}
+	dispOpts := &jxrgo.DisplayOptions{
+		Filter:      jxrgo.ResampleBilinear,
+		ApplyICC:    hasEmbeddedICC,
+		Intent:      intent,
+		HDRPeakNits: cfg.HDRPeakNits,
+		Limits:      limits,
+	}
+	conv, err := jxrgo.NewColorConverter(ctx, info, dispOpts)
+	if err != nil {
+		if errors.Is(err, jxrgo.ErrUnsupported) {
+			return nil, false, nil
+		}
+		return nil, false, jxrImageError(err)
+	}
+	return conv, true, nil
+}
+
+// readAlphaRow 批量读取JPEG XR单行归一化透明度值，支持常规通道与子采样通道
+// 入参: y 目标显示行坐标, dst 长度至少为图像宽度的浮点切片
+// 返回: error 读取或非有限透明度错误
+func (source *jxrImage) readAlphaRow(y int, dst []float64) error {
+	width := source.bounds.Dx()
+	if !source.alpha {
+		for x := range width {
+			dst[x] = 1
+		}
+		return nil
+	}
+	alphaComp := source.components[source.channels]
+	alphaInfo := alphaComp.Info()
+	if source.ycc && (alphaInfo.XStep != 1 || alphaInfo.YStep != 1 || alphaInfo.Bounds != source.bounds) {
+		for x := range width {
+			v, err := jxrSampleComponent(alphaComp, source.bounds.Min.X+x, y, source.bounds)
+			if err != nil {
+				return err
+			}
+			dst[x] = v
+		}
+	} else if err := alphaComp.ReadRow(y, dst[:width]); err != nil {
+		return jxrImageError(err)
+	}
+	for x := range width {
+		if !geometryFinite(dst[x]) {
+			return fmt.Errorf("%w: JPEG XR non-finite alpha", ErrUnsupported)
+		}
+		dst[x] = colorClamp(dst[x])
+	}
+	return nil
+}
+
+// decodeJXRImageRows 经ImageDecoderWithOptions、DecodeStrips与ConvertStripRegion逐条带流式导出JPEG XR八位NRGBA行
+// 正序水平行带仅保持三带滑动窗口以常数内存流式回调，倒序与转置方向在三带窗口转换后按y递增回调；不适用时返回false由上层回退
+// 入参: ctx 已规范化取消Context, data JPEG XR字节数据, maxPixels 像素容量上限, maxBytes 字节上限, cfg 色彩转换选项, fn 逐行回调
+// 返回: bool 是否已由流式条带管线处理完成, error 解码、色彩、预算、回调或取消错误
+func decodeJXRImageRows(ctx context.Context, data []byte, maxPixels, maxBytes uint64, cfg ImageConvertOptions, fn func(y int, nrgba []byte) error) (bool, error) {
+	if len(cfg.Profile) > 0 {
+		return false, nil
+	}
+	if err := checkContext(ctx); err != nil {
+		return false, err
+	}
+	if maxPixels == 0 {
+		return false, fmt.Errorf("%w: JPEG XR document pixel capacity", ErrLimit)
+	}
+	if maxBytes > 0 && uint64(len(data)) > maxBytes {
+		return false, fmt.Errorf("%w: JPEG XR input byte budget", ErrLimit)
+	}
+	memoryLimit := jxrDecodeMemoryLimit(uint64(len(data)), maxPixels, maxBytes)
+	workers := jxrDecodeWorkers(ctx, maxPixels, memoryLimit)
+	limits := jxrgo.Limits{MaxInputBytes: uint64(max(1, len(data))), MaxPixels: maxPixels, MaxMemoryBytes: memoryLimit}
+	decoder, err := jxrgo.NewDecoderAt(ctx, bytes.NewReader(data), int64(len(data)), &jxrgo.DecodeOptions{Workers: workers, Limits: limits})
+	if err != nil {
+		return false, jxrImageError(err)
+	}
+	defer decoder.Close()
+	if decoder.Info().Format != jxrgo.FormatJXR {
+		return false, fmt.Errorf("%w: JPEG XR requires a file container", ErrInvalid)
+	}
+	imageIndex, info, err := selectJXRPrimaryImage(ctx, decoder)
+	if err != nil {
+		return false, err
+	}
+	fullW, fullH := info.Bounds.Dx(), info.Bounds.Dy()
+	if info.Bounds.Min != (image.Point{}) || info.Bounds.Empty() || fullW > rasterMaxDimension || fullH > rasterMaxDimension || uint64(fullW)*uint64(fullH) > maxPixels {
+		return false, fmt.Errorf("%w: JPEG XR document pixel capacity", ErrLimit)
+	}
+	conv, usable, err := jxrDisplayConverter(ctx, info, cfg, limits)
+	if err != nil || !usable {
+		return false, err
+	}
+	imgDec := decoder
+	if imageIndex != 0 {
+		sub, subErr := decoder.ImageDecoderWithOptions(ctx, imageIndex, &jxrgo.DecodeOptions{Workers: workers, Limits: limits})
+		if subErr != nil {
+			if errors.Is(subErr, jxrgo.ErrUnsupported) {
+				return false, nil
+			}
+			return false, jxrImageError(subErr)
+		}
+		defer sub.Close()
+		imgDec = sub
+	}
+	toneMapPeak := jxrExtraToneMapPeak(info, cfg)
+	fastNRGBA := cfg.Background == nil && !cfg.Negative && cfg.ColorMode == PrintColorOriginal && toneMapPeak == 0
+	var bgLinear [3]float64
+	hasBG := cfg.Background != nil
+	if hasBG {
+		bgLinear, _ = imageConvertBackground(cfg.Background)
+	}
+	directStream := info.Orientation == jxrgo.OrientationNone || info.Orientation == jxrgo.OrientationFlipX
+	var frameBuf []byte
+	if !directStream {
+		need := uint64(fullW) * uint64(fullH) * 4
+		if need > memoryLimit || need > uint64(^uint(0)>>1) {
+			return false, fmt.Errorf("%w: image row buffer memory budget", ErrLimit)
+		}
+		frameBuf = make([]byte, int(need))
+	}
+	var rowBytes []byte
+	var rowLinear []float64
+	emitted := false
+	processStrip := func(prev, curr, next jxrgo.StripRegion) error {
+		sw, sh := curr.Region.Dx(), curr.Region.Dy()
+		if emitted && (curr.Region.Min.X != 0 || sw != fullW) {
+			return fmt.Errorf("%w: non-full-width JPEG XR strip after streaming output", ErrUnsupported)
+		}
+		if cap(rowBytes) < sw*4 {
+			rowBytes = make([]byte, sw*4)
+		} else {
+			rowBytes = rowBytes[:sw*4]
+		}
+		if !fastNRGBA {
+			if cap(rowLinear) < sw*4 {
+				rowLinear = make([]float64, sw*4)
+			} else {
+				rowLinear = rowLinear[:sw*4]
+			}
+		}
+		for ly := range sh {
+			if err := checkContext(ctx); err != nil {
+				return err
+			}
+			if fastNRGBA {
+				if err := conv.ConvertStripRegionNRGBA(ctx, prev, curr, next, ly, rowBytes); err != nil {
+					return jxrImageError(err)
+				}
+				if info.Alpha {
+					zeroTransparentNRGBARow(rowBytes)
+				}
+			} else {
+				if err := conv.ConvertStripRegionLinear(ctx, prev, curr, next, ly, rowLinear); err != nil {
+					return jxrImageError(err)
+				}
+				if err := finishLinearRowToNRGBA(rowLinear, sw, toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode, rowBytes); err != nil {
+					return err
+				}
+			}
+			gy := curr.Region.Min.Y + ly
+			if directStream && curr.Region.Min.X == 0 && sw == fullW {
+				emitted = true
+				if err := fn(gy, rowBytes); err != nil {
+					return err
+				}
+			} else {
+				if frameBuf == nil {
+					need := uint64(fullW) * uint64(fullH) * 4
+					if need > memoryLimit || need > uint64(^uint(0)>>1) {
+						return fmt.Errorf("%w: image row buffer memory budget", ErrLimit)
+					}
+					frameBuf = make([]byte, int(need))
+					directStream = false
+				}
+				dstOff := (gy*fullW + curr.Region.Min.X) * 4
+				copy(frameBuf[dstOff:dstOff+sw*4], rowBytes)
+			}
+		}
+		return nil
+	}
+	var prev, curr jxrgo.StripRegion
+	stripErr := imgDec.DecodeStrips(ctx, func(cbCtx context.Context, region image.Rectangle, source *jxrgo.Raster) error {
+		cloned, cloneErr := source.Clone(cbCtx, limits)
+		if cloneErr != nil {
+			return jxrImageError(cloneErr)
+		}
+		incoming := jxrgo.StripRegion{Region: region, Raster: cloned}
+		if curr.Raster != nil {
+			if err := processStrip(prev, curr, incoming); err != nil {
+				return err
+			}
+		}
+		prev, curr = curr, incoming
+		return nil
+	})
+	if stripErr != nil {
+		if !emitted && errors.Is(stripErr, jxrgo.ErrUnsupported) {
+			return false, nil
+		}
+		return emitted, jxrImageError(stripErr)
+	}
+	if curr.Raster != nil {
+		if err := processStrip(prev, curr, jxrgo.StripRegion{}); err != nil {
+			return emitted, err
+		}
+	}
+	if frameBuf != nil {
+		for y := range fullH {
+			if err := checkContext(ctx); err != nil {
+				return true, err
+			}
+			if err := fn(y, frameBuf[y*fullW*4:(y+1)*fullW*4]); err != nil {
+				return true, err
+			}
+		}
+	}
+	return true, checkContext(ctx)
 }

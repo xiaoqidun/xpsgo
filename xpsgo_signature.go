@@ -853,7 +853,7 @@ func (r *Reader) signatureCoverage(info *SignatureInfo, graph *signaturePartGrap
 		relations: make(map[signatureCoverageKey]SignatureRelationship), modes: make(map[signatureCoverageKey]int), targets: make(map[signatureCoverageKey]string),
 		bySource: make(map[string][]Relationship), covered: make(map[signatureCoverageKey]bool), ungrouped: make(map[signatureCoverageKey]bool),
 	}
-	if err := c.collect(r, info.Part.Name); err != nil {
+	if err := c.collect(r); err != nil {
 		return nil, err
 	}
 	result := &SignatureCoverage{Part: info.Part}
@@ -916,11 +916,10 @@ func (r *Reader) signatureCoverage(info *SignatureInfo, graph *signaturePartGrap
 	return result, nil
 }
 
-// collect 按当前固定布局与有效关系建立签名覆盖规则与可选部件集合，支持会签其他已关联签名并排除自身及孤立部件
-// 入参: reader 已持有读锁的阅读器, selfPart 当前检查或签署的签名部件URI
+// collect 按当前固定布局与有效关系建立签名覆盖规则与可选部件集合，排除所有签名部件及孤立部件
+// 入参: reader 已持有读锁的阅读器
 // 返回: error 关联、目标、资源或取消错误
-func (c *signatureCoverageGraph) collect(reader *Reader, selfPart string) error {
-	selfKey := strings.ToLower(selfPart)
+func (c *signatureCoverageGraph) collect(reader *Reader) error {
 	c.owners["/"] = "root"
 	c.owners[strings.ToLower(reader.sequence)] = "sequence"
 	c.parts[strings.ToLower(reader.sequence)], c.required[strings.ToLower(reader.sequence)] = true, true
@@ -974,9 +973,6 @@ func (c *signatureCoverageGraph) collect(reader *Reader, selfPart string) error 
 			}
 			targetKey := strings.ToLower(target.Name)
 			c.owners[targetKey] = "signature"
-			if targetKey != selfKey {
-				c.parts[targetKey] = true
-			}
 		}
 	}
 	keys := slices.Sorted(maps.Keys(c.graph.pkg.parts))
@@ -1049,7 +1045,7 @@ func (c *signatureCoverageGraph) rule(owner, typ string) (int, string) {
 		return signatureCoverageRequiredPart, ""
 	case owner == "document" && typ == namespace+"/restricted-font":
 		return signatureCoverageRequiredRelationship, ""
-	case (owner == "root" || owner == "document" || owner == "page") && typ == thumbnailRelationship:
+	case (owner == "root" || owner == "page" || c.format == FormatXPS && owner == "document") && typ == thumbnailRelationship:
 		return signatureCoverageRequiredPart, ""
 	case owner == "root" && typ == opcCoreRel:
 		return signatureCoverageOptionalPart, opcCoreType

@@ -16,6 +16,7 @@ package xpsgo
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"image"
@@ -39,15 +40,27 @@ const (
 // sceneWorkerPool 复用场景多核光栅化工作Goroutine的临时图块缓冲
 var sceneWorkerPool sync.Pool
 
+// renderStandardSRGBProfile 缓存用于打印色彩计划预览输出的标准sRGB ICC配置字节
+var renderStandardSRGBProfile = buildRenderStandardSRGBICCProfile()
+
+// RenderedElement 保存单元素隔离光栅化输出的原点归零图像、页面包围盒、像素到页面精确仿射矩阵及设备像素边界
+type RenderedElement struct {
+	Image       *image.NRGBA
+	PageRect    Rect
+	PixelToPage Matrix
+	PixelBounds image.Rectangle
+}
+
 // sceneParser 将资源图中的已绑定定义解析为页面绘制数据
 type sceneParser struct {
-	format     Format
-	resources  *resourceGraph
-	geometries map[*xmlElement]*Geometry
-	matrices   map[*xmlElement]Matrix
-	brushes    map[*xmlElement]*Brush
-	elements   map[*xmlElement]Element
-	budget     *printSideGeometryBudget
+	format          Format
+	resources       *resourceGraph
+	geometries      map[*xmlElement]*Geometry
+	matrices        map[*xmlElement]Matrix
+	brushes         map[*xmlElement]*Brush
+	elements        map[*xmlElement]Element
+	budget          *printSideGeometryBudget
+	allowUnresolved bool
 }
 
 // sceneRenderOptions 保存内部场景绘制器的采样精度、合成空间与资源预算
@@ -84,6 +97,7 @@ type sceneRenderOptions struct {
 	workers       int
 	hdrPeakNits   float64
 	pageSubClip   *image.Rectangle
+	clipAliased   map[*Canvas]bool
 }
 
 // sceneSample 同时接收当前覆盖采样点和所属设备像素中心，保持嵌套图块的采样相位
@@ -421,7 +435,13 @@ func (p *sceneParser) brushProperty(node *xmlElement, name string) (*Brush, erro
 	}
 	if reference {
 		definition := p.resources.Bindings[node][name]
-		if definition == nil || definition.Key != key || resourceKind(definition.Kind) != "brush" {
+		if definition == nil {
+			if p.allowUnresolved {
+				return nil, nil
+			}
+			return nil, p.elementError(node, fmt.Errorf("%w: unresolved brush %q", ErrInvalid, key))
+		}
+		if definition.Key != key || resourceKind(definition.Kind) != "brush" {
 			return nil, p.elementError(node, fmt.Errorf("%w: unresolved brush %q", ErrInvalid, key))
 		}
 		return p.brush(definition.Element, true)
@@ -451,6 +471,9 @@ func (p *sceneParser) brush(node *xmlElement, resource bool) (*Brush, error) {
 		if err != nil {
 			return Matrix{}, err
 		}
+		if definition == nil {
+			return IdentityMatrix(), nil
+		}
 		return p.matrix(definition.Element, true)
 	}, resource)
 	if err != nil {
@@ -459,10 +482,15 @@ func (p *sceneParser) brush(node *xmlElement, resource bool) (*Brush, error) {
 	value.Part = p.resources.Parts[node]
 	if value.VisualReference != "" {
 		definition := p.resources.Bindings[node]["Visual"]
-		if definition == nil || definition.Key != value.VisualReference || resourceKind(definition.Kind) != "visual" {
+		if definition == nil {
+			if !p.allowUnresolved {
+				return nil, p.elementError(node, fmt.Errorf("%w: unresolved visual resource", ErrInvalid))
+			}
+		} else if definition.Key != value.VisualReference || resourceKind(definition.Kind) != "visual" {
 			return nil, p.elementError(node, fmt.Errorf("%w: unresolved visual resource", ErrInvalid))
+		} else {
+			value.Visual, err = p.elementValue(definition.Element)
 		}
-		value.Visual, err = p.elementValue(definition.Element)
 	} else if value.visualElement != nil {
 		value.Visual, err = p.elementValue(value.visualElement)
 	}
@@ -487,6 +515,9 @@ func (p *sceneParser) geometry(node *xmlElement, resource bool) (*Geometry, erro
 		definition, err := p.binding(node, "Transform", key, "MatrixTransform")
 		if err != nil {
 			return Matrix{}, err
+		}
+		if definition == nil {
+			return IdentityMatrix(), nil
 		}
 		return p.matrix(definition.Element, true)
 	}, resource, p.budget.charge, p.budget.shared(node))
@@ -551,6 +582,9 @@ func (p *sceneParser) geometryProperty(node *xmlElement, name string) (*Geometry
 		if err != nil {
 			return nil, err
 		}
+		if definition == nil {
+			return nil, nil
+		}
 		return p.geometry(definition.Element, true)
 	}
 	if err := p.budget.charge(1, 0); err != nil {
@@ -592,6 +626,9 @@ func (p *sceneParser) matrixProperty(node *xmlElement, name string) (*Matrix, er
 		if err != nil {
 			return nil, err
 		}
+		if definition == nil {
+			return nil, nil
+		}
 		value, err = p.matrix(definition.Element, true)
 	} else {
 		value, err = ParseMatrix(text)
@@ -628,7 +665,13 @@ func (p *sceneParser) property(node *xmlElement, name string) (*xmlElement, erro
 // 返回: *resourceDefinition 已绑定定义, error 错误信息
 func (p *sceneParser) binding(node *xmlElement, property, key, kind string) (*resourceDefinition, error) {
 	definition := p.resources.Bindings[node][property]
-	if definition == nil || definition.Key != key || definition.Kind != kind {
+	if definition == nil {
+		if p.allowUnresolved {
+			return nil, nil
+		}
+		return nil, p.elementError(node, fmt.Errorf("%w: unresolved %s resource %q", ErrInvalid, property, key))
+	}
+	if definition.Key != key || definition.Kind != kind {
 		return nil, p.elementError(node, fmt.Errorf("%w: unresolved %s resource %q", ErrInvalid, property, key))
 	}
 	return definition, nil
@@ -1115,17 +1158,36 @@ func (r *Reader) attachSceneCaches(options *sceneRenderOptions, fonts *fontCache
 }
 
 // RenderElement 仅隔离光栅化单个元素到透明背景的最小外包整数像素画布，不混入页面其他背景元素
-// state指定顶层元素在页面或纸面坐标系下的完整图形状态（Matrix、Clip、Opacity、OpacityMask、EdgeMode、Negative与PrintColor）
+// state指定顶层元素在页面或纸面坐标系下的完整图形状态（Matrix、Clip、Opacity、OpacityMask、EdgeMode、Negative、PrintColor与PrintColorPlan）
 // 顶层element自身的RenderTransform、Clip、Opacity与OpacityMask由state接管而不重复叠加，子元素局部属性正常生效
 // 入参: ctx 取消Context，nil采用Background, part 相对资源解析基准部件URI，空值回退state.PagePart, element 单个Canvas/Path/Glyphs元素, state 有效图形状态, options 绘制参数，nil采用96DPI透明默认配置
 // 返回: *image.NRGBA 原点归零的透明背景隔离图像, Rect 图像在页面或纸面坐标系中的精确包围盒, error 参数、资源、预算或取消错误
 func (r *Reader) RenderElement(ctx context.Context, part string, element Element, state WalkState, options *RenderOptions) (*image.NRGBA, Rect, error) {
-	ctx = normalizeContext(ctx)
-	if err := checkContext(ctx); err != nil {
+	mapped, err := r.renderElementMapped(ctx, part, element, state, options)
+	if err != nil {
 		return nil, Rect{}, err
 	}
+	return mapped.Image, mapped.PageRect, nil
+}
+
+// RenderElementMapped 隔离光栅化单个元素到透明背景画布，并同步返回像素坐标到页面96DPI坐标的精确仿射矩阵
+// 支持透传state中的PrintColor、PrintColorPlan、Negative以及每层祖先Clip独立的锯齿边缘模式
+// 入参: ctx 取消Context，nil采用Background, elem 单个Canvas/Path/Glyphs元素, state 有效图形与打印色彩状态, options 绘制参数，nil采用96DPI透明默认配置
+// 返回: *RenderedElement 含图像、页面包围盒、PixelToPage矩阵与设备像素范围的结果, error 参数、资源、预算或取消错误
+func (r *Reader) RenderElementMapped(ctx context.Context, elem Element, state WalkState, options *RenderOptions) (*RenderedElement, error) {
+	return r.renderElementMapped(ctx, "", elem, state, options)
+}
+
+// renderElementMapped 统一执行单元素隔离光栅化，精确隔离祖先Clip边缘模式、接入PrintColorPlan并计算PixelToPage矩阵
+// 入参: ctx 取消Context，nil采用Background, part 可选基准部件覆盖, element 目标绘制元素, state 顶层图形与色彩状态, options 绘制参数
+// 返回: *RenderedElement 完整映射渲染结果, error 参数、资源、预算或取消错误
+func (r *Reader) renderElementMapped(ctx context.Context, part string, element Element, state WalkState, options *RenderOptions) (*RenderedElement, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
 	if err := r.readLock(); err != nil {
-		return nil, Rect{}, err
+		return nil, err
 	}
 	defer r.mu.RUnlock()
 	basePart := part
@@ -1136,21 +1198,21 @@ func (r *Reader) RenderElement(ctx context.Context, part string, element Element
 		var err error
 		basePart, err = opcPartName(basePart)
 		if err != nil {
-			return nil, Rect{}, err
+			return nil, err
 		}
 	}
 	if !geometryFinite(state.Opacity) || state.Opacity < 0 || state.Opacity > 1 || !geometryFillMatrixFinite(state.Matrix) {
-		return nil, Rect{}, fmt.Errorf("%w: render element state", ErrInvalid)
+		return nil, fmt.Errorf("%w: render element state", ErrInvalid)
 	}
 	if state.EdgeMode != "" && state.EdgeMode != EdgeModeAliased {
-		return nil, Rect{}, fmt.Errorf("%w: render element edge mode", ErrInvalid)
+		return nil, fmt.Errorf("%w: render element edge mode", ErrInvalid)
 	}
 	if err := validatePrintColor(state.PrintColor); err != nil {
-		return nil, Rect{}, err
+		return nil, err
 	}
 	for _, clip := range state.Clip {
 		if clip.Geometry != nil && !geometryFillMatrixFinite(clip.Matrix) {
-			return nil, Rect{}, fmt.Errorf("%w: render element clip transform", ErrInvalid)
+			return nil, fmt.Errorf("%w: render element clip transform", ErrInvalid)
 		}
 	}
 	configuration := RenderOptions{}
@@ -1160,20 +1222,23 @@ func (r *Reader) RenderElement(ctx context.Context, part string, element Element
 	configuration.Background = color.Transparent
 	settings, devTransform, err := configuration.settings(ctx)
 	if err != nil {
-		return nil, Rect{}, err
+		return nil, err
 	}
 	settings.outputColor = state.PrintColor.Mode
 	if configuration.Region != nil && (configuration.Region.Min.X > configuration.Region.Max.X || configuration.Region.Min.Y > configuration.Region.Max.Y) {
-		return nil, Rect{}, fmt.Errorf("%w: render element region", ErrInvalid)
+		return nil, fmt.Errorf("%w: render element region", ErrInvalid)
 	}
 	core, err := isolateElementNode(element, basePart, state)
 	if err != nil {
-		return nil, Rect{}, err
+		return nil, err
 	}
 	if state.Opacity == 0 || geometryMatrixSingular(state.Matrix) {
-		return image.NewNRGBA(image.Rectangle{}), Rect{}, nil
+		return &RenderedElement{Image: image.NewNRGBA(image.Rectangle{})}, nil
 	}
 	current := core
+	if state.EdgeMode == EdgeModeAliased {
+		current = &Canvas{ElementProperties: ElementProperties{Part: basePart, Opacity: 1}, EdgeMode: EdgeModeAliased, Elements: []Element{current}}
+	}
 	if state.Negative {
 		negCanvas := &Canvas{ElementProperties: ElementProperties{Part: basePart, Opacity: 1}, Elements: []Element{current}}
 		settings.negative = map[*Canvas]bool{negCanvas: true}
@@ -1185,7 +1250,7 @@ func (r *Reader) RenderElement(ctx context.Context, part string, element Element
 			continue
 		}
 		if geometryMatrixSingular(clip.Matrix) {
-			return image.NewNRGBA(image.Rectangle{}), Rect{}, nil
+			return &RenderedElement{Image: image.NewNRGBA(image.Rectangle{})}, nil
 		}
 		clipGeom := *clip.Geometry
 		if clipGeom.Transform == nil {
@@ -1193,54 +1258,334 @@ func (r *Reader) RenderElement(ctx context.Context, part string, element Element
 			clipGeom.Transform = &m
 		} else {
 			if !geometryFillMatrixFinite(*clipGeom.Transform) {
-				return nil, Rect{}, fmt.Errorf("%w: render element clip geometry transform", ErrInvalid)
+				return nil, fmt.Errorf("%w: render element clip geometry transform", ErrInvalid)
 			}
 			composed := strokePathCompose(clip.Matrix, *clipGeom.Transform)
 			if !geometryFillMatrixFinite(composed) {
-				return nil, Rect{}, fmt.Errorf("%w: render element clip transform overflow", ErrLimit)
+				return nil, fmt.Errorf("%w: render element clip transform overflow", ErrLimit)
 			}
 			clipGeom.Transform = &composed
 		}
-		current = &Canvas{ElementProperties: ElementProperties{Part: basePart, Opacity: 1, Clip: &clipGeom}, Elements: []Element{current}}
+		clipCanvas := &Canvas{ElementProperties: ElementProperties{Part: basePart, Opacity: 1, Clip: &clipGeom}, Elements: []Element{current}}
+		if settings.clipAliased == nil {
+			settings.clipAliased = make(map[*Canvas]bool)
+		}
+		settings.clipAliased[clipCanvas] = clip.Aliased
+		current = clipCanvas
 	}
-	if state.EdgeMode == EdgeModeAliased {
-		current = &Canvas{ElementProperties: ElementProperties{Part: basePart, Opacity: 1}, EdgeMode: EdgeModeAliased, Elements: []Element{current}}
+	if state.PrintColorPlan != nil {
+		planCanvas := &Canvas{ElementProperties: ElementProperties{Part: basePart, Opacity: 1}, Elements: []Element{current}}
+		if err := attachPrintColorPlanPreview(ctx, &settings, configuration, planCanvas, state.PrintColorPlan); err != nil {
+			return nil, err
+		}
+		current = planCanvas
 	}
 	fonts := &fontCache{pkg: r.pkg, data: make(map[string][]byte), faces: make(map[fontCacheKey]*fontSource), remaining: settings.fontBytes, maxFaces: settings.fonts}
 	r.attachSceneCaches(&settings, fonts)
 	sr := sceneRenderer{options: settings, active: make(map[Element]bool), elements: settings.elements, edges: settings.edges, work: settings.work, glyphs: settings.glyphs, exact: rasterMaxExact}
 	defer sr.cleanup()
+	if len(settings.printPlan) != 0 {
+		sr.printContext = make(map[*Canvas]*printColorRuntime)
+		if err := sr.preparePrintColorContext([]Element{current}); err != nil {
+			return nil, err
+		}
+	}
 	nodes, err := sr.prepare([]Element{current}, devTransform, false, 0)
 	if err != nil {
-		return nil, Rect{}, err
+		return nil, err
 	}
 	bounds := nodes[0].bounds
 	if configuration.Region != nil {
 		bounds = bounds.Intersect(*configuration.Region)
 	}
 	if bounds.Empty() {
-		return image.NewNRGBA(image.Rectangle{}), Rect{}, nil
+		return &RenderedElement{Image: image.NewNRGBA(image.Rectangle{})}, nil
 	}
 	pixels, err := validateSceneOutput(bounds, devTransform, settings)
 	if err != nil {
-		return nil, Rect{}, err
+		return nil, err
 	}
 	if err := sr.reservePixels(pixels); err != nil {
-		return nil, Rect{}, err
+		return nil, err
 	}
-	output, err := sr.renderPrepared(nodes, bounds)
+	var output *image.NRGBA
+	if len(settings.printPlan) != 0 {
+		output, err = sr.renderPreparedPrintColor(nodes, bounds)
+	} else {
+		output, err = sr.renderPrepared(nodes, bounds)
+	}
 	if err != nil {
-		return nil, Rect{}, err
+		return nil, err
+	}
+	invDev, err := devTransform.Inverse()
+	if err != nil {
+		return nil, err
+	}
+	pixelToPage := strokePathCompose(invDev, Matrix{A: 1, D: 1, E: float64(bounds.Min.X), F: float64(bounds.Min.Y)})
+	if !geometryFillMatrixFinite(pixelToPage) {
+		return nil, fmt.Errorf("%w: element pixel mapping overflow", ErrLimit)
 	}
 	pageRect, err := renderBoundsToPageRect(bounds, configuration, devTransform)
 	if err != nil {
-		return nil, Rect{}, err
+		return nil, err
 	}
 	output.Rect = image.Rect(0, 0, bounds.Dx(), bounds.Dy())
 	if err := checkContext(ctx); err != nil {
-		return nil, Rect{}, err
+		return nil, err
 	}
-	return output, pageRect, nil
+	return &RenderedElement{
+		Image:       output,
+		PageRect:    pageRect,
+		PixelToPage: pixelToPage,
+		PixelBounds: bounds,
+	}, nil
+}
+
+// attachPrintColorPlanPreview 为NRGBA隔离渲染配置基于标准sRGB目标的打印色彩管理执行上下文
+// 入参: ctx 取消Context, settings 待配置的内部场景参数, config 渲染配置, root 承载颜色计划的根画布, plan 打印色彩管理计划
+// 返回: error 目标初始化或参数错误
+func attachPrintColorPlanPreview(ctx context.Context, settings *sceneRenderOptions, config RenderOptions, root *Canvas, plan *PrintColorPlan) error {
+	deviceConfig := config
+	deviceConfig.ColorSpace = ColorScRGB
+	maxBytes := max(int64(64<<20), int64(settings.pixels)*8)
+	devState, err := newDeviceRenderStateMode(ctx, &DeviceColorTarget{Profile: renderStandardSRGBProfile, MaxBytes: maxBytes}, deviceConfig, true)
+	if err != nil {
+		return err
+	}
+	printOpts := &PrintColorOptions{
+		Profile:  renderStandardSRGBProfile,
+		Override: true,
+	}
+	if plan.Management == PrintColorManagementNone {
+		printOpts.Conditions = "srgb-preview"
+		printOpts.Colorants = []string{"R", "G", "B"}
+		printOpts.NativeProfiles = [][]byte{renderStandardSRGBProfile}
+	}
+	settings.device = devState
+	settings.printPlan = map[*Canvas]*PrintColorPlan{root: clonePrintColorPlan(plan)}
+	settings.printOptions = printOpts
+	return nil
+}
+
+// renderLoadedElementsPrintPreview 在已配置PrintColorPlan的预览场景中渲染并转换为sRGB八位图像
+// 入参: elements 待渲染元素, transform 场景到设备的变换, bounds 目标设备整数像素范围, options 含打印色彩计划的场景参数
+// 返回: *image.NRGBA 八位非预乘sRGB图像, error 准备、渲染、预算或取消错误
+func (r *Reader) renderLoadedElementsPrintPreview(elements []Element, transform Matrix, bounds image.Rectangle, options sceneRenderOptions) (*image.NRGBA, error) {
+	fonts := &fontCache{pkg: r.pkg, data: make(map[string][]byte), faces: make(map[fontCacheKey]*fontSource), remaining: options.fontBytes, maxFaces: options.fonts}
+	r.attachSceneCaches(&options, fonts)
+	pixels, err := validateSceneOutput(bounds, transform, options)
+	if err != nil {
+		return nil, err
+	}
+	sr := sceneRenderer{options: options, active: make(map[Element]bool), elements: options.elements, edges: options.edges, work: options.work, live: pixels, glyphs: options.glyphs, exact: rasterMaxExact}
+	defer sr.cleanup()
+	sr.printContext = make(map[*Canvas]*printColorRuntime)
+	if err := sr.preparePrintColorContext(elements); err != nil {
+		return nil, err
+	}
+	nodes, err := sr.prepare(elements, transform, false, 0)
+	if err != nil {
+		return nil, err
+	}
+	return sr.renderPreparedPrintColor(nodes, bounds)
+}
+
+// renderPreparedPrintColor 将已完成准备的打印色彩节点树按图块合成到sRGB设备缓冲并转换为NRGBA图像
+// 入参: nodes 已准备场景节点树, bounds 目标设备整数像素范围
+// 返回: *image.NRGBA 非预乘sRGB输出图像, error 合成、预算或转换错误
+func (r *sceneRenderer) renderPreparedPrintColor(nodes []*sceneNode, bounds image.Rectangle) (*image.NRGBA, error) {
+	if r.options.device == nil {
+		return nil, fmt.Errorf("%w: print color device target", ErrUnsupported)
+	}
+	if err := r.options.device.allocate(bounds); err != nil {
+		return nil, err
+	}
+	if bounds.Empty() {
+		return image.NewNRGBA(image.Rectangle{}), nil
+	}
+	samples := r.options.samples
+	var background printNativeColor
+	if r.options.background.a != 0 {
+		space := ColorScRGB
+		if r.options.space == renderSRGB {
+			space = ColorSRGB
+		}
+		background = printNativeColor{
+			value: [iccMaxChannels]float64{r.options.background.r / r.options.background.a, r.options.background.g / r.options.background.a, r.options.background.b / r.options.background.a},
+			alpha: r.options.background.a,
+			space: &printWorkingSpace{space: space, channels: 3},
+		}
+	}
+	cols := (bounds.Dx() + sceneTileSize - 1) / sceneTileSize
+	rows := (bounds.Dy() + sceneTileSize - 1) / sceneTileSize
+	tileCount := cols * rows
+	tileW := min(sceneTileSize, bounds.Dx()) * samples
+	tileH := min(sceneTileSize, bounds.Dy()) * samples
+	first := image.Rect(bounds.Min.X*samples, bounds.Min.Y*samples, bounds.Min.X*samples+tileW, bounds.Min.Y*samples+tileH)
+	workers := resolveXPSWorkers(r.options.workers, tileCount)
+	if r.options.workers == 0 && (tileCount < 4 || bounds.Dx()*bounds.Dy() < 4096) {
+		workers = 1
+	}
+	if workers > 1 {
+		available := uint64(max(0, r.options.pixels-r.live))
+		perWorker := uint64(tileW) * uint64(tileH) * 4 * uint64(1+sceneMaxIsolatedDepth(nodes))
+		if r.hasFiltered {
+			if available <= perWorker*2 {
+				workers = 1
+			} else {
+				workers = budgetXPSWorkers(workers, available/2, perWorker)
+			}
+		} else {
+			workers = budgetXPSWorkers(workers, available, perWorker)
+		}
+	}
+	if workers <= 1 {
+		storage, err := r.acquirePrintSurface(first)
+		if err != nil {
+			return nil, err
+		}
+		defer r.releasePrintSurface(storage)
+		worker := acquireSceneWorker()
+		defer releaseSceneWorker(worker)
+		for y := bounds.Min.Y; y < bounds.Max.Y; y += sceneTileSize {
+			for x := bounds.Min.X; x < bounds.Max.X; x += sceneTileSize {
+				tileOut := image.Rect(x, y, min(x+sceneTileSize, bounds.Max.X), min(y+sceneTileSize, bounds.Max.Y))
+				if err := r.printColorTile(nodes, storage, background, tileOut, worker); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return deviceImageToNRGBA(r.options.device.result), nil
+	}
+	surfaces := make([]*printSurfaceBuffer, workers)
+	states := make([]*sceneWorkerState, workers)
+	defer func() {
+		for i := range workers {
+			if states[i] != nil {
+				releaseSceneWorker(states[i])
+			}
+			if surfaces[i] != nil {
+				r.releasePrintSurface(surfaces[i])
+			}
+		}
+	}()
+	for i := range workers {
+		surface, err := r.acquirePrintSurface(first)
+		if err != nil {
+			return nil, err
+		}
+		surfaces[i] = surface
+		states[i] = acquireSceneWorker()
+	}
+	r.concurrent = true
+	if err := runXPSWorkerSlots(r.options.context, workers, tileCount, func(runCtx context.Context, slot, task int) error {
+		if err := runCtx.Err(); err != nil {
+			r.cancelled.Store(true)
+			return err
+		}
+		tx := task % cols
+		ty := task / cols
+		x := bounds.Min.X + tx*sceneTileSize
+		y := bounds.Min.Y + ty*sceneTileSize
+		tileOut := image.Rect(x, y, min(x+sceneTileSize, bounds.Max.X), min(y+sceneTileSize, bounds.Max.Y))
+		if err := r.printColorTile(nodes, surfaces[slot], background, tileOut, states[slot]); err != nil {
+			r.cancelled.Store(true)
+			return err
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return deviceImageToNRGBA(r.options.device.result), nil
+}
+
+// deviceImageToNRGBA 将三通道十六位sRGB设备图像精确量化转换为八位非预乘NRGBA图像
+// 入参: dev 三通道十六位sRGB设备图像
+// 返回: *image.NRGBA 八位非预乘sRGB图像
+func deviceImageToNRGBA(dev *DeviceImage) *image.NRGBA {
+	if dev == nil || dev.Rect.Empty() {
+		return image.NewNRGBA(image.Rectangle{})
+	}
+	w, h := dev.Rect.Dx(), dev.Rect.Dy()
+	out := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for y := range h {
+		srcRow := dev.Pix[y*dev.Stride : y*dev.Stride+w*4]
+		dstRow := out.Pix[y*out.Stride : y*out.Stride+w*4]
+		for x := range w {
+			off := x * 4
+			dstRow[off] = uint8((uint32(srcRow[off])*255 + 32767) / 65535)
+			dstRow[off+1] = uint8((uint32(srcRow[off+1])*255 + 32767) / 65535)
+			dstRow[off+2] = uint8((uint32(srcRow[off+2])*255 + 32767) / 65535)
+			dstRow[off+3] = uint8((uint32(srcRow[off+3])*255 + 32767) / 65535)
+		}
+	}
+	return out
+}
+
+// buildRenderStandardSRGBICCProfile 构造与IEC 61966-2-1一致的标准D50适配sRGB矩阵-TRC ICC配置文件
+// 返回: []byte 完整只读sRGB ICC配置字节
+func buildRenderStandardSRGBICCProfile() []byte {
+	encodeXYZ := func(x, y, z float64) []byte {
+		buf := make([]byte, 20)
+		copy(buf[0:4], "XYZ ")
+		binary.BigEndian.PutUint32(buf[8:12], uint32(int32(math.Round(x*65536))))
+		binary.BigEndian.PutUint32(buf[12:16], uint32(int32(math.Round(y*65536))))
+		binary.BigEndian.PutUint32(buf[16:20], uint32(int32(math.Round(z*65536))))
+		return buf
+	}
+	trc := make([]byte, 32)
+	copy(trc[0:4], "para")
+	binary.BigEndian.PutUint16(trc[8:10], 3)
+	for i, v := range [5]float64{2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045} {
+		binary.BigEndian.PutUint32(trc[12+i*4:], uint32(int32(math.Round(v*65536))))
+	}
+	m := iccPCSFromLinearRGB
+	entries := []struct {
+		name string
+		data []byte
+	}{
+		{"bTRC", trc},
+		{"bXYZ", encodeXYZ(m[2], m[5], m[8])},
+		{"gTRC", trc},
+		{"gXYZ", encodeXYZ(m[1], m[4], m[7])},
+		{"rTRC", trc},
+		{"rXYZ", encodeXYZ(m[0], m[3], m[6])},
+		{"wtpt", encodeXYZ(iccPCSWhite[0], iccPCSWhite[1], iccPCSWhite[2])},
+	}
+	data := make([]byte, 132+12*len(entries))
+	data[8] = 4
+	data[9] = 0x20
+	copy(data[12:16], "mntr")
+	copy(data[16:20], "RGB ")
+	copy(data[20:24], "XYZ ")
+	binary.BigEndian.PutUint16(data[24:26], 2026)
+	binary.BigEndian.PutUint16(data[26:28], 1)
+	binary.BigEndian.PutUint16(data[28:30], 1)
+	copy(data[36:40], "acsp")
+	binary.BigEndian.PutUint32(data[64:68], 1)
+	binary.BigEndian.PutUint32(data[68:72], uint32(int32(math.Round(iccPCSWhite[0]*65536))))
+	binary.BigEndian.PutUint32(data[72:76], uint32(int32(math.Round(iccPCSWhite[1]*65536))))
+	binary.BigEndian.PutUint32(data[76:80], uint32(int32(math.Round(iccPCSWhite[2]*65536))))
+	binary.BigEndian.PutUint32(data[128:132], uint32(len(entries)))
+	shared := make(map[string]uint32)
+	for i, entry := range entries {
+		key := string(entry.data)
+		offset, ok := shared[key]
+		if !ok {
+			for len(data)%4 != 0 {
+				data = append(data, 0)
+			}
+			offset = uint32(len(data))
+			data = append(data, entry.data...)
+			shared[key] = offset
+		}
+		dir := data[132+i*12:]
+		copy(dir[0:4], entry.name)
+		binary.BigEndian.PutUint32(dir[4:8], offset)
+		binary.BigEndian.PutUint32(dir[8:12], uint32(len(entry.data)))
+	}
+	binary.BigEndian.PutUint32(data[0:4], uint32(len(data)))
+	return data
 }
 
 // isolateElementNode 浅拷贝单个顶层元素并用WalkState接管其变换、透明度与蒙版，同时补齐相对资源解析所需的基准部件
@@ -1680,7 +2025,13 @@ func (r *sceneRenderer) node(element Element, transform Matrix, aliased bool, de
 			return nil, fmt.Errorf("%w: canvas edge mode", ErrInvalid)
 		}
 	}
-	n := &sceneNode{part: properties.Part, kind: kind, opacity: properties.Opacity, aliased: aliased, color: r.printRuntime}
+	clipAliased := aliased
+	if canvas, ok := element.(*Canvas); ok {
+		if override, present := r.options.clipAliased[canvas]; present {
+			clipAliased = override
+		}
+	}
+	n := &sceneNode{part: properties.Part, kind: kind, opacity: properties.Opacity, aliased: clipAliased, color: r.printRuntime}
 	if canvas, ok := element.(*Canvas); ok {
 		n.negative = r.options.negative[canvas]
 	}
@@ -1689,7 +2040,7 @@ func (r *sceneRenderer) node(element Element, transform Matrix, aliased bool, de
 		return n, nil
 	}
 	if properties.Clip != nil {
-		region, err := r.fill(properties.Clip, transform, aliased)
+		region, err := r.fill(properties.Clip, transform, clipAliased)
 		if err != nil {
 			return nil, err
 		}
@@ -1767,7 +2118,7 @@ func (r *sceneRenderer) node(element Element, transform Matrix, aliased bool, de
 		n.bounds = n.bounds.Union(child.bounds)
 	}
 	if n.clip != nil {
-		n.bounds = n.bounds.Intersect(r.regionBounds(*n.clip, aliased))
+		n.bounds = n.bounds.Intersect(r.regionBounds(*n.clip, n.aliased))
 	}
 	return n, nil
 }

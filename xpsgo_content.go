@@ -216,24 +216,26 @@ type Element interface {
 	element()
 }
 
-// ElementProperties 保存元素的局部变换、透明度、链接与语言声明
+// ElementProperties 保存元素的局部变换、静态资源变换引用、透明度、链接与语言声明
 // Language和NavigateURI为nil时沿用父级或使用位置的环境值
 type ElementProperties struct {
-	Part            string
-	Name            string
-	RenderTransform *Matrix
-	Clip            *Geometry
-	Opacity         float64
-	OpacityMask     *Brush
-	Language        *string
-	NavigateURI     *string
-	source          *xmlElement
+	Part                    string
+	Name                    string
+	RenderTransform         *Matrix
+	RenderTransformResource string
+	Clip                    *Geometry
+	Opacity                 float64
+	OpacityMask             *Brush
+	Language                *string
+	NavigateURI             *string
+	source                  *xmlElement
 }
 
-// Canvas 保存按声明顺序绘制并作为整体合成的子元素，坐标与变换均采用1/96英寸设备无关单位
+// Canvas 保存按声明顺序绘制并作为整体合成的子元素及可选资源字典，坐标与变换均采用1/96英寸设备无关单位
 // EdgeMode省略为空字符串时默认启用抗锯齿，非空合法取值为EdgeModeAliased
 type Canvas struct {
 	ElementProperties
+	Resources          *ResourceDictionary
 	Elements           []Element
 	EdgeMode           EdgeMode
 	AutomationName     string

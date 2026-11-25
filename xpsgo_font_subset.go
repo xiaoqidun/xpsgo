@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"maps"
@@ -27,15 +28,18 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
-// FontSubsetOptions 设置集合字体面索引、输入输出字节上限、字形解析工作上限及无cmap打印流子集容忍开关
+// FontSubsetOptions 设置集合字体面索引、输入输出字节上限、字形解析工作上限、紧凑重映射与合成cmap配置
 // MaxWork累计TrueType轮廓展开、CFF程序执行及替换程序字节，零值采用1048576个工作单元
 type FontSubsetOptions struct {
 	CollectionIndex  uint32
 	MaxBytes         int64
 	MaxWork          int
 	AllowMissingCmap bool
+	CompactGIDs      bool
+	SynthesizeCmap   map[rune]uint16
 }
 
 // subsetCFFPrivate 保存重定位后的私有字典与未重编号的局部子程序索引
@@ -93,12 +97,24 @@ func DefaultFontSubsetOptions() FontSubsetOptions {
 	return FontSubsetOptions{MaxBytes: DefaultLimits().MaxPartBytes, MaxWork: 1 << 20}
 }
 
-// SubsetFont 裁剪已解混淆的TrueType或CFF1字体，保留原字形编号、.notdef、复合依赖与排版度量并返回独立SFNT
+// SubsetFont 裁剪已解混淆的TrueType或CFF1字体，保留.notdef、复合依赖与排版度量并返回独立SFNT
 // 集合输入仅输出指定字体面并移除失效的DSIG，受嵌入或子集化限制时返回ErrRestricted
 // 入参: ctx 取消Context，nil采用Background, data 原始字体数据，调用期间不得修改, glyphs 保留的原字形编号, options 资源上限参数
 // 返回: []byte 独立字体数据，失败为nil, error 封装、许可、能力、字形、资源或取消错误
 func SubsetFont(ctx context.Context, data []byte, glyphs []uint16, options *FontSubsetOptions) ([]byte, error) {
 	return subsetFont(normalizeContext(ctx), data, glyphs, options, nil)
+}
+
+// SubsetFontMapped 裁剪已解混淆的TrueType或CFF1字体并返回旧GID到新GID的映射表
+// 启用CompactGIDs时将保留字形按升序紧凑重编号为0至N-1并重写轮廓、度量与cmap表，否则返回恒等映射
+// 入参: ctx 取消Context，nil采用Background, data 原始字体数据，调用期间不得修改, collectionIndex 集合字体面索引, glyphIDs 保留的原字形编号, options 裁剪选项
+// 返回: []byte 独立字体数据, map[uint16]uint16 旧GID到新GID映射表, error 封装、许可、能力、字形、资源或取消错误
+func SubsetFontMapped(ctx context.Context, data []byte, collectionIndex int, glyphIDs []uint16, options FontSubsetOptions) (encoded []byte, gidMap map[uint16]uint16, err error) {
+	if collectionIndex < 0 || uint64(collectionIndex) > math.MaxUint32 {
+		return nil, nil, fmt.Errorf("%w: negative or overflowing collection index", ErrInvalid)
+	}
+	options.CollectionIndex = uint32(collectionIndex)
+	return subsetFontMapped(normalizeContext(ctx), data, glyphIDs, &options, nil)
 }
 
 // subsetFontConfig 规范化字体裁剪预算参数并结合累计剩余工作上限约束单次上限
@@ -109,6 +125,8 @@ func subsetFontConfig(options *FontSubsetOptions, remaining *int) (FontSubsetOpt
 	if options != nil {
 		configuration.CollectionIndex = options.CollectionIndex
 		configuration.AllowMissingCmap = options.AllowMissingCmap
+		configuration.CompactGIDs = options.CompactGIDs
+		configuration.SynthesizeCmap = options.SynthesizeCmap
 		if options.MaxBytes != 0 {
 			configuration.MaxBytes = options.MaxBytes
 		}
@@ -132,69 +150,77 @@ func subsetFontConfig(options *FontSubsetOptions, remaining *int) (FontSubsetOpt
 // 入参: ctx 已规范化取消Context, data 字体数据, glyphs 保留编号, options 单字体选项, remaining 可选累计剩余工作量
 // 返回: []byte 独立字体数据, error 字体、资源或取消错误
 func subsetFont(ctx context.Context, data []byte, glyphs []uint16, options *FontSubsetOptions, remaining *int) ([]byte, error) {
+	encoded, _, err := subsetFontMapped(ctx, data, glyphs, options, remaining)
+	return encoded, err
+}
+
+// subsetFontMapped 共用单字体裁剪入口，可将执行工作计入包级累计预算并返回旧GID到新GID映射
+// 入参: ctx 已规范化取消Context, data 字体数据, glyphs 保留编号, options 单字体选项, remaining 可选累计剩余工作量
+// 返回: []byte 独立字体数据, map[uint16]uint16 旧GID到新GID映射表, error 字体、资源或取消错误
+func subsetFontMapped(ctx context.Context, data []byte, glyphs []uint16, options *FontSubsetOptions, remaining *int) ([]byte, map[uint16]uint16, error) {
 	configuration, err := subsetFontConfig(options, remaining)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := checkContext(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if int64(len(data)) > configuration.MaxBytes || len(glyphs) > configuration.MaxWork {
-		return nil, fmt.Errorf("%w: font subset input budget", ErrLimit)
+		return nil, nil, fmt.Errorf("%w: font subset input budget", ErrLimit)
 	}
 	face, err := parseFontFace(data, configuration.CollectionIndex)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if issues := face.validateDirectory(); len(issues) != 0 {
-		return nil, fmt.Errorf("%w: font subset directory %s: %s", ErrInvalid, issues[0].table, issues[0].message)
+		return nil, nil, fmt.Errorf("%w: font subset directory %s: %s", ErrInvalid, issues[0].table, issues[0].message)
 	}
 	return subsetFontFace(ctx, face, glyphs, configuration, remaining)
 }
 
 // subsetFontFace 对已完成目录与校验和验证的字体面执行权限检查、元数据校验与轮廓子集化
 // 入参: ctx 已规范化取消Context, face 已校验字体面, glyphs 保留编号, configuration 已规范化选项, remaining 累计工作预算
-// 返回: []byte 独立字体数据, error 字体、许可、预算或取消错误
-func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, configuration FontSubsetOptions, remaining *int) ([]byte, error) {
+// 返回: []byte 独立字体数据, map[uint16]uint16 旧GID到新GID映射表, error 字体、许可、预算或取消错误
+func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, configuration FontSubsetOptions, remaining *int) ([]byte, map[uint16]uint16, error) {
 	if err := checkContext(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var os2 *fontOS2Metrics
 	if _, hasOS2 := face.tables["OS/2"]; hasOS2 || !fontIsBitmapOnly(face) && !configuration.AllowMissingCmap {
 		var err error
 		os2, err = parseFontOS2Metrics(face)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		rights, err := fontEmbeddingRights(os2)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if rights&0x302 != 0 {
-			return nil, fmt.Errorf("%w: font embedding or subsetting restriction", ErrRestricted)
+			return nil, nil, fmt.Errorf("%w: font embedding or subsetting restriction", ErrRestricted)
 		}
 	}
 	if fontIsBitmapOnly(face) {
-		return nil, fmt.Errorf("%w: bitmap-only font subsetting", ErrUnsupported)
+		return nil, nil, fmt.Errorf("%w: bitmap-only font subsetting", ErrUnsupported)
 	}
 	for _, tag := range []string{"fvar", "COLR", "SVG "} {
 		if _, present := face.tables[tag]; present {
-			return nil, fmt.Errorf("%w: font subset dependencies in %s", ErrUnsupported, tag)
+			return nil, nil, fmt.Errorf("%w: font subset dependencies in %s", ErrUnsupported, tag)
 		}
 	}
 	fontMetrics, err := validateFontSubsetMetrics(face, os2, configuration.AllowMissingCmap)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if face.cff {
 		return subsetCFFFont(ctx, face, fontMetrics, glyphs, configuration, remaining)
 	}
 	if _, present := face.tables["gvar"]; present {
-		return nil, fmt.Errorf("%w: variable TrueType font subsetting", ErrUnsupported)
+		return nil, nil, fmt.Errorf("%w: variable TrueType font subsetting", ErrUnsupported)
 	}
 	font, err := parseTrueType(face)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	needed := make([]bool, int(font.numGlyphs))
 	queue := make([]uint16, 0, min(int(font.numGlyphs), len(glyphs)+1))
@@ -202,7 +228,7 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, config
 	queue = append(queue, 0)
 	for _, gid := range glyphs {
 		if gid >= font.numGlyphs {
-			return nil, fmt.Errorf("%w: subset glyph index %d", ErrInvalid, gid)
+			return nil, nil, fmt.Errorf("%w: subset glyph index %d", ErrInvalid, gid)
 		}
 		if !needed[gid] {
 			needed[gid] = true
@@ -216,18 +242,18 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, config
 	profile := subsetFontProfile{}
 	for index := 0; index < len(queue); index++ {
 		if err := checkContext(ctx); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		gid := queue[index]
 		glyph, err := font.load(gid, budget)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		budget.points, budget.contours, budget.components = 0, 0, 0
 		start, end := font.locations[gid], font.locations[int(gid)+1]
 		composite := start != end && int16(binary.BigEndian.Uint16(font.glyf[start:])) < 0
 		if err := profile.add(gid, glyph, fontMetrics, composite); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, component := range glyph.components {
 			if !needed[component.glyph] {
@@ -236,26 +262,57 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, config
 			}
 		}
 	}
+	oldToNew, newToOld := buildSubsetGIDMap(needed, configuration.CompactGIDs)
 	head, _ := face.table("head")
 	short := binary.BigEndian.Uint16(head[50:]) == 0
-	offsets := make([]uint32, int(font.numGlyphs)+1)
+	var offsets []uint32
 	var glyf []byte
-	for index := 0; index <= int(font.numGlyphs); index++ {
-		if err := checkContext(ctx); err != nil {
-			return nil, err
+	if configuration.CompactGIDs {
+		offsets = make([]uint32, len(newToOld)+1)
+		for newGID, oldGID := range newToOld {
+			if err := checkContext(ctx); err != nil {
+				return nil, nil, err
+			}
+			offsets[newGID] = uint32(len(glyf))
+			start, end := font.locations[oldGID], font.locations[int(oldGID)+1]
+			if start == end {
+				continue
+			}
+			length := uint64(end-start) + uint64((int(end-start))&1)
+			if uint64(len(glyf))+length > uint64(configuration.MaxBytes) || uint64(len(glyf))+length > math.MaxUint32 {
+				return nil, nil, fmt.Errorf("%w: subset glyph byte budget", ErrLimit)
+			}
+			raw := bytes.Clone(font.glyf[start:end])
+			if len(raw) >= 10 && int16(binary.BigEndian.Uint16(raw)) < 0 {
+				if err := rewriteCompositeGlyphIDs(raw, oldToNew); err != nil {
+					return nil, nil, err
+				}
+			}
+			glyf = append(glyf, raw...)
+			if len(glyf)&1 != 0 {
+				glyf = append(glyf, 0)
+			}
 		}
-		offsets[index] = uint32(len(glyf))
-		if index == int(font.numGlyphs) || !needed[index] {
-			continue
-		}
-		start, end := font.locations[index], font.locations[index+1]
-		length := uint64(end-start) + uint64((int(end-start))&1)
-		if uint64(len(glyf))+length > uint64(configuration.MaxBytes) || uint64(len(glyf))+length > math.MaxUint32 {
-			return nil, fmt.Errorf("%w: subset glyph byte budget", ErrLimit)
-		}
-		glyf = append(glyf, font.glyf[start:end]...)
-		if len(glyf)&1 != 0 {
-			glyf = append(glyf, 0)
+		offsets[len(newToOld)] = uint32(len(glyf))
+	} else {
+		offsets = make([]uint32, int(font.numGlyphs)+1)
+		for index := 0; index <= int(font.numGlyphs); index++ {
+			if err := checkContext(ctx); err != nil {
+				return nil, nil, err
+			}
+			offsets[index] = uint32(len(glyf))
+			if index == int(font.numGlyphs) || !needed[index] {
+				continue
+			}
+			start, end := font.locations[index], font.locations[index+1]
+			length := uint64(end-start) + uint64((int(end-start))&1)
+			if uint64(len(glyf))+length > uint64(configuration.MaxBytes) || uint64(len(glyf))+length > math.MaxUint32 {
+				return nil, nil, fmt.Errorf("%w: subset glyph byte budget", ErrLimit)
+			}
+			glyf = append(glyf, font.glyf[start:end]...)
+			if len(glyf)&1 != 0 {
+				glyf = append(glyf, 0)
+			}
 		}
 	}
 	if short {
@@ -271,7 +328,7 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, config
 		stride = 2
 	}
 	if uint64(len(offsets))*uint64(stride) > uint64(configuration.MaxBytes) {
-		return nil, fmt.Errorf("%w: subset loca byte budget", ErrLimit)
+		return nil, nil, fmt.Errorf("%w: subset loca byte budget", ErrLimit)
 	}
 	loca := make([]byte, len(offsets)*stride)
 	for index, offset := range offsets {
@@ -283,22 +340,54 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, config
 	}
 	tables := map[string][]byte{"glyf": glyf, "loca": loca}
 	if err := profile.apply(face, fontMetrics, tables, ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if !short {
+	if configuration.CompactGIDs {
+		if err := applyCompactSubsetTables(face, fontMetrics, newToOld, oldToNew, tables); err != nil {
+			return nil, nil, err
+		}
+	}
+	if cmapTable, err := buildSubsetCmapTable(face, uint32(font.numGlyphs), oldToNew, configuration); err != nil {
+		return nil, nil, err
+	} else if cmapTable != nil {
+		tables["cmap"] = cmapTable
+	}
+	if short {
+		binary.BigEndian.PutUint16(tables["head"][50:], 0)
+	} else {
 		binary.BigEndian.PutUint16(tables["head"][50:], 1)
 	}
-	return encodeSubsetFont(ctx, face, tables, slices.Contains(needed, false), configuration)
+	encoded, err := encodeSubsetFont(ctx, face, tables, slices.Contains(needed, false), configuration.CompactGIDs, configuration)
+	if err != nil {
+		return nil, nil, err
+	}
+	return encoded, oldToNew, nil
 }
 
-// encodeSubsetFont 重建独立SFNT目录及四字节表填充，剔除失效签名及与被置空字形不一致的衍生表
-// 入参: ctx 取消Context, face 原字体面, replacements 替换的字体表, pruned 是否置空了未用轮廓字形, options 字节上限
+// encodeSubsetFont 重建独立SFNT目录及四字节表填充，剔除失效签名及与被置空或重排字形不一致的衍生表
+// 入参: ctx 取消Context, face 原字体面, replacements 替换或新增的字体表, pruned 是否置空了未用轮廓字形, compact 是否启用紧凑GID重编号, options 字节上限
 // 返回: []byte 独立字体数据, error 表、字节、目录或取消错误
-func encodeSubsetFont(ctx context.Context, face *fontFace, replacements map[string][]byte, pruned bool, options FontSubsetOptions) ([]byte, error) {
-	tags := slices.Sorted(maps.Keys(face.tables))
+func encodeSubsetFont(ctx context.Context, face *fontFace, replacements map[string][]byte, pruned, compact bool, options FontSubsetOptions) ([]byte, error) {
+	tagSet := make(map[string]bool, len(face.tables)+len(replacements))
+	for tag := range face.tables {
+		tagSet[tag] = true
+	}
+	for tag := range replacements {
+		tagSet[tag] = true
+	}
+	tags := slices.Sorted(maps.Keys(tagSet))
 	tags = slices.DeleteFunc(tags, func(tag string) bool {
 		if tag == "DSIG" {
 			return true
+		}
+		if _, replaced := replacements[tag]; replaced {
+			return false
+		}
+		if compact {
+			switch tag {
+			case "kern", "GPOS", "GSUB", "GDEF", "JSTF", "BASE", "VORG", "hdmx", "LTSH", "VDMX", "EBLC", "EBDT", "EBSC", "CBDT", "CBLC", "sbix":
+				return true
+			}
 		}
 		if !pruned {
 			return false
@@ -370,40 +459,40 @@ func encodeSubsetFont(ctx context.Context, face *fontFace, replacements map[stri
 	return output, nil
 }
 
-// subsetCFFFont 保留原GID与子程序编号并重建CFF1字体子集表，未用字形按原度量生成空程序
-// 入参: ctx 已规范化取消Context, face 原SFNT字体面, metrics 已校验字体度量, glyphs 保留字形编号, options 资源上限, work 可选包级剩余工作量
-// 返回: []byte 独立SFNT, error 字形、结构、矩阵、预算或取消错误
-func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, glyphs []uint16, options FontSubsetOptions, work *int) ([]byte, error) {
+// subsetCFFFont 裁剪CFF1字体子集表，支持原GID保号或紧凑重编号与合成cmap
+// 入参: ctx 已规范化取消Context, face 原SFNT字体面, metrics 已校验字体度量, glyphs 保留字形编号, options 资源上限与重映射配置, work 可选包级剩余工作量
+// 返回: []byte 独立SFNT, map[uint16]uint16 旧GID到新GID映射表, error 字形、结构、矩阵、预算或取消错误
+func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, glyphs []uint16, options FontSubsetOptions, work *int) ([]byte, map[uint16]uint16, error) {
 	data, err := face.table("CFF ")
 	if err != nil {
 		if _, exists := face.tables["CFF2"]; exists {
-			return nil, fmt.Errorf("%w: CFF2 font subsetting", ErrUnsupported)
+			return nil, nil, fmt.Errorf("%w: CFF2 font subsetting", ErrUnsupported)
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	set, err := parseCFFSet(data)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(set.names) != 1 {
-		return nil, fmt.Errorf("%w: OpenType CFF FontSet count", ErrInvalid)
+		return nil, nil, fmt.Errorf("%w: OpenType CFF FontSet count", ErrInvalid)
 	}
 	font, err := parseCFFFont(set, 0)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if font.charstringType != 2 || font.paintType != 0 {
-		return nil, fmt.Errorf("%w: subset CFF outline representation", ErrUnsupported)
+		return nil, nil, fmt.Errorf("%w: subset CFF outline representation", ErrUnsupported)
 	}
 	if len(font.charstrings) != int(metrics.numGlyphs) {
-		return nil, fmt.Errorf("%w: subset CFF and maxp glyph count", ErrInvalid)
+		return nil, nil, fmt.Errorf("%w: subset CFF and maxp glyph count", ErrInvalid)
 	}
 	needed := make([]bool, len(font.charstrings))
 	needed[0] = true
 	queue := []uint16{0}
 	for _, gid := range glyphs {
 		if int(gid) >= len(needed) {
-			return nil, fmt.Errorf("%w: subset CFF glyph index", ErrInvalid)
+			return nil, nil, fmt.Errorf("%w: subset CFF glyph index", ErrInvalid)
 		}
 		if !needed[gid] {
 			needed[gid] = true
@@ -419,18 +508,18 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 		gid := queue[index]
 		glyph, err := subsetCFFGlyph(ctx, font, gid, &remaining)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		selected[gid] = glyph
 		if glyph.seac != nil {
 			if font.cid {
-				return nil, fmt.Errorf("%w: CID subset CFF seac", ErrInvalid)
+				return nil, nil, fmt.Errorf("%w: CID subset CFF seac", ErrInvalid)
 			}
 			for _, code := range []byte{glyph.seac.base, glyph.seac.accent} {
 				sid := cffStandardSID(code)
 				component, present := font.charset.glyph(sid)
 				if sid == 0 || !present {
-					return nil, fmt.Errorf("%w: missing subset CFF seac component", ErrInvalid)
+					return nil, nil, fmt.Errorf("%w: missing subset CFF seac component", ErrInvalid)
 				}
 				if !needed[component] {
 					needed[component] = true
@@ -439,28 +528,52 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 			}
 		}
 	}
-	programs := make([][]byte, len(font.charstrings))
-	for index, original := range font.charstrings {
-		if err := checkContext(ctx); err != nil {
-			return nil, err
+	oldToNew, newToOld := buildSubsetGIDMap(needed, options.CompactGIDs)
+	var programs [][]byte
+	var charsetValues []uint16
+	var fdSelect []uint8
+	if options.CompactGIDs {
+		programs = make([][]byte, len(newToOld))
+		charsetValues = make([]uint16, len(newToOld))
+		if font.cid {
+			fdSelect = make([]uint8, len(newToOld))
 		}
-		if needed[index] {
-			programs[index] = original
-			continue
+		for newGID, oldGID := range newToOld {
+			if err := checkContext(ctx); err != nil {
+				return nil, nil, err
+			}
+			programs[newGID] = font.charstrings[oldGID]
+			charsetValues[newGID] = font.charset.values[oldGID]
+			if font.cid {
+				fdSelect[newGID] = font.fdSelect[oldGID]
+			}
 		}
-		if remaining == 0 {
-			return nil, fmt.Errorf("%w: CFF subset replacement work", ErrLimit)
+	} else {
+		programs = make([][]byte, len(font.charstrings))
+		charsetValues = font.charset.values
+		fdSelect = font.fdSelect
+		for index, original := range font.charstrings {
+			if err := checkContext(ctx); err != nil {
+				return nil, nil, err
+			}
+			if needed[index] {
+				programs[index] = original
+				continue
+			}
+			if remaining == 0 {
+				return nil, nil, fmt.Errorf("%w: CFF subset replacement work", ErrLimit)
+			}
+			width, _, err := metrics.horizontal(uint16(index))
+			if err != nil {
+				return nil, nil, err
+			}
+			charWidth, hasWidth := subsetCFFEmptyWidth(font, uint16(index), width, metrics.unitsPerEm)
+			programs[index] = subsetCFFEmptyGlyph(charWidth, hasWidth, subsetCFFGlyphPrivate(font, uint16(index)))
+			if len(programs[index]) > remaining {
+				return nil, nil, fmt.Errorf("%w: CFF subset replacement work", ErrLimit)
+			}
+			remaining -= len(programs[index])
 		}
-		width, _, err := metrics.horizontal(uint16(index))
-		if err != nil {
-			return nil, err
-		}
-		charWidth, hasWidth := subsetCFFEmptyWidth(font, uint16(index), width, metrics.unitsPerEm)
-		programs[index] = subsetCFFEmptyGlyph(charWidth, hasWidth, subsetCFFGlyphPrivate(font, uint16(index)))
-		if len(programs[index]) > remaining {
-			return nil, fmt.Errorf("%w: CFF subset replacement work", ErrLimit)
-		}
-		remaining -= len(programs[index])
 	}
 	profile := subsetFontProfile{}
 	var cffBounds [4]float64
@@ -472,12 +585,12 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 				component, _ := font.charset.glyph(cffStandardSID(code))
 				child := selected[component]
 				if child.seac != nil {
-					return nil, fmt.Errorf("%w: nested subset CFF seac", ErrInvalid)
+					return nil, nil, fmt.Errorf("%w: nested subset CFF seac", ErrInvalid)
 				}
 				part := subsetCFFCloneGeometry(child.geometry)
 				if index == 1 {
 					if err := cffTranslateGlyph(&part, seac.offset); err != nil {
-						return nil, err
+						return nil, nil, err
 					}
 				}
 				geometry.Figures = append(geometry.Figures, part.Figures...)
@@ -494,21 +607,21 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 						bboxMatrix = (Matrix{A: 1000, D: 1000}).Mul(bboxMatrix)
 					}
 					if !geometryFinite(bboxMatrix.A, bboxMatrix.B, bboxMatrix.C, bboxMatrix.D, bboxMatrix.E, bboxMatrix.F) {
-						return nil, fmt.Errorf("%w: subset CFF FontBBox matrix", ErrLimit)
+						return nil, nil, fmt.Errorf("%w: subset CFF FontBBox matrix", ErrLimit)
 					}
 					bboxGeometry = subsetCFFCloneGeometry(geometry)
 					if err := fontTransformOutline(&bboxGeometry, bboxMatrix); err != nil {
-						return nil, err
+						return nil, nil, err
 					}
 				}
 			}
 			cb, err := bboxGeometry.Bounds()
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			box := [4]float64{cb.X, cb.Y, cb.X + cb.Width, cb.Y + cb.Height}
 			if !geometryFinite(box[0], box[1], box[2], box[3]) {
-				return nil, fmt.Errorf("%w: subset CFF FontBBox range", ErrLimit)
+				return nil, nil, fmt.Errorf("%w: subset CFF FontBBox range", ErrLimit)
 			}
 			if !hasCFFBounds {
 				cffBounds, hasCFFBounds = box, true
@@ -519,34 +632,48 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 		}
 		matrix, err := font.designMatrix(gid, metrics.unitsPerEm)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := fontTransformOutline(&geometry, matrix); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		bounds, err := geometry.Bounds()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		xMin, yMin := math.Floor(bounds.X), math.Floor(bounds.Y)
 		xMax, yMax := math.Ceil(bounds.X+bounds.Width), math.Ceil(bounds.Y+bounds.Height)
 		if xMin < -32768 || yMin < -32768 || xMax > 32767 || yMax > 32767 {
-			return nil, fmt.Errorf("%w: subset CFF bounds outside FWORD", ErrInvalid)
+			return nil, nil, fmt.Errorf("%w: subset CFF bounds outside FWORD", ErrInvalid)
 		}
 		bounds = Rect{X: xMin, Y: yMin, Width: xMax - xMin, Height: yMax - yMin}
 		if err := profile.addBounds(gid, bounds, hasOutline, metrics); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	encoded, err := encodeSubsetCFFWithBBox(ctx, font, programs, cffBounds[:], options)
+	encoded, err := encodeSubsetCFFTable(ctx, font, programs, charsetValues, fdSelect, cffBounds[:], options.CompactGIDs, options)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	tables := map[string][]byte{"CFF ": encoded}
 	if err := profile.apply(face, metrics, tables, ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return encodeSubsetFont(ctx, face, tables, slices.Contains(needed, false), options)
+	if options.CompactGIDs {
+		if err := applyCompactSubsetTables(face, metrics, newToOld, oldToNew, tables); err != nil {
+			return nil, nil, err
+		}
+	}
+	if cmapTable, err := buildSubsetCmapTable(face, uint32(len(font.charstrings)), oldToNew, options); err != nil {
+		return nil, nil, err
+	} else if cmapTable != nil {
+		tables["cmap"] = cmapTable
+	}
+	out, err := encodeSubsetFont(ctx, face, tables, slices.Contains(needed, false), options.CompactGIDs, options)
+	if err != nil {
+		return nil, nil, err
+	}
+	return out, oldToNew, nil
 }
 
 // subsetCFFGlyph 按原字体字典执行单个字形，共用累计操作预算和取消Context
@@ -863,10 +990,10 @@ func subsetCFFNumberOperand(value float64) ([]byte, error) {
 	return data, nil
 }
 
-// encodeSubsetCFFWithBBox 重建CFF1表并在提供FontBBox时同步更新Top DICT的FontBBox
-// 入参: ctx 取消Context, font 原CFF字体, programs 按原GID排列的新字形程序, fontBBox 可选四元组FontBBox, options 字节上限
+// encodeSubsetCFFTable 重建CFF1表，支持自定义字符集、FDSelect、FontBBox更新与紧凑模式标准编码重置
+// 入参: ctx 取消Context, font 原CFF字体, programs 新字形程序, charsetValues GID到SID或CID映射, fdSelect CID字体字典选择数组, fontBBox 可选四元组FontBBox, resetEncoding 紧凑模式下是否重置自定义编码, options 字节上限
 // 返回: []byte 独立CFF表, error 字典、布局、范围或取消错误
-func encodeSubsetCFFWithBBox(ctx context.Context, font *cffFont, programs [][]byte, fontBBox []float64, options FontSubsetOptions) ([]byte, error) {
+func encodeSubsetCFFTable(ctx context.Context, font *cffFont, programs [][]byte, charsetValues []uint16, fdSelect []uint8, fontBBox []float64, resetEncoding bool, options FontSubsetOptions) ([]byte, error) {
 	maximum := min(options.MaxBytes, int64(math.MaxInt32))
 	set := font.set
 	_, afterName, err := parseCFFIndex(set.data, uint32(set.data[2]))
@@ -930,7 +1057,12 @@ func encodeSubsetCFFWithBBox(ctx context.Context, font *cffFont, programs [][]by
 		values[0x0c24], values[0x0c25] = []int64{0}, []int64{0}
 	} else {
 		values[18] = []int64{int64(privates[0].size), 0}
-		if customEncoding {
+		if resetEncoding {
+			customEncoding = false
+			if _, hasEnc := font.top.dict.value(16); hasEnc {
+				values[16] = []int64{0}
+			}
+		} else if customEncoding {
 			values[16] = []int64{0}
 		}
 	}
@@ -968,10 +1100,10 @@ func encodeSubsetCFFWithBBox(ctx context.Context, font *cffFont, programs [][]by
 	}
 	var charset []byte
 	if font.cid {
-		charset = encodeSubsetCFFCharsetFormat2(font.charset.values)
+		charset = encodeSubsetCFFCharsetFormat2(charsetValues)
 	} else {
-		charset = make([]byte, 1, 1+2*(len(font.charset.values)-1))
-		for _, value := range font.charset.values[1:] {
+		charset = make([]byte, 1, 1+2*max(0, len(charsetValues)-1))
+		for _, value := range charsetValues[1:] {
 			charset = binary.BigEndian.AppendUint16(charset, value)
 		}
 	}
@@ -998,7 +1130,7 @@ func encodeSubsetCFFWithBBox(ctx context.Context, font *cffFont, programs [][]by
 	values[17][0] = position
 	var fdPosition, fdLength int
 	if font.cid {
-		position, err := put(encodeSubsetCFFFDSelectFormat3(font.fdSelect))
+		position, err := put(encodeSubsetCFFFDSelectFormat3(fdSelect))
 		if err != nil {
 			return nil, err
 		}
@@ -1156,63 +1288,72 @@ func subsetCFFEncoding(font *cffFont) ([]byte, bool, error) {
 	return data, true, err
 }
 
-// subsetFontResourceFace 复用已解析首字体面裁剪单字体或集合资源，避免重复解析字体面及校验和
-// 入参: ctx 已规范化取消Context, firstFace 已解析的零号字体面, usage 各字体面使用编号, options 字节上限参数, work 包级剩余工作预算
-// 返回: []byte 独立字体资源, error 字体、集合、预算或取消错误
-func subsetFontResourceFace(ctx context.Context, firstFace *fontFace, usage map[uint32][]uint16, options FontSubsetOptions, work *int) ([]byte, error) {
+// subsetFontResourceFaceMapped 复用已解析首字体面裁剪单字体或集合资源，并返回各字体面的旧GID到新GID映射表
+// 入参: ctx 已规范化取消Context, firstFace 已解析的零号字体面, usage 各字体面使用编号, options 字节上限与紧凑重映射参数, work 包级剩余工作预算
+// 返回: []byte 独立字体资源, map[uint32]map[uint16]uint16 各字体面的旧GID到新GID映射, error 字体、集合、预算或取消错误
+func subsetFontResourceFaceMapped(ctx context.Context, firstFace *fontFace, usage map[uint32][]uint16, options FontSubsetOptions, work *int) ([]byte, map[uint32]map[uint16]uint16, error) {
 	data := firstFace.data
 	if !firstFace.collection {
 		configuration, err := subsetFontConfig(&options, work)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := checkContext(ctx); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		glyphs := usage[0]
 		if int64(len(data)) > configuration.MaxBytes || len(glyphs) > configuration.MaxWork {
-			return nil, fmt.Errorf("%w: font subset input budget", ErrLimit)
+			return nil, nil, fmt.Errorf("%w: font subset input budget", ErrLimit)
 		}
 		if issues := firstFace.validateDirectory(); len(issues) != 0 {
-			return nil, fmt.Errorf("%w: font subset directory %s: %s", ErrInvalid, issues[0].table, issues[0].message)
+			return nil, nil, fmt.Errorf("%w: font subset directory %s: %s", ErrInvalid, issues[0].table, issues[0].message)
 		}
-		return subsetFontFace(ctx, firstFace, glyphs, configuration, work)
+		encoded, gidMap, err := subsetFontFace(ctx, firstFace, glyphs, configuration, work)
+		if err != nil {
+			return nil, nil, err
+		}
+		return encoded, map[uint32]map[uint16]uint16{0: gidMap}, nil
 	}
 	if int64(len(data)) > options.MaxBytes {
-		return nil, fmt.Errorf("%w: collection subset input byte budget", ErrLimit)
+		return nil, nil, fmt.Errorf("%w: collection subset input byte budget", ErrLimit)
 	}
 	if err := checkContext(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	count := binary.BigEndian.Uint32(data[8:])
 	builder, err := newFontCollectionBuilder(count, options.MaxBytes, ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	checksums := newFontChecksums(data, 3*uint64(len(data)))
-	cached := make(map[fontSubsetFaceKey][]byte)
+	type cachedCollectionFace struct {
+		header []byte
+		gidMap map[uint16]uint16
+	}
+	cached := make(map[fontSubsetFaceKey]cachedCollectionFace)
+	gidMaps := make(map[uint32]map[uint16]uint16, count)
 	remaining := options.MaxWork
 	if work == nil {
 		work = &remaining
 	}
 	for index := uint32(0); index < count; index++ {
 		if err := checkContext(ctx); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		face := firstFace
 		if index != 0 {
 			face, err = parseFontFace(data, index)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 		if issues := face.validateDirectoryChecksums(checksums); len(issues) != 0 {
-			return nil, fmt.Errorf("%w: collection source face %d %s: %s", ErrInvalid, index, issues[0].table, issues[0].message)
+			return nil, nil, fmt.Errorf("%w: collection source face %d %s: %s", ErrInvalid, index, issues[0].table, issues[0].message)
 		}
 		glyphs := usage[index]
 		charge := 1 + len(face.tables) + len(glyphs)
 		if charge > *work {
-			return nil, fmt.Errorf("%w: collection subset directory budget", ErrLimit)
+			return nil, nil, fmt.Errorf("%w: collection subset directory budget", ErrLimit)
 		}
 		*work -= charge
 		glyphs = slices.Clone(glyphs)
@@ -1226,34 +1367,36 @@ func subsetFontResourceFace(ctx context.Context, firstFace *fontFace, usage map[
 			binary.BigEndian.PutUint16(encodedGlyphs[i*2:], gid)
 		}
 		key := fontSubsetFaceKey{directory: string(data[face.offset : uint64(face.offset)+uint64(12+len(face.tables)*16)]), glyphs: string(encodedGlyphs)}
-		if header, present := cached[key]; present {
-			if err := builder.directory(index, header); err != nil {
-				return nil, err
+		if entry, present := cached[key]; present {
+			if err := builder.directory(index, entry.header); err != nil {
+				return nil, nil, err
 			}
+			gidMaps[index] = entry.gidMap
 			continue
 		}
 		options.CollectionIndex = index
 		configuration, err := subsetFontConfig(&options, work)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if int64(len(data)) > configuration.MaxBytes || len(glyphs) > configuration.MaxWork {
-			return nil, fmt.Errorf("%w: font subset input budget", ErrLimit)
+			return nil, nil, fmt.Errorf("%w: font subset input budget", ErrLimit)
 		}
-		font, err := subsetFontFace(ctx, face, glyphs, configuration, work)
+		font, gidMap, err := subsetFontFace(ctx, face, glyphs, configuration, work)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		header, err := builder.face(index, font)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		cached[key] = header
+		cached[key] = cachedCollectionFace{header: header, gidMap: gidMap}
+		gidMaps[index] = gidMap
 	}
 	if err := checkContext(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return builder.data, nil
+	return builder.data, gidMaps, nil
 }
 
 // newFontCollectionBuilder 在字节和地址上限内建立集合头，不复制字体数据
@@ -1535,9 +1678,9 @@ func (a *subsetFontAxis) apply(table []byte) error {
 	return nil
 }
 
-// SubsetFonts 汇总包内字体使用并裁剪资源，保持URI、集合索引、混淆密钥、GID与度量不变且仅提交更小候选
+// SubsetFonts 汇总包内字体使用并裁剪资源，默认保持GID不变；启用CompactGIDs时按升序紧凑重编号并同步重写所有引用页面与资源字典的Glyphs.Indices
 // 不绕过字体许可且不自动重签，失败不修改包；不支持或X3D关联字体原样保留并以ErrUnsupported记入结果
-// 入参: ctx 取消Context，nil采用Background, options 字节及累计工作参数，nil采用默认值
+// 入参: ctx 取消Context，nil采用Background, options 字节、累计工作及CompactGIDs参数，nil采用默认值
 // 返回: []ResourceOptimization 按部件名排列的资源结果，失败为nil, error 使用汇总、字体、预算或取消错误
 func (p *Package) SubsetFonts(ctx context.Context, options *OptimizationOptions) ([]ResourceOptimization, error) {
 	ctx = normalizeContext(ctx)
@@ -1553,8 +1696,38 @@ func (p *Package) SubsetFonts(ctx context.Context, options *OptimizationOptions)
 		if options.MaxWork != 0 {
 			configuration.MaxWork = options.MaxWork
 		}
+		configuration.CompactGIDs = options.CompactGIDs
 	}
-	if configuration.MaxBytes < 1 || configuration.MaxWork < 1 {
+	return p.subsetFontsLocked(ctx, FontSubsetOptions{MaxBytes: configuration.MaxBytes, MaxWork: configuration.MaxWork, CompactGIDs: configuration.CompactGIDs})
+}
+
+// SubsetFontsWithOptions 按FontSubsetOptions裁剪包内字体资源，支持CompactGIDs紧凑重编号并同步重写引用页面与字典中的Glyphs.Indices
+// 入参: ctx 取消Context，nil采用Background, options 字体子集化选项，nil采用默认值
+// 返回: []ResourceOptimization 按部件名排列的资源结果，失败为nil, error 使用汇总、字体、预算或取消错误
+func (p *Package) SubsetFontsWithOptions(ctx context.Context, options *FontSubsetOptions) ([]ResourceOptimization, error) {
+	ctx = normalizeContext(ctx)
+	if err := p.lock(); err != nil {
+		return nil, err
+	}
+	defer p.mu.Unlock()
+	cfg := FontSubsetOptions{MaxBytes: p.limits.MaxPartBytes, MaxWork: 1 << 20}
+	if options != nil {
+		cfg = *options
+		if cfg.MaxBytes == 0 {
+			cfg.MaxBytes = p.limits.MaxPartBytes
+		}
+		if cfg.MaxWork == 0 {
+			cfg.MaxWork = 1 << 20
+		}
+	}
+	return p.subsetFontsLocked(ctx, cfg)
+}
+
+// subsetFontsLocked 在持有包写锁时执行包级字体裁剪，并在启用CompactGIDs时同步重映射所有引用页面的Glyphs.Indices
+// 入参: ctx 已规范化取消Context, options 字体裁剪配置
+// 返回: []ResourceOptimization 优化结果列表, error 裁剪、重写或校验错误
+func (p *Package) subsetFontsLocked(ctx context.Context, options FontSubsetOptions) ([]ResourceOptimization, error) {
+	if options.MaxBytes < 1 || options.MaxWork < 1 {
 		return nil, fmt.Errorf("%w: package font optimization limits", ErrInvalid)
 	}
 	reader, err := p.reader(ctx)
@@ -1600,8 +1773,9 @@ func (p *Package) SubsetFonts(ctx context.Context, options *OptimizationOptions)
 		groups[key][font.CollectionIndex] = font.Glyphs
 	}
 	pending := make(map[string]packagePart)
+	remaps := make(map[string]map[uint32]map[uint16]uint16)
 	var result []ResourceOptimization
-	remaining := configuration.MaxWork
+	remaining := options.MaxWork
 	for _, key := range slices.Sorted(maps.Keys(groups)) {
 		if err := checkContext(ctx); err != nil {
 			return nil, err
@@ -1613,11 +1787,12 @@ func (p *Package) SubsetFonts(ctx context.Context, options *OptimizationOptions)
 			result = append(result, entry)
 			continue
 		}
-		face, err := reader.pkg.readFontFaceLimit(part.name, 0, configuration.MaxBytes)
+		face, err := reader.pkg.readFontFaceLimit(part.name, 0, options.MaxBytes)
 		if err != nil {
 			return nil, err
 		}
-		encoded, err := subsetFontResourceFace(ctx, face, groups[key], FontSubsetOptions{MaxBytes: configuration.MaxBytes, MaxWork: configuration.MaxWork}, &remaining)
+		faceOpts := FontSubsetOptions{MaxBytes: options.MaxBytes, MaxWork: options.MaxWork, AllowMissingCmap: options.AllowMissingCmap, CompactGIDs: options.CompactGIDs}
+		encoded, gidMaps, err := subsetFontResourceFaceMapped(ctx, face, groups[key], faceOpts, &remaining)
 		if err != nil {
 			if !errors.Is(err, ErrUnsupported) && !errors.Is(err, ErrRestricted) {
 				return nil, &PartError{Part: part.name, Err: err}
@@ -1627,7 +1802,7 @@ func (p *Package) SubsetFonts(ctx context.Context, options *OptimizationOptions)
 			continue
 		}
 		if int64(len(encoded)) < entry.OriginalBytes {
-			if strings.EqualFold(part.media, "application/vnd.ms-package.obfuscated-opentype") {
+			if matchStandardContentType(p.format, part.media, "application/vnd.ms-package.obfuscated-opentype") {
 				encoded, err = ObfuscateFont(part.name, encoded)
 				if err != nil {
 					return nil, err
@@ -1635,15 +1810,532 @@ func (p *Package) SubsetFonts(ctx context.Context, options *OptimizationOptions)
 			}
 			entry.Bytes, entry.Changed = int64(len(encoded)), true
 			pending[key] = packagePart{name: part.name, media: part.media, data: encoded}
+			if options.CompactGIDs && fontSubsetHasNonIdentityRemap(gidMaps) {
+				remaps[key] = gidMaps
+			}
 		}
 		result = append(result, entry)
 	}
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	for key, value := range pending {
-		p.total -= int64(len(p.parts[key].data)) - int64(len(value.data))
-		p.parts[key], p.dirty[key] = value, true
+	if len(remaps) == 0 {
+		for key, value := range pending {
+			p.total -= int64(len(p.parts[key].data)) - int64(len(value.data))
+			p.parts[key], p.dirty[key] = value, true
+		}
+		return result, nil
 	}
+	q := p.storyCopy()
+	for key, value := range pending {
+		q.total -= int64(len(q.parts[key].data)) - int64(len(value.data))
+		q.parts[key], q.dirty[key] = value, true
+	}
+	for _, key := range slices.Sorted(maps.Keys(q.parts)) {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		part := q.parts[key]
+		if !strings.EqualFold(part.media, fixedContentType("fixedpage")) && !strings.EqualFold(part.media, resourceDictionaryContentType) {
+			continue
+		}
+		rewritten, changed, err := rewriteSubsetFontGlyphIndices(part.name, part.data, q.format, q.limits, remaps, ctx)
+		if err != nil {
+			return nil, &PartError{Part: part.name, Err: err}
+		}
+		if !changed {
+			continue
+		}
+		if err := q.editable(part.name); err != nil {
+			return nil, err
+		}
+		if int64(len(rewritten)) > q.limits.MaxPartBytes {
+			return nil, &PartError{Part: part.name, Err: fmt.Errorf("%w: rewritten glyph indices exceed part budget", ErrLimit)}
+		}
+		nextTotal := q.total - int64(len(part.data)) + int64(len(rewritten))
+		if nextTotal > q.limits.MaxPackageBytes {
+			return nil, fmt.Errorf("%w: rewritten glyph indices exceed package budget", ErrLimit)
+		}
+		q.total = nextTotal
+		q.parts[key] = packagePart{name: part.name, media: part.media, data: rewritten}
+		q.dirty[key] = true
+	}
+	verified, err := q.reader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	verified.Close()
+	p.commitStory(q)
 	return result, nil
+}
+
+// fontSubsetHasNonIdentityRemap 判断字体各面的GID映射是否存在实际变化
+// 入参: gidMaps 字体面索引到旧新GID映射表的集合
+// 返回: bool 是否至少有一个字形编号发生改变
+func fontSubsetHasNonIdentityRemap(gidMaps map[uint32]map[uint16]uint16) bool {
+	for _, faceMap := range gidMaps {
+		for oldGID, newGID := range faceMap {
+			if oldGID != newGID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// rewriteSubsetFontGlyphIndices 重写FixedPage或ResourceDictionary中引用紧凑重映射字体的Glyphs.Indices属性
+// 入参: partName 当前标记部件URI, original 原始XML字节, format 文档方言, limits 资源上限, remaps 字体部件及面索引对应的旧新GID映射, ctx 取消Context
+// 返回: []byte 重写后XML字节, bool 是否发生修改, error XML、解析或映射缺失错误
+func rewriteSubsetFontGlyphIndices(partName string, original []byte, format Format, limits Limits, remaps map[string]map[uint32]map[uint16]uint16, ctx context.Context) ([]byte, bool, error) {
+	namespace := formatNamespace(format)
+	tracker := newResourceMarkupIgnoreTracker(format, false, ctx)
+	filter := func(token xml.Token, node *xmlElement) (bool, error) {
+		skip, _, err := tracker.visit(token, node)
+		return skip, err
+	}
+	encoder := pageEncoder{format: format, ns: namespace, part: partName, limits: limits, ctx: ctx}
+	return rewriteXMLAttributes(original, limits, ctx, nil, filter, func(node *xmlElement, attr xml.Attr) (string, bool, error) {
+		if node.Name != (xml.Name{Space: namespace, Local: "Glyphs"}) || attr.Name != (xml.Name{Local: "Indices"}) {
+			return attr.Value, false, nil
+		}
+		fontAttr, ok := node.attribute("FontUri")
+		if !ok {
+			return attr.Value, false, nil
+		}
+		uri, faceIndex, _, err := ParseFontURI(strings.Trim(fontAttr, " \t\r\n"))
+		if err != nil {
+			return "", false, err
+		}
+		fontPart, err := resolvePart(partName, uri)
+		if err != nil {
+			return "", false, err
+		}
+		faceMaps, present := remaps[strings.ToLower(fontPart)]
+		if !present {
+			return attr.Value, false, nil
+		}
+		gidMap, present := faceMaps[faceIndex]
+		if !present {
+			return attr.Value, false, nil
+		}
+		clusters, err := ParseGlyphIndices(attr.Value)
+		if err != nil {
+			return "", false, err
+		}
+		modified := false
+		for ci := range clusters {
+			for gi := range clusters[ci].Glyphs {
+				entry := &clusters[ci].Glyphs[gi]
+				if !entry.HasIndex {
+					continue
+				}
+				newGID, ok := gidMap[entry.Index]
+				if !ok {
+					return "", false, fmt.Errorf("%w: missing remapped glyph %d for %s", ErrInvalid, entry.Index, fontPart)
+				}
+				if newGID != entry.Index {
+					entry.Index = newGID
+					modified = true
+				}
+			}
+		}
+		if !modified {
+			return attr.Value, false, nil
+		}
+		encoder.work, encoder.bytes = 0, 0
+		encoded, err := encoder.glyphIndices(clusters, 1)
+		if err != nil {
+			return "", false, err
+		}
+		return encoded, true, nil
+	})
+}
+
+// buildSubsetGIDMap 按保留字形集合生成旧GID到新GID映射表及按新GID排序的旧GID切片
+// 入参: needed 源字体各GID保留标记, compact 是否启用紧凑升序重编号
+// 返回: map[uint16]uint16 旧GID到新GID映射表, []uint16 新GID到旧GID反查表
+func buildSubsetGIDMap(needed []bool, compact bool) (map[uint16]uint16, []uint16) {
+	oldToNew := make(map[uint16]uint16)
+	var newToOld []uint16
+	for oldGID, keep := range needed {
+		if !keep {
+			continue
+		}
+		if compact {
+			newGID := uint16(len(newToOld))
+			oldToNew[uint16(oldGID)] = newGID
+			newToOld = append(newToOld, uint16(oldGID))
+		} else {
+			oldToNew[uint16(oldGID)] = uint16(oldGID)
+			newToOld = append(newToOld, uint16(oldGID))
+		}
+	}
+	return oldToNew, newToOld
+}
+
+// rewriteCompositeGlyphIDs 按紧凑重映射表原地替换TrueType复合字形记录中的所有组件GID
+// 入参: raw 单个复合字形的glyf字节副本, oldToNew 旧GID到新GID映射表
+// 返回: error 复合记录截断或组件缺失错误
+func rewriteCompositeGlyphIDs(raw []byte, oldToNew map[uint16]uint16) error {
+	for pos := 10; ; {
+		if pos+4 > len(raw) {
+			return fmt.Errorf("%w: truncated composite glyph during GID remap", ErrInvalid)
+		}
+		flags := binary.BigEndian.Uint16(raw[pos:])
+		oldGID := binary.BigEndian.Uint16(raw[pos+2:])
+		newGID, ok := oldToNew[oldGID]
+		if !ok {
+			return fmt.Errorf("%w: missing remapped composite component %d", ErrInvalid, oldGID)
+		}
+		binary.BigEndian.PutUint16(raw[pos+2:], newGID)
+		pos += 4
+		if flags&0x0001 != 0 {
+			pos += 4
+		} else {
+			pos += 2
+		}
+		switch {
+		case flags&0x0008 != 0:
+			pos += 2
+		case flags&0x0040 != 0:
+			pos += 4
+		case flags&0x0080 != 0:
+			pos += 8
+		}
+		if pos > len(raw) {
+			return fmt.Errorf("%w: truncated composite glyph transform during GID remap", ErrInvalid)
+		}
+		if flags&0x0020 == 0 {
+			break
+		}
+	}
+	return nil
+}
+
+// applyCompactSubsetTables 按紧凑GID顺序重建hmtx、vmtx、maxp、post与可选VORG并同步hhea和vhea记录数与最大步进
+// 入参: face 原字体面, metrics 原字体度量, newToOld 新GID到旧GID表, oldToNew 旧GID到新GID表, tables 替换表集合
+// 返回: error 度量读取或表数据错误
+func applyCompactSubsetTables(face *fontFace, metrics *fontMetrics, newToOld []uint16, oldToNew map[uint16]uint16, tables map[string][]byte) error {
+	count := len(newToOld)
+	if count == 0 || count > 65535 {
+		return fmt.Errorf("%w: compact subset glyph count", ErrLimit)
+	}
+	hmtx := make([]byte, count*4)
+	var maxHAdv uint16
+	for newGID, oldGID := range newToOld {
+		adv, lsb, err := metrics.horizontal(oldGID)
+		if err != nil {
+			return err
+		}
+		binary.BigEndian.PutUint16(hmtx[newGID*4:], adv)
+		binary.BigEndian.PutUint16(hmtx[newGID*4+2:], uint16(lsb))
+		maxHAdv = max(maxHAdv, adv)
+	}
+	tables["hmtx"] = hmtx
+	binary.BigEndian.PutUint16(tables["hhea"][10:], maxHAdv)
+	binary.BigEndian.PutUint16(tables["hhea"][34:], uint16(count))
+	binary.BigEndian.PutUint16(tables["maxp"][4:], uint16(count))
+	if metrics.vhea != nil && tables["vhea"] != nil {
+		vmtx := make([]byte, count*4)
+		var maxVAdv uint16
+		for newGID, oldGID := range newToOld {
+			adv, tsb, err := metrics.vertical(oldGID)
+			if err != nil {
+				return err
+			}
+			binary.BigEndian.PutUint16(vmtx[newGID*4:], adv)
+			binary.BigEndian.PutUint16(vmtx[newGID*4+2:], uint16(tsb))
+			maxVAdv = max(maxVAdv, adv)
+		}
+		tables["vmtx"] = vmtx
+		binary.BigEndian.PutUint16(tables["vhea"][10:], maxVAdv)
+		binary.BigEndian.PutUint16(tables["vhea"][34:], uint16(count))
+	}
+	if _, hasPost := face.tables["post"]; hasPost {
+		postData, err := face.table("post")
+		if err != nil {
+			return err
+		}
+		if len(postData) >= 32 && binary.BigEndian.Uint32(postData) != 0x00030000 {
+			post3 := bytes.Clone(postData[:32])
+			binary.BigEndian.PutUint32(post3, 0x00030000)
+			tables["post"] = post3
+		}
+	}
+	if len(metrics.vorg) >= 8 {
+		type vorgEntry struct {
+			gid uint16
+			y   uint16
+		}
+		origCount := int(binary.BigEndian.Uint16(metrics.vorg[6:]))
+		var entries []vorgEntry
+		for i := range origCount {
+			oldGID := binary.BigEndian.Uint16(metrics.vorg[8+4*i:])
+			if newGID, ok := oldToNew[oldGID]; ok {
+				entries = append(entries, vorgEntry{gid: newGID, y: binary.BigEndian.Uint16(metrics.vorg[10+4*i:])})
+			}
+		}
+		slices.SortFunc(entries, func(a, b vorgEntry) int {
+			if a.gid < b.gid {
+				return -1
+			}
+			if a.gid > b.gid {
+				return 1
+			}
+			return 0
+		})
+		vorg := make([]byte, 8+4*len(entries))
+		copy(vorg[:6], metrics.vorg[:6])
+		binary.BigEndian.PutUint16(vorg[6:], uint16(len(entries)))
+		for i, entry := range entries {
+			binary.BigEndian.PutUint16(vorg[8+4*i:], entry.gid)
+			binary.BigEndian.PutUint16(vorg[10+4*i:], entry.y)
+		}
+		tables["VORG"] = vorg
+	}
+	return nil
+}
+
+// buildSubsetCmapTable 按SynthesizeCmap或CompactGIDs生成标准OpenType Format 4与Format 12 cmap表
+// 入参: face 原字体面, numGlyphs 原字形总数, oldToNew 旧GID到新GID映射表, options 子集配置
+// 返回: []byte 新cmap表字节，无需重写时为nil, error 映射越界或解析错误
+func buildSubsetCmapTable(face *fontFace, numGlyphs uint32, oldToNew map[uint16]uint16, options FontSubsetOptions) ([]byte, error) {
+	if len(options.SynthesizeCmap) > 0 {
+		mapping := make(map[rune]uint16, len(options.SynthesizeCmap))
+		for r, oldGID := range options.SynthesizeCmap {
+			if !utf8.ValidRune(r) || uint32(oldGID) >= numGlyphs {
+				return nil, fmt.Errorf("%w: invalid SynthesizeCmap rune %U or glyph %d", ErrInvalid, r, oldGID)
+			}
+			if oldGID == 0 {
+				continue
+			}
+			newGID, ok := oldToNew[oldGID]
+			if !ok {
+				continue
+			}
+			if newGID != 0 {
+				mapping[r] = newGID
+			}
+		}
+		return encodeOpenTypeCmap(mapping)
+	}
+	if !options.CompactGIDs {
+		return nil, nil
+	}
+	if _, hasCmap := face.tables["cmap"]; !hasCmap {
+		return nil, nil
+	}
+	cmapData, err := face.table("cmap")
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := parseFontCmap(cmapData, numGlyphs)
+	if err != nil {
+		return nil, err
+	}
+	mapping := make(map[rune]uint16, len(oldToNew))
+	for oldGID, newGID := range oldToNew {
+		if oldGID == 0 || newGID == 0 {
+			continue
+		}
+		for _, r := range parsed.runesForGlyph(oldGID, fontGlyphRunesLimit) {
+			if _, exists := mapping[r]; !exists {
+				mapping[r] = newGID
+			}
+		}
+	}
+	return encodeOpenTypeCmap(mapping)
+}
+
+// encodeOpenTypeCmap 合成标准OpenType cmap表，BMP优先使用Format 4，超限或含增补平面码点时写出Format 12
+// 入参: mapping Unicode标量到非零字形编号映射
+// 返回: []byte 符合OpenType规范的完整cmap表字节, error 超出格式限制错误
+func encodeOpenTypeCmap(mapping map[rune]uint16) ([]byte, error) {
+	type pair struct {
+		code uint32
+		gid  uint16
+	}
+	var all []pair
+	var bmp []pair
+	hasNonBMP := false
+	for r, gid := range mapping {
+		if gid == 0 || !utf8.ValidRune(r) {
+			continue
+		}
+		code := uint32(r)
+		all = append(all, pair{code: code, gid: gid})
+		if code <= 0xfffe {
+			bmp = append(bmp, pair{code: code, gid: gid})
+		} else if code > 0xffff {
+			hasNonBMP = true
+		}
+	}
+	slices.SortFunc(all, func(a, b pair) int {
+		if a.code < b.code {
+			return -1
+		}
+		if a.code > b.code {
+			return 1
+		}
+		return 0
+	})
+	slices.SortFunc(bmp, func(a, b pair) int {
+		if a.code < b.code {
+			return -1
+		}
+		if a.code > b.code {
+			return 1
+		}
+		return 0
+	})
+	type format4Seg struct {
+		start uint16
+		end   uint16
+		delta uint16
+		gids  []uint16
+	}
+	buildFormat4 := func(mergeGap uint32) []byte {
+		var segs []format4Seg
+		for i := 0; i < len(bmp); {
+			startCode := bmp[i].code
+			startGID := bmp[i].gid
+			endIdx := i
+			if mergeGap == 0 {
+				for endIdx+1 < len(bmp) && bmp[endIdx+1].code == bmp[endIdx].code+1 && uint32(bmp[endIdx+1].gid) == uint32(bmp[endIdx].gid)+1 {
+					endIdx++
+				}
+				segs = append(segs, format4Seg{start: uint16(startCode), end: uint16(bmp[endIdx].code), delta: startGID - uint16(startCode)})
+			} else {
+				for endIdx+1 < len(bmp) && bmp[endIdx+1].code-bmp[endIdx].code <= mergeGap {
+					endIdx++
+				}
+				endCode := bmp[endIdx].code
+				gids := make([]uint16, endCode-startCode+1)
+				for j := i; j <= endIdx; j++ {
+					gids[bmp[j].code-startCode] = bmp[j].gid
+				}
+				segs = append(segs, format4Seg{start: uint16(startCode), end: uint16(endCode), gids: gids})
+			}
+			i = endIdx + 1
+		}
+		segs = append(segs, format4Seg{start: 0xffff, end: 0xffff, delta: 1})
+		segCount := len(segs)
+		arrayLen := 0
+		for _, seg := range segs {
+			arrayLen += len(seg.gids)
+		}
+		totalLen := 16 + 8*segCount + 2*arrayLen
+		if totalLen > 65535 {
+			return nil
+		}
+		segCountX2 := uint16(segCount * 2)
+		entrySelector := uint16(bits.Len(uint(segCount)) - 1)
+		searchRange := uint16(2 << entrySelector)
+		rangeShift := segCountX2 - searchRange
+		out := make([]byte, totalLen)
+		binary.BigEndian.PutUint16(out[0:], 4)
+		binary.BigEndian.PutUint16(out[2:], uint16(totalLen))
+		binary.BigEndian.PutUint16(out[6:], segCountX2)
+		binary.BigEndian.PutUint16(out[8:], searchRange)
+		binary.BigEndian.PutUint16(out[10:], entrySelector)
+		binary.BigEndian.PutUint16(out[12:], rangeShift)
+		arrayPos := 16 + 8*segCount
+		for idx, seg := range segs {
+			binary.BigEndian.PutUint16(out[14+2*idx:], seg.end)
+			binary.BigEndian.PutUint16(out[16+2*segCount+2*idx:], seg.start)
+			binary.BigEndian.PutUint16(out[16+4*segCount+2*idx:], seg.delta)
+			wordPos := 16 + 6*segCount + 2*idx
+			if len(seg.gids) > 0 {
+				binary.BigEndian.PutUint16(out[wordPos:], uint16(arrayPos-wordPos))
+				for _, gid := range seg.gids {
+					binary.BigEndian.PutUint16(out[arrayPos:], gid)
+					arrayPos += 2
+				}
+			}
+		}
+		return out
+	}
+	sub4 := buildFormat4(0)
+	if sub4 == nil {
+		sub4 = buildFormat4(8)
+	}
+	if sub4 == nil {
+		sub4 = buildFormat4(65535)
+	}
+	if sub4 != nil && !hasNonBMP {
+		headerLen := uint32(4 + 2*8)
+		out := make([]byte, int(headerLen)+len(sub4))
+		binary.BigEndian.PutUint16(out[2:], 2)
+		binary.BigEndian.PutUint16(out[4:], 0)
+		binary.BigEndian.PutUint16(out[6:], 3)
+		binary.BigEndian.PutUint32(out[8:], headerLen)
+		binary.BigEndian.PutUint16(out[12:], 3)
+		binary.BigEndian.PutUint16(out[14:], 1)
+		binary.BigEndian.PutUint32(out[16:], headerLen)
+		copy(out[headerLen:], sub4)
+		return out, nil
+	}
+	type format12Group struct {
+		start uint32
+		end   uint32
+		gid   uint32
+	}
+	var groups []format12Group
+	for i := 0; i < len(all); {
+		j := i
+		for j+1 < len(all) && all[j+1].code == all[j].code+1 && uint32(all[j+1].gid) == uint32(all[j].gid)+1 {
+			j++
+		}
+		groups = append(groups, format12Group{start: all[i].code, end: all[j].code, gid: uint32(all[i].gid)})
+		i = j + 1
+	}
+	sub12Len := uint64(16) + 12*uint64(len(groups))
+	if sub12Len > math.MaxUint32 {
+		return nil, fmt.Errorf("%w: encoded cmap format 12 exceeds uint32 range", ErrLimit)
+	}
+	sub12 := make([]byte, int(sub12Len))
+	binary.BigEndian.PutUint16(sub12[0:], 12)
+	binary.BigEndian.PutUint32(sub12[4:], uint32(sub12Len))
+	binary.BigEndian.PutUint32(sub12[12:], uint32(len(groups)))
+	for i, group := range groups {
+		pos := 16 + 12*i
+		binary.BigEndian.PutUint32(sub12[pos:], group.start)
+		binary.BigEndian.PutUint32(sub12[pos+4:], group.end)
+		binary.BigEndian.PutUint32(sub12[pos+8:], group.gid)
+	}
+	if sub4 == nil {
+		headerLen := uint32(4 + 2*8)
+		if uint64(headerLen)+sub12Len > math.MaxUint32 {
+			return nil, fmt.Errorf("%w: encoded cmap exceeds uint32 range", ErrLimit)
+		}
+		out := make([]byte, int(headerLen)+len(sub12))
+		binary.BigEndian.PutUint16(out[2:], 2)
+		records := [2][3]uint32{{0, 4, headerLen}, {3, 10, headerLen}}
+		for i, rec := range records {
+			pos := 4 + 8*i
+			binary.BigEndian.PutUint16(out[pos:], uint16(rec[0]))
+			binary.BigEndian.PutUint16(out[pos+2:], uint16(rec[1]))
+			binary.BigEndian.PutUint32(out[pos+4:], rec[2])
+		}
+		copy(out[headerLen:], sub12)
+		return out, nil
+	}
+	headerLen := uint32(4 + 4*8)
+	off4 := headerLen
+	off12 := uint64(off4) + uint64((len(sub4)+3)&^3)
+	if off12+sub12Len > math.MaxUint32 {
+		return nil, fmt.Errorf("%w: encoded cmap exceeds uint32 range", ErrLimit)
+	}
+	out := make([]byte, int(off12)+len(sub12))
+	binary.BigEndian.PutUint16(out[2:], 4)
+	records := [4][3]uint32{{0, 3, off4}, {0, 4, uint32(off12)}, {3, 1, off4}, {3, 10, uint32(off12)}}
+	for i, rec := range records {
+		pos := 4 + 8*i
+		binary.BigEndian.PutUint16(out[pos:], uint16(rec[0]))
+		binary.BigEndian.PutUint16(out[pos+2:], uint16(rec[1]))
+		binary.BigEndian.PutUint32(out[pos+4:], rec[2])
+	}
+	copy(out[off4:], sub4)
+	copy(out[int(off12):], sub12)
+	return out, nil
 }

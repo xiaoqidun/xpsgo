@@ -153,6 +153,7 @@ type compositionIndex struct {
 type compositionSource struct {
 	format            Format
 	sourceFormat      Format
+	targetFormat      Format
 	sequence          string
 	documents         []Document
 	pages             []PageReference
@@ -268,7 +269,7 @@ func Compose(ctx context.Context, documents [][]PageSelection, options *ComposeO
 	fixed := make(map[compositionPartKey]bool)
 	format := configuration.Format
 	for index, source := range sources {
-		value, err := captureCompositionSource(source.reader, source.pages, budget)
+		value, err := captureCompositionSourceForTarget(source.reader, source.pages, format, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -316,6 +317,59 @@ func Compose(ctx context.Context, documents [][]PageSelection, options *ComposeO
 		return nil, err
 	}
 	return result, nil
+}
+
+// ConvertFormat 将源阅读器的全部文档与页面按原结构一步转换为指定目标方言的独立可编辑包
+// 内部复用Compose保留核心属性、目录结构、打印票据与签署请求；受限或不可无损转换内容返回对应错误
+// 入参: ctx 取消Context，nil采用Background, source 源阅读器, targetFormat 目标方言, options 可选组合参数，nil采用默认值
+// 返回: *Package 目标方言的独立可编辑包，失败为nil, error 参数、格式、支持范围、许可、预算、关闭或取消错误
+func ConvertFormat(ctx context.Context, source *Reader, targetFormat Format, options *ComposeOptions) (*Package, error) {
+	ctx = normalizeContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if source == nil || formatNamespace(targetFormat) == "" {
+		return nil, fmt.Errorf("%w: format conversion source or target format", ErrInvalid)
+	}
+	configuration := ComposeOptions{}
+	if options != nil {
+		configuration = *options
+		if configuration.Format != FormatUnknown && configuration.Format != targetFormat {
+			return nil, fmt.Errorf("%w: conflicting format conversion target", ErrInvalid)
+		}
+		if configuration.Metadata != nil && configuration.Metadata != source {
+			return nil, fmt.Errorf("%w: format conversion metadata source must match source reader", ErrInvalid)
+		}
+	}
+	if err := source.readLock(); err != nil {
+		return nil, err
+	}
+	docCount := len(source.documents)
+	pageCounts := make([]int, docCount)
+	totalPages := len(source.pages)
+	for i, doc := range source.documents {
+		pageCounts[i] = len(doc.Pages)
+	}
+	source.mu.RUnlock()
+	if docCount == 0 || totalPages == 0 {
+		return nil, fmt.Errorf("%w: empty source package for format conversion", ErrInvalid)
+	}
+	selections := make([][]PageSelection, docCount)
+	pageIndex := 0
+	for docIdx, count := range pageCounts {
+		if count == 0 {
+			return nil, fmt.Errorf("%w: empty document in format conversion", ErrInvalid)
+		}
+		pages := make([]PageSelection, count)
+		for pos := range count {
+			pages[pos] = PageSelection{Reader: source, Page: pageIndex}
+			pageIndex++
+		}
+		selections[docIdx] = pages
+	}
+	configuration.Format = targetFormat
+	configuration.Metadata = source
+	return Compose(ctx, selections, &configuration)
 }
 
 // root 查找票据的等价类并缩短后续查找路径，不保存跨校验的内容结论
@@ -900,6 +954,7 @@ func convertCompositionSourceWithReport(source *compositionSource, format Format
 	result.indices = nil
 	result.retained = maps.Clone(source.retained)
 	result.sourceFormat = source.format
+	result.targetFormat = FormatUnknown
 	result.format, result.parts = format, make(map[string]packagePart, len(source.parts))
 	result.relationships = make(map[string][]Relationship, len(source.relationships))
 	result.pages = make([]PageReference, len(source.pages))
@@ -1030,6 +1085,21 @@ func convertCompositionPartMarkup(part packagePart, source, target Format, parts
 	if !layout && !definition && !discard {
 		return part, nil
 	}
+	if source != target {
+		risky, err := compositionPartMCETargetRisk(part.data, source, target, budget)
+		if err != nil {
+			return packagePart{}, err
+		}
+		if risky {
+			if index {
+				return packagePart{}, fmt.Errorf("%w: composition index acquires target-format semantics", ErrUnsupported)
+			}
+			part, err = projectCompositionPartMCE(part, source, target, budget)
+			if err != nil {
+				return packagePart{}, err
+			}
+		}
+	}
 	if err := validateCompositionFormatMarkup(part, source, budget); err != nil {
 		return packagePart{}, err
 	}
@@ -1038,6 +1108,7 @@ func convertCompositionPartMarkup(part packagePart, source, target Format, parts
 	for _, suffix := range []string{"/resourcedictionary-key", "/documentstructure", "/signature-definitions", "/discard-control"} {
 		namespaces[namespace+suffix] = destination + suffix
 	}
+	targetNamespaces := compositionDialectNamespaces(target)
 	for range 2 {
 		if err := budget.scan(int64(len(part.data))); err != nil {
 			return packagePart{}, err
@@ -1051,7 +1122,7 @@ func convertCompositionPartMarkup(part packagePart, source, target Format, parts
 			value, mapped := namespaces[attribute.Value]
 			return value, mapped, nil
 		}
-		if index && source != target && node.Name == (xml.Name{Space: mcNamespace, Local: "Choice"}) && attribute.Name == (xml.Name{Local: "Requires"}) {
+		if source != target && (node.Name == (xml.Name{Space: mcNamespace, Local: "Choice"}) && attribute.Name == (xml.Name{Local: "Requires"}) || attribute.Name == (xml.Name{Space: mcNamespace, Local: "MustUnderstand"}) || attribute.Name == (xml.Name{Space: mcNamespace, Local: "Ignorable"})) {
 			if err := budget.scan(int64(len(attribute.Value))); err != nil {
 				return "", false, err
 			}
@@ -1063,8 +1134,8 @@ func convertCompositionPartMarkup(part packagePart, source, target Format, parts
 				return "", false, err
 			}
 			for _, uri := range uris {
-				if uri == destination || uri == destination+"/resourcedictionary-key" {
-					return "", false, fmt.Errorf("%w: composition index acquires target-format semantics", ErrUnsupported)
+				if targetNamespaces[uri] {
+					return "", false, fmt.Errorf("%w: composition markup acquires target-format semantics", ErrUnsupported)
 				}
 			}
 		}
@@ -1120,6 +1191,268 @@ func convertCompositionPartMarkup(part packagePart, source, target Format, parts
 	if err := budget.step(0); err != nil {
 		return packagePart{}, err
 	}
+	return result, nil
+}
+
+// compositionDialectNamespaces 返回指定方言的全部标准及标准扩展命名空间集合
+// 入参: format 文档方言
+// 返回: map[string]bool 命名空间集合
+func compositionDialectNamespaces(format Format) map[string]bool {
+	ns := formatNamespace(format)
+	if ns == "" {
+		return nil
+	}
+	result := map[string]bool{
+		ns:                             true,
+		ns + "/resourcedictionary-key": true,
+		ns + "/documentstructure":      true,
+		ns + "/signature-definitions":  true,
+		ns + "/discard-control":        true,
+	}
+	if format == FormatOpenXPS {
+		result[openXPS3DNamespace] = true
+	}
+	return result
+}
+
+// compositionPartUnderstoodNamespaces 返回部件在指定方言下可理解的标准命名空间列表
+// 入参: part XML部件, format 文档方言
+// 返回: []string 理解的命名空间列表
+func compositionPartUnderstoodNamespaces(part packagePart, format Format) []string {
+	ns := formatNamespace(format)
+	switch {
+	case strings.EqualFold(part.media, fixedContentType("signaturedefinitions")):
+		return []string{ns + "/signature-definitions"}
+	case strings.EqualFold(part.media, fixedContentType("discard-control")):
+		return []string{ns + "/discard-control"}
+	case strings.EqualFold(part.media, fixedContentType("documentstructure")), strings.EqualFold(part.media, fixedContentType("storyfragments")):
+		return []string{structureNamespace(format)}
+	default:
+		return []string{ns, ns + "/resourcedictionary-key"}
+	}
+}
+
+// compositionPartMCETargetRisk 检查原始XML中的MCE声明是否命中目标方言命名空间激活或源独占扩展冲突
+// 入参: data 原始XML字节, source 原方言, target 目标方言, budget 共享预算
+// 返回: bool 是否命中跨方言MCE语义变化风险, error XML、前缀解析、源独占扩展不可转换、预算或取消错误
+func compositionPartMCETargetRisk(data []byte, source, target Format, budget *compositionBudget) (bool, error) {
+	if source == target {
+		return false, nil
+	}
+	if err := budget.scan(int64(len(data))); err != nil {
+		return false, err
+	}
+	targetNS := compositionDialectNamespaces(target)
+	risky := false
+	_, err := decodeXMLVisit(data, budget.limits, func(token xml.Token, node *xmlElement) error {
+		if err := budget.step(1); err != nil {
+			return err
+		}
+		if _, start := token.(xml.StartElement); !start {
+			return nil
+		}
+		if targetNS[node.Name.Space] || source == FormatOpenXPS && target == FormatXPS && node.Name.Space == openXPS3DNamespace {
+			risky = true
+		}
+		for _, attr := range node.Attr {
+			if err := budget.step(1); err != nil {
+				return err
+			}
+			if attr.Name.Space == xmlnsNamespace || attr.Name == (xml.Name{Local: "xmlns"}) {
+				continue
+			}
+			if targetNS[attr.Name.Space] || source == FormatOpenXPS && target == FormatXPS && attr.Name.Space == openXPS3DNamespace {
+				risky = true
+			}
+			checkTarget := node.Name == (xml.Name{Space: mcNamespace, Local: "Choice"}) && attr.Name == (xml.Name{Local: "Requires"}) || attr.Name == (xml.Name{Space: mcNamespace, Local: "MustUnderstand"}) || attr.Name == (xml.Name{Space: mcNamespace, Local: "Ignorable"})
+			if !checkTarget {
+				continue
+			}
+			if err := budget.scan(int64(len(attr.Value))); err != nil {
+				return err
+			}
+			uris, err := compatibilityPrefixes(node, attr.Value)
+			if err != nil {
+				return err
+			}
+			if err := budget.step(len(uris)); err != nil {
+				return err
+			}
+			for _, uri := range uris {
+				if source == FormatOpenXPS && target == FormatXPS && uri == openXPS3DNamespace {
+					if attr.Name.Local != "Ignorable" {
+						return fmt.Errorf("%w: openxps 3d extension cannot convert to xps", ErrUnsupported)
+					}
+					risky = true
+				}
+				if targetNS[uri] {
+					risky = true
+				}
+			}
+		}
+		return nil
+	})
+	return risky, err
+}
+
+// compositionCanProjectTargetChoices 判断非索引部件在跨方言转换中是否仅含目标方言标准命名空间条件分支而无未知第三方分支
+// 入参: part 原始XML部件, source 原方言, target 目标方言, budget 共享预算
+// 返回: bool 是否可按源方言有效分支安全跳过沉睡目标方言分支, error XML、前缀解析、预算或取消错误
+func compositionCanProjectTargetChoices(part packagePart, source, target Format, budget *compositionBudget) (bool, error) {
+	if target == FormatUnknown || source == target || compositionIndexRoot(part.media) != "" {
+		return false, nil
+	}
+	if err := budget.scan(int64(len(part.data))); err != nil {
+		return false, err
+	}
+	sourceNS := map[string]bool{mcNamespace: true, xmlNamespace: true}
+	for _, uri := range compositionPartUnderstoodNamespaces(part, source) {
+		sourceNS[uri] = true
+	}
+	targetNS := compositionDialectNamespaces(target)
+	hasTargetChoice := false
+	hasUnknownChoice := false
+	_, err := decodeXMLVisit(part.data, budget.limits, func(token xml.Token, node *xmlElement) error {
+		if err := budget.step(1); err != nil {
+			return err
+		}
+		if hasUnknownChoice {
+			return nil
+		}
+		if _, start := token.(xml.StartElement); !start {
+			return nil
+		}
+		if node.Name != (xml.Name{Space: mcNamespace, Local: "Choice"}) {
+			return nil
+		}
+		requires, ok := node.attribute("Requires")
+		if !ok {
+			return nil
+		}
+		if err := budget.scan(int64(len(requires))); err != nil {
+			return err
+		}
+		uris, err := compatibilityPrefixes(node, requires)
+		if err != nil {
+			return err
+		}
+		if err := budget.step(len(uris)); err != nil {
+			return err
+		}
+		for _, uri := range uris {
+			if sourceNS[uri] {
+				continue
+			}
+			if targetNS[uri] {
+				hasTargetChoice = true
+				continue
+			}
+			hasUnknownChoice = true
+			return nil
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return hasTargetChoice && !hasUnknownChoice, nil
+}
+
+// projectCompositionPartMCE 在源方言下执行MCE预处理投影固化当前有效分支，若保留扩展仍冲突目标方言则返回ErrUnsupported
+// 入参: part 原部件, source 原方言, target 目标方言, budget 共享预算
+// 返回: packagePart 投影固化后的源方言部件, error MCE、冲突扩展、预算或取消错误
+func projectCompositionPartMCE(part packagePart, source, target Format, budget *compositionBudget) (packagePart, error) {
+	if err := budget.scan(int64(len(part.data))); err != nil {
+		return packagePart{}, err
+	}
+	understood := compositionPartUnderstoodNamespaces(part, source)
+	active, ordered, err := preprocessXMLContentContext(part.data, understood, budget.limits, budget.context)
+	if err != nil {
+		return packagePart{}, err
+	}
+	targetNS := compositionDialectNamespaces(target)
+	forbiddenNS := func(ns string) bool {
+		return targetNS[ns] || source == FormatOpenXPS && target == FormatXPS && ns == openXPS3DNamespace
+	}
+	var checkNode func(*xmlElement, bool) error
+	checkNode = func(node *xmlElement, preserved bool) error {
+		if err := budget.step(1); err != nil {
+			return err
+		}
+		if forbiddenNS(node.Name.Space) {
+			return fmt.Errorf("%w: composition markup preserves target-format namespace %q", ErrUnsupported, node.Name.Space)
+		}
+		if !preserved {
+			var kept []xml.Attr
+			for _, attr := range node.Attr {
+				if attr.Name.Space == xmlnsNamespace || attr.Name == (xml.Name{Local: "xmlns"}) {
+					continue
+				}
+				if forbiddenNS(attr.Name.Space) {
+					return fmt.Errorf("%w: composition markup preserves target-format attribute namespace %q", ErrUnsupported, attr.Name.Space)
+				}
+				kept = append(kept, attr)
+			}
+			node.Attr = kept
+		} else {
+			for _, attr := range node.Attr {
+				if attr.Name.Space == xmlnsNamespace || attr.Name == (xml.Name{Local: "xmlns"}) {
+					continue
+				}
+				if forbiddenNS(attr.Name.Space) {
+					return fmt.Errorf("%w: composition markup preserves target-format attribute namespace %q", ErrUnsupported, attr.Name.Space)
+				}
+				if node.Name == (xml.Name{Space: mcNamespace, Local: "Choice"}) && attr.Name == (xml.Name{Local: "Requires"}) || attr.Name == (xml.Name{Space: mcNamespace, Local: "MustUnderstand"}) || attr.Name == (xml.Name{Space: mcNamespace, Local: "Ignorable"}) {
+					uris, err := compatibilityPrefixes(node, attr.Value)
+					if err != nil {
+						return err
+					}
+					for _, uri := range uris {
+						if forbiddenNS(uri) {
+							return fmt.Errorf("%w: composition preserved subtree references target-format namespace %q", ErrUnsupported, uri)
+						}
+					}
+				}
+			}
+		}
+		for _, attr := range node.PreservedAttributes {
+			if forbiddenNS(attr.Name.Space) {
+				return fmt.Errorf("%w: composition markup preserves target-format attribute namespace %q", ErrUnsupported, attr.Name.Space)
+			}
+		}
+		for _, child := range node.Children {
+			if err := checkNode(child, preserved); err != nil {
+				return err
+			}
+		}
+		for _, item := range node.PreservedElements {
+			if err := checkNode(item, true); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := checkNode(active, false); err != nil {
+		return packagePart{}, err
+	}
+	limits := budget.limits
+	if strings.EqualFold(part.media, fixedContentType("signaturedefinitions")) || strings.EqualFold(part.media, fixedContentType("discard-control")) {
+		limits.MaxPartBytes = min(limits.MaxPartBytes, limits.MaxMetadataBytes, limits.MaxPackageBytes)
+	}
+	projected, err := createdPreservedMarkup(active, ordered, limits, budget.context)
+	if err != nil {
+		return packagePart{}, err
+	}
+	maximum := min(limits.MaxPartBytes, limits.MaxPackageBytes, int64(math.MaxInt))
+	restored, err := restoreXMLEncoding(part.data, projected, maximum, budget.context)
+	if err != nil {
+		return packagePart{}, err
+	}
+	if err := budget.scan(int64(len(restored))); err != nil {
+		return packagePart{}, err
+	}
+	result := part
+	result.data, result.items = restored, nil
 	return result, nil
 }
 
@@ -1892,10 +2225,10 @@ func (c *compositionIndex) project(part packagePart, budget *compositionBudget) 
 	return part, nil
 }
 
-// captureCompositionSource 在源阅读器读锁内捕获选中页面、完整索引及资源依赖闭包，不改写原始字节
-// 入参: r 源阅读器, selected 零基页面索引，可重复, budget 多源共享的累计预算
+// captureCompositionSourceForTarget 按可选目标方言捕获源快照，跨方言转换时允许对纯目标方言兼容分支延后投影固化
+// 入参: r 源阅读器, selected 零基页面索引，可重复, targetFormat 可选目标方言，未知时不启用跨方言兼容投影, budget 多源共享的累计预算
 // 返回: *compositionSource 关闭源后仍可使用的快照，失败为nil, error 结构、资源、取消或关闭错误
-func captureCompositionSource(r *Reader, selected []int, budget *compositionBudget) (*compositionSource, error) {
+func captureCompositionSourceForTarget(r *Reader, selected []int, targetFormat Format, budget *compositionBudget) (*compositionSource, error) {
 	if budget == nil {
 		return nil, fmt.Errorf("%w: missing composition budget", ErrInvalid)
 	}
@@ -1924,7 +2257,7 @@ func captureCompositionSource(r *Reader, selected []int, budget *compositionBudg
 	if len(r.pages) > budget.limits.MaxPageCount || len(r.documents) > budget.limits.MaxPageCount {
 		return nil, fmt.Errorf("%w: composition source index", ErrLimit)
 	}
-	s := &compositionCapture{reader: r, budget: budget, source: &compositionSource{format: r.format, sequence: r.sequence, selected: make(map[int]bool), parts: make(map[string]packagePart), relationships: make(map[string][]Relationship), auxiliary: make(map[string]bool), retained: make(map[string]bool), restricted: make(map[string]bool), printResources: make(map[string][]printResourceReference)}, layout: make(map[string]bool), queued: make(map[compositionSourcePart]bool), roles: &createdNavigation{parts: make(map[string]createdNavigationKind)}, owners: make(map[string]bool), unbound: make(map[string]bool), opaque: make(map[string]bool), profiles: make(map[string]bool)}
+	s := &compositionCapture{reader: r, budget: budget, source: &compositionSource{format: r.format, targetFormat: targetFormat, sequence: r.sequence, selected: make(map[int]bool), parts: make(map[string]packagePart), relationships: make(map[string][]Relationship), auxiliary: make(map[string]bool), retained: make(map[string]bool), restricted: make(map[string]bool), printResources: make(map[string][]printResourceReference)}, layout: make(map[string]bool), queued: make(map[compositionSourcePart]bool), roles: &createdNavigation{parts: make(map[string]createdNavigationKind)}, owners: make(map[string]bool), unbound: make(map[string]bool), opaque: make(map[string]bool), profiles: make(map[string]bool)}
 	for _, index := range selected {
 		if err := budget.step(1); err != nil {
 			return nil, err
@@ -2201,7 +2534,15 @@ func (s *compositionCapture) markup(part packagePart, owner string) error {
 			return err
 		}
 	}
-	tracker := newResourceMarkupScopeTracker(s.source.format, s.source.format == FormatOpenXPS, s.budget.context)
+	selectAlt := false
+	if layout && index == nil {
+		var err error
+		selectAlt, err = compositionCanProjectTargetChoices(part, s.source.format, s.source.targetFormat, s.budget)
+		if err != nil {
+			return err
+		}
+	}
+	tracker := newResourceMarkupScopeTrackerWithAlternate(s.source.format, s.source.format == FormatOpenXPS, selectAlt, s.budget.context)
 	visit := func(token xml.Token, node *xmlElement) error {
 		if err := s.budget.step(1); err != nil {
 			return err

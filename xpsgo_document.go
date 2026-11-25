@@ -15,14 +15,21 @@
 package xpsgo
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net/url"
 	"slices"
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 const (
@@ -84,7 +91,32 @@ type PageReference struct {
 	LinkTargets []string
 }
 
-// Page 保存固定页面的方言、尺寸、区域及内容，Has字段保留区域属性的显式声明状态
+// PageHeader 保存固定页面根元素的轻量元数据，不含子元素树与资源图
+type PageHeader struct {
+	Part          string
+	Width         float64
+	Height        float64
+	ContentBox    Rect
+	BleedBox      Rect
+	HasContentBox bool
+	HasBleedBox   bool
+	Language      string
+	Name          string
+}
+
+// utf16StreamReader 按需流式将UTF-16字节流转换为UTF-8字节流供XML页头读取器使用
+type utf16StreamReader struct {
+	src        io.Reader
+	bigEndian  bool
+	pending    []byte
+	rawBuf     [256]byte
+	hasOddByte bool
+	oddByte    byte
+	hasHigh    bool
+	high       rune
+}
+
+// Page 保存固定页面的方言、尺寸、区域、显式链接目标、资源字典及内容，Has字段保留区域属性的显式声明状态
 // Width、Height、ContentBox与BleedBox均采用XPS标准的1/96英寸设备无关单位
 type Page struct {
 	Format        Format
@@ -97,6 +129,8 @@ type Page struct {
 	BleedBox      Rect
 	HasContentBox bool
 	HasBleedBox   bool
+	LinkTargets   []string
+	Resources     *ResourceDictionary
 	Diagnostics   []Diagnostic
 	Elements      []Element
 	root          *xmlElement
@@ -501,6 +535,7 @@ func (r *Reader) readPageSceneLoaders(index int, retainVisuals bool, load xmlPar
 	if err != nil {
 		return nil, err
 	}
+	page.LinkTargets = slices.Clone(r.pages[index].LinkTargets)
 	return r.readPageSceneContent(page, retainVisuals, dictionaries, ctx)
 }
 
@@ -658,7 +693,7 @@ func (r *Reader) readFixedPartLoader(part, kind, rootName string, load xmlPartLo
 	if err != nil {
 		return nil, &PartError{Part: part, Err: err}
 	}
-	if !strings.EqualFold(opcMediaTypeBase(typeName), fixedContentType(kind)) {
+	if !matchStandardContentType(r.format, typeName, fixedContentType(kind)) {
 		return nil, &PartError{Part: part, Err: fmt.Errorf("%w: unexpected content type %q", ErrInvalid, typeName)}
 	}
 	if !handled {
@@ -1092,7 +1127,7 @@ func (r *Reader) readStructurePartContext(ctx context.Context, source, kind, roo
 	if err != nil {
 		return "", nil, &PartError{Part: part, Err: err}
 	}
-	if !strings.EqualFold(opcMediaTypeBase(media), fixedContentType(kind)) {
+	if !matchStandardContentType(r.format, media, fixedContentType(kind)) {
 		return "", nil, &PartError{Part: part, Err: fmt.Errorf("%w: %s content type %q", ErrInvalid, rootName, media)}
 	}
 	data, err := r.pkg.readItemsContext(ctx, strings.ToLower(part), r.limits.MaxPartBytes)
@@ -1513,10 +1548,9 @@ func validateLinkFragment(media, fragment string, indexed bool) error {
 	if fragment == "" {
 		return nil
 	}
-	base := opcMediaTypeBase(media)
-	page := strings.EqualFold(base, fixedContentType("fixedpage"))
-	document := strings.EqualFold(base, fixedContentType("fixeddocument"))
-	sequence := strings.EqualFold(base, fixedContentType("fixeddocumentsequence"))
+	page := matchStandardContentType(FormatOpenXPS, media, fixedContentType("fixedpage"))
+	document := matchStandardContentType(FormatOpenXPS, media, fixedContentType("fixeddocument"))
+	sequence := matchStandardContentType(FormatOpenXPS, media, fixedContentType("fixeddocumentsequence"))
 	if page || document && linkPageNumber(fragment) {
 		return fmt.Errorf("%w: internal fragment address targets the wrong fixed layout type", ErrInvalid)
 	}
@@ -1653,9 +1687,8 @@ func (r *Reader) resolveAuxiliaryLink(ctx context.Context, source string, result
 	if err := validateLinkFragment(media, fragment, true); err != nil {
 		return LinkTarget{}, err
 	}
-	base := opcMediaTypeBase(media)
-	document := strings.EqualFold(base, fixedContentType("fixeddocument"))
-	sequence := strings.EqualFold(base, fixedContentType("fixeddocumentsequence"))
+	document := matchStandardContentType(r.format, media, fixedContentType("fixeddocument"))
+	sequence := matchStandardContentType(r.format, media, fixedContentType("fixeddocumentsequence"))
 	if !document && !sequence {
 		return result, nil
 	}
@@ -1687,7 +1720,7 @@ func (r *Reader) resolveAuxiliaryLink(ctx context.Context, source string, result
 	if err != nil {
 		return LinkTarget{}, err
 	}
-	if !strings.EqualFold(opcMediaTypeBase(media), fixedContentType("fixedpage")) {
+	if !matchStandardContentType(r.format, media, fixedContentType("fixedpage")) {
 		return LinkTarget{}, fmt.Errorf("%w: auxiliary link target is not a fixed page", ErrInvalid)
 	}
 	resolved.Page = -1
@@ -1716,6 +1749,591 @@ func fixedNamePattern(value string) bool {
 		}
 	}
 	return true
+}
+
+// Read 按需读取并解码UTF-16流为UTF-8字节，支持代理对与奇数边界分块
+// 入参: p 目标字节切片
+// 返回: int 写入字节数, error 读取或编码错误
+func (u *utf16StreamReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	for len(u.pending) == 0 {
+		start := 0
+		if u.hasOddByte {
+			u.rawBuf[0] = u.oddByte
+			u.hasOddByte = false
+			start = 1
+		}
+		n, err := u.src.Read(u.rawBuf[start:])
+		total := start + n
+		if total == 0 {
+			if err != nil {
+				if u.hasHigh && err == io.EOF {
+					return 0, fmt.Errorf("%w: truncated UTF-16 surrogate pair", ErrInvalid)
+				}
+				return 0, err
+			}
+			continue
+		}
+		if total&1 != 0 {
+			if err == io.EOF {
+				return 0, fmt.Errorf("%w: truncated UTF-16 stream", ErrInvalid)
+			}
+			u.oddByte = u.rawBuf[total-1]
+			u.hasOddByte = true
+			total--
+		}
+		var encoded [4]byte
+		for i := 0; i < total; i += 2 {
+			var unit uint16
+			if u.bigEndian {
+				unit = binary.BigEndian.Uint16(u.rawBuf[i:])
+			} else {
+				unit = binary.LittleEndian.Uint16(u.rawBuf[i:])
+			}
+			r := rune(unit)
+			if u.hasHigh {
+				if !utf16.IsSurrogate(r) || r < 0xdc00 || r > 0xdfff {
+					return 0, fmt.Errorf("%w: invalid UTF-16 low surrogate", ErrInvalid)
+				}
+				decoded := utf16.DecodeRune(u.high, r)
+				u.hasHigh = false
+				k := utf8.EncodeRune(encoded[:], decoded)
+				u.pending = append(u.pending, encoded[:k]...)
+				continue
+			}
+			if r >= 0xd800 && r <= 0xdbff {
+				u.high = r
+				u.hasHigh = true
+				continue
+			}
+			if r >= 0xdc00 && r <= 0xdfff {
+				return 0, fmt.Errorf("%w: unpaired UTF-16 low surrogate", ErrInvalid)
+			}
+			k := utf8.EncodeRune(encoded[:], r)
+			u.pending = append(u.pending, encoded[:k]...)
+		}
+		if len(u.pending) == 0 && err != nil {
+			if u.hasHigh && err == io.EOF {
+				return 0, fmt.Errorf("%w: truncated UTF-16 surrogate pair", ErrInvalid)
+			}
+			return 0, err
+		}
+	}
+	copied := copy(p, u.pending)
+	if copied == len(u.pending) {
+		u.pending = u.pending[:0]
+	} else {
+		u.pending = append(u.pending[:0], u.pending[copied:]...)
+	}
+	return copied, nil
+}
+
+// PageHeader 仅流式读取FixedPage根标签属性返回页面尺寸、裁剪区域、语言与名称，不解析整页子元素
+// 入参: ctx 取消Context，nil采用Background, pageIndex 从零开始的全局页号
+// 返回: *PageHeader 轻量页面头信息, error 状态、序号、媒体类型、XML或取消错误
+func (r *Reader) PageHeader(ctx context.Context, pageIndex int) (*PageHeader, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := r.readLock(); err != nil {
+		return nil, err
+	}
+	defer r.mu.RUnlock()
+	if pageIndex < 0 || pageIndex >= len(r.pages) {
+		return nil, fmt.Errorf("%w: page index out of range: %d", ErrInvalid, pageIndex)
+	}
+	return r.readPageHeaderStream(ctx, r.pages[pageIndex].Part)
+}
+
+// readPageHeaderStream 在持有阅读器读锁时流式读取指定页面部件的FixedPage根元素属性
+// 入参: ctx 已规范化取消Context, part 页面部件包根URI
+// 返回: *PageHeader 轻量页面头信息, error 部件、媒体类型、XML或取消错误
+func (r *Reader) readPageHeaderStream(ctx context.Context, part string) (*PageHeader, error) {
+	canonical, err := opcPartName(part)
+	if err != nil {
+		return nil, err
+	}
+	media, err := r.pkg.contentType(canonical)
+	if err != nil {
+		return nil, &PartError{Part: canonical, Err: err}
+	}
+	if !matchStandardContentType(r.format, media, fixedContentType("fixedpage")) {
+		return nil, &PartError{Part: canonical, Err: fmt.Errorf("%w: unexpected content type %q", ErrInvalid, media)}
+	}
+	stream, err := r.pkg.openPartStream(ctx, strings.ToLower(canonical), PartReadOptions{MaxBytes: r.limits.MaxPartBytes})
+	if err != nil {
+		return nil, &PartError{Part: canonical, Err: err}
+	}
+	defer stream.Close()
+	buf := bufio.NewReader(stream)
+	var input io.Reader = buf
+	utf16Encoding := ""
+	if peek, peekErr := buf.Peek(3); len(peek) >= 2 && (peekErr == nil || peekErr == io.EOF) {
+		switch {
+		case peek[0] == 0xff && peek[1] == 0xfe:
+			_, _ = buf.Discard(2)
+			input = &utf16StreamReader{src: buf, bigEndian: false}
+			utf16Encoding = "utf-16le"
+		case peek[0] == 0xfe && peek[1] == 0xff:
+			_, _ = buf.Discard(2)
+			input = &utf16StreamReader{src: buf, bigEndian: true}
+			utf16Encoding = "utf-16be"
+		case len(peek) >= 3 && peek[0] == 0xef && peek[1] == 0xbb && peek[2] == 0xbf:
+			_, _ = buf.Discard(3)
+		}
+	}
+	dec := xml.NewDecoder(input)
+	dec.CharsetReader = func(charset string, reader io.Reader) (io.Reader, error) {
+		if strings.EqualFold(charset, "utf-16") || strings.EqualFold(charset, "utf-16le") || strings.EqualFold(charset, "utf-16be") {
+			if utf16Encoding != "" && (strings.EqualFold(charset, "utf-16") || strings.EqualFold(charset, utf16Encoding)) {
+				return reader, nil
+			}
+			return nil, fmt.Errorf("%w: XML encoding declaration differs from input", ErrInvalid)
+		}
+		return nil, fmt.Errorf("%w: XML encoding %q", ErrUnsupported, charset)
+	}
+	var rootStart *xml.StartElement
+	for {
+		if err := checkContext(ctx); err != nil {
+			return nil, &PartError{Part: canonical, Err: err}
+		}
+		tok, tokErr := dec.Token()
+		if tokErr != nil {
+			if errors.Is(tokErr, ErrLimit) || errors.Is(tokErr, ErrUnsupported) || errors.Is(tokErr, ErrInvalid) || errors.Is(tokErr, ErrClosed) || errors.Is(tokErr, context.Canceled) || errors.Is(tokErr, context.DeadlineExceeded) {
+				return nil, &PartError{Part: canonical, Err: tokErr}
+			}
+			return nil, &PartError{Part: canonical, Err: fmt.Errorf("%w: %w", ErrInvalid, tokErr)}
+		}
+		switch typed := tok.(type) {
+		case xml.StartElement:
+			copied := typed.Copy()
+			rootStart = &copied
+		case xml.ProcInst, xml.Comment:
+		case xml.CharData:
+			if strings.TrimSpace(string(typed)) != "" {
+				return nil, &PartError{Part: canonical, Err: fmt.Errorf("%w: unexpected text before root element", ErrInvalid)}
+			}
+		case xml.Directive:
+			return nil, &PartError{Part: canonical, Err: fmt.Errorf("%w: XML directive is forbidden", ErrInvalid)}
+		}
+		if rootStart != nil {
+			break
+		}
+	}
+	namespaces := make(map[string]string)
+	attrs := make([]xml.Attr, 0, len(rootStart.Attr))
+	for _, attr := range rootStart.Attr {
+		if attr.Name.Space == "" && attr.Name.Local == "xmlns" {
+			namespaces[""] = attr.Value
+			continue
+		}
+		if attr.Name.Space == "xmlns" {
+			namespaces[attr.Name.Local] = attr.Value
+			continue
+		}
+		attrs = append(attrs, attr)
+	}
+	root := &xmlElement{Name: rootStart.Name, Attr: attrs, Namespaces: namespaces}
+	namespace := formatNamespace(r.format)
+	root, err = preprocessXMLContext(root, []string{namespace, namespace + "/resourcedictionary-key"}, ctx)
+	if err != nil {
+		return nil, &PartError{Part: canonical, Err: err}
+	}
+	if root.Name.Space != namespace || root.Name.Local != "FixedPage" {
+		return nil, &PartError{Part: canonical, Element: root.Name.Local, Err: fmt.Errorf("%w: unexpected root {%s}%s", ErrInvalid, root.Name.Space, root.Name.Local)}
+	}
+	page, err := parsePageHeader(root, canonical, r.format)
+	if err != nil {
+		return nil, err
+	}
+	return &PageHeader{
+		Part:          page.Part,
+		Width:         page.Width,
+		Height:        page.Height,
+		ContentBox:    page.ContentBox,
+		BleedBox:      page.BleedBox,
+		HasContentBox: page.HasContentBox,
+		HasBleedBox:   page.HasBleedBox,
+		Language:      page.Language,
+		Name:          page.Name,
+	}, nil
+}
+
+// ElementBounds 计算Path、Glyphs或Canvas在指定页面及初始变换矩阵下的精确页面空间轴对齐包围盒
+// 递归展开Canvas并结合字体真实度量计算Glyphs包围盒，支持RenderTransform、描边半宽与Clip裁剪
+// 入参: ctx 取消Context，nil采用Background, pageIndex 全局页号, elem 目标绘制元素, transform 初始父变换矩阵，零值按单位矩阵处理
+// 返回: Rect 页面空间轴对齐包围盒, bool 是否存在非空有效包围盒, error 参数、字体、变换或取消错误
+func (r *Reader) ElementBounds(ctx context.Context, pageIndex int, elem Element, transform Matrix) (Rect, bool, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return Rect{}, false, err
+	}
+	if err := r.readLock(); err != nil {
+		return Rect{}, false, err
+	}
+	defer r.mu.RUnlock()
+	if pageIndex < 0 || pageIndex >= len(r.pages) {
+		return Rect{}, false, fmt.Errorf("%w: page index out of range: %d", ErrInvalid, pageIndex)
+	}
+	if elem == nil {
+		return Rect{}, false, nil
+	}
+	if transform == (Matrix{}) {
+		transform = IdentityMatrix()
+	}
+	if !geometryFillMatrixFinite(transform) {
+		return Rect{}, false, fmt.Errorf("%w: non-finite element transform", ErrInvalid)
+	}
+	return r.elementBoundsInPart(ctx, r.pages[pageIndex].Part, elem, transform, true)
+}
+
+// ResolveLinkBounds 解析链接目标并同步返回其目标元素或目标页面的精确页面空间包围盒
+// 外部链接或非固定页面资源返回有效LinkTarget并将bool置为false
+// 入参: ctx 取消Context，nil采用Background, sourcePart 源部件包根URI, uri 待解析链接URI
+// 返回: *LinkTarget 已解析链接目标, Rect 目标页面空间包围盒, bool 是否具备有效包围盒, error 解析、字体或取消错误
+func (r *Reader) ResolveLinkBounds(ctx context.Context, sourcePart, uri string) (*LinkTarget, Rect, bool, error) {
+	ctx = normalizeContext(ctx)
+	target, err := r.ResolveLink(ctx, sourcePart, uri)
+	if err != nil {
+		return nil, Rect{}, false, err
+	}
+	if target.External {
+		return &target, Rect{}, false, nil
+	}
+	if target.Element != nil {
+		if err := r.readLock(); err != nil {
+			return nil, Rect{}, false, err
+		}
+		box, ok, boundsErr := r.elementBoundsInPart(ctx, target.Part, target.Element, target.Transform, false)
+		r.mu.RUnlock()
+		if boundsErr != nil {
+			return nil, Rect{}, false, boundsErr
+		}
+		return &target, box, ok, nil
+	}
+	if target.Page >= 0 {
+		hdr, hdrErr := r.PageHeader(ctx, target.Page)
+		if hdrErr != nil {
+			return nil, Rect{}, false, hdrErr
+		}
+		return &target, Rect{Width: hdr.Width, Height: hdr.Height}, true, nil
+	}
+	if target.Part != "" {
+		if err := r.readLock(); err != nil {
+			return nil, Rect{}, false, err
+		}
+		media, mediaErr := r.pkg.contentType(target.Part)
+		if mediaErr == nil && matchStandardContentType(r.format, media, fixedContentType("fixedpage")) {
+			hdr, hdrErr := r.readPageHeaderStream(ctx, target.Part)
+			r.mu.RUnlock()
+			if hdrErr != nil {
+				return nil, Rect{}, false, hdrErr
+			}
+			return &target, Rect{Width: hdr.Width, Height: hdr.Height}, true, nil
+		}
+		r.mu.RUnlock()
+	}
+	return &target, Rect{}, false, nil
+}
+
+// elementBoundsInPart 在持有阅读器读锁时计算指定页面部件内单个元素的页面空间包围盒
+// 入参: ctx 已规范化取消Context, pagePart 所属页面部件URI, elem 绘制元素, transform 变换矩阵, applySelfTransform 是否叠加元素自身RenderTransform
+// 返回: Rect 页面空间包围盒, bool 是否非空, error 计算或取消错误
+func (r *Reader) elementBoundsInPart(ctx context.Context, pagePart string, elem Element, transform Matrix, applySelfTransform bool) (Rect, bool, error) {
+	fonts := &fontCache{
+		pkg:       r.pkg,
+		data:      make(map[string][]byte),
+		faces:     make(map[fontCacheKey]*fontSource),
+		remaining: r.limits.MaxPackageBytes,
+		maxFaces:  r.limits.MaxPartCount,
+	}
+	return r.elementBoundsRecursive(ctx, pagePart, elem, transform, applySelfTransform, 0, fonts)
+}
+
+// elementBoundsRecursive 递归计算Path、Glyphs与Canvas的变换后包围盒并应用Clip交集
+// 入参: ctx 已规范化取消Context, pagePart 页面部件URI, elem 绘制元素, parent 变换矩阵, applySelf 是否叠加元素自身RenderTransform, depth 当前嵌套深度, fonts 字体缓存
+// 返回: Rect 轴对齐包围盒, bool 是否非空, error 深度、字体、变换或取消错误
+func (r *Reader) elementBoundsRecursive(ctx context.Context, pagePart string, elem Element, parent Matrix, applySelf bool, depth int, fonts *fontCache) (Rect, bool, error) {
+	if err := checkContext(ctx); err != nil {
+		return Rect{}, false, err
+	}
+	if depth >= r.limits.MaxXMLDepth {
+		return Rect{}, false, fmt.Errorf("%w: element bounds depth", ErrLimit)
+	}
+	props := contentProperties(elem)
+	if props == nil {
+		return Rect{}, false, fmt.Errorf("%w: unsupported element type", ErrInvalid)
+	}
+	local := parent
+	if applySelf && props.RenderTransform != nil {
+		local = strokePathCompose(parent, *props.RenderTransform)
+		if !geometryFillMatrixFinite(local) {
+			return Rect{}, false, fmt.Errorf("%w: element bounds transform overflow", ErrLimit)
+		}
+	}
+	var box Rect
+	hasBox := false
+	switch typed := elem.(type) {
+	case *Path:
+		if typed.Data != nil {
+			var err error
+			box, hasBox, err = pathGeometryBounds(typed.Data, local, typed.Stroke != nil, typed.StrokeThickness)
+			if err != nil {
+				return Rect{}, false, err
+			}
+		}
+	case *Glyphs:
+		var err error
+		box, hasBox, err = r.glyphsElementBounds(ctx, pagePart, typed, local, fonts)
+		if err != nil {
+			return Rect{}, false, err
+		}
+	case *Canvas:
+		for _, child := range typed.Elements {
+			childBox, childOK, err := r.elementBoundsRecursive(ctx, pagePart, child, local, true, depth+1, fonts)
+			if err != nil {
+				return Rect{}, false, err
+			}
+			if !childOK {
+				continue
+			}
+			if !hasBox {
+				box, hasBox = childBox, true
+			} else {
+				box = rectUnion(box, childBox)
+			}
+		}
+	}
+	if hasBox && props.Clip != nil {
+		clipMatrix := local
+		if props.Clip.Transform != nil {
+			clipMatrix = strokePathCompose(local, *props.Clip.Transform)
+			if !geometryFillMatrixFinite(clipMatrix) {
+				return Rect{}, false, fmt.Errorf("%w: clip transform overflow", ErrLimit)
+			}
+		}
+		clipBox, clipOK, err := transformedGeometryBounds(props.Clip, clipMatrix)
+		if err != nil {
+			return Rect{}, false, err
+		}
+		if !clipOK {
+			return Rect{}, false, nil
+		}
+		box, hasBox = rectIntersect(box, clipBox)
+	}
+	return box, hasBox, nil
+}
+
+// glyphsElementBounds 结合字体度量与字形排布计算Glyphs在指定变换矩阵下的页面包围盒
+// 入参: ctx 已规范化取消Context, pagePart 页面部件URI, glyphs 字形元素, local 有效变换矩阵, fonts 字体缓存
+// 返回: Rect 页面空间包围盒, bool 是否非空, error 字体或排布错误
+func (r *Reader) glyphsElementBounds(ctx context.Context, pagePart string, glyphs *Glyphs, local Matrix, fonts *fontCache) (Rect, bool, error) {
+	resolved := *glyphs
+	if resolved.FontPart == "" && resolved.FontURI != "" {
+		uri, face, hasFace, err := ParseFontURI(strings.TrimSpace(resolved.FontURI))
+		if err != nil {
+			return Rect{}, false, err
+		}
+		part, err := resolvePart(pagePart, uri)
+		if err != nil {
+			return Rect{}, false, err
+		}
+		resolved.FontPart, resolved.CollectionIndex, resolved.HasCollectionIndex = part, face, hasFace
+	}
+	resolved.Text = strings.TrimPrefix(resolved.Text, "{}")
+	source, err := fonts.load(&resolved)
+	if err != nil {
+		return Rect{}, false, err
+	}
+	run, _, err := source.resolveGlyphRun(ctx, &resolved)
+	if err != nil {
+		return Rect{}, false, err
+	}
+	if len(run.glyphs) == 0 {
+		return Rect{}, false, nil
+	}
+	em := float64(source.metrics.unitsPerEm)
+	asc, desc := float64(source.metrics.hhea.ascender), float64(source.metrics.hhea.descender)
+	if asc == 0 && desc == 0 && source.metrics.os2 != nil {
+		asc, desc = float64(source.metrics.os2.typoAscender), float64(source.metrics.os2.typoDescender)
+	}
+	if asc == 0 && desc == 0 {
+		asc, desc = 0.85*em, -0.15*em
+	}
+	direction := 1.0
+	if run.rtl {
+		direction = -1
+	}
+	have := false
+	var minX, minY, maxX, maxY float64
+	for _, pg := range run.glyphs {
+		gm := strokePathCompose(local, pg.matrix)
+		base0 := local.Transform(pg.origin)
+		base1 := local.Transform(Point{X: pg.origin.X + direction*pg.advance, Y: pg.origin.Y})
+		var v0, v1 Point
+		if !run.sideways {
+			v0 = Point{X: gm.C * asc, Y: gm.D * asc}
+			v1 = Point{X: gm.C * desc, Y: gm.D * desc}
+		} else {
+			half := em / 2
+			v0 = Point{X: gm.A * half, Y: gm.B * half}
+			v1 = Point{X: -v0.X, Y: -v0.Y}
+		}
+		for _, pt := range [4]Point{
+			{X: base0.X + v0.X, Y: base0.Y + v0.Y},
+			{X: base1.X + v0.X, Y: base1.Y + v0.Y},
+			{X: base0.X + v1.X, Y: base0.Y + v1.Y},
+			{X: base1.X + v1.X, Y: base1.Y + v1.Y},
+		} {
+			if !geometryFinite(pt.X, pt.Y) {
+				continue
+			}
+			if !have {
+				minX, minY, maxX, maxY, have = pt.X, pt.Y, pt.X, pt.Y, true
+			} else {
+				minX, minY = min(minX, pt.X), min(minY, pt.Y)
+				maxX, maxY = max(maxX, pt.X), max(maxY, pt.Y)
+			}
+		}
+	}
+	if !have {
+		return Rect{}, false, nil
+	}
+	return Rect{X: minX, Y: minY, Width: maxX - minX, Height: maxY - minY}, true, nil
+}
+
+// transformedGeometryBounds 计算局部几何应用仿射矩阵后的轴对齐包围盒，直线与贝塞尔曲线采用精确极值
+// 入参: g 局部几何, m 仿射变换矩阵
+// 返回: Rect 变换后轴对齐包围盒, bool 是否非空, error 几何或数值溢出错误
+func transformedGeometryBounds(g *Geometry, m Matrix) (Rect, bool, error) {
+	if g == nil || len(g.Figures) == 0 {
+		return Rect{}, false, nil
+	}
+	hasArc := false
+	for _, fig := range g.Figures {
+		for _, seg := range fig.Segments {
+			if seg.Kind == GeometryArc {
+				hasArc = true
+				break
+			}
+		}
+		if hasArc {
+			break
+		}
+	}
+	if !hasArc {
+		transformed := Geometry{FillRule: g.FillRule, Figures: make([]GeometryFigure, len(g.Figures))}
+		for i, fig := range g.Figures {
+			outFig := GeometryFigure{StartPoint: m.Transform(fig.StartPoint), Segments: make([]GeometrySegment, len(fig.Segments)), IsClosed: fig.IsClosed, IsFilled: fig.IsFilled}
+			for j, seg := range fig.Segments {
+				seg.Point = m.Transform(seg.Point)
+				if seg.Kind == GeometryQuadratic || seg.Kind == GeometryCubic {
+					seg.Control1 = m.Transform(seg.Control1)
+				}
+				if seg.Kind == GeometryCubic {
+					seg.Control2 = m.Transform(seg.Control2)
+				}
+				outFig.Segments[j] = seg
+			}
+			transformed.Figures[i] = outFig
+		}
+		box, err := transformed.Bounds()
+		if err != nil {
+			return Rect{}, false, err
+		}
+		return box, true, nil
+	}
+	local, err := g.Bounds()
+	if err != nil {
+		return Rect{}, false, err
+	}
+	corners := [4]Point{
+		m.Transform(Point{X: local.X, Y: local.Y}),
+		m.Transform(Point{X: local.X + local.Width, Y: local.Y}),
+		m.Transform(Point{X: local.X, Y: local.Y + local.Height}),
+		m.Transform(Point{X: local.X + local.Width, Y: local.Y + local.Height}),
+	}
+	if !geometryFinite(corners[0].X, corners[0].Y) {
+		return Rect{}, false, fmt.Errorf("%w: transformed geometry bounds overflow", ErrLimit)
+	}
+	minX, minY, maxX, maxY := corners[0].X, corners[0].Y, corners[0].X, corners[0].Y
+	for _, pt := range corners[1:] {
+		if !geometryFinite(pt.X, pt.Y) {
+			return Rect{}, false, fmt.Errorf("%w: transformed geometry bounds overflow", ErrLimit)
+		}
+		minX, minY = min(minX, pt.X), min(minY, pt.Y)
+		maxX, maxY = max(maxX, pt.X), max(maxY, pt.Y)
+	}
+	if !geometryFinite(maxX-minX, maxY-minY) {
+		return Rect{}, false, fmt.Errorf("%w: transformed geometry bounds overflow", ErrLimit)
+	}
+	return Rect{X: minX, Y: minY, Width: maxX - minX, Height: maxY - minY}, true, nil
+}
+
+// pathGeometryBounds 计算路径几何及其可选描边半宽在指定变换矩阵下的轴对齐包围盒
+// 入参: data 路径几何, local 有效变换矩阵, hasStroke 是否存在有效描边画刷, strokeThickness 描边线宽
+// 返回: Rect 变换后含描边外延的轴对齐包围盒, bool 是否非空, error 变换或数值溢出错误
+func pathGeometryBounds(data *Geometry, local Matrix, hasStroke bool, strokeThickness float64) (Rect, bool, error) {
+	if data == nil || len(data.Figures) == 0 {
+		return Rect{}, false, nil
+	}
+	geomMatrix := local
+	if data.Transform != nil {
+		if !geometryFillMatrixFinite(*data.Transform) {
+			return Rect{}, false, fmt.Errorf("%w: path data transform overflow", ErrLimit)
+		}
+		geomMatrix = strokePathCompose(local, *data.Transform)
+		if !geometryFillMatrixFinite(geomMatrix) {
+			return Rect{}, false, fmt.Errorf("%w: path data transform overflow", ErrLimit)
+		}
+	}
+	box, hasBox, err := transformedGeometryBounds(data, geomMatrix)
+	if err != nil || !hasBox {
+		return Rect{}, false, err
+	}
+	if hasStroke && strokeThickness > 0 {
+		padX := 0.5 * strokeThickness * math.Hypot(local.A, local.C)
+		padY := 0.5 * strokeThickness * math.Hypot(local.B, local.D)
+		if !geometryFinite(padX, padY) {
+			return Rect{}, false, fmt.Errorf("%w: path stroke padding overflow", ErrLimit)
+		}
+		box.X -= padX
+		box.Y -= padY
+		box.Width += 2 * padX
+		box.Height += 2 * padY
+		if !geometryFinite(box.X, box.Y, box.Width, box.Height, box.X+box.Width, box.Y+box.Height) {
+			return Rect{}, false, fmt.Errorf("%w: path stroke bounds overflow", ErrLimit)
+		}
+	}
+	return box, true, nil
+}
+
+// rectUnion 返回两个轴对齐矩形的最小并集矩形
+// 入参: a 第一个矩形, b 第二个矩形
+// 返回: Rect 合并后的最小外接矩形
+func rectUnion(a, b Rect) Rect {
+	minX := min(a.X, b.X)
+	minY := min(a.Y, b.Y)
+	maxX := max(a.X+a.Width, b.X+b.Width)
+	maxY := max(a.Y+a.Height, b.Y+b.Height)
+	return Rect{X: minX, Y: minY, Width: maxX - minX, Height: maxY - minY}
+}
+
+// rectIntersect 计算两个轴对齐矩形的交集，不相交时返回零矩形和false
+// 入参: a 第一个矩形, b 第二个矩形
+// 返回: Rect 交集矩形, bool 是否存在非空交集
+func rectIntersect(a, b Rect) (Rect, bool) {
+	minX := max(a.X, b.X)
+	minY := max(a.Y, b.Y)
+	maxX := min(a.X+a.Width, b.X+b.Width)
+	maxY := min(a.Y+a.Height, b.Y+b.Height)
+	if maxX < minX || maxY < minY {
+		return Rect{}, false
+	}
+	return Rect{X: minX, Y: minY, Width: maxX - minX, Height: maxY - minY}, true
 }
 
 // validateFixedNames 规范化固定布局名称并校验部件内的标识唯一性

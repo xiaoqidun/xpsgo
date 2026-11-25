@@ -243,10 +243,14 @@ var printBindingNames = map[string]PrintBinding{
 	"JogOffset": PrintBindingJogOffset, "Trim": PrintBindingTrim,
 }
 
-// printMediaPlacement 保存进纸坐标系中的图像旋转方向及偏移
+// printMediaPlacement 保存进纸坐标系中的图像旋转方向、偏移、精确微米尺寸及纸型名
 type printMediaPlacement struct {
-	rotation Matrix
-	offset   Point
+	rotation      Matrix
+	offset        Point
+	widthMicrons  int64
+	heightMicrons int64
+	hasMicrons    bool
+	mediaName     string
 }
 
 // PrintLayoutOptions 设置页面打印的基础票据、物理介质及解析预算，Settings.Scope须为Unknown
@@ -269,13 +273,25 @@ type PrintMedia struct {
 	DefaultOnly      bool
 }
 
-// PrintLayout 保存页面到物理介质的变换及裁剪区域，PageClip位于页面空间，MediaClip位于介质空间
+// PrintLayout 保存页面到物理介质的变换、裁剪区域及精确物理元数据，PageClip位于页面空间，MediaClip、ImageableArea、ContentBox与BleedBox位于介质空间
+// MediaWidthMicrons与MediaHeightMicrons保留精确微米物理尺寸，ScaleX与ScaleY为内容缩放比，RotationDegrees取0、90、180或270
 // PageBorderless为Borderless时采用出血区域裁剪，否则按固定页面宽高校验和裁剪
 type PrintLayout struct {
-	Width, Height float64
-	Transform     Matrix
-	PageClip      Rect
-	MediaClip     Rect
+	Width, Height      float64
+	Transform          Matrix
+	PageClip           Rect
+	MediaClip          Rect
+	MediaWidthMicrons  int64
+	MediaHeightMicrons int64
+	MediaSizeName      string
+	ImageableArea      Rect
+	ContentBox         Rect
+	BleedBox           *Rect
+	ScaleX             float64
+	ScaleY             float64
+	RotationDegrees    int
+	Borderless         bool
+	Mirrored           bool
 }
 
 // printLayoutSettings 保存已校验票据及参数初始值，只读取当前布局引用的参数
@@ -337,15 +353,16 @@ func (b PrintBinding) String() string {
 	}
 }
 
-// mediaSize 解析显式介质几何或公开纸型默认尺寸，并校验是否与调用方物理介质冲突
+// mediaSize 解析显式介质几何或公开纸型默认尺寸，保留精确微米物理尺寸并校验是否与调用方物理介质冲突
 // 入参: media 待确定的物理介质，PS自定义介质使用跨进纸宽度和沿进纸高度
-// 返回: printMediaPlacement 介质方向及独立偏移, error 描述值、缺参、未知尺寸或冲突错误
+// 返回: printMediaPlacement 介质方向、独立偏移与精确微米尺寸, error 描述值、缺参、未知尺寸或冲突错误
 func (s *printLayoutSettings) mediaSize(media *PrintMedia) (printMediaPlacement, error) {
 	placement := printMediaPlacement{rotation: IdentityMatrix()}
 	option, _, err := s.option(s.model.Elements, "PageMediaSize")
 	if err != nil || option == nil {
 		return placement, err
 	}
+	placement.mediaName = option.Name.Local
 	if printPublicKeywordSpace(option.Name.Space) && option.Name.Local == "PSCustomMediaSize" {
 		return s.postScriptMedia(option, media)
 	}
@@ -358,16 +375,17 @@ func (s *printLayoutSettings) mediaSize(media *PrintMedia) (printMediaPlacement,
 	if err := printOptionProperties(option, "MediaSizeWidth", "MediaSizeHeight"); err != nil {
 		return placement, err
 	}
-	width, hasWidth, err := s.number(option, "MediaSizeWidth")
+	width, widthMicrons, hasWidth, err := s.numberExact(option, "MediaSizeWidth")
 	if err != nil {
 		return placement, err
 	}
-	height, hasHeight, err := s.number(option, "MediaSizeHeight")
+	height, heightMicrons, hasHeight, err := s.numberExact(option, "MediaSizeHeight")
 	if err != nil {
 		return placement, err
 	}
 	if !hasWidth && !hasHeight && predefined {
 		width, height = float64(dimensions[0]), float64(dimensions[1])
+		widthMicrons, heightMicrons = int64(dimensions[0]), int64(dimensions[1])
 		if height == 0 {
 			if media.Width == 0 {
 				return placement, fmt.Errorf("%w: roll media requires an explicit length", ErrUnsupported)
@@ -380,6 +398,7 @@ func (s *printLayoutSettings) mediaSize(media *PrintMedia) (printMediaPlacement,
 				media.ImageableArea = nil
 				media.Width = rollWidth
 			}
+			placement.widthMicrons = widthMicrons
 			return placement, nil
 		}
 	} else if !hasWidth && !hasHeight && !custom && media.Width > 0 {
@@ -387,28 +406,33 @@ func (s *printLayoutSettings) mediaSize(media *PrintMedia) (printMediaPlacement,
 	} else if !hasWidth || !hasHeight {
 		return placement, fmt.Errorf("%w: print media option requires dimensions", ErrUnsupported)
 	}
-	return placement, printSetMediaSize(media, width, height)
+	if err := printSetMediaSize(media, width, height); err != nil {
+		return placement, err
+	}
+	placement.widthMicrons, placement.heightMicrons, placement.hasMicrons = widthMicrons, heightMicrons, true
+	return placement, nil
 }
 
-// postScriptMedia 解析PSCustomMediaSize的五个PostScript参数并换算进纸方向与偏移
+// postScriptMedia 解析PSCustomMediaSize的五个PostScript参数并换算进纸方向、偏移与精确微米尺寸
 // 入参: option PS自定义选择, media 跨进纸宽度及沿进纸高度
-// 返回: printMediaPlacement 内容方向及微米换算后的偏移, error 缺参、非法数、尺寸或冲突错误
+// 返回: printMediaPlacement 内容方向、微米换算后的偏移与精确微米尺寸, error 缺参、非法数、尺寸或冲突错误
 func (s *printLayoutSettings) postScriptMedia(option *PrintSetting, media *PrintMedia) (printMediaPlacement, error) {
-	var placement printMediaPlacement
+	placement := printMediaPlacement{mediaName: option.Name.Local}
 	names := [...]string{"PSWidth", "PSHeight", "PSWidthOffset", "PSHeightOffset", "PSOrientation"}
 	if err := printOptionProperties(option, names[:]...); err != nil {
 		return placement, err
 	}
 	var values [5]float64
+	var exact [5]int64
 	for index, name := range names {
-		value, exists, err := s.number(option, name)
+		value, microns, exists, err := s.numberExact(option, name)
 		if err != nil {
 			return placement, err
 		}
 		if !exists {
 			return placement, fmt.Errorf("%w: missing print media %s", ErrUnsupported, name)
 		}
-		values[index] = value
+		values[index], exact[index] = value, microns
 	}
 	if values[4] < 0 || values[4] > 3 {
 		return placement, fmt.Errorf("%w: print media PSOrientation", ErrInvalid)
@@ -427,6 +451,7 @@ func (s *printLayoutSettings) postScriptMedia(option *PrintSetting, media *Print
 		placement.rotation = Matrix{A: -1, D: -1, E: media.Width, F: media.Height}
 	}
 	placement.offset = Point{X: values[2] * printMicronUnit, Y: values[3] * printMicronUnit}
+	placement.widthMicrons, placement.heightMicrons, placement.hasMicrons = exact[0], exact[1], true
 	return placement, nil
 }
 
@@ -662,8 +687,16 @@ func (s *printLayoutSettings) keyword(option *PrintSetting, fallback string) (st
 // 入参: option 已选Option, name 公共描述值名称
 // 返回: float64 数值, bool 是否声明, error 类型、缺失参数或数值范围错误
 func (s *printLayoutSettings) number(option *PrintSetting, name string) (float64, bool, error) {
+	result, _, present, err := s.numberExact(option, name)
+	return result, present, err
+}
+
+// numberExact 读取布局Option的整数描述值，同时返回浮点近似值与精确int64整数值
+// 入参: option 已选Option, name 公共描述值名称
+// 返回: float64 浮点数值, int64 精确整数值, bool 是否声明, error 类型、缺失参数或数值范围错误
+func (s *printLayoutSettings) numberExact(option *PrintSetting, name string) (float64, int64, bool, error) {
 	if option == nil {
-		return 0, false, nil
+		return 0, 0, false, nil
 	}
 	for _, child := range option.Children {
 		if child.Kind != PrintSettingScoredProperty || !printPublicKeywordSpace(child.Name.Space) || child.Name.Local != name {
@@ -673,23 +706,27 @@ func (s *printLayoutSettings) number(option *PrintSetting, name string) (float64
 		if reference != (xml.Name{}) {
 			value = s.values[printCanonicalKey(reference)]
 			if value == nil {
-				return 0, true, fmt.Errorf("%w: print layout parameter {%s}%s not initialized", ErrUnsupported, reference.Space, reference.Local)
+				return 0, 0, true, fmt.Errorf("%w: print layout parameter {%s}%s not initialized", ErrUnsupported, reference.Space, reference.Local)
 			}
 		}
 		if value == nil || value.Type != (xml.Name{Space: printValueNS, Local: "integer"}) || !printInteger(strings.Trim(value.Text, " \t\r\n")) {
-			return 0, true, fmt.Errorf("%w: print layout integer %s", ErrInvalid, name)
+			return 0, 0, true, fmt.Errorf("%w: print layout integer %s", ErrInvalid, name)
 		}
 		decimal, err := printParameterNumber(value.Text, s.options)
 		if err != nil {
-			return 0, true, err
+			return 0, 0, true, err
 		}
 		result, _ := decimal.Float64()
 		if !geometryFinite(result) {
-			return 0, true, fmt.Errorf("%w: print layout numeric range", ErrLimit)
+			return 0, 0, true, fmt.Errorf("%w: print layout numeric range", ErrLimit)
 		}
-		return result, true, nil
+		var exact int64
+		if decimal.IsInt() && decimal.Num().IsInt64() {
+			exact = decimal.Num().Int64()
+		}
+		return result, exact, true, nil
 	}
-	return 0, false, nil
+	return 0, 0, false, nil
 }
 
 // layoutWithRotation 组合无边距区域、内容缩放、物理介质方向及轴向镜像，保持两个坐标空间裁剪独立并返回纯方向旋转矩阵
@@ -807,10 +844,75 @@ func (s *printLayoutSettings) layoutWithRotation(page *Page, media PrintMedia) (
 	transform.E += placement.offset.X
 	transform.F += placement.offset.Y
 	outputBox := printTransformBox(pageClip, transform)
-	if media.Width <= 0 || media.Height <= 0 || !geometryFillMatrixFinite(transform) || !geometryFinite(media.Width, media.Height, area.X+area.Width, area.Y+area.Height, outputBox.X, outputBox.Y, outputBox.Width, outputBox.Height, outputBox.X+outputBox.Width, outputBox.Y+outputBox.Height) {
+	mappedContent := printTransformBox(content, transform)
+	var mappedBleed *Rect
+	if page.HasBleedBox {
+		box := printTransformBox(page.BleedBox, transform)
+		if !geometryFinite(box.X, box.Y, box.Width, box.Height, box.X+box.Width, box.Y+box.Height) {
+			return nil, Matrix{}, fmt.Errorf("%w: print layout bleed box range", ErrLimit)
+		}
+		mappedBleed = &box
+	}
+	if media.Width <= 0 || media.Height <= 0 || !geometryFillMatrixFinite(transform) || !geometryFinite(media.Width, media.Height, area.X+area.Width, area.Y+area.Height, outputBox.X, outputBox.Y, outputBox.Width, outputBox.Height, outputBox.X+outputBox.Width, outputBox.Y+outputBox.Height, mappedContent.X, mappedContent.Y, mappedContent.Width, mappedContent.Height, mappedContent.X+mappedContent.Width, mappedContent.Y+mappedContent.Height) {
 		return nil, Matrix{}, fmt.Errorf("%w: print layout transform range", ErrLimit)
 	}
-	return &PrintLayout{Width: media.Width, Height: media.Height, Transform: transform, PageClip: pageClip, MediaClip: area}, rotation, nil
+	widthMicrons, heightMicrons := placement.widthMicrons, placement.heightMicrons
+	if !placement.hasMicrons {
+		if widthMicrons <= 0 {
+			widthMicrons = printUnitsToMicrons(media.Width)
+		}
+		if heightMicrons <= 0 {
+			heightMicrons = printUnitsToMicrons(media.Height)
+		}
+	}
+	return &PrintLayout{
+		Width:              media.Width,
+		Height:             media.Height,
+		Transform:          transform,
+		PageClip:           pageClip,
+		MediaClip:          area,
+		MediaWidthMicrons:  widthMicrons,
+		MediaHeightMicrons: heightMicrons,
+		MediaSizeName:      placement.mediaName,
+		ImageableArea:      area,
+		ContentBox:         mappedContent,
+		BleedBox:           mappedBleed,
+		ScaleX:             scale.A,
+		ScaleY:             scale.D,
+		RotationDegrees:    printRotationDegrees(rotation),
+		Borderless:         border == "Borderless",
+		Mirrored:           mirrorName != "None",
+	}, rotation, nil
+}
+
+// printUnitsToMicrons 将96 DPI布局坐标单位安全四舍五入为微米整数
+// 入参: units 96 DPI长度值
+// 返回: int64 微米整数，溢出时截断至int64边界
+func printUnitsToMicrons(units float64) int64 {
+	raw := math.Round(units / printMicronUnit)
+	if !geometryFinite(raw) || raw <= 0 {
+		return 0
+	}
+	if raw >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(raw)
+}
+
+// printRotationDegrees 从直角正交旋转矩阵提取逆时针旋转角度（0、90、180或270）
+// 入参: rotation 纯方向旋转矩阵
+// 返回: int 逆时针旋转角度
+func printRotationDegrees(rotation Matrix) int {
+	if rotation.A > 0 {
+		return 0
+	}
+	if rotation.A < 0 {
+		return 180
+	}
+	if rotation.B < 0 {
+		return 90
+	}
+	return 270
 }
 
 // printOrientation 将内容坐标空间映射到物理介质坐标空间，旋转角采用Print Schema的逆时针约定
@@ -844,6 +946,22 @@ func printTransformBox(box Rect, transform Matrix) Rect {
 	d := transform.Transform(Point{box.X, box.Y + box.Height})
 	x, y := min(a.X, b.X, c.X, d.X), min(a.Y, b.Y, c.Y, d.Y)
 	return Rect{X: x, Y: y, Width: max(a.X, b.X, c.X, d.X) - x, Height: max(a.Y, b.Y, c.Y, d.Y) - y}
+}
+
+// validatePrintMedia 校验物理介质尺寸与可选可打印区域的有限性、正值与包含关系
+// 入参: media 待校验物理介质配置
+// 返回: error 介质或可打印区域非法错误
+func validatePrintMedia(media PrintMedia) error {
+	if !geometryFinite(media.Width, media.Height) || media.Width < 0 || media.Height < 0 || (media.Width == 0) != (media.Height == 0) {
+		return fmt.Errorf("%w: print media", ErrInvalid)
+	}
+	if media.ImageableArea != nil {
+		area := *media.ImageableArea
+		if !geometryFinite(area.X, area.Y, area.Width, area.Height, area.X+area.Width, area.Y+area.Height) || area.Width <= 0 || area.Height <= 0 || media.Width > 0 && !printBoxWithin(area, Rect{Width: media.Width, Height: media.Height}) {
+			return fmt.Errorf("%w: print imageable area", ErrInvalid)
+		}
+	}
+	return nil
 }
 
 // printBoxWithin 校验有限非负区域是否完整落入另一区域，不使用裁剪掩盖非法设备参数
@@ -977,7 +1095,7 @@ func (s *printLayoutSettings) scale(option, feature *PrintSetting, content, blee
 		return IdentityMatrix(), nil
 	}
 	if name == "Custom" || name == "CustomSquare" {
-		return s.customScale(option, content, anchor, selected)
+		return s.customScale(option, content, imageable, anchor, selected)
 	}
 	source, target := page, imageable
 	switch name {
@@ -1038,10 +1156,10 @@ func (s *printLayoutSettings) alignment(feature *PrintSetting) (Point, bool, err
 	}
 }
 
-// customScale 按百分比缩放并应用以微米声明的偏移，未引用的ParameterInit不参与计算
-// 入参: option Custom或CustomSquare, content 原内容区域, anchor 对齐锚点, aligned 是否声明对齐
+// customScale 按百分比缩放并将内容相对PageImageableSize对齐与叠加微米偏移，未引用的ParameterInit不参与计算
+// 入参: option Custom或CustomSquare, content 原内容区域, imageable 内容空间可打印区域, anchor 对齐锚点, aligned 是否声明对齐
 // 返回: Matrix 内容空间变换, error 描述值、参数或范围错误
-func (s *printLayoutSettings) customScale(option *PrintSetting, content Rect, anchor Point, aligned bool) (Matrix, error) {
+func (s *printLayoutSettings) customScale(option *PrintSetting, content, imageable Rect, anchor Point, aligned bool) (Matrix, error) {
 	xName, yName := "ScaleWidth", "ScaleHeight"
 	if option.Name.Local == "CustomSquare" {
 		xName, yName = "Scale", "Scale"
@@ -1071,11 +1189,11 @@ func (s *printLayoutSettings) customScale(option *PrintSetting, content Rect, an
 	if err := printOptionProperties(option, xName, yName, "OffsetWidth", "OffsetHeight"); err != nil {
 		return Matrix{}, err
 	}
-	result := Matrix{A: x / 100, D: y / 100, E: offsetX * printMicronUnit, F: offsetY * printMicronUnit}
+	sx, sy := x/100, y/100
+	result := Matrix{A: sx, D: sy, E: imageable.X + offsetX*printMicronUnit, F: imageable.Y + offsetY*printMicronUnit}
 	if aligned {
-		position := Point{content.X + content.Width*anchor.X, content.Y + content.Height*anchor.Y}
-		result.E += position.X * (1 - result.A)
-		result.F += position.Y * (1 - result.D)
+		result.E = imageable.X + (imageable.Width-content.Width*sx)*anchor.X - content.X*sx + offsetX*printMicronUnit
+		result.F = imageable.Y + (imageable.Height-content.Height*sy)*anchor.Y - content.Y*sy + offsetY*printMicronUnit
 	}
 	return result, nil
 }
@@ -1309,7 +1427,7 @@ func (s *printLayoutSettings) poster(maximum int) (int, error) {
 	return s.integer(value, "SheetsPerPage", maximum)
 }
 
-// poster 按整除网格与行优先顺序将单页分幅为独立单面纸张并追加到输出
+// poster 按最优拼合总纸幅与方向计算等比放大系数并将单页分幅为独立单面纸张
 // 入参: page 页面描述, document 文档设置
 // 返回: error 冲突、几何、取消或容量错误
 func (p *printSheetPacker) poster(page printPlanPage, document printPlanDocument) error {
@@ -1319,20 +1437,33 @@ func (p *printSheetPacker) poster(page printPlanPage, document printPlanDocument
 	if err := p.flush(); err != nil {
 		return err
 	}
-	columns, rows, err := p.posterGrid(page.poster, page.layout.MediaClip)
+	area := page.layout.MediaClip
+	columns, rows, rotated, factor, err := p.posterLayout(page.poster, area)
 	if err != nil {
 		return err
 	}
-	area := page.layout.MediaClip
-	factor := float64(min(columns, rows))
+	totalW, totalH := float64(columns)*area.Width, float64(rows)*area.Height
 	for row := range rows {
 		for column := range columns {
 			if err := p.builder.step(1); err != nil {
 				return err
 			}
-			mapping := Matrix{A: factor, D: factor,
-				E: area.X*(1-factor) + (float64(columns)-factor)*area.Width/2 - float64(column)*area.Width,
-				F: area.Y*(1-factor) + (float64(rows)-factor)*area.Height/2 - float64(row)*area.Height}
+			var mapping Matrix
+			if rotated {
+				mapping = Matrix{
+					B: -factor,
+					C: factor,
+					E: area.X + (totalW-factor*area.Height)/2 - factor*area.Y - float64(column)*area.Width,
+					F: area.Y + (totalH+factor*area.Width)/2 + factor*area.X - float64(row)*area.Height,
+				}
+			} else {
+				mapping = Matrix{
+					A: factor,
+					D: factor,
+					E: area.X*(1-factor) + (float64(columns)-factor)*area.Width/2 - float64(column)*area.Width,
+					F: area.Y*(1-factor) + (float64(rows)-factor)*area.Height/2 - float64(row)*area.Height,
+				}
+			}
 			placement := PrintPlacement{Page: page.index, DocumentIndex: page.document, Transform: mapping.Mul(page.layout.Transform), PageClip: page.layout.PageClip, MediaClip: area, Watermark: page.watermark, Negative: page.negative, Color: clonePrintColorPlan(page.colorPlan)}
 			box := printTransformBox(page.layout.PageClip, placement.Transform)
 			if !geometryFillMatrixFinite(placement.Transform) || !geometryFinite(box.X, box.Y, box.Width, box.Height, box.X+box.Width, box.Y+box.Height) {
@@ -1346,6 +1477,30 @@ func (p *printSheetPacker) poster(page printPlanPage, document printPlanDocument
 		}
 	}
 	return nil
+}
+
+// posterLayout 按拼合总纸幅与方向选择使等比放大系数最大的整除网格与方向，平局时优先不旋转与纸张原生朝向
+// 入参: count 纸张数, area 单张纸可打印区域
+// 返回: int 列数, int 行数, bool 是否逆时针旋转90度, float64 最优等比放大系数, error 取消、容量或无效区域错误
+func (p *printSheetPacker) posterLayout(count int, area Rect) (int, int, bool, float64, error) {
+	columns, rows, err := p.posterGrid(count, area)
+	if err != nil {
+		return 0, 0, false, 0, err
+	}
+	bestCols, bestRows, bestRotated := columns, rows, false
+	bestFactor := float64(min(columns, rows))
+	candidates := [][2]int{{columns, rows}}
+	if columns != rows {
+		candidates = append(candidates, [2]int{rows, columns})
+	}
+	for _, grid := range candidates {
+		totalW, totalH := float64(grid[0])*area.Width, float64(grid[1])*area.Height
+		rotatedFactor := min(totalW/area.Height, totalH/area.Width)
+		if rotatedFactor > bestFactor*(1+1e-12) {
+			bestCols, bestRows, bestRotated, bestFactor = grid[0], grid[1], true, rotatedFactor
+		}
+	}
+	return bestCols, bestRows, bestRotated, bestFactor, nil
 }
 
 // posterGrid 按纸张数与可打印区域宽高比计算近方形整除分幅网格并计入工作预算

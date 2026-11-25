@@ -105,16 +105,18 @@ type SignatureVerifyOptions struct {
 }
 
 // SignatureVerification 保存单份签名的策略判定、密码学、信任及MCE证据，SignatureVerified仅在全部摘要与签名验证后为true
+// MatchedCertificate保存证书模式下通过密码学验签的独立证书副本，信任链失败时仍保留
 // Signer非nil表示显式证书链策略接受了签名者，不包含吊销或可信时间戳结论
 type SignatureVerification struct {
-	Part              PartInfo
-	Status            SignatureStatus
-	Coverage          *SignatureCoverage
-	SignatureVerified bool
-	Signer            *SignatureSigner
-	SignatureError    error
-	TrustError        error
-	UnknownNamespaces []SignatureNamespace
+	Part               PartInfo
+	Status             SignatureStatus
+	Coverage           *SignatureCoverage
+	SignatureVerified  bool
+	MatchedCertificate *x509.Certificate
+	Signer             *SignatureSigner
+	SignatureError     error
+	TrustError         error
+	UnknownNamespaces  []SignatureNamespace
 }
 
 // String 返回数字签名状态的可读名称
@@ -366,24 +368,24 @@ func signatureTrustOptions(options x509.VerifyOptions) x509.VerifyOptions {
 
 // verifySignatureSigner 共用摘要、包内证书匹配及显式信任验证，不把缺少证书当作密码学成功
 // 入参: info 同次读取的声明, data 原始签名XML, graph 私有读取预算, limits 处理上限, options 独立信任参数
-// 返回: *SignatureSigner 已信任签名者, bool 签名值是否曾由包内证书验证, error 数据、密码学、信任、能力、资源或取消错误
-func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePartGraph, limits Limits, options x509.VerifyOptions) (*SignatureSigner, bool, error) {
+// 返回: *SignatureSigner 已信任签名者, *x509.Certificate 通过密码学验签的独立证书副本, bool 签名值是否曾由包内证书或公钥验证, error 数据、密码学、信任、能力、资源或取消错误
+func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePartGraph, limits Limits, options x509.VerifyOptions) (*SignatureSigner, *x509.Certificate, bool, error) {
 	ctx := graph.context
 	certificates, err := loadSignatureCertificates(info, graph)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	v := signatureVerifier{graph: graph, limits: limits, work: limits.MaxPackageBytes}
 	canonical, err := v.prepare(info, data)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	if len(certificates) == 0 {
 		var keyCapErr error
 		triedKey := false
 		for _, key := range info.PublicKeys {
 			if err := ctx.Err(); err != nil {
-				return nil, false, err
+				return nil, nil, false, err
 			}
 			if err := signatureKey(info.Method, key); err != nil {
 				if !errors.Is(err, ErrInvalid) {
@@ -400,27 +402,28 @@ func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePar
 					keyCapErr = err
 					continue
 				}
-				return nil, false, err
+				return nil, nil, false, err
 			}
-			return nil, true, fmt.Errorf("%w: no document signer certificates", ErrTrust)
+			return nil, nil, true, fmt.Errorf("%w: no document signer certificates", ErrTrust)
 		}
 		if keyCapErr != nil {
-			return nil, false, keyCapErr
+			return nil, nil, false, keyCapErr
 		}
 		if triedKey {
-			return nil, false, fmt.Errorf("%w: no key value matches the signature value", ErrSignature)
+			return nil, nil, false, fmt.Errorf("%w: no key value matches the signature value", ErrSignature)
 		}
-		return nil, false, fmt.Errorf("%w: no document signer certificates", ErrTrust)
+		return nil, nil, false, fmt.Errorf("%w: no document signer certificates", ErrTrust)
 	}
 	for _, certificate := range certificates {
 		options.Intermediates.AddCert(certificate)
 	}
 	var trustError error
 	var capabilityError error
+	var matchedCert *x509.Certificate
 	matched := false
 	for _, certificate := range certificates {
 		if err := ctx.Err(); err != nil {
-			return nil, false, err
+			return nil, nil, false, err
 		}
 		if err := signatureKey(info.Method, certificate.PublicKey); err != nil {
 			if errors.Is(err, ErrInvalid) {
@@ -437,9 +440,12 @@ func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePar
 				capabilityError = err
 				continue
 			}
-			return nil, false, err
+			return nil, nil, false, err
 		}
 		matched = true
+		if matchedCert == nil {
+			matchedCert = certificate
+		}
 		if err := signatureCertificateUsage(certificate); err != nil {
 			trustError = err
 			continue
@@ -450,18 +456,29 @@ func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePar
 			continue
 		}
 		if err := ctx.Err(); err != nil {
-			return nil, true, err
+			return nil, nil, true, err
 		}
 		signer, err := cloneSignatureSigner(ctx, certificate, chains)
-		return signer, true, err
+		if err != nil {
+			return nil, nil, true, err
+		}
+		matchedCopy, err := cloneSignatureCertificate(certificate)
+		if err != nil {
+			return nil, nil, true, err
+		}
+		return signer, matchedCopy, true, nil
 	}
 	if matched && trustError != nil {
-		return nil, true, trustError
+		matchedCopy, err := cloneSignatureCertificate(matchedCert)
+		if err != nil {
+			return nil, nil, true, err
+		}
+		return nil, matchedCopy, true, trustError
 	}
 	if capabilityError != nil {
-		return nil, matched, capabilityError
+		return nil, nil, false, capabilityError
 	}
-	return nil, false, fmt.Errorf("%w: no certificate matches the signature value", ErrSignature)
+	return nil, nil, false, fmt.Errorf("%w: no certificate matches the signature value", ErrSignature)
 }
 
 // loadSignatureCertificates 优先使用KeyInfo已指定的证书，合并重复DER，损坏证书不触发来源回退
@@ -524,15 +541,26 @@ func signatureCertificateUsage(certificate *x509.Certificate) error {
 	return nil
 }
 
+// cloneSignatureCertificate 重新解析返回独立证书副本，避免共享DER字节或池中可变对象
+// 入参: certificate 待复制证书
+// 返回: *x509.Certificate 独立证书副本, error 解析错误
+func cloneSignatureCertificate(certificate *x509.Certificate) (*x509.Certificate, error) {
+	copyCert, err := x509.ParseCertificate(bytes.Clone(certificate.Raw))
+	if err != nil {
+		return nil, fmt.Errorf("%w: verified signer certificate: %w", ErrInvalid, err)
+	}
+	return copyCert, nil
+}
+
 // cloneSignatureSigner 重新解析返回证书及链，避免返回调用方证书池中的对象或共享DER字节
 // 入参: ctx 取消Context, certificate 匹配签名的证书, chains 已验证的证书链
 // 返回: *SignatureSigner 独立结果, error 解析或取消错误
 func cloneSignatureSigner(ctx context.Context, certificate *x509.Certificate, chains [][]*x509.Certificate) (*SignatureSigner, error) {
-	copy, err := x509.ParseCertificate(bytes.Clone(certificate.Raw))
+	copyCert, err := cloneSignatureCertificate(certificate)
 	if err != nil {
-		return nil, fmt.Errorf("%w: verified signer certificate: %w", ErrInvalid, err)
+		return nil, err
 	}
-	result := &SignatureSigner{Certificate: copy, Chains: make([][]*x509.Certificate, len(chains))}
+	result := &SignatureSigner{Certificate: copyCert, Chains: make([][]*x509.Certificate, len(chains))}
 	for index, chain := range chains {
 		for _, certificate := range chain {
 			if err := checkContext(ctx); err != nil {
@@ -1161,9 +1189,9 @@ func (r *Reader) verifyLoadedDocumentSignature(info *SignatureInfo, data []byte,
 		if err := signatureKey(info.Method, configuration.PublicKey); err != nil {
 			return nil, err
 		}
-		if _, err := signatureMethodDigest(info.Method, info.PSS); err != nil {
-			return nil, err
-		}
+	}
+	if _, err := signatureMethodDigest(info.Method, info.PSS); err != nil {
+		return nil, err
 	}
 	coverage, err := r.signatureCoverage(info, graph)
 	if err != nil {
@@ -1190,42 +1218,25 @@ func (r *Reader) verifyLoadedDocumentSignature(info *SignatureInfo, data []byte,
 		} else {
 			result.SignatureVerified = true
 		}
-		if len(coverage.UnexpectedParts)+len(coverage.UnexpectedRelationships)+len(coverage.UngroupedSignatures) != 0 {
-			result.Status = SignatureIncompliant
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			return result, nil
-		}
-		if len(coverage.MissingParts)+len(coverage.MissingRelationships) != 0 {
-			result.Status = SignatureBroken
-			if r.format == FormatXPS {
-				result.Status = SignatureIncompliant
-			}
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			return result, nil
-		}
-		if !result.SignatureVerified {
-			result.Status = SignatureBroken
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			return result, nil
-		}
-		result.Status = SignatureValid
-		result.UnknownNamespaces, err = signatureNamespaces(info, data, graph, r.format, configuration.Namespaces)
+	} else {
+		signer, matchedCert, verified, err := verifySignatureSigner(info, data, graph, r.limits, signatureTrustOptions(configuration.Trust))
+		result.SignatureVerified, result.MatchedCertificate = verified, matchedCert
 		if err != nil {
-			return nil, err
+			var failure *packageReadError
+			if errors.As(err, &failure) {
+				return nil, err
+			}
+			switch {
+			case errors.Is(err, ErrTrust):
+				result.TrustError = err
+			case errors.Is(err, ErrSignature), errors.Is(err, ErrInvalid):
+				result.SignatureError = err
+			default:
+				return nil, err
+			}
+		} else {
+			result.Signer = signer
 		}
-		if len(result.UnknownNamespaces) != 0 {
-			result.Status = SignatureQuestionable
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		return result, nil
 	}
 	if len(coverage.UnexpectedParts)+len(coverage.UnexpectedRelationships)+len(coverage.UngroupedSignatures) != 0 {
 		result.Status = SignatureIncompliant
@@ -1244,30 +1255,17 @@ func (r *Reader) verifyLoadedDocumentSignature(info *SignatureInfo, data []byte,
 		}
 		return result, nil
 	}
-	if _, err := signatureMethodDigest(info.Method, info.PSS); err != nil {
-		return nil, err
+	if result.SignatureError != nil {
+		result.Status = SignatureBroken
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return result, nil
 	}
-	signer, verified, err := verifySignatureSigner(info, data, graph, r.limits, signatureTrustOptions(configuration.Trust))
-	result.SignatureVerified = verified
-	if err != nil {
-		var failure *packageReadError
-		if errors.As(err, &failure) {
-			return nil, err
-		}
-		switch {
-		case errors.Is(err, ErrTrust):
-			result.Status, result.TrustError = SignatureQuestionable, err
-		case errors.Is(err, ErrSignature), errors.Is(err, ErrInvalid):
-			result.Status, result.SignatureError = SignatureBroken, err
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			return result, nil
-		default:
-			return nil, err
-		}
+	if result.TrustError != nil {
+		result.Status = SignatureQuestionable
 	} else {
-		result.Status, result.Signer = SignatureValid, signer
+		result.Status = SignatureValid
 	}
 	result.UnknownNamespaces, err = signatureNamespaces(info, data, graph, r.format, configuration.Namespaces)
 	if err != nil {

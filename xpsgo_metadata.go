@@ -677,7 +677,7 @@ func (r *Reader) DiscardControl(ctx context.Context) (*DiscardControl, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !strings.EqualFold(opcMediaTypeBase(media), fixedContentType("discard-control")) {
+	if !matchStandardContentType(r.format, media, fixedContentType("discard-control")) {
 		return nil, &PartError{Part: part, Err: fmt.Errorf("%w: discard control content type", ErrInvalid)}
 	}
 	data, err := r.pkg.readItemsContext(ctx, strings.ToLower(part), min(r.limits.MaxMetadataBytes, r.limits.MaxPartBytes, r.limits.MaxPackageBytes))
@@ -1043,13 +1043,20 @@ func (r *Reader) Thumbnail(ctx context.Context, source string, options *ImageOpt
 // 入参: source 包根或来源部件, ctx 取消Context
 // 返回: []PartInfo 按部件名排序的不同目标, error 元数据或取消错误
 func (r *Reader) thumbnailParts(source string, ctx context.Context) ([]PartInfo, error) {
+	return r.thumbnailPartsWithOptions(source, false, ctx)
+}
+
+// thumbnailPartsWithOptions 在读锁内校验缩略图来源及目标，并按需纳入MS-XPS 1.0固定文档缩略图检查
+// 入参: source 包根或来源部件, allowDocument 是否允许固定文档作为缩略图来源, ctx 取消Context
+// 返回: []PartInfo 按部件名排序的不同目标, error 元数据或取消错误
+func (r *Reader) thumbnailPartsWithOptions(source string, allowDocument bool, ctx context.Context) ([]PartInfo, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
 	if source == "" {
 		source = "/"
 	}
-	page := false
+	single := false
 	if source != "/" {
 		canonical, err := opcPartName(source)
 		if err != nil {
@@ -1061,11 +1068,19 @@ func (r *Reader) thumbnailParts(source string, ctx context.Context) ([]PartInfo,
 		}
 		for _, value := range r.pages {
 			if strings.EqualFold(value.Part, source) {
-				page = true
+				single = true
 				break
 			}
 		}
-		if !page {
+		if !single && allowDocument {
+			for _, value := range r.documents {
+				if strings.EqualFold(value.Part, source) {
+					single = true
+					break
+				}
+			}
+		}
+		if !single {
 			return nil, nil
 		}
 	}
@@ -1073,7 +1088,7 @@ func (r *Reader) thumbnailParts(source string, ctx context.Context) ([]PartInfo,
 	if err != nil {
 		return nil, err
 	}
-	targets, err := thumbnailTargets(source, relations, page)
+	targets, err := thumbnailTargets(source, relations, single)
 	if err != nil {
 		return nil, err
 	}
@@ -1144,6 +1159,12 @@ func thumbnailMedia(media string) bool {
 // 返回: error 关联、图像、资源或取消错误
 func (p *Package) validateThumbnailLinks(r *Reader, ctx context.Context) error {
 	sources := []string{"/"}
+	allowDocument := r.format == FormatXPS
+	if allowDocument {
+		for _, doc := range r.documents {
+			sources = append(sources, doc.Part)
+		}
+	}
 	for _, page := range r.pages {
 		sources = append(sources, page.Part)
 	}
@@ -1151,7 +1172,7 @@ func (p *Package) validateThumbnailLinks(r *Reader, ctx context.Context) error {
 	remaining := p.limits.MaxPackageBytes
 	pixels := p.maxImagePixels
 	for _, source := range sources {
-		parts, err := r.thumbnailParts(source, ctx)
+		parts, err := r.thumbnailPartsWithOptions(source, allowDocument, ctx)
 		if err != nil {
 			return err
 		}

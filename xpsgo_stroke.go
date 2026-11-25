@@ -15,6 +15,7 @@
 package xpsgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"math/big"
@@ -33,10 +34,11 @@ const (
 // errStrokePathRefine 表示当前弧长界不足以确定虚线端点，需要进一步细分
 var errStrokePathRefine = fmt.Errorf("%w: stroke dash endpoint requires refinement", ErrLimit)
 
-// StrokeOutlineOptions 设置描边转闭合轮廓几何时的逼近容限与边数预算，零值采用默认配置
+// StrokeOutlineOptions 设置描边转闭合轮廓几何时的逼近容限、边数预算与标称细线宽，零值采用默认配置
 type StrokeOutlineOptions struct {
-	Tolerance float64
-	MaxEdges  int
+	Tolerance    float64
+	MaxEdges     int
+	NominalWidth float64
 }
 
 // strokeDashSpan 表示中心线距离域中的闭合虚线区间，包括零长区间
@@ -1348,7 +1350,18 @@ func (b *strokeOutlineBuilder) miter(p, incoming, outgoing Point, limit float64)
 // 入参: path 已填入规范默认值的路径, transform 有效设备变换, tolerance 正的设备误差容限, maxEdges 非负几何输出及中心线预算
 // 返回: []geometryEdge 供非零规则统一覆盖的描边边集, error 参数、能力、数值或资源限制错误，失败时无部分结果
 func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges int) ([]geometryEdge, error) {
-	if path == nil || path.Data == nil || !geometryFillMatrixFinite(transform) || !geometryFinite(tolerance) || tolerance <= 0 || maxEdges < 0 {
+	return pathStrokeEdgesContext(context.Background(), path, transform, tolerance, maxEdges, 0)
+}
+
+// pathStrokeEdgesContext 在支持取消检查与可选标称细线宽的条件下生成闭合非零规则描边边集
+// 入参: ctx 取消Context, path 路径元素, transform 有效仿射变换矩阵, tolerance 逼近容限, maxEdges 边数上限, nominalWidth 零宽细线标称宽度（零值保持标准默认一单位）
+// 返回: []geometryEdge 闭合有向边集, error 参数、样式、数值、预算或取消错误
+func pathStrokeEdgesContext(ctx context.Context, path *Path, transform Matrix, tolerance float64, maxEdges int, nominalWidth float64) ([]geometryEdge, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if path == nil || path.Data == nil || !geometryFillMatrixFinite(transform) || !geometryFinite(tolerance, nominalWidth) || tolerance <= 0 || maxEdges < 0 || nominalWidth < 0 {
 		return nil, fmt.Errorf("%w: stroke path parameters", ErrInvalid)
 	}
 	if maxEdges > int(^uint(0)>>1)/4 {
@@ -1358,9 +1371,18 @@ func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges i
 	if !geometryFinite(style.thickness, style.miter, path.StrokeDashOffset) || style.thickness < 0 || style.miter < 1 || !strokeOutlineCapValid(style.startCap) || !strokeOutlineCapValid(style.endCap) || !strokeOutlineCapValid(path.StrokeDashCap) || style.join != LineJoinMiter && style.join != LineJoinBevel && style.join != LineJoinRound {
 		return nil, fmt.Errorf("%w: stroke path style", ErrInvalid)
 	}
-	dashed, nominal, err := strokePathDashMode(path.StrokeDashArray, path.StrokeDashOffset)
+	dashed, dashNominal, err := strokePathDashMode(path.StrokeDashArray, path.StrokeDashOffset)
 	if err != nil {
 		return nil, err
+	}
+	nominal := dashNominal || style.thickness == 0 && nominalWidth > 0
+	effectiveNominalWidth := 1.0
+	if nominalWidth > 0 {
+		effectiveNominalWidth = nominalWidth
+	}
+	nominalRadius := effectiveNominalWidth / 2
+	if nominal && nominalRadius == 0 {
+		return nil, fmt.Errorf("%w: stroke nominal radius underflow", ErrLimit)
 	}
 	geometry := IdentityMatrix()
 	if path.Data.Transform != nil {
@@ -1371,6 +1393,9 @@ func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges i
 	}
 	segments, segmentLimit := 0, max(rasterMaxEdges, maxEdges)
 	for _, figure := range path.Data.Figures {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
 		if !geometryFinite(figure.StartPoint.X, figure.StartPoint.Y) {
 			return nil, fmt.Errorf("%w: stroke figure start", ErrInvalid)
 		}
@@ -1378,7 +1403,12 @@ func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges i
 			return nil, fmt.Errorf("%w: stroke segment budget", ErrLimit)
 		}
 		segments += len(figure.Segments) + 1
-		for _, segment := range figure.Segments {
+		for idx, segment := range figure.Segments {
+			if idx&255 == 0 {
+				if err := checkContext(ctx); err != nil {
+					return nil, err
+				}
+			}
 			if err := geometryFillValidateSegment(segment); err != nil {
 				return nil, err
 			}
@@ -1413,13 +1443,13 @@ func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges i
 		geometryZero := geometry.A == 0 && geometry.B == 0 && geometry.C == 0 && geometry.D == 0
 		curveGeometry = strokePathCompose(transform, geometry)
 		curveDevice = IdentityMatrix()
-		planningPath.StrokeThickness = 1
+		planningPath.StrokeThickness = effectiveNominalWidth
 		lengthTolerance = tolerance / float64(max(1, segments)) / 8
 		if !geometryFillMatrixFinite(curveGeometry) || !geometrySingular && geometryMatrixSingular(curveGeometry) || !geometryZero && curveGeometry.A == 0 && curveGeometry.B == 0 && curveGeometry.C == 0 && curveGeometry.D == 0 {
 			return nil, fmt.Errorf("%w: nominal stroke transform precision", ErrLimit)
 		}
 	}
-	angularTolerance, err := strokePathAngleBudget(builder.radius, transform, tolerance, nominal, deviceSpace)
+	angularTolerance, err := strokePathAngleBudgetWidth(builder.radius, transform, tolerance, nominal, deviceSpace, nominalRadius)
 	if err != nil {
 		return nil, err
 	}
@@ -1436,14 +1466,20 @@ func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges i
 		curveAngle /= 2
 	}
 	for _, figure := range path.Data.Figures {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
 		var pieces []strokePathPiece
 		precision := lengthTolerance
 		for attempt := 0; ; attempt++ {
-			runs, runErr := strokePathRuns(figure, curveGeometry, metric, tolerance/4, precision, curveAngle, &remaining)
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+			runs, runErr := strokePathRunsContext(ctx, figure, curveGeometry, metric, tolerance/4, precision, curveAngle, &remaining)
 			if runErr != nil {
 				return nil, runErr
 			}
-			pieces, err = strokePathPieces(runs, figure.IsClosed, &planningPath, dashed, angularTolerance, lengthTolerance*float64(max(1, segments)), maxEdges-len(builder.fill.edges), &dashWork)
+			pieces, err = strokePathPiecesContext(ctx, runs, figure.IsClosed, &planningPath, dashed, angularTolerance, lengthTolerance*float64(max(1, segments)), maxEdges-len(builder.fill.edges), &dashWork)
 			if err != errStrokePathRefine || attempt == 11 {
 				break
 			}
@@ -1456,8 +1492,11 @@ func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges i
 			return nil, err
 		}
 		for _, piece := range pieces {
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
 			if builder.radius != 0 {
-				if err := builder.pathPiece(piece, style); err != nil {
+				if err := builder.pathPieceContext(ctx, piece, style); err != nil {
 					return nil, err
 				}
 			}
@@ -1470,8 +1509,8 @@ func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges i
 					}
 				}
 				firstEdge := len(builder.fill.edges)
-				hairline := strokeOutlineBuilder{fill: builder.fill, transform: IdentityMatrix(), radius: 0.5}
-				if err := hairline.pathPiece(devicePiece, style); err != nil {
+				hairline := strokeOutlineBuilder{fill: builder.fill, transform: IdentityMatrix(), radius: nominalRadius}
+				if err := hairline.pathPieceContext(ctx, devicePiece, style); err != nil {
 					return nil, err
 				}
 				if geometryMatrixOrientation(transform) < 0 {
@@ -1486,13 +1525,13 @@ func pathStrokeEdges(path *Path, transform Matrix, tolerance float64, maxEdges i
 	return builder.fill.edges, nil
 }
 
-// strokePathAngleBudget 按笔画半宽与设备误差容限分配局部切线角度预算
-// 入参: radius 描边半宽, transform 有效设备变换, tolerance 设备误差预算, nominal 是否有标称轮廓, deviceSpace 是否已在设备空间展开
+// strokePathAngleBudgetWidth 按笔画半宽、标称细线半宽与设备误差容限分配局部切线角度预算
+// 入参: radius 描边半宽, transform 有效设备变换, tolerance 设备误差预算, nominal 是否有标称轮廓, deviceSpace 是否已在设备空间展开, nominalRadius 标称细线半宽
 // 返回: float64 正的弧度上限, error 角度或变换精度超出表示范围错误
-func strokePathAngleBudget(radius float64, transform Matrix, tolerance float64, nominal, deviceSpace bool) (float64, error) {
+func strokePathAngleBudgetWidth(radius float64, transform Matrix, tolerance float64, nominal, deviceSpace bool, nominalRadius float64) (float64, error) {
 	angle := math.Pi / 8
 	if deviceSpace {
-		angle = strokePathRadiusAngle(tolerance, 0.5, 1)
+		angle = strokePathRadiusAngle(tolerance, nominalRadius, 1)
 	} else {
 		scale := math.Hypot(math.Hypot(transform.A, transform.B), math.Hypot(transform.C, transform.D))
 		if radius > 0 {
@@ -1510,7 +1549,7 @@ func strokePathAngleBudget(radius float64, transform Matrix, tolerance float64, 
 			if !geometryFinite(condition) || condition == 0 {
 				return 0, fmt.Errorf("%w: nominal stroke direction range", ErrLimit)
 			}
-			angle = min(angle, strokePathRadiusAngle(tolerance, 1, condition))
+			angle = min(angle, strokePathRadiusAngle(tolerance, nominalRadius*2, condition))
 			angle = min(angle, 2*math.Asin(math.Sin(math.Pi/16)/condition/2))
 		}
 	}
@@ -1645,10 +1684,10 @@ func strokePathDashMode(pattern []float64, offset float64) (bool, bool, error) {
 	return dashed, nominal, nil
 }
 
-// strokePathRuns 展开原始段并在未描边段处分组，显式保留闭合附加段及退化连接
-// 入参: figure 原始子路径, geometry 几何变换, device 设备误差度量变换, tolerance 设备展开误差, lengthTolerance 单段弧长误差, angularTolerance 切线角度上限, remaining 剩余中心线点数
-// 返回: []strokePathRun 按原始顺序排列的描边连续段, error 展开或数值限制错误
-func strokePathRuns(figure GeometryFigure, geometry, device Matrix, tolerance, lengthTolerance, angularTolerance float64, remaining *int) ([]strokePathRun, error) {
+// strokePathRunsContext 在支持取消检查的条件下展开原始段并在未描边段处分组
+// 入参: ctx 取消Context, figure 原始子路径, geometry 几何变换, device 设备误差度量变换, tolerance 设备展开误差, lengthTolerance 单段弧长误差, angularTolerance 切线角度上限, remaining 剩余中心线点数
+// 返回: []strokePathRun 按原始顺序排列的描边连续段, error 展开、数值限制或取消错误
+func strokePathRunsContext(ctx context.Context, figure GeometryFigure, geometry, device Matrix, tolerance, lengthTolerance, angularTolerance float64, remaining *int) ([]strokePathRun, error) {
 	var runs []strokePathRun
 	var run strokePathRun
 	current := figure.StartPoint
@@ -1668,6 +1707,9 @@ func strokePathRuns(figure GeometryFigure, geometry, device Matrix, tolerance, l
 		return []strokePathRun{{points: []Point{point, point}, joins: []bool{false, false}, distance: []float64{0, 0}, lengthBounds: make([]strokeDistanceRange, 2), start: true, end: true}}, nil
 	}
 	for i := range count {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
 		segment := GeometrySegment{Kind: GeometryLine, Point: figure.StartPoint, IsStroked: true}
 		if i < len(figure.Segments) {
 			segment = figure.Segments[i]
@@ -1710,6 +1752,9 @@ func strokePathRuns(figure GeometryFigure, geometry, device Matrix, tolerance, l
 		runs = append(runs, run)
 	}
 	for i := range runs {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
 		if err := strokePathMeasure(&runs[i]); err != nil {
 			return nil, err
 		}
@@ -1717,14 +1762,17 @@ func strokePathRuns(figure GeometryFigure, geometry, device Matrix, tolerance, l
 	return runs, nil
 }
 
-// strokePathPieces 按连续段独立重启虚线相位，并区分真实端点与内部断口的端帽
-// 入参: runs 有弧长定位的描边连续段, closed 原始子路径是否闭合, path 原始描边样式, dashed 是否需要虚线切分, angle 切线角预算, tolerance 弧长定位预算, maxPieces 非负片段数量上限, work 剩余虚线定位工作量
-// 返回: []strokePathPiece 描边片段, error 虚线或资源限制错误
-func strokePathPieces(runs []strokePathRun, closed bool, path *Path, dashed bool, angle, tolerance float64, maxPieces int, work *int) ([]strokePathPiece, error) {
+// strokePathPiecesContext 在支持取消检查的条件下按连续段独立重启虚线相位并切分片段
+// 入参: ctx 取消Context, runs 有弧长定位的描边连续段, closed 原始子路径是否闭合, path 原始描边样式, dashed 是否需要虚线切分, angle 切线角预算, tolerance 弧长定位预算, maxPieces 非负片段数量上限, work 剩余虚线定位工作量
+// 返回: []strokePathPiece 描边片段, error 虚线、资源限制或取消错误
+func strokePathPiecesContext(ctx context.Context, runs []strokePathRun, closed bool, path *Path, dashed bool, angle, tolerance float64, maxPieces int, work *int) ([]strokePathPiece, error) {
 	var pieces []strokePathPiece
 	firstRunEnd := 0
 	remaining := maxPieces
 	for i, run := range runs {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
 		length := run.distance[len(run.distance)-1]
 		spans := []strokeDashSpan{{0, length}}
 		if dashed {
@@ -1737,7 +1785,12 @@ func strokePathPieces(runs []strokePathRun, closed bool, path *Path, dashed bool
 		if len(spans) > maxPieces-len(pieces) {
 			return nil, fmt.Errorf("%w: stroke piece budget", ErrLimit)
 		}
-		for _, span := range spans {
+		for spanIdx, span := range spans {
+			if spanIdx&63 == 0 {
+				if err := checkContext(ctx); err != nil {
+					return nil, err
+				}
+			}
 			piece, err := strokePathSlice(run, span, remaining)
 			if err != nil {
 				return nil, err
@@ -1896,13 +1949,18 @@ func strokePathPositionIndex(run strokePathRun, distance float64, outgoing bool)
 	return max(1, i)
 }
 
-// pathPiece 扩展描边片段，原始连接使用指定样式，平滑细分点使用圆连接，内部回折不加连接
-// 入参: piece 中心线片段及端帽, style 原始描边参数
-// 返回: error 数值或资源限制错误
-func (b *strokeOutlineBuilder) pathPiece(piece strokePathPiece, style strokeOutlineStyle) error {
+// pathPieceContext 在支持取消检查的条件下扩展描边片段的线段、连接与端帽
+// 入参: ctx 取消Context, piece 中心线片段及端帽, style 原始描边参数
+// 返回: error 数值、资源限制或取消错误
+func (b *strokeOutlineBuilder) pathPieceContext(ctx context.Context, piece strokePathPiece, style strokeOutlineStyle) error {
 	first, previous := -1, -1
 	var firstDirection, previousDirection Point
 	for i := 1; i < len(piece.points); i++ {
+		if i&63 == 0 {
+			if err := checkContext(ctx); err != nil {
+				return err
+			}
+		}
 		p, q := piece.points[i-1], piece.points[i]
 		if p == q {
 			continue
@@ -1966,15 +2024,20 @@ func (b *strokeOutlineBuilder) pathPiece(piece strokePathPiece, style strokeOutl
 }
 
 // StrokeOutline 将路径描边展开为非零绕数规则的闭合多边形填充几何，用于无损导出复杂端帽、虚线、局部不描边段与非均匀缩放描边
-// options为nil或零值字段采用默认容限0.25与边数上限200000，path中省略的端帽、连接与尖角限制按XPS规范默认值补齐
-// 入参: path 路径元素, transform 有效仿射变换矩阵, options 可选展开容限与边数预算
-// 返回: *Geometry 非零规则闭合填充几何, error 参数、样式、数值或预算错误
-func StrokeOutline(path *Path, transform Matrix, options *StrokeOutlineOptions) (*Geometry, error) {
+// options为nil或零值字段采用默认容限0.25与边数上限200000，NominalWidth大于零时在StrokeThickness为零时按该标称细线宽展开轮廓
+// 入参: ctx 用于取消操作的Context, path 路径元素, transform 有效仿射变换矩阵, options 可选展开容限、边数预算与标称细线宽
+// 返回: *Geometry 非零规则闭合填充几何, error 参数、样式、数值、预算或取消错误
+func StrokeOutline(ctx context.Context, path *Path, transform Matrix, options *StrokeOutlineOptions) (*Geometry, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
 	if path == nil || path.Data == nil || !geometryFillMatrixFinite(transform) {
 		return nil, fmt.Errorf("%w: stroke outline parameters", ErrInvalid)
 	}
 	tolerance := defaultStrokeOutlineTolerance
 	maxEdges := defaultStrokeOutlineMaxEdges
+	nominalWidth := 0.0
 	if options != nil {
 		if options.Tolerance != 0 {
 			if !geometryFinite(options.Tolerance) || options.Tolerance < 0 {
@@ -1988,17 +2051,23 @@ func StrokeOutline(path *Path, transform Matrix, options *StrokeOutlineOptions) 
 		if options.MaxEdges > 0 {
 			maxEdges = options.MaxEdges
 		}
+		if options.NominalWidth != 0 {
+			if !geometryFinite(options.NominalWidth) || options.NominalWidth < 0 {
+				return nil, fmt.Errorf("%w: stroke outline nominal width", ErrInvalid)
+			}
+			nominalWidth = options.NominalWidth
+		}
 	}
 	normalized := *path
 	if normalized.Stroke == nil {
 		normalized.Stroke = &Brush{Kind: BrushSolidColor, Opacity: 1}
 	}
 	normalizePathStrokeDefaults(&normalized)
-	edges, err := pathStrokeEdges(&normalized, transform, tolerance, maxEdges)
+	edges, err := pathStrokeEdgesContext(ctx, &normalized, transform, tolerance, maxEdges, nominalWidth)
 	if err != nil {
 		return nil, err
 	}
-	return strokeEdgesToGeometry(edges)
+	return strokeEdgesToGeometryContext(ctx, edges)
 }
 
 // normalizePathStrokeDefaults 为未显式指定的路径描边端帽、连接样式与斜接上限补齐ECMA-388默认值
@@ -2021,16 +2090,24 @@ func normalizePathStrokeDefaults(path *Path) {
 	}
 }
 
-// strokeEdgesToGeometry 校验边坐标有限性、抵消反向共享边并将有向边集整理为非零规则闭合多边形子路径几何
-// 入参: edges 描边引擎生成的有向边切片
-// 返回: *Geometry 非零规则闭合几何, error 非有限坐标错误
-func strokeEdgesToGeometry(edges []geometryEdge) (*Geometry, error) {
+// strokeEdgesToGeometryContext 在支持取消检查的条件下抵消反向共享边并还原非零规则闭合多边形子路径几何
+// 入参: ctx 取消Context, edges 描边引擎生成的有向边切片
+// 返回: *Geometry 非零规则闭合几何, error 非有限坐标或取消错误
+func strokeEdgesToGeometryContext(ctx context.Context, edges []geometryEdge) (*Geometry, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
 	result := &Geometry{FillRule: GeometryNonZero}
 	if len(edges) == 0 {
 		return result, nil
 	}
 	counts := make(map[geometryEdge]int, len(edges))
-	for _, edge := range edges {
+	for i, edge := range edges {
+		if i&255 == 0 {
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+		}
 		if !geometryFinite(edge.start.X, edge.start.Y, edge.end.X, edge.end.Y) {
 			return nil, fmt.Errorf("%w: non-finite stroke outline edge", ErrLimit)
 		}
@@ -2046,7 +2123,12 @@ func strokeEdgesToGeometry(edges []geometryEdge) (*Geometry, error) {
 	}
 	filtered := make([]geometryEdge, 0, len(edges))
 	emitted := make(map[geometryEdge]int, len(counts))
-	for _, edge := range edges {
+	for i, edge := range edges {
+		if i&255 == 0 {
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+		}
 		if edge.start == edge.end {
 			continue
 		}
@@ -2061,9 +2143,19 @@ func strokeEdgesToGeometry(edges []geometryEdge) (*Geometry, error) {
 	outgoing := make(map[Point][]int, len(filtered))
 	used := make([]bool, len(filtered))
 	for i, edge := range filtered {
+		if i&255 == 0 {
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+		}
 		outgoing[edge.start] = append(outgoing[edge.start], i)
 	}
 	for i, edge := range filtered {
+		if i&255 == 0 {
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+		}
 		if used[i] {
 			continue
 		}
@@ -2071,7 +2163,14 @@ func strokeEdgesToGeometry(edges []geometryEdge) (*Geometry, error) {
 		start := edge.start
 		current := edge.end
 		segments := []GeometrySegment{{Kind: GeometryLine, Point: current, IsStroked: true}}
+		steps := 0
 		for current != start {
+			steps++
+			if steps&255 == 0 {
+				if err := checkContext(ctx); err != nil {
+					return nil, err
+				}
+			}
 			list := outgoing[current]
 			nextIdx := -1
 			for len(list) > 0 {

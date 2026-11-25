@@ -27,6 +27,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -64,12 +65,13 @@ const (
 	iccStageSegmentedCurves
 )
 
-// iccMaxChannels 等常量限制ICC色彩通道、管线元素与命名色条目上限
+// iccMaxChannels 等常量限制ICC色彩通道、管线元素、命名色条目与色彩解析缓存上限
 const (
-	iccMaxChannels    = 15
-	iccMaxElements    = 4096
-	iccMaxNamedColors = 1 << 20
-	iccMinFloat32     = 1.1754943508222875e-38
+	iccMaxChannels           = 15
+	iccMaxElements           = 4096
+	iccMaxNamedColors        = 1 << 20
+	iccMinFloat32            = 1.1754943508222875e-38
+	colorResolverMaxProfiles = 256
 )
 
 // cicpBT2100Red 等常量定义ITU-R BT.2100亮度权重与PQ、HLG传递特性常数
@@ -144,19 +146,37 @@ type ColorResolveOptions struct {
 	Negative   bool
 }
 
-// ResolvedColor 保存颜色经ICC与打印色彩策略解析后的精确线性值、量化sRGB、可选源CMYK及灰度结果
+// ResolvedColor 保存颜色经ICC与打印色彩策略解析后的精确线性值、量化sRGB、源色彩空间、专色、设备分量及灰度结果
 type ResolvedColor struct {
-	Space        ColorSpace
-	ProfilePart  string
-	ProfileSpace string
-	Components   []float64
-	Alpha        float64
-	SRGB         color.NRGBA
-	SRGB16       color.NRGBA64
-	Linear       [3]float64
-	CMYK         [4]float64
-	HasCMYK      bool
-	Gray         float64
+	Space            ColorSpace
+	ColorSpace       string
+	ProfilePart      string
+	ProfileSpace     string
+	SpotName         string
+	DeviceComponents []float64
+	Components       []float64
+	Alpha            float64
+	SRGB             color.NRGBA
+	SRGB16           color.NRGBA64
+	Linear           [3]float64
+	CMYK             [4]float64
+	HasCMYK          bool
+	Gray             float64
+}
+
+// colorResolverEntry 保存单个规范化ICC部件对应的已解析配置与四个标准渲染意图的变换缓存
+type colorResolverEntry struct {
+	profile    *iccProfile
+	transforms [4]*iccTransform
+}
+
+// ColorResolver 提供并发安全且有界的ICC配置与变换缓存，用于高频复用ContextColor颜色解析
+type ColorResolver struct {
+	reader     *Reader
+	mu         sync.RWMutex
+	entries    map[string]*colorResolverEntry
+	order      []string
+	maxEntries int
 }
 
 // renderColorSpace 表示页面与图层的合成工作色彩空间
@@ -273,26 +293,105 @@ func ResolvePartURI(basePart, relURI string) (string, error) {
 	return resolvePart(basePart, relURI)
 }
 
+// NewColorResolver 创建绑定当前阅读器的并发安全有界ICC缓存颜色解析器
+// 返回: *ColorResolver 可跨页高频复用的颜色解析器
+func (r *Reader) NewColorResolver() *ColorResolver {
+	return &ColorResolver{
+		reader:     r,
+		entries:    make(map[string]*colorResolverEntry),
+		maxEntries: colorResolverMaxProfiles,
+	}
+}
+
+// ResolveColor 经有界ICC缓存解析sRGB、scRGB或ContextColor，避免重复读取和构建同一配置文件变换
+// 入参: ctx 取消Context，nil采用Background, basePart 源部件包根URI, value 待解析颜色, opts 色彩解析选项，nil采用默认值
+// 返回: ResolvedColor 解析后的多空间颜色及专色元数据, error 状态、参数、部件、配置、转换或取消错误
+func (c *ColorResolver) ResolveColor(ctx context.Context, basePart string, value Color, opts *ColorResolveOptions) (ResolvedColor, error) {
+	if c == nil || c.reader == nil {
+		return ResolvedColor{}, fmt.Errorf("%w: color resolver has no reader", ErrInvalid)
+	}
+	return c.reader.resolveColorWithCache(ctx, basePart, value, opts, c)
+}
+
+// lookup 在读锁下查询已缓存的ICC配置及对应意图变换
+// 入参: key 规范化小写部件名, intent ICC意图编号（0至3）
+// 返回: *iccProfile 缓存配置，未命中为nil, *iccTransform 缓存变换，未命中为nil
+func (c *ColorResolver) lookup(key string, intent uint32) (*iccProfile, *iccTransform) {
+	c.mu.RLock()
+	entry := c.entries[key]
+	if entry == nil {
+		c.mu.RUnlock()
+		return nil, nil
+	}
+	profile := entry.profile
+	transform := entry.transforms[intent]
+	c.mu.RUnlock()
+	return profile, transform
+}
+
+// store 在写锁下写入已解析ICC配置与对应意图变换，超出条目上限时按先进先出淘汰最旧项
+// 入参: key 规范化小写部件名, intent ICC意图编号（0至3）, profile 已解析配置, transform 已准备变换
+func (c *ColorResolver) store(key string, intent uint32, profile *iccProfile, transform *iccTransform) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := c.entries[key]
+	if entry == nil {
+		for len(c.entries) >= c.maxEntries && len(c.order) > 0 {
+			oldest := c.order[0]
+			copy(c.order, c.order[1:])
+			c.order[len(c.order)-1] = ""
+			c.order = c.order[:len(c.order)-1]
+			delete(c.entries, oldest)
+		}
+		entry = &colorResolverEntry{profile: profile}
+		c.entries[key] = entry
+		c.order = append(c.order, key)
+	}
+	entry.transforms[intent] = transform
+}
+
 // ResolveColor 解析sRGB、scRGB及含ICC配置的ContextColor，支持按意图、负片及灰度黑白打印策略转换
 // 源为四通道CMYK配置且未启用反相或灰度单色转换时在CMYK保留原始源分量并置HasCMYK为真
 // 入参: ctx 取消Context，nil采用Background, basePart 源部件包根URI, value 待解析颜色, opts 色彩解析选项，nil采用默认值
 // 返回: ResolvedColor 解析后的多空间颜色结果, error 状态、参数、部件、配置、转换或取消错误
 func (r *Reader) ResolveColor(ctx context.Context, basePart string, value Color, opts *ColorResolveOptions) (ResolvedColor, error) {
-	ctx = normalizeContext(ctx)
-	if err := checkContext(ctx); err != nil {
-		return ResolvedColor{}, err
+	return r.resolveColorWithCache(ctx, basePart, value, opts, nil)
+}
+
+// finalizeResolvedColor 按打印色彩策略完成线性RGB后处理并填充解析颜色的线性、灰度及sRGB字段
+// 入参: result 待填充解析颜色指针, linear 非预乘线性RGB分量, opts 色彩解析选项
+// 返回: error 数值范围错误
+func finalizeResolvedColor(result *ResolvedColor, linear [3]float64, opts ColorResolveOptions) error {
+	outLinear, luminance, err := applyPrintLinearColor(linear, opts.Negative, opts.PrintColor)
+	if err != nil {
+		return err
 	}
-	if err := r.readLock(); err != nil {
-		return ResolvedColor{}, err
+	srgb := [3]float64{
+		renderLinearToSRGB(colorClamp(outLinear[0])),
+		renderLinearToSRGB(colorClamp(outLinear[1])),
+		renderLinearToSRGB(colorClamp(outLinear[2])),
 	}
-	defer r.mu.RUnlock()
-	var cfg ColorResolveOptions
-	if opts != nil {
-		cfg = *opts
+	result.Linear = outLinear
+	result.Gray = renderLinearToSRGB(luminance)
+	result.SRGB = color.NRGBA{
+		R: colorQuantize8(srgb[0]),
+		G: colorQuantize8(srgb[1]),
+		B: colorQuantize8(srgb[2]),
+		A: colorQuantize8(result.Alpha),
 	}
-	if cfg.Intent > IntentAbsoluteColorimetric || cfg.PrintColor > PrintColorMonochrome {
-		return ResolvedColor{}, fmt.Errorf("%w: color resolve options", ErrInvalid)
+	result.SRGB16 = color.NRGBA64{
+		R: colorQuantize16(srgb[0]),
+		G: colorQuantize16(srgb[1]),
+		B: colorQuantize16(srgb[2]),
+		A: colorQuantize16(result.Alpha),
 	}
+	return nil
+}
+
+// resolveLocalColor 在无需Reader及ICC配置文件的纯内存路径下解析sRGB与scRGB颜色
+// 入参: value 待解析颜色, opts 色彩解析选项
+// 返回: ResolvedColor 解析后的多空间颜色结果, error 参数、色彩空间、能力或数值范围错误
+func resolveLocalColor(value Color, opts ColorResolveOptions) (ResolvedColor, error) {
 	if !geometryFinite(value.Alpha) || value.Alpha < 0 || value.Alpha > 1 {
 		return ResolvedColor{}, fmt.Errorf("%w: invalid color alpha", ErrInvalid)
 	}
@@ -318,20 +417,78 @@ func (r *Reader) ResolveColor(ctx context.Context, basePart string, value Color,
 			}
 			linear[i] = renderSRGBToLinear(component)
 		}
+		result.ColorSpace = "sRGB"
 	case ColorScRGB:
 		if len(value.Components) != 3 {
 			return ResolvedColor{}, fmt.Errorf("%w: scRGB color requires three components", ErrInvalid)
 		}
 		linear = [3]float64{value.Components[0], value.Components[1], value.Components[2]}
+		result.ColorSpace = "scRGB"
 	case ColorContext:
-		sourceBase := basePart
-		if sourceBase == "" && strings.HasPrefix(value.ProfileURI, "/") {
-			sourceBase = "/"
+		return ResolvedColor{}, fmt.Errorf("%w: context color requires Reader or ColorResolver", ErrUnsupported)
+	default:
+		return ResolvedColor{}, fmt.Errorf("%w: unsupported color space", ErrInvalid)
+	}
+	if err := finalizeResolvedColor(&result, linear, opts); err != nil {
+		return ResolvedColor{}, err
+	}
+	return result, nil
+}
+
+// resolveColorWithCache 共用颜色解析管线，支持可选有界ICC缓存并填充专色与设备分量元数据
+// 入参: ctx 取消Context，nil采用Background, basePart 源部件包根URI, value 待解析颜色, opts 色彩解析选项, cache 可选有界缓存
+// 返回: ResolvedColor 解析后的多空间颜色结果, error 状态、参数、部件、配置、转换或取消错误
+func (r *Reader) resolveColorWithCache(ctx context.Context, basePart string, value Color, opts *ColorResolveOptions, cache *ColorResolver) (ResolvedColor, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return ResolvedColor{}, err
+	}
+	if err := r.readLock(); err != nil {
+		return ResolvedColor{}, err
+	}
+	defer r.mu.RUnlock()
+	var cfg ColorResolveOptions
+	if opts != nil {
+		cfg = *opts
+	}
+	if cfg.Intent > IntentAbsoluteColorimetric || cfg.PrintColor > PrintColorMonochrome {
+		return ResolvedColor{}, fmt.Errorf("%w: color resolve options", ErrInvalid)
+	}
+	if value.Space != ColorContext {
+		return resolveLocalColor(value, cfg)
+	}
+	if !geometryFinite(value.Alpha) || value.Alpha < 0 || value.Alpha > 1 {
+		return ResolvedColor{}, fmt.Errorf("%w: invalid color alpha", ErrInvalid)
+	}
+	for _, component := range value.Components {
+		if !geometryFinite(component) {
+			return ResolvedColor{}, fmt.Errorf("%w: non-finite color component", ErrInvalid)
 		}
-		part, err := resolvePart(sourceBase, value.ProfileURI)
-		if err != nil {
-			return ResolvedColor{}, err
-		}
+	}
+	result := ResolvedColor{
+		Space:      value.Space,
+		Alpha:      value.Alpha,
+		Components: slices.Clone(value.Components),
+	}
+	sourceBase := basePart
+	if sourceBase == "" && strings.HasPrefix(value.ProfileURI, "/") {
+		sourceBase = "/"
+	}
+	part, err := resolvePart(sourceBase, value.ProfileURI)
+	if err != nil {
+		return ResolvedColor{}, err
+	}
+	iccIntent := uint32(1)
+	if cfg.Intent != IntentDefault {
+		iccIntent = uint32(cfg.Intent - 1)
+	}
+	key := strings.ToLower(part)
+	var profile *iccProfile
+	var transform *iccTransform
+	if cache != nil {
+		profile, transform = cache.lookup(key, iccIntent)
+	}
+	if profile == nil {
 		media, err := r.pkg.contentType(part)
 		if err != nil {
 			return ResolvedColor{}, wrapPartError(part, "", err)
@@ -343,75 +500,92 @@ func (r *Reader) ResolveColor(ctx context.Context, basePart string, value Color,
 		if err != nil {
 			return ResolvedColor{}, wrapPartError(part, "", err)
 		}
-		profile, err := parseICCProfile(data)
+		profile, err = parseICCProfile(data)
 		if err != nil {
 			return ResolvedColor{}, wrapPartError(part, "", err)
 		}
-		iccIntent := uint32(1)
-		if cfg.Intent != IntentDefault {
-			iccIntent = uint32(cfg.Intent - 1)
-		}
-		transform, err := prepareICCTransform(profile, iccIntent)
-		if err != nil {
-			return ResolvedColor{}, wrapPartError(part, "", err)
-		}
-		if len(value.Components) != transform.inputChannels() {
-			return ResolvedColor{}, wrapPartError(part, "", fmt.Errorf("%w: context color channel count", ErrInvalid))
-		}
-		input := value.Components
-		var scaled [iccMaxChannels]float64
-		if transform.pipeline != nil && transform.pipeline.inputPrecision != 0 {
-			scale := 255.0
-			if transform.pipeline.inputPrecision == 2 {
-				scale = 65535
-			}
-			for i, component := range input {
-				scaled[i] = math.Floor(colorClamp(component)*scale+0.5) / scale
-			}
-			input = scaled[:len(input)]
-		}
-		linear, err = transform.linearRGB(input, false)
-		if err != nil {
-			return ResolvedColor{}, wrapPartError(part, "", err)
-		}
-		result.ProfilePart = part
-		result.ProfileSpace = profile.space
-		if profile.space == "CMYK" && profile.class != "nmcl" && len(value.Components) == 4 && !cfg.Negative && cfg.PrintColor != PrintColorGrayscale && cfg.PrintColor != PrintColorMonochrome {
-			result.CMYK = [4]float64{
-				colorClamp(value.Components[0]),
-				colorClamp(value.Components[1]),
-				colorClamp(value.Components[2]),
-				colorClamp(value.Components[3]),
-			}
-			result.HasCMYK = true
-		}
-	default:
-		return ResolvedColor{}, fmt.Errorf("%w: unsupported color space", ErrInvalid)
 	}
-	outLinear, luminance, err := applyPrintLinearColor(linear, cfg.Negative, cfg.PrintColor)
+	if transform == nil {
+		transform, err = prepareICCTransform(profile, iccIntent)
+		if err != nil {
+			return ResolvedColor{}, wrapPartError(part, "", err)
+		}
+		if cache != nil {
+			cache.store(key, iccIntent, profile, transform)
+		}
+	}
+	if len(value.Components) != transform.inputChannels() {
+		return ResolvedColor{}, wrapPartError(part, "", fmt.Errorf("%w: context color channel count", ErrInvalid))
+	}
+	input := value.Components
+	var scaled [iccMaxChannels]float64
+	if transform.pipeline != nil && transform.pipeline.inputPrecision != 0 {
+		scale := 255.0
+		if transform.pipeline.inputPrecision == 2 {
+			scale = 65535
+		}
+		for i, component := range input {
+			scaled[i] = math.Floor(colorClamp(component)*scale+0.5) / scale
+		}
+		input = scaled[:len(input)]
+	}
+	linear, err := transform.linearRGB(input, false)
 	if err != nil {
+		return ResolvedColor{}, wrapPartError(part, "", err)
+	}
+	result.ProfilePart = part
+	result.ProfileSpace = profile.space
+	result.ColorSpace = strings.TrimSpace(profile.space)
+	if profile.class == "nmcl" && len(transform.named) > 0 {
+		result.SpotName, result.DeviceComponents = resolveICCNamedSpotMetadata(transform.named, value.Components)
+	} else {
+		result.DeviceComponents = slices.Clone(value.Components)
+	}
+	if profile.space == "CMYK" && profile.class != "nmcl" && len(value.Components) == 4 && !cfg.Negative && cfg.PrintColor != PrintColorGrayscale && cfg.PrintColor != PrintColorMonochrome {
+		result.CMYK = [4]float64{
+			colorClamp(value.Components[0]),
+			colorClamp(value.Components[1]),
+			colorClamp(value.Components[2]),
+			colorClamp(value.Components[3]),
+		}
+		result.HasCMYK = true
+	}
+	if err := finalizeResolvedColor(&result, linear, cfg); err != nil {
 		return ResolvedColor{}, err
 	}
-	srgb := [3]float64{
-		renderLinearToSRGB(colorClamp(outLinear[0])),
-		renderLinearToSRGB(colorClamp(outLinear[1])),
-		renderLinearToSRGB(colorClamp(outLinear[2])),
-	}
-	result.Linear = outLinear
-	result.Gray = renderLinearToSRGB(luminance)
-	result.SRGB = color.NRGBA{
-		R: colorQuantize8(srgb[0]),
-		G: colorQuantize8(srgb[1]),
-		B: colorQuantize8(srgb[2]),
-		A: colorQuantize8(value.Alpha),
-	}
-	result.SRGB16 = color.NRGBA64{
-		R: colorQuantize16(srgb[0]),
-		G: colorQuantize16(srgb[1]),
-		B: colorQuantize16(srgb[2]),
-		A: colorQuantize16(value.Alpha),
-	}
 	return result, nil
+}
+
+// resolveICCNamedSpotMetadata 根据命名色配置与各色调分量提取命中的完整专色名及可选设备坐标
+// 入参: named 命名色表条目, tints 各命名色色调分量
+// 返回: string 命中的完整专色名, []float64 对应设备坐标副本或nil
+func resolveICCNamedSpotMetadata(named []iccNamedColor, tints []float64) (string, []float64) {
+	if len(named) == 0 {
+		return "", nil
+	}
+	var active []int
+	for i := range named {
+		if i < len(tints) && colorClamp(tints[i]) > 0 {
+			active = append(active, i)
+		}
+	}
+	if len(active) == 1 {
+		entry := named[active[0]]
+		return entry.prefix + entry.name + entry.suffix, slices.Clone(entry.device)
+	}
+	if len(active) == 0 && len(named) == 1 {
+		entry := named[0]
+		return entry.prefix + entry.name + entry.suffix, slices.Clone(entry.device)
+	}
+	if len(active) > 1 {
+		names := make([]string, len(active))
+		for i, idx := range active {
+			entry := named[idx]
+			names[i] = entry.prefix + entry.name + entry.suffix
+		}
+		return strings.Join(names, ", "), nil
+	}
+	return "", nil
 }
 
 // applyPrintLinearColor 对非预乘线性RGB依次施加负片反相及灰度或黑白单色转换，并返回最终线性RGB与BT.709线性亮度

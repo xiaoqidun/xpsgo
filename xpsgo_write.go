@@ -54,12 +54,13 @@ var errCompressionBuffer = errors.New("compression buffer limit exceeded")
 // Compression 选择保留原压缩数据、直接存储、重新Deflate或无损优化，不改变逻辑部件内容
 type Compression uint8
 
-// WriteOptions 设置整包写出压缩方式、字体子集化、交错分片、普通部件顺序及输出字节上限
-// 零值保留原压缩数据（内存包沿用导入方法或Deflate），Optimize仅在候选更小时替换，SubsetFonts仅作用于Package写出
+// WriteOptions 设置整包写出压缩方式、字体子集化、紧凑字形重映射、交错分片、普通部件顺序及输出字节上限
+// 零值保留原压缩数据（内存包沿用导入方法或Deflate），Optimize仅在候选更小时替换，SubsetFonts与CompactFontGIDs仅作用于Package写出
 // InterleaveBytes非零时按至多8MiB分片并按元数据优先与PartOrder轮转写出，MaxBytes零值沿用包上限
 type WriteOptions struct {
 	Compression     Compression
 	SubsetFonts     bool
+	CompactFontGIDs bool
 	InterleaveBytes int64
 	PartOrder       []string
 	MaxBytes        int64

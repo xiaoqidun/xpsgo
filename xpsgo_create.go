@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"encoding/xml"
 	"fmt"
+	"image"
 	"image/color"
 	"io"
 	"maps"
@@ -33,6 +34,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/xiaoqidun/jxrgo"
 )
 
 // createdNavigationOther 等常量表示固定布局部件的导航地址角色
@@ -48,6 +51,15 @@ const (
 type PackageOptions struct {
 	Limits         Limits
 	MaxImagePixels uint64
+}
+
+// AddFontOptions 设置字体嵌入时的混淆策略、内容去重与TTC/OTC集合面索引
+// Obfuscate为nil时默认按ODTTF混淆嵌入，设为false时仅允许无限制字体按OpenType明文嵌入
+// Deduplicate为true时按内容摘要与字节比对复用已嵌入部件；CollectionIndex指定TTC/OTC返回的#index面索引
+type AddFontOptions struct {
+	Obfuscate       *bool
+	Deduplicate     bool
+	CollectionIndex int
 }
 
 // Package 持有独立的文档、页面和资源数据，修改成功后才更新状态，支持并发读取及串行修改
@@ -325,12 +337,12 @@ func (p *Package) addPageLocked(ctx context.Context, docIndex int, page *Page) (
 	value.Part = part
 	if p.hasDiscardControl() {
 		q := p.storyCopy()
-		targets, err := q.storePage(&value, ctx)
+		targets, err := q.storePage(&value, docIndex, -1, ctx)
 		if err != nil {
 			return 0, err
 		}
 		q.layout[strings.ToLower(part)] = true
-		q.documents[docIndex].Pages = append(q.documents[docIndex].Pages, PageReference{Part: part, LinkTargets: targets})
+		q.documents[docIndex].Pages = append(q.documents[docIndex].Pages, PageReference{Part: part, Width: value.Width, Height: value.Height, LinkTargets: targets})
 		q.pageCount++
 		q.dirty[strings.ToLower(q.documents[docIndex].Part)] = true
 		q.commitName(pattern, part)
@@ -340,12 +352,12 @@ func (p *Package) addPageLocked(ctx context.Context, docIndex int, page *Page) (
 		p.commitStory(q)
 		return len(p.documents[docIndex].Pages) - 1, nil
 	}
-	targets, err := p.storePage(&value, ctx)
+	targets, err := p.storePage(&value, docIndex, -1, ctx)
 	if err != nil {
 		return 0, err
 	}
 	p.layout[strings.ToLower(part)] = true
-	p.documents[docIndex].Pages = append(p.documents[docIndex].Pages, PageReference{Part: part, LinkTargets: targets})
+	p.documents[docIndex].Pages = append(p.documents[docIndex].Pages, PageReference{Part: part, Width: value.Width, Height: value.Height, LinkTargets: targets})
 	p.pageCount++
 	p.dirty[strings.ToLower(p.documents[docIndex].Part)] = true
 	p.commitName(pattern, part)
@@ -356,30 +368,126 @@ func (p *Package) addPageLocked(ctx context.Context, docIndex int, page *Page) (
 // 入参: data 原始OpenType或TrueType字体字节
 // 返回: string 混淆字体的包根URI, error 字体格式、许可、名称或资源错误
 func (p *Package) AddFont(data []byte) (string, error) {
+	return p.AddFontWithOptions(context.Background(), data, nil)
+}
+
+// AddFontWithOptions 按指定选项校验许可、可选去重与混淆嵌入字体，对TTC/OTC集合返回带#index的FontUri
+// 入参: ctx 取消Context，nil采用Background, data 原始OpenType/TrueType或TTC/OTC字体字节, options 嵌入选项，nil默认混淆
+// 返回: string 字体部件URI，集合字体附加#index片段, error 字体格式、许可、索引、取消或资源错误
+func (p *Package) AddFontWithOptions(ctx context.Context, data []byte, options *AddFontOptions) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
 	if err := p.lock(); err != nil {
 		return "", err
 	}
 	defer p.mu.Unlock()
-	if len(data) == 0 {
-		return "", fmt.Errorf("%w: empty font data", ErrInvalid)
+	if err := checkContext(ctx); err != nil {
+		return "", err
 	}
-	if int64(len(data)) > p.limits.MaxPartBytes {
-		return "", fmt.Errorf("%w: font byte budget", ErrLimit)
+	obfuscate := true
+	deduplicate := false
+	collectionIndex := 0
+	if options != nil {
+		if options.Obfuscate != nil {
+			obfuscate = *options.Obfuscate
+		}
+		deduplicate = options.Deduplicate
+		collectionIndex = options.CollectionIndex
 	}
-	face, err := parseFontFace(data, 0)
+	isCollection, isCFF, err := validateEmbeddedFontData(ctx, data, p.limits.MaxPartBytes, obfuscate, collectionIndex)
 	if err != nil {
 		return "", err
 	}
+	media := "application/vnd.ms-package.obfuscated-opentype"
+	if !obfuscate {
+		media = "application/vnd.ms-opentype"
+	}
+	if deduplicate {
+		if existing, found := p.findDuplicateFontLocked(data, media, obfuscate); found {
+			if isCollection {
+				return fmt.Sprintf("%s#%d", existing, collectionIndex), nil
+			}
+			return existing, nil
+		}
+	}
+	var part string
+	pattern := ""
+	if obfuscate {
+		part, err = p.newFontPart()
+	} else {
+		ext := "ttf"
+		if isCollection {
+			ext = "ttc"
+		} else if isCFF {
+			ext = "otf"
+		}
+		pattern = "/Resources/Fonts/%d." + ext
+		part, err = p.newName(pattern, ctx)
+	}
+	if err != nil {
+		return "", err
+	}
+	payload := data
+	if obfuscate {
+		payload, err = ObfuscateFont(part, data)
+		if err != nil {
+			return "", err
+		}
+	}
+	if err := p.editable(part); err != nil {
+		return "", err
+	}
+	if err := p.storePart(part, media, payload, false); err != nil {
+		return "", err
+	}
+	p.commitName(pattern, part)
+	if isCollection {
+		return fmt.Sprintf("%s#%d", part, collectionIndex), nil
+	}
+	return part, nil
+}
+
+// validateEmbeddedFontData 校验待嵌入字体的全部字体面格式、索引范围与OS/2嵌入及混淆许可规则
+// 入参: ctx 取消Context, data 原始字体字节, maxBytes 字节上限, obfuscate 是否执行混淆嵌入, collectionIndex 目标字体面索引
+// 返回: bool 是否为TTC/OTC集合, bool 首面是否为CFF轮廓, error 格式、索引、许可、预算或取消错误
+func validateEmbeddedFontData(ctx context.Context, data []byte, maxBytes int64, obfuscate bool, collectionIndex int) (bool, bool, error) {
+	if err := checkContext(ctx); err != nil {
+		return false, false, err
+	}
+	if len(data) == 0 {
+		return false, false, fmt.Errorf("%w: empty font data", ErrInvalid)
+	}
+	if int64(len(data)) > maxBytes {
+		return false, false, fmt.Errorf("%w: font byte budget", ErrLimit)
+	}
+	if collectionIndex < 0 {
+		return false, false, fmt.Errorf("%w: negative font collection index", ErrInvalid)
+	}
+	face, err := parseFontFace(data, 0)
+	if err != nil {
+		return false, false, err
+	}
+	isCollection, isCFF := face.collection, face.cff
 	count := uint32(1)
-	if face.collection {
+	if isCollection {
 		count = binary.BigEndian.Uint32(data[8:12])
+		if uint64(collectionIndex) >= uint64(count) {
+			return false, false, fmt.Errorf("%w: font collection index out of range", ErrInvalid)
+		}
+	} else if collectionIndex != 0 {
+		return false, false, fmt.Errorf("%w: collection index %d on standalone font", ErrInvalid, collectionIndex)
 	}
 	checked := make(map[uint32]bool)
 	for index := uint32(0); index < count; index++ {
+		if err := checkContext(ctx); err != nil {
+			return false, false, err
+		}
 		if index != 0 {
 			face, err = parseFontFace(data, index)
 			if err != nil {
-				return "", err
+				return false, false, err
 			}
 		}
 		if checked[face.offset] {
@@ -387,35 +495,75 @@ func (p *Package) AddFont(data []byte) (string, error) {
 		}
 		os2, err := parseFontOS2Metrics(face)
 		if err != nil {
-			return "", err
+			return false, false, err
 		}
 		if os2 == nil {
-			return "", fmt.Errorf("%w: producer font needs OS/2", ErrInvalid)
+			return false, false, fmt.Errorf("%w: producer font needs OS/2", ErrInvalid)
 		}
 		rights, err := fontEmbeddingRights(os2)
 		if err != nil {
-			return "", err
+			return false, false, err
 		}
 		if rights&2 != 0 {
-			return "", fmt.Errorf("%w: font prohibits embedding", ErrRestricted)
+			return false, false, fmt.Errorf("%w: font prohibits embedding", ErrRestricted)
+		}
+		if !obfuscate && rights&0x30c != 0 {
+			return false, false, fmt.Errorf("%w: font requires obfuscation", ErrRestricted)
 		}
 		checked[face.offset] = true
 	}
-	part, err := p.newFontPart()
-	if err != nil {
-		return "", err
+	return isCollection, isCFF, nil
+}
+
+// findDuplicateFontLocked 在已存入部件中按媒体类型与完整字节查找可复用的同类型字体部件
+// 入参: raw 原始未混淆字体字节, media 目标媒体类型, obfuscated 是否混淆部件
+// 返回: string 已存在的字体部件URI, bool 是否命中复用
+func (p *Package) findDuplicateFontLocked(raw []byte, media string, obfuscated bool) (string, bool) {
+	for _, key := range slices.Sorted(maps.Keys(p.parts)) {
+		part := p.parts[key]
+		if !strings.EqualFold(part.media, media) || len(part.data) != len(raw) {
+			continue
+		}
+		candidate := part.data
+		if obfuscated {
+			if len(candidate) < 32 {
+				continue
+			}
+			xorKey, err := FontObfuscationKey(part.name)
+			if err != nil {
+				continue
+			}
+			var prefix [32]byte
+			copy(prefix[:], candidate[:32])
+			for i := range 32 {
+				prefix[i] ^= xorKey[i%len(xorKey)]
+			}
+			if !bytes.Equal(prefix[:], raw[:32]) || !bytes.Equal(candidate[32:], raw[32:]) {
+				continue
+			}
+			return part.name, true
+		}
+		if bytes.Equal(candidate, raw) {
+			return part.name, true
+		}
 	}
-	obfuscated, err := ObfuscateFont(part, data)
-	if err != nil {
-		return "", err
+	return "", false
+}
+
+// findDuplicatePartLocked 在已存入部件中按媒体类型与完整字节查找可复用的相同资源部件
+// 入参: media 目标媒体类型, data 原始资源字节
+// 返回: string 已存在的部件URI, bool 是否命中复用
+func (p *Package) findDuplicatePartLocked(media string, data []byte) (string, bool) {
+	for _, key := range slices.Sorted(maps.Keys(p.parts)) {
+		part := p.parts[key]
+		if !strings.EqualFold(part.media, media) || len(part.data) != len(data) {
+			continue
+		}
+		if bytes.Equal(part.data, data) {
+			return part.name, true
+		}
 	}
-	if err := p.editable(part); err != nil {
-		return "", err
-	}
-	if err := p.storePart(part, "application/vnd.ms-package.obfuscated-opentype", obfuscated, false); err != nil {
-		return "", err
-	}
-	return part, nil
+	return "", false
 }
 
 // newFontPart 生成包内不冲突的UUIDv4混淆字体部件路径
@@ -440,10 +588,24 @@ func (p *Package) newFontPart() (string, error) {
 // 入参: data 原始图像字节
 // 返回: string 图像部件的包根URI, error 格式、预算或名称冲突错误
 func (p *Package) AddImage(data []byte) (string, error) {
+	return p.AddImageWithOptions(context.Background(), data, nil)
+}
+
+// AddImageWithOptions 按魔数识别图像并支持内容去重后存入包中
+// 入参: ctx 取消Context，nil采用Background, data 原始图像字节, options 嵌入选项，nil禁用去重
+// 返回: string 图像部件的包根URI, error 格式、预算、取消或名称冲突错误
+func (p *Package) AddImageWithOptions(ctx context.Context, data []byte, options *AddImageOptions) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
 	if err := p.lock(); err != nil {
 		return "", err
 	}
 	defer p.mu.Unlock()
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
 	if len(data) == 0 {
 		return "", fmt.Errorf("%w: empty image data", ErrInvalid)
 	}
@@ -451,8 +613,143 @@ func (p *Package) AddImage(data []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	pattern := "/Resources/Images/%d." + ext
-	part, err := p.newName(pattern, nil)
+	return p.storeDeduplicatedResourceLocked(ctx, "/Resources/Images/%d."+ext, media, data, options != nil && options.Deduplicate)
+}
+
+// AddGoImage 将Go标准图像按指定格式、质量、分辨率与ICC配置编码并嵌入包中，支持内容去重
+// 入参: ctx 取消Context，nil采用Background, img 标准Go图像, options 编码与去重选项，nil自动选择格式
+// 返回: string 图像部件的包根URI, error 编码、许可、预算或取消错误
+func (p *Package) AddGoImage(ctx context.Context, img image.Image, options *ImageEncodeOptions) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	if err := p.lock(); err != nil {
+		return "", err
+	}
+	defer p.mu.Unlock()
+	data, media, ext, err := encodeGoImage(ctx, img, options, p.limits.MaxPartBytes)
+	if err != nil {
+		return "", err
+	}
+	return p.storeDeduplicatedResourceLocked(ctx, "/Resources/Images/%d."+ext, media, data, options != nil && options.Deduplicate)
+}
+
+// AddImageFromRows 通过逐行流式回调对接jxrgo.EncodeRows编码为JPEG XR图像并嵌入包中
+// 入参: ctx 取消Context，nil采用Background, info JPEG XR图像头信息, read 按行读取回调, options JPEG XR编码选项，nil采用默认值
+// 返回: string 图像部件的包根URI, error 编码、预算或取消错误
+func (p *Package) AddImageFromRows(ctx context.Context, info jxrgo.Info, read jxrgo.RasterRowReader, options *jxrgo.EncodeOptions) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	if read == nil {
+		return "", fmt.Errorf("%w: missing row reader", ErrInvalid)
+	}
+	if err := p.lock(); err != nil {
+		return "", err
+	}
+	defer p.mu.Unlock()
+	var cfg jxrgo.EncodeOptions
+	if options != nil {
+		cfg = *options
+	}
+	if cfg.MaxOutputBytes == 0 || cfg.MaxOutputBytes > uint64(p.limits.MaxPartBytes) {
+		cfg.MaxOutputBytes = uint64(p.limits.MaxPartBytes)
+	}
+	var buf bytes.Buffer
+	counted := packageOutput{writer: &buf, context: ctx, limit: p.limits.MaxPartBytes}
+	if err := jxrgo.EncodeRows(ctx, &counted, info, read, &cfg); err != nil {
+		return "", err
+	}
+	return p.storeAllocatedResourceLocked(ctx, "/Resources/Images/%d.jxr", "image/vnd.ms-photo", buf.Bytes())
+}
+
+// AddColorProfile 校验ICC颜色配置文件并分配唯一路径存入包中
+// 入参: data 原始ICC颜色配置文件字节
+// 返回: string 配置文件部件的包根URI, error 格式、预算或名称冲突错误
+func (p *Package) AddColorProfile(data []byte) (string, error) {
+	return p.AddColorProfileWithOptions(context.Background(), data, false)
+}
+
+// AddColorProfileWithOptions 校验ICC颜色配置文件并支持按内容去重后存入包中
+// 入参: ctx 取消Context，nil采用Background, data 原始ICC颜色配置文件字节, deduplicate 是否按内容去重复用已有部件
+// 返回: string 配置文件部件的包根URI, error 格式、预算、取消或名称冲突错误
+func (p *Package) AddColorProfileWithOptions(ctx context.Context, data []byte, deduplicate bool) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	if err := p.lock(); err != nil {
+		return "", err
+	}
+	defer p.mu.Unlock()
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	if len(data) == 0 {
+		return "", fmt.Errorf("%w: empty color profile data", ErrInvalid)
+	}
+	if int64(len(data)) > p.limits.MaxPartBytes {
+		return "", fmt.Errorf("%w: color profile byte budget", ErrLimit)
+	}
+	if _, err := validateCreatedICCProfile(data, ctx); err != nil {
+		return "", err
+	}
+	return p.storeDeduplicatedResourceLocked(ctx, "/Resources/Profiles/%d.icc", "application/vnd.ms-color.iccprofile", data, deduplicate)
+}
+
+// storeDeduplicatedResourceLocked 在持有写锁时按可选字节去重复用已有部件或分配路径原子存储
+// 入参: ctx 已规范化取消Context, pattern 路径模板, media 内容类型, data 资源字节, deduplicate 是否启用内容去重
+// 返回: string 资源部件URI, error 名称、预算、许可或取消错误
+func (p *Package) storeDeduplicatedResourceLocked(ctx context.Context, pattern, media string, data []byte, deduplicate bool) (string, error) {
+	if deduplicate {
+		if existing, found := p.findDuplicatePartLocked(media, data); found {
+			return existing, nil
+		}
+	}
+	return p.storeAllocatedResourceLocked(ctx, pattern, media, data)
+}
+
+// AddResourceDictionary 编码共享远程资源字典并分配唯一部件路径存入包中
+// 入参: ctx 取消Context，nil采用Background, dict 资源字典模型，Source必须为空
+// 返回: string 资源字典部件的包根URI, error 模型、编码、预算或取消错误
+func (p *Package) AddResourceDictionary(ctx context.Context, dict *ResourceDictionary) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	if dict == nil {
+		return "", fmt.Errorf("%w: nil resource dictionary", ErrInvalid)
+	}
+	if err := p.lock(); err != nil {
+		return "", err
+	}
+	defer p.mu.Unlock()
+	const pattern = "/Resources/Dictionaries/%d.dict"
+	part, err := p.newName(pattern, ctx)
+	if err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	if _, err := EncodeResourceDictionary(ctx, &buf, dict, &EncodeOptions{Format: p.format, Limits: p.limits, Part: part}); err != nil {
+		return "", err
+	}
+	if err := p.editable(part); err != nil {
+		return "", err
+	}
+	if err := p.storePart(part, resourceDictionaryContentType, buf.Bytes(), false); err != nil {
+		return "", err
+	}
+	p.commitName(pattern, part)
+	return part, nil
+}
+
+// storeAllocatedResourceLocked 在持有写锁时按模板分配资源部件路径并原子存储
+// 入参: ctx 取消Context, pattern 含唯一%d占位符的部件路径模板, media 内容类型, data 部件字节
+// 返回: string 分配后的部件URI, error 分配、许可或预算错误
+func (p *Package) storeAllocatedResourceLocked(ctx context.Context, pattern, media string, data []byte) (string, error) {
+	part, err := p.newName(pattern, ctx)
 	if err != nil {
 		return "", err
 	}
@@ -460,38 +757,6 @@ func (p *Package) AddImage(data []byte) (string, error) {
 		return "", err
 	}
 	if err := p.storePart(part, media, data, false); err != nil {
-		return "", err
-	}
-	p.commitName(pattern, part)
-	return part, nil
-}
-
-// AddColorProfile 校验ICC颜色配置文件并分配唯一路径存入包中
-// 入参: data 原始ICC颜色配置文件字节
-// 返回: string 配置文件部件的包根URI, error 格式、预算或名称冲突错误
-func (p *Package) AddColorProfile(data []byte) (string, error) {
-	if err := p.lock(); err != nil {
-		return "", err
-	}
-	defer p.mu.Unlock()
-	if len(data) == 0 {
-		return "", fmt.Errorf("%w: empty color profile data", ErrInvalid)
-	}
-	if int64(len(data)) > p.limits.MaxPartBytes {
-		return "", fmt.Errorf("%w: color profile byte budget", ErrLimit)
-	}
-	if _, err := validateCreatedICCProfile(data, nil); err != nil {
-		return "", err
-	}
-	pattern := "/Resources/Profiles/%d.icc"
-	part, err := p.newName(pattern, nil)
-	if err != nil {
-		return "", err
-	}
-	if err := p.editable(part); err != nil {
-		return "", err
-	}
-	if err := p.storePart(part, "application/vnd.ms-color.iccprofile", data, false); err != nil {
 		return "", err
 	}
 	p.commitName(pattern, part)
@@ -648,7 +913,11 @@ func (p *Package) writeReader(ctx context.Context, options *WriteOptions) (*Read
 	}
 	clone := p.storyCopy()
 	p.mu.Unlock()
-	if _, err := clone.SubsetFonts(ctx, nil); err != nil {
+	var subOpts *OptimizationOptions
+	if options.CompactFontGIDs {
+		subOpts = &OptimizationOptions{CompactGIDs: true}
+	}
+	if _, err := clone.SubsetFonts(ctx, subOpts); err != nil {
 		return nil, err
 	}
 	return clone.reader(ctx)
@@ -692,10 +961,10 @@ func (p *Package) managed(part string) bool {
 	return p.layout[strings.ToLower(part)]
 }
 
-// storePage 完成页面编码及目标收集后原子替换部件，编码失败不改变已有内容
-// 入参: page 带有目标部件名的模型, ctx 取消Context
-// 返回: []string 页面链接目标, error 编码或预算错误
-func (p *Package) storePage(page *Page, ctx context.Context) ([]string, error) {
+// storePage 完成页面编码及显式链接目标校验后原子替换部件，编码失败不改变已有内容
+// 入参: page 带有目标部件名的模型, docIndex 所属文档序号, replacePageIndex 替换页面序号，新增页传-1, ctx 取消Context
+// 返回: []string 经校验的显式页面链接目标, error 编码、链接目标或预算错误
+func (p *Package) storePage(page *Page, docIndex, replacePageIndex int, ctx context.Context) ([]string, error) {
 	var output bytes.Buffer
 	if _, err := EncodePage(ctx, &output, page, &EncodeOptions{Format: p.format, Limits: p.limits}); err != nil {
 		return nil, err
@@ -704,7 +973,10 @@ func (p *Package) storePage(page *Page, ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	targets := createdPageTargets(root)
+	targets, err := validateExplicitLinkTargetsForPage(p.format, p.documents, page.LinkTargets, createdPageTargets(root), docIndex, replacePageIndex)
+	if err != nil {
+		return nil, err
+	}
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
@@ -712,6 +984,52 @@ func (p *Package) storePage(page *Page, ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return targets, nil
+}
+
+// validateExplicitLinkTargetsForPage 校验显式LinkTargets名称均存在于当前页内且在XPS 1.0下不与同文档其它页重名
+// 入参: format 文档格式, documents 文档列表, declared 调用方显式声明的链接目标列表, pageNames 页内可寻址元素名称列表, docIndex 所属文档序号, replacePageIndex 替换页面序号，新增页传-1
+// 返回: []string 独立拷贝的链接目标列表，未声明时为nil, error 缺失、重复或命名冲突错误
+func validateExplicitLinkTargetsForPage(format Format, documents []Document, declared, pageNames []string, docIndex, replacePageIndex int) ([]string, error) {
+	if len(declared) == 0 {
+		return nil, nil
+	}
+	present := make(map[string]bool, len(pageNames))
+	for _, name := range pageNames {
+		present[name] = true
+	}
+	var otherTargets map[string]bool
+	if format == FormatXPS && docIndex >= 0 && docIndex < len(documents) {
+		otherTargets = make(map[string]bool)
+		for i, ref := range documents[docIndex].Pages {
+			if i == replacePageIndex {
+				continue
+			}
+			for _, name := range ref.LinkTargets {
+				otherTargets[name] = true
+			}
+		}
+	}
+	seen := make(map[string]bool, len(declared))
+	result := make([]string, 0, len(declared))
+	for _, target := range declared {
+		if target == "" || !present[target] {
+			return nil, fmt.Errorf("%w: LinkTarget %q does not match any element Name on page", ErrInvalid, target)
+		}
+		if seen[target] {
+			return nil, fmt.Errorf("%w: duplicate LinkTarget %q on page", ErrInvalid, target)
+		}
+		if format == FormatXPS {
+			if !xmlNCName(target) {
+				return nil, fmt.Errorf("%w: invalid XPS LinkTarget Name %q", ErrInvalid, target)
+			}
+			if otherTargets[target] {
+				return nil, fmt.Errorf("%w: duplicate XPS LinkTarget %q across document pages", ErrInvalid, target)
+			}
+		}
+		seen[target] = true
+		result = append(result, target)
+	}
+	return result, nil
 }
 
 // available 检查新名称不与既有部件相同或构成部件路径派生，不接受关系保留名称
@@ -751,7 +1069,7 @@ func (p *Package) store(part, media string, data []byte) error {
 // 入参: part 已规范化部件名, media 内容类型, data 部件内容, checkName 是否检查新部件名称冲突
 // 返回: error 类型、冲突或预算错误
 func (p *Package) storePart(part, media string, data []byte, checkName bool) error {
-	if err := validatePackageMedia(media); err != nil {
+	if err := validatePackageMediaForFormat(p.format, media); err != nil {
 		return err
 	}
 	if int64(len(data)) > p.limits.MaxPartBytes {
@@ -2665,12 +2983,27 @@ func createdRelationshipIDs(relations []Relationship) func() string {
 // 入参: value 内容类型
 // 返回: error 非法内容类型错误
 func validatePackageMedia(value string) error {
+	return validatePackageMediaForFormat(FormatUnknown, value)
+}
+
+// validatePackageMediaForFormat 按OPC规则及当前方言[M12.8]标准表校验内容类型，禁止标准表内类型携带任何MIME参数
+// 入参: format 文档方言，FormatUnknown仅校验OPC自有媒体类型, value 内容类型
+// 返回: error 非法内容类型或禁止参数错误
+func validatePackageMediaForFormat(format Format, value string) error {
 	media, parameters, err := mime.ParseMediaType(value)
 	if err != nil || !strings.Contains(media, "/") || strings.ContainsAny(value, "\r\n\t") || strings.TrimSpace(value) != value || !xmlTextValid(value) {
 		return fmt.Errorf("%w: invalid content type", ErrInvalid)
 	}
-	if len(parameters) != 0 && opcSpecificContentType(media) {
-		return fmt.Errorf("%w: parameters on package-specific content type", ErrInvalid)
+	if strings.Contains(value, ";") {
+		if len(parameters) == 0 {
+			return fmt.Errorf("%w: empty parameter in content type", ErrInvalid)
+		}
+		if opcSpecificContentType(media) {
+			return fmt.Errorf("%w: parameters on package-specific content type", ErrInvalid)
+		}
+		if format != FormatUnknown && standardXPSContentType(format, opcMediaTypeBase(value)) {
+			return fmt.Errorf("%w: M12.8 prohibits MIME parameters on standard XPS content type %q", ErrInvalid, media)
+		}
 	}
 	return nil
 }

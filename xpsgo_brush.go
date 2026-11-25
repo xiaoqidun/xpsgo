@@ -15,10 +15,13 @@
 package xpsgo
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"image/color"
 	"math"
 	"math/big"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -67,8 +70,12 @@ const (
 	TileFlipXY
 )
 
-// gradientStopBucketCount 定义渐变色标索引分桶数量
-const gradientStopBucketCount = 64
+// gradientStopBucketCount 等常量定义渐变色标索引分桶数与scRGB自适应重采样默认参数
+const (
+	gradientStopBucketCount         = 64
+	defaultGradientResampleMaxError = 0.002
+	defaultGradientResampleMaxStops = 64
+)
 
 // BrushKind 表示固定布局画刷种类
 type BrushKind uint8
@@ -88,14 +95,16 @@ type GradientStop struct {
 	Color  Color
 }
 
-// Brush 保存画刷参数、未预乘颜色及图片或视觉内容引用
+// Brush 保存画刷参数、未预乘颜色、静态资源键引用及图片或视觉内容引用
 // Transform为nil时采用单位矩阵，坐标均使用绝对单位，ImageSource与ImageProfileURI相对于定义部件
-// Visual由页面层按定义部件资源类型化，VisualReference为静态资源键
+// ResourceKey非空时在写侧编码为StaticResource引用，TransformResource与VisualReference分别表示变换与视觉静态资源键
 type Brush struct {
 	Kind                   BrushKind
 	Part                   string
+	ResourceKey            string
 	Opacity                float64
 	Transform              *Matrix
+	TransformResource      string
 	Color                  Color
 	Stops                  []GradientStop
 	ColorInterpolationMode ColorInterpolationMode
@@ -114,6 +123,59 @@ type Brush struct {
 	Visual                 Element
 	VisualReference        string
 	visualElement          *xmlElement
+}
+
+// BrushTilePattern 保存图像或视觉平铺画刷的单瓦片尺寸、规范超级瓦片周期、象限局部矩阵及页面映射矩阵
+type BrushTilePattern struct {
+	TileWidth     float64
+	TileHeight    float64
+	StepX         float64
+	StepY         float64
+	TileMode      TileMode
+	Cells         []Matrix
+	PatternToPage Matrix
+	ViewboxToTile Matrix
+}
+
+// ResolvedGradientStop 保存规范化排序与边界裁剪后的渐变停靠点偏移及解析颜色
+type ResolvedGradientStop struct {
+	Offset float64
+	Color  ResolvedColor
+}
+
+// GradientResolveOptions 设置渐变规范化解算的颜色缓存、渲染意图、scRGB自适应细分及停靠点上限
+type GradientResolveOptions struct {
+	ColorResolver *ColorResolver
+	Intent        RenderingIntent
+	ResampleScRGB bool
+	MaxColorError float64
+	MaxStops      int
+}
+
+// ResolvedGradient 保存规范化渐变停靠点、变换后几何、径向椭圆分解及页面映射矩阵
+type ResolvedGradient struct {
+	Kind                   BrushKind
+	SpreadMethod           SpreadMethod
+	ColorInterpolationMode ColorInterpolationMode
+	Opacity                float64
+	Stops                  []ResolvedGradientStop
+	StartPoint             Point
+	EndPoint               Point
+	Center                 Point
+	Focus                  Point
+	Radius                 float64
+	ShadingToPage          Matrix
+	FocusOutsideEllipse    bool
+	Constant               bool
+	ConstantColor          ResolvedColor
+}
+
+// resolvedGradientEntry 保存规范化渐变处理过程中的偏移、插值空间分量及关联解析颜色
+type resolvedGradientEntry struct {
+	offset   float64
+	values   [4]float64
+	resolved ResolvedColor
+	exact    bool
 }
 
 // gradientSampleStop 保存已转换到插值空间的非预乘颜色及透明度
@@ -793,11 +855,20 @@ func gradientColorValues(color Color, space ColorSpace) ([4]float64, error) {
 	return [4]float64{converted.r, converted.g, converted.b, alpha}, nil
 }
 
-// boundary 仅在缺少指定端点时插值补点并删除该侧范围外停靠点
+// boundary 补齐或保留指定端点并裁剪该侧单位区间外的全部停靠点
 // 入参: offset 端点偏移零或一
 func (s *gradientSampler) boundary(offset float64) {
 	i := sort.Search(len(s.stops), func(i int) bool { return s.stops[i].offset >= offset })
 	if i < len(s.stops) && s.stops[i].offset == offset {
+		if offset == 0 {
+			s.stops = s.stops[i:]
+			return
+		}
+		j := i
+		for j+1 < len(s.stops) && s.stops[j+1].offset == offset {
+			j++
+		}
+		s.stops = s.stops[:j+1]
 		return
 	}
 	var values [4]float64
@@ -1182,4 +1253,414 @@ func gradientRadialResult(t float64) (float64, bool, error) {
 		return 0, false, fmt.Errorf("%w: radial gradient parameter overflow", ErrLimit)
 	}
 	return t, true, nil
+}
+
+// ResolveBrushTilePattern 计算图像或视觉平铺画刷的单瓦片尺寸、超级瓦片周期、象限局部矩阵及页面映射矩阵
+// 入参: brush 图像或视觉画刷, stateMatrix 宿主元素累计页面变换矩阵
+// 返回: *BrushTilePattern 规范平铺几何参数, error 画刷种类、矩形或矩阵错误
+func ResolveBrushTilePattern(brush *Brush, stateMatrix Matrix) (*BrushTilePattern, error) {
+	if brush == nil || brush.Kind != BrushImage && brush.Kind != BrushVisual || brush.TileMode > TileFlipXY {
+		return nil, fmt.Errorf("%w: tile pattern requires image or visual brush", ErrInvalid)
+	}
+	if stateMatrix == (Matrix{}) {
+		stateMatrix = IdentityMatrix()
+	}
+	if !geometryFillMatrixFinite(stateMatrix) {
+		return nil, fmt.Errorf("%w: non-finite tile pattern state matrix", ErrInvalid)
+	}
+	if !geometryFinite(brush.Viewbox.X, brush.Viewbox.Y, brush.Viewbox.Width, brush.Viewbox.Height, brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height) || brush.Viewbox.Width <= 0 || brush.Viewbox.Height <= 0 || brush.Viewport.Width <= 0 || brush.Viewport.Height <= 0 {
+		return nil, fmt.Errorf("%w: invalid brush viewbox or viewport", ErrInvalid)
+	}
+	brushMatrix := stateMatrix
+	if brush.Transform != nil {
+		if !geometryFillMatrixFinite(*brush.Transform) {
+			return nil, fmt.Errorf("%w: non-finite brush transform", ErrInvalid)
+		}
+		brushMatrix = strokePathCompose(brushMatrix, *brush.Transform)
+		if !geometryFillMatrixFinite(brushMatrix) {
+			return nil, fmt.Errorf("%w: brush pattern transform overflow", ErrLimit)
+		}
+	}
+	patternToPage := strokePathCompose(brushMatrix, Matrix{A: 1, D: 1, E: brush.Viewport.X, F: brush.Viewport.Y})
+	if !geometryFillMatrixFinite(patternToPage) {
+		return nil, fmt.Errorf("%w: brush pattern origin overflow", ErrLimit)
+	}
+	sx := brush.Viewport.Width / brush.Viewbox.Width
+	sy := brush.Viewport.Height / brush.Viewbox.Height
+	viewboxToTile := Matrix{A: sx, D: sy, E: -brush.Viewbox.X * sx, F: -brush.Viewbox.Y * sy}
+	if !geometryFillMatrixFinite(viewboxToTile) {
+		return nil, fmt.Errorf("%w: brush viewbox mapping overflow", ErrLimit)
+	}
+	w, h := brush.Viewport.Width, brush.Viewport.Height
+	stepX, stepY := w, h
+	var cells []Matrix
+	switch brush.TileMode {
+	case TileNone, TileRepeat:
+		cells = []Matrix{IdentityMatrix()}
+	case TileFlipX:
+		stepX = 2 * w
+		cells = []Matrix{
+			IdentityMatrix(),
+			{A: -1, D: 1, E: 2 * w, F: 0},
+		}
+	case TileFlipY:
+		stepY = 2 * h
+		cells = []Matrix{
+			IdentityMatrix(),
+			{A: 1, D: -1, E: 0, F: 2 * h},
+		}
+	case TileFlipXY:
+		stepX = 2 * w
+		stepY = 2 * h
+		cells = []Matrix{
+			IdentityMatrix(),
+			{A: -1, D: 1, E: 2 * w, F: 0},
+			{A: 1, D: -1, E: 0, F: 2 * h},
+			{A: -1, D: -1, E: 2 * w, F: 2 * h},
+		}
+	}
+	if !geometryFinite(stepX, stepY) {
+		return nil, fmt.Errorf("%w: brush super tile period overflow", ErrLimit)
+	}
+	return &BrushTilePattern{
+		TileWidth:     w,
+		TileHeight:    h,
+		StepX:         stepX,
+		StepY:         stepY,
+		TileMode:      brush.TileMode,
+		Cells:         cells,
+		PatternToPage: patternToPage,
+		ViewboxToTile: viewboxToTile,
+	}, nil
+}
+
+// ResolveGradientStops 按XPS标准规范化渐变停靠点、完成色彩解析、按需重采样scRGB线性渐变并输出径向椭圆分解几何
+// 入参: ctx 取消Context，nil采用Background, r 可选阅读器用于解析ContextColor, brush 线性或径向渐变画刷, basePart 相对资源解析基准部件, state 当前图形与打印色彩状态, options 可选解算参数
+// 返回: *ResolvedGradient 规范化渐变模型, error 参数、色彩、几何、数值或取消错误
+func ResolveGradientStops(ctx context.Context, r *Reader, brush *Brush, basePart string, state WalkState, options *GradientResolveOptions) (*ResolvedGradient, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if brush == nil || brush.Kind != BrushLinearGradient && brush.Kind != BrushRadialGradient {
+		return nil, fmt.Errorf("%w: expected gradient brush", ErrInvalid)
+	}
+	if brush.ColorInterpolationMode > ColorInterpolationScRGB || brush.SpreadMethod > SpreadRepeat || !geometryFinite(brush.Opacity) || brush.Opacity < 0 || brush.Opacity > 1 || len(brush.Stops) < 2 {
+		return nil, fmt.Errorf("%w: invalid gradient attributes or stops", ErrInvalid)
+	}
+	if err := validatePrintColor(state.PrintColor); err != nil {
+		return nil, err
+	}
+	var cfg GradientResolveOptions
+	if options != nil {
+		cfg = *options
+	}
+	if cfg.Intent > IntentAbsoluteColorimetric || !geometryFinite(cfg.MaxColorError) || cfg.MaxColorError < 0 || cfg.MaxStops < 0 {
+		return nil, fmt.Errorf("%w: invalid gradient resolve options", ErrInvalid)
+	}
+	stateMatrix := state.Matrix
+	if stateMatrix == (Matrix{}) {
+		stateMatrix = IdentityMatrix()
+	}
+	if !geometryFillMatrixFinite(stateMatrix) {
+		return nil, fmt.Errorf("%w: non-finite gradient state matrix", ErrInvalid)
+	}
+	totalMatrix := stateMatrix
+	if brush.Transform != nil {
+		if !geometryFillMatrixFinite(*brush.Transform) {
+			return nil, fmt.Errorf("%w: non-finite gradient brush transform", ErrInvalid)
+		}
+		totalMatrix = strokePathCompose(totalMatrix, *brush.Transform)
+		if !geometryFillMatrixFinite(totalMatrix) {
+			return nil, fmt.Errorf("%w: gradient transform composition overflow", ErrLimit)
+		}
+	}
+	effectivePart := brush.Part
+	if effectivePart == "" {
+		effectivePart = basePart
+	}
+	if effectivePart == "" {
+		effectivePart = state.PagePart
+	}
+	if effectivePart == "" {
+		effectivePart = "/"
+	}
+	intent := cfg.Intent
+	if intent == IntentDefault && state.PrintColorPlan != nil {
+		intent = state.PrintColorPlan.Intent
+	}
+	colorOpts := ColorResolveOptions{
+		Intent:     intent,
+		PrintColor: state.PrintColor.Mode,
+		Negative:   state.Negative,
+	}
+	isScRGB := brush.ColorInterpolationMode == ColorInterpolationScRGB
+	entries := make([]resolvedGradientEntry, len(brush.Stops))
+	for i, stop := range brush.Stops {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		if !geometryFinite(stop.Offset) {
+			return nil, fmt.Errorf("%w: non-finite gradient stop offset", ErrInvalid)
+		}
+		resolved, err := resolveGradientStopColor(ctx, r, cfg.ColorResolver, effectivePart, stop.Color, colorOpts)
+		if err != nil {
+			return nil, fmt.Errorf("gradient stop %d: %w", i, err)
+		}
+		var vals [4]float64
+		if isScRGB {
+			vals = [4]float64{resolved.Linear[0], resolved.Linear[1], resolved.Linear[2], resolved.Alpha}
+		} else {
+			vals = [4]float64{
+				renderLinearToSRGB(colorClamp(resolved.Linear[0])),
+				renderLinearToSRGB(colorClamp(resolved.Linear[1])),
+				renderLinearToSRGB(colorClamp(resolved.Linear[2])),
+				resolved.Alpha,
+			}
+		}
+		entries[i] = resolvedGradientEntry{offset: stop.Offset, values: vals, resolved: resolved, exact: true}
+	}
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].offset < entries[j].offset })
+	folded := entries[:0]
+	for i := 0; i < len(entries); {
+		j := i + 1
+		for j < len(entries) && entries[j].offset == entries[i].offset {
+			j++
+		}
+		folded = append(folded, entries[i])
+		if j-i > 1 {
+			folded = append(folded, entries[j-1])
+		}
+		i = j
+	}
+	entries = resolvedGradientBoundary(folded, 0)
+	entries = resolvedGradientBoundary(entries, 1)
+	if isScRGB && (cfg.ResampleScRGB || cfg.MaxColorError > 0) {
+		maxErr := cfg.MaxColorError
+		if maxErr == 0 {
+			maxErr = defaultGradientResampleMaxError
+		}
+		maxStops := cfg.MaxStops
+		if maxStops == 0 {
+			maxStops = defaultGradientResampleMaxStops
+		}
+		var err error
+		entries, err = resampleScRGBGradientEntries(ctx, entries, maxErr, maxStops)
+		if err != nil {
+			return nil, err
+		}
+	}
+	stops := make([]ResolvedGradientStop, len(entries))
+	for i, entry := range entries {
+		col := entry.resolved
+		if !entry.exact {
+			col = resolvedColorFromGradientValues(entry.values, isScRGB)
+		}
+		stops[i] = ResolvedGradientStop{Offset: entry.offset, Color: col}
+	}
+	result := &ResolvedGradient{
+		Kind:                   brush.Kind,
+		SpreadMethod:           brush.SpreadMethod,
+		ColorInterpolationMode: brush.ColorInterpolationMode,
+		Opacity:                brush.Opacity,
+		Stops:                  stops,
+		ShadingToPage:          totalMatrix,
+	}
+	if brush.Kind == BrushLinearGradient {
+		if !geometryFinite(brush.StartPoint.X, brush.StartPoint.Y, brush.EndPoint.X, brush.EndPoint.Y) {
+			return nil, fmt.Errorf("%w: non-finite linear gradient points", ErrInvalid)
+		}
+		start, err := geometryFillPoint(totalMatrix, brush.StartPoint)
+		if err != nil {
+			return nil, err
+		}
+		end, err := geometryFillPoint(totalMatrix, brush.EndPoint)
+		if err != nil {
+			return nil, err
+		}
+		result.StartPoint, result.EndPoint = start, end
+		if start == end {
+			sampleStops := make([]gradientSampleStop, len(entries))
+			for i, entry := range entries {
+				sampleStops[i] = gradientSampleStop{offset: entry.offset, values: entry.values}
+			}
+			result.Constant = true
+			result.ConstantColor = resolvedColorFromGradientValues(gradientAverage(sampleStops), isScRGB)
+		}
+		return result, nil
+	}
+	if !geometryFinite(brush.Center.X, brush.Center.Y, brush.GradientOrigin.X, brush.GradientOrigin.Y, brush.RadiusX, brush.RadiusY) || brush.RadiusX < 0 || brush.RadiusY < 0 {
+		return nil, fmt.Errorf("%w: invalid radial gradient geometry", ErrInvalid)
+	}
+	if brush.RadiusX > 0 && brush.RadiusY > 0 {
+		fx := (brush.GradientOrigin.X - brush.Center.X) / brush.RadiusX
+		fy := (brush.GradientOrigin.Y - brush.Center.Y) / brush.RadiusY
+		if !geometryFinite(fx, fy) {
+			return nil, fmt.Errorf("%w: radial gradient focus overflow", ErrLimit)
+		}
+		ellipseToBrush := Matrix{A: brush.RadiusX, D: brush.RadiusY, E: brush.Center.X, F: brush.Center.Y}
+		shadingToPage := strokePathCompose(totalMatrix, ellipseToBrush)
+		if !geometryFillMatrixFinite(shadingToPage) {
+			return nil, fmt.Errorf("%w: radial gradient transform overflow", ErrLimit)
+		}
+		result.Center = Point{X: 0, Y: 0}
+		result.Focus = Point{X: fx, Y: fy}
+		result.Radius = 1
+		result.ShadingToPage = shadingToPage
+		result.FocusOutsideEllipse = math.Hypot(fx, fy) > 1
+		return result, nil
+	}
+	result.Center = brush.Center
+	result.Focus = brush.GradientOrigin
+	result.Radius = max(brush.RadiusX, brush.RadiusY)
+	if brush.RadiusX == 0 && brush.RadiusY == 0 {
+		result.FocusOutsideEllipse = brush.GradientOrigin != brush.Center
+	} else if brush.RadiusX == 0 {
+		result.FocusOutsideEllipse = brush.GradientOrigin.X != brush.Center.X || math.Abs(brush.GradientOrigin.Y-brush.Center.Y) > brush.RadiusY
+	} else {
+		result.FocusOutsideEllipse = brush.GradientOrigin.Y != brush.Center.Y || math.Abs(brush.GradientOrigin.X-brush.Center.X) > brush.RadiusX
+	}
+	return result, nil
+}
+
+// resolveGradientStopColor 解析单个渐变停靠点颜色，优先使用ColorResolver缓存，无阅读器时纯内存解析sRGB与scRGB
+// 入参: ctx 取消Context, r 可选阅读器, resolver 可选颜色解析器, basePart 基准部件URI, value 源颜色, opts 色彩解析参数
+// 返回: ResolvedColor 解析后颜色, error 参数、配置、能力或取消错误
+func resolveGradientStopColor(ctx context.Context, r *Reader, resolver *ColorResolver, basePart string, value Color, opts ColorResolveOptions) (ResolvedColor, error) {
+	if resolver != nil {
+		return resolver.ResolveColor(ctx, basePart, value, &opts)
+	}
+	if r != nil {
+		return r.ResolveColor(ctx, basePart, value, &opts)
+	}
+	return resolveLocalColor(value, opts)
+}
+
+// resolvedGradientBoundary 按与gradientSampler一致的规则裁剪域外停靠点并在缺失边界时插值补点
+// 入参: entries 已排序并折叠重合点的停靠点序列, offset 端点偏移零或一
+// 返回: []resolvedGradientEntry 裁剪并补齐端点后的停靠点序列
+func resolvedGradientBoundary(entries []resolvedGradientEntry, offset float64) []resolvedGradientEntry {
+	i := sort.Search(len(entries), func(i int) bool { return entries[i].offset >= offset })
+	if i < len(entries) && entries[i].offset == offset {
+		if offset == 0 {
+			return entries[i:]
+		}
+		j := i
+		for j+1 < len(entries) && entries[j+1].offset == offset {
+			j++
+		}
+		return entries[:j+1]
+	}
+	var entry resolvedGradientEntry
+	switch {
+	case i == 0:
+		entry = entries[0]
+		entry.offset = offset
+	case i == len(entries):
+		entry = entries[i-1]
+		entry.offset = offset
+	default:
+		lo, hi := entries[i-1], entries[i]
+		vals := gradientBlend(lo.values, hi.values, gradientFraction(offset, lo.offset, hi.offset))
+		entry = resolvedGradientEntry{offset: offset, values: vals}
+	}
+	if offset == 0 {
+		out := make([]resolvedGradientEntry, 0, len(entries)-i+1)
+		out = append(out, entry)
+		return append(out, entries[i:]...)
+	}
+	out := make([]resolvedGradientEntry, 0, i+1)
+	out = append(out, entries[:i]...)
+	return append(out, entry)
+}
+
+// resampleScRGBGradientEntries 在scRGB线性光区间按最大sRGB偏差贪心插入中点，使分段sRGB线性插值逼近真实线性渐变
+// 入参: ctx 取消Context, entries 单位区间已规范化停靠点, maxErr 允许的最大归一化sRGB偏差, maxStops 总停靠点数量上限
+// 返回: []resolvedGradientEntry 细分后的停靠点切片, error 取消错误
+func resampleScRGBGradientEntries(ctx context.Context, entries []resolvedGradientEntry, maxErr float64, maxStops int) ([]resolvedGradientEntry, error) {
+	if len(entries) < 2 || len(entries) >= maxStops {
+		return entries, nil
+	}
+	out := slices.Clone(entries)
+	for len(out) < maxStops {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		bestIdx := -1
+		bestErr := maxErr
+		var bestMid [4]float64
+		for i := 0; i < len(out)-1; i++ {
+			lo, hi := out[i], out[i+1]
+			if hi.offset-lo.offset <= 1e-6 {
+				continue
+			}
+			midVals := gradientBlend(lo.values, hi.values, 0.5)
+			diff := 0.0
+			for c := range 3 {
+				sLo := renderLinearToSRGB(colorClamp(lo.values[c]))
+				sHi := renderLinearToSRGB(colorClamp(hi.values[c]))
+				sMidTrue := renderLinearToSRGB(colorClamp(midVals[c]))
+				sMidApprox := 0.5 * (sLo + sHi)
+				if d := math.Abs(sMidTrue - sMidApprox); d > diff {
+					diff = d
+				}
+			}
+			if diff > bestErr {
+				bestErr = diff
+				bestIdx = i
+				bestMid = midVals
+			}
+		}
+		if bestIdx < 0 {
+			break
+		}
+		midOffset := 0.5 * (out[bestIdx].offset + out[bestIdx+1].offset)
+		inserted := resolvedGradientEntry{offset: midOffset, values: bestMid}
+		out = slices.Insert(out, bestIdx+1, inserted)
+	}
+	return out, nil
+}
+
+// resolvedColorFromGradientValues 将插值空间内的非预乘RGB与透明度构造为完整的ResolvedColor
+// 入参: values 非预乘RGB与alpha分量, isScRGB 分量是否处于线性scRGB空间
+// 返回: ResolvedColor 规范化解析颜色
+func resolvedColorFromGradientValues(values [4]float64, isScRGB bool) ResolvedColor {
+	alpha := colorClamp(values[3])
+	var linear, srgb [3]float64
+	space := ColorSRGB
+	colorSpace := "sRGB"
+	if isScRGB {
+		space = ColorScRGB
+		colorSpace = "scRGB"
+		linear = [3]float64{values[0], values[1], values[2]}
+		for i := range 3 {
+			srgb[i] = renderLinearToSRGB(colorClamp(linear[i]))
+		}
+	} else {
+		for i := range 3 {
+			srgb[i] = colorClamp(values[i])
+			linear[i] = renderSRGBToLinear(srgb[i])
+		}
+	}
+	luminance := colorClamp(0.2126*linear[0] + 0.7152*linear[1] + 0.0722*linear[2])
+	return ResolvedColor{
+		Space:      space,
+		ColorSpace: colorSpace,
+		Components: []float64{values[0], values[1], values[2]},
+		Alpha:      alpha,
+		Linear:     linear,
+		Gray:       renderLinearToSRGB(luminance),
+		SRGB: color.NRGBA{
+			R: colorQuantize8(srgb[0]),
+			G: colorQuantize8(srgb[1]),
+			B: colorQuantize8(srgb[2]),
+			A: colorQuantize8(alpha),
+		},
+		SRGB16: color.NRGBA64{
+			R: colorQuantize16(srgb[0]),
+			G: colorQuantize16(srgb[1]),
+			B: colorQuantize16(srgb[2]),
+			A: colorQuantize16(alpha),
+		},
+	}
 }

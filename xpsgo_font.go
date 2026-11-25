@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -50,6 +51,9 @@ const (
 	// FontEmbeddingEditable 表示允许可编辑嵌入许可
 	FontEmbeddingEditable
 )
+
+// fontGlyphClusterMax 限制单次字形簇解算允许展开的最大字形数量
+const fontGlyphClusterMax = 1 << 20
 
 // fontTable 保存字体表相对于完整字体部件的范围及校验和
 type fontTable struct {
@@ -209,6 +213,38 @@ type FontUsage struct {
 	Glyphs          []uint16
 }
 
+// ResolvedGlyphItem 保存单个已解算字形相对于Glyphs原点的编号、局部偏移、步进、竖排原点与变换矩阵
+type ResolvedGlyphItem struct {
+	GlyphID        uint16
+	Origin         Point
+	DeltaX         float64
+	DeltaY         float64
+	Advance        float64
+	VerticalOrigin Point
+	Transform      Matrix
+	IsRTL          bool
+	IsSideways     bool
+}
+
+// ResolvedGlyphCluster 保存按ECMA-388 §5.1解算的单个字形簇的码点区间、UTF-8字节区间、逻辑文本与字形定位结果
+type ResolvedGlyphCluster struct {
+	RuneStart      int
+	RuneCount      int
+	UTF8Start      int
+	UTF8End        int
+	Text           string
+	GlyphStart     int
+	GlyphCount     int
+	GlyphIDs       []uint16
+	Glyphs         []ResolvedGlyphItem
+	Origin         Point
+	DeltaX         float64
+	DeltaY         float64
+	VerticalOrigin Point
+	IsRTL          bool
+	IsSideways     bool
+}
+
 // fontUsageCollector 汇总全部原始固定布局标记，包括未选兼容分支和未引用字典
 type fontUsageCollector struct {
 	reader  *Reader
@@ -245,7 +281,7 @@ func (p *packageReader) readFontFaceInfo(part string, index uint32, maximum int6
 	if err != nil {
 		return nil, false, &PartError{Part: part, Err: err}
 	}
-	obfuscated := strings.EqualFold(media, "application/vnd.ms-package.obfuscated-opentype")
+	obfuscated := matchStandardContentType(FormatOpenXPS, media, "application/vnd.ms-package.obfuscated-opentype")
 	if obfuscated {
 		if len(data) < 32 {
 			return nil, false, &PartError{Part: part, Err: fmt.Errorf("%w: truncated obfuscated font", ErrInvalid)}
@@ -690,6 +726,13 @@ func (r *Reader) Font(ctx context.Context, fontURI string) (*FontResource, error
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
+	return buildFontResource(part, collectionIndex, hasCollectionIndex, obfuscated, face, source, bytes.Clone(face.data), names, style, fsType, permission), nil
+}
+
+// buildFontResource 汇总已解析字体面、度量、名称、样式与嵌入权限构造FontResource
+// 入参: part 部件URI, collectionIndex 集合索引, hasCollectionIndex 是否显式指定索引, obfuscated 是否原为混淆字体, face 已解析字体面, source 已解析字体源, data 独立字体字节, names 名称集合, style 样式信息, fsType 原始fsType标志, permission 嵌入许可级别
+// 返回: *FontResource 构造完成的字体资源
+func buildFontResource(part string, collectionIndex uint32, hasCollectionIndex, obfuscated bool, face *fontFace, source *fontSource, data []byte, names fontResourceNameSet, style fontResourceStyleInfo, fsType uint16, permission FontEmbeddingPermission) *FontResource {
 	return &FontResource{
 		Part:                part,
 		CollectionIndex:     collectionIndex,
@@ -701,7 +744,7 @@ func (r *Reader) Font(ctx context.Context, fontURI string) (*FontResource, error
 		SubfamilyName:       names.subfamily,
 		FullName:            names.full,
 		PostScriptName:      names.postScript,
-		Data:                bytes.Clone(face.data),
+		Data:                data,
 		UnitsPerEm:          source.metrics.unitsPerEm,
 		Ascender:            source.metrics.hhea.ascender,
 		Descender:           source.metrics.hhea.descender,
@@ -716,7 +759,7 @@ func (r *Reader) Font(ctx context.Context, fontURI string) (*FontResource, error
 		EmbeddingPermission: fsType,
 		Permission:          permission,
 		source:              source,
-	}, nil
+	}
 }
 
 // ExtractFontFace 从单面SFNT或TTC/OTC字体集合中无损提取指定索引的独立单面TTF/OTF字节
@@ -2265,25 +2308,197 @@ func fontUsageElement(name string) bool {
 	return false
 }
 
+// resolveGlyphRun 结合字形顶部缓存与取消检查解算Glyphs排布，不支持轮廓yMax时回退零值
+// 入参: ctx 取消Context, glyphs 已规范化前导转义的字形元素
+// 返回: *glyphRun 已排布字形运行, func(uint16) (float64, error) 字形yMax缓存查询器, error 解算或取消错误
+func (s *fontSource) resolveGlyphRun(ctx context.Context, glyphs *Glyphs) (*glyphRun, func(uint16) (float64, error), error) {
+	yMaxCache := make(map[uint16]float64)
+	yMax := func(gid uint16) (float64, error) {
+		if v, ok := yMaxCache[gid]; ok {
+			return v, nil
+		}
+		v, err := s.glyphYMax(gid)
+		if err != nil {
+			if errors.Is(err, ErrUnsupported) {
+				yMaxCache[gid] = 0
+				return 0, nil
+			}
+			return 0, err
+		}
+		yMaxCache[gid] = v
+		return v, nil
+	}
+	run, err := resolveGlyphRunWithStep(glyphs, s.metrics, s.glyphIndex, yMax, fontGlyphClusterMax, func() error { return checkContext(ctx) })
+	if err != nil {
+		return nil, nil, err
+	}
+	return run, yMax, nil
+}
+
+// ResolveGlyphClusters 严格按ECMA-388 §5.1解析Glyphs的ClusterMap、UnicodeString与Indices并输出结构化字形簇
+// 自动剥离UnicodeString前导{}转义并正确处理UTF-16代理对，各字形Origin为相对Glyphs.Origin的局部偏移
+// 入参: ctx 取消Context，nil采用Background, glyphs 待解算字形元素, font 关联字体资源
+// 返回: []ResolvedGlyphCluster 按逻辑顺序排列的结构化字形簇, error 参数、字体、度量、结构、资源或取消错误
+func ResolveGlyphClusters(ctx context.Context, glyphs *Glyphs, font *FontResource) ([]ResolvedGlyphCluster, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if glyphs == nil || font == nil || font.source == nil || font.source.metrics == nil || font.UnitsPerEm == 0 {
+		return nil, fmt.Errorf("%w: glyphs or font resource is unavailable", ErrInvalid)
+	}
+	normalized := *glyphs
+	normalized.Text = strings.TrimPrefix(normalized.Text, "{}")
+	run, yMax, err := font.source.resolveGlyphRun(ctx, &normalized)
+	if err != nil {
+		return nil, err
+	}
+	scale := normalized.FontRenderingEmSize / float64(font.source.metrics.unitsPerEm)
+	direction := 1.0
+	if run.rtl {
+		direction = -1
+	}
+	verticalOriginFor := func(gid uint16) (Point, error) {
+		if !run.sideways {
+			return Point{}, nil
+		}
+		var top float64
+		if font.source.metrics.needsGlyphYMax() {
+			var topErr error
+			top, topErr = yMax(gid)
+			if topErr != nil {
+				return Point{}, topErr
+			}
+		}
+		anchor, vErr := font.source.metrics.verticalOrigin(gid, top)
+		if vErr != nil {
+			return Point{}, vErr
+		}
+		return Point{X: anchor.X * scale, Y: anchor.Y * scale}, nil
+	}
+	buildItem := func(p positionedGlyph) (ResolvedGlyphItem, error) {
+		vOrigin, vErr := verticalOriginFor(p.gid)
+		if vErr != nil {
+			return ResolvedGlyphItem{}, vErr
+		}
+		return ResolvedGlyphItem{
+			GlyphID:        p.gid,
+			Origin:         Point{X: p.origin.X - normalized.Origin.X, Y: p.origin.Y - normalized.Origin.Y},
+			DeltaX:         direction * p.advance,
+			DeltaY:         0,
+			Advance:        p.advance,
+			VerticalOrigin: vOrigin,
+			Transform:      p.matrix,
+			IsRTL:          run.rtl,
+			IsSideways:     run.sideways,
+		}, nil
+	}
+	var clusters []ResolvedGlyphCluster
+	text := normalized.Text
+	runePos, utf8Pos, glyphPos := 0, 0, 0
+	for _, cluster := range normalized.Indices {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		runeStart, utf8Start := runePos, utf8Pos
+		if normalized.Text != "" {
+			for remaining := cluster.CodeUnitCount; remaining > 0; {
+				r, size := utf8.DecodeRuneInString(text[utf8Pos:])
+				width := 1
+				if r > 0xffff {
+					width = 2
+				}
+				remaining -= width
+				utf8Pos += size
+				runePos++
+			}
+		}
+		glyphStart := glyphPos
+		glyphCount := len(cluster.Glyphs)
+		glyphPos += glyphCount
+		ids := make([]uint16, glyphCount)
+		items := make([]ResolvedGlyphItem, glyphCount)
+		deltaX := 0.0
+		for i := range glyphCount {
+			item, itemErr := buildItem(run.glyphs[glyphStart+i])
+			if itemErr != nil {
+				return nil, itemErr
+			}
+			ids[i] = item.GlyphID
+			items[i] = item
+			deltaX += item.DeltaX
+		}
+		entry := ResolvedGlyphCluster{
+			RuneStart:  runeStart,
+			RuneCount:  runePos - runeStart,
+			UTF8Start:  utf8Start,
+			UTF8End:    utf8Pos,
+			Text:       text[utf8Start:utf8Pos],
+			GlyphStart: glyphStart,
+			GlyphCount: glyphCount,
+			GlyphIDs:   ids,
+			Glyphs:     items,
+			DeltaX:     deltaX,
+			IsRTL:      run.rtl,
+			IsSideways: run.sideways,
+		}
+		if glyphCount > 0 {
+			entry.Origin = items[0].Origin
+			entry.VerticalOrigin = items[0].VerticalOrigin
+		}
+		clusters = append(clusters, entry)
+	}
+	for utf8Pos < len(text) {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		_, size := utf8.DecodeRuneInString(text[utf8Pos:])
+		item, itemErr := buildItem(run.glyphs[glyphPos])
+		if itemErr != nil {
+			return nil, itemErr
+		}
+		clusters = append(clusters, ResolvedGlyphCluster{
+			RuneStart:      runePos,
+			RuneCount:      1,
+			UTF8Start:      utf8Pos,
+			UTF8End:        utf8Pos + size,
+			Text:           text[utf8Pos : utf8Pos+size],
+			GlyphStart:     glyphPos,
+			GlyphCount:     1,
+			GlyphIDs:       []uint16{item.GlyphID},
+			Glyphs:         []ResolvedGlyphItem{item},
+			Origin:         item.Origin,
+			DeltaX:         item.DeltaX,
+			VerticalOrigin: item.VerticalOrigin,
+			IsRTL:          run.rtl,
+			IsSideways:     run.sideways,
+		})
+		runePos++
+		utf8Pos += size
+		glyphPos++
+	}
+	return clusters, checkContext(ctx)
+}
+
 // fontUsageMarkup 区分字体标记和已知非布局元数据，拒绝猜测自定义XML的字体语义
 // 入参: media 部件内容类型
 // 返回: bool 是否含布局标记, error 未理解XML部件错误
 func fontUsageMarkup(media string) (bool, error) {
 	for _, kind := range []string{"fixedpage", "fixeddocument", "fixeddocumentsequence", "documentstructure", "storyfragments"} {
-		if strings.EqualFold(media, fixedContentType(kind)) {
+		if matchStandardContentType(FormatOpenXPS, media, fixedContentType(kind)) {
 			return true, nil
 		}
 	}
-	if strings.EqualFold(media, resourceDictionaryContentType) {
+	if matchStandardContentType(FormatOpenXPS, media, resourceDictionaryContentType) {
 		return true, nil
 	}
 	for _, known := range []string{opcCoreType, opcSignatureType, printTicketType, "application/vnd.ms-printing.printcapabilities+xml", fixedContentType("signaturedefinitions"), fixedContentType("discard-control")} {
-		if strings.EqualFold(media, known) {
+		if matchStandardContentType(FormatOpenXPS, media, known) {
 			return false, nil
 		}
 	}
-	media = strings.ToLower(media)
-	if strings.HasSuffix(media, "+xml") || media == "application/xml" || media == "text/xml" {
+	base := strings.ToLower(opcMediaTypeBase(media))
+	if strings.HasSuffix(base, "+xml") || base == "application/xml" || base == "text/xml" {
 		return false, fmt.Errorf("%w: font usage in custom XML content type %q", ErrUnsupported, media)
 	}
 	return false, nil
