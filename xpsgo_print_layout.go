@@ -408,11 +408,22 @@ func (s *printLayoutSettings) mediaSize(media *PrintMedia) (printMediaPlacement,
 			return placement, fmt.Errorf("%w: print media dimensions", ErrInvalid)
 		}
 		placement.widthMicrons = widthMicrons
-		if media.Width > 0 && !printCoordinateEqual(media.Width, width*printMicronUnit) && !media.DefaultOnly {
-			return placement, fmt.Errorf("%w: physical roll width conflicts with print ticket", ErrInvalid)
+		rollWidth := width * printMicronUnit
+		if media.Height <= 0 {
+			if media.Width > 0 && !printCoordinateEqual(media.Width, rollWidth) && !media.DefaultOnly {
+				return placement, fmt.Errorf("%w: physical roll width conflicts with print ticket", ErrInvalid)
+			}
+			placement.rollNoLength = true
+			return placement, fmt.Errorf("%w: roll media requires an explicit length", ErrUnsupported)
 		}
-		placement.rollNoLength = true
-		return placement, fmt.Errorf("%w: roll media requires an explicit length", ErrUnsupported)
+		if !printCoordinateEqual(media.Width, rollWidth) {
+			if !media.DefaultOnly {
+				return placement, fmt.Errorf("%w: physical roll width conflicts with print ticket", ErrInvalid)
+			}
+			media.ImageableArea = nil
+			media.Width = rollWidth
+		}
+		return placement, nil
 	} else if !hasWidth && !hasHeight && !custom && media.Width > 0 {
 		return placement, nil
 	} else if !hasWidth || !hasHeight {
@@ -620,14 +631,8 @@ func (s *PrintSettings) layoutWithRotation(ctx context.Context, page *Page, medi
 	if err != nil {
 		return nil, Matrix{}, err
 	}
-	if configuration.Scope != PrintScopeUnknown || page == nil || !geometryFinite(page.Width, page.Height, media.Width, media.Height) || page.Width < 1 || page.Height < 1 || media.Width < 0 || media.Height < 0 || (media.Width == 0) != (media.Height == 0) {
-		return nil, Matrix{}, fmt.Errorf("%w: print layout page or media", ErrInvalid)
-	}
-	if media.ImageableArea != nil {
-		area := *media.ImageableArea
-		if !geometryFinite(area.X, area.Y, area.Width, area.Height, area.X+area.Width, area.Y+area.Height) || area.Width <= 0 || area.Height <= 0 {
-			return nil, Matrix{}, fmt.Errorf("%w: print imageable area", ErrInvalid)
-		}
+	if err := validatePrintLayoutPageMedia(configuration, page, media); err != nil {
+		return nil, Matrix{}, err
 	}
 	if s == nil {
 		s = &PrintSettings{Version: 1}
@@ -637,6 +642,22 @@ func (s *PrintSettings) layoutWithRotation(ctx context.Context, page *Page, medi
 		return nil, Matrix{}, err
 	}
 	return newPrintLayoutSettings(model, configuration).layoutWithRotation(page, media)
+}
+
+// validatePrintLayoutPageMedia 校验页面尺寸、物理介质及可打印区域合法性
+// 入参: configuration 已校验设置参数, page 页面头, media 物理介质
+// 返回: error 参数、页面或介质非法错误
+func validatePrintLayoutPageMedia(configuration printSettingsConfig, page *Page, media PrintMedia) error {
+	if configuration.Scope != PrintScopeUnknown || page == nil || !geometryFinite(page.Width, page.Height, media.Width, media.Height) || page.Width < 1 || page.Height < 1 || media.Width < 0 || media.Height < 0 || (media.Width == 0) != (media.Height == 0) {
+		return fmt.Errorf("%w: print layout page or media", ErrInvalid)
+	}
+	if media.ImageableArea != nil {
+		area := *media.ImageableArea
+		if !geometryFinite(area.X, area.Y, area.Width, area.Height, area.X+area.Width, area.Y+area.Height) || area.Width <= 0 || area.Height <= 0 {
+			return fmt.Errorf("%w: print imageable area", ErrInvalid)
+		}
+	}
+	return nil
 }
 
 // option 读取指定层级的唯一选择，仅匹配Print Schema公共关键字命名空间
@@ -1472,12 +1493,12 @@ func (p *printSheetPacker) poster(page printPlanPage, document printPlanDocument
 					F: area.Y*(1-factor) + (float64(rows)-factor)*area.Height/2 - float64(row)*area.Height,
 				}
 			}
-			placement := PrintPlacement{Page: page.index, DocumentIndex: page.document, Transform: mapping.Mul(page.layout.Transform), PageClip: page.layout.PageClip, MediaClip: area, Watermark: page.watermark, Negative: page.negative, Color: clonePrintColorPlan(page.colorPlan)}
+			placement := PrintPlacement{Page: page.index, DocumentIndex: page.document, Transform: mapping.Mul(page.layout.Transform), PageClip: page.layout.PageClip, MediaClip: area, Watermark: page.watermark, Negative: page.negative, Color: clonePrintColorPlan(page.colorPlan), Resolution: clonePrintResolution(page.resolution)}
 			box := printTransformBox(page.layout.PageClip, placement.Transform)
 			if !geometryFillMatrixFinite(placement.Transform) || !geometryFinite(box.X, box.Y, box.Width, box.Height, box.X+box.Width, box.Y+box.Height) {
 				return fmt.Errorf("%w: print poster mapping", ErrLimit)
 			}
-			sheet := PrintSheet{Front: PrintSide{Width: page.layout.Width, Height: page.layout.Height, MediaClip: area, Pages: []PrintPlacement{placement}, Color: page.color}}
+			sheet := PrintSheet{Front: PrintSide{Width: page.layout.Width, Height: page.layout.Height, MediaClip: area, Pages: []PrintPlacement{placement}, Color: page.color, Resolution: clonePrintResolution(page.resolution)}}
 			sheet.Front.Gutter = printBindingGutter(document.finishing, sheet.Front, PrintSimplex, false)
 			if err := p.builder.appendSheet(p.output, sheet, p.temporary); err != nil {
 				return err
@@ -1533,39 +1554,4 @@ func (p *printSheetPacker) posterGrid(count int, area Rect) (int, int, error) {
 		columns, rows = rows, columns
 	}
 	return columns, rows, p.builder.step(1)
-}
-
-// printSinglePosterSettings 移除单张海报的恒等设置，拒绝在单页绘制方法中静默丢弃分幅
-// 入参: settings 有效设置, options 描述值的资源及取消参数
-// 返回: *PrintSettings 单页设置视图, error 类型、能力或容量错误
-func printSinglePosterSettings(settings *PrintSettings, options printSettingsConfig) (*PrintSettings, error) {
-	present := false
-	for _, element := range settings.Elements {
-		if element.Kind == PrintSettingFeature && printPublicKeywordSpace(element.Name.Space) && element.Name.Local == "PagePoster" {
-			present = true
-			break
-		}
-	}
-	if !present {
-		return settings, nil
-	}
-	configuration, err := printSettingsOptions(options.context, &options.PrintSettingsOptions)
-	if err != nil {
-		return nil, err
-	}
-	control := newPrintLayoutSettings(settings, configuration)
-	count, err := control.poster(int(^uint(0) >> 1))
-	if err != nil {
-		return nil, err
-	}
-	if count != 1 {
-		return nil, fmt.Errorf("%w: multiple poster sheets require PrintPlan", ErrUnsupported)
-	}
-	result := &PrintSettings{Version: settings.Version}
-	for _, element := range settings.Elements {
-		if element.Kind != PrintSettingFeature || !printPublicKeywordSpace(element.Name.Space) || element.Name.Local != "PagePoster" {
-			result.Elements = append(result.Elements, element)
-		}
-	}
-	return result, nil
 }

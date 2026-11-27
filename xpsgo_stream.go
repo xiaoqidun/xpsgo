@@ -102,6 +102,7 @@ type streamEntry struct {
 	localZIP64        bool
 	headerFreed       bool
 	payloadFreed      bool
+	reclaimPayload    bool
 	headerFreedBytes  int64
 	payloadFreedBytes int64
 	trailerFreedBytes int64
@@ -222,9 +223,24 @@ type streamPackage struct {
 	pendingEnvelopes     []*streamEntry
 	pendingParts         map[string]bool
 	pinnedParts          map[string]int
+	onPartReady          func(string) error
 	onConsumeFinish      func(*Reader, bool) error
 	ticketMu             sync.RWMutex
 	ticketCache          map[streamTicketCacheKey]streamCachedTicket
+}
+
+// streamConsumeHooks 保存纯前向消费模式内部的预锁定部件与部件就绪及完成回调钩子
+type streamConsumeHooks struct {
+	pinParts    []string
+	onPartReady func(string) error
+	onFinish    func(*Reader, bool) error
+}
+
+// streamConcatReaderAt 将底层顺序存储与末尾内存中央目录无缝拼接为标准io.ReaderAt
+type streamConcatReaderAt struct {
+	base    io.ReaderAt
+	baseLen int64
+	tail    []byte
 }
 
 // streamCachedResource 保存独立且不再修改的部件字节，活动读取器可在缓存淘汰后继续读取
@@ -273,14 +289,15 @@ type streamLimitedInput struct {
 
 // streamInput 记录真正消费的字节并批量存储，为Deflate提供不越过码流结尾的ReadByte
 type streamInput struct {
-	reader      *bufio.Reader
-	storage     StreamStorage
-	ownedMemory *streamMemory
-	onLimit     func() int64
-	context     context.Context
-	limit       int64
-	count       int64
-	pending     []byte
+	reader       *bufio.Reader
+	storage      StreamStorage
+	ownedMemory  *streamMemory
+	onLimit      func() int64
+	context      context.Context
+	limit        int64
+	count        int64
+	flushedCount int64
+	pending      []byte
 }
 
 // streamPartialDiscard 保存释放提示的根声明和已闭合子元素，不把未结束元素作为完整提示
@@ -502,10 +519,10 @@ func ConsumeStream(ctx context.Context, input io.Reader, options *StreamReadOpti
 	return consumeStreamInternal(ctx, input, options, nil)
 }
 
-// consumeStreamInternal 执行纯前向流式消费并在流收尾释放存储前触发可选完成钩子
-// 入参: ctx 取消Context, input 前向输入, options 读取选项, onFinish 流消费完成时的收尾钩子
+// consumeStreamInternal 执行纯前向流式消费并在消费期间维护外部预锁定部件、部件就绪钩子与流收尾完成钩子
+// 入参: ctx 取消Context, input 前向输入, options 读取选项, hooks 可选内部钩子与预锁定部件配置
 // 返回: error 输入、封装、结构、存储、回调、预算或取消错误
-func consumeStreamInternal(ctx context.Context, input io.Reader, options *StreamReadOptions, onFinish func(*Reader, bool) error) error {
+func consumeStreamInternal(ctx context.Context, input io.Reader, options *StreamReadOptions, hooks *streamConsumeHooks) error {
 	ctx, configuration, err := normalizeStreamReadOptions(ctx, input, options)
 	if err != nil {
 		return err
@@ -517,8 +534,9 @@ func consumeStreamInternal(ctx context.Context, input io.Reader, options *Stream
 		owned = &streamMemory{limit: min(configuration.MaxMemoryBytes, configuration.MaxInputBytes), reclaim: true}
 		storage = owned
 		defer owned.Close()
-		if owned.limit < int64(pendingCap) {
-			pendingCap = int(max(owned.limit, 1))
+		capLimit := min(int64(streamBufferBytes), max(owned.limit/4, 1))
+		if int64(pendingCap) > capLimit {
+			pendingCap = int(capLimit)
 		}
 	}
 	inputBytes := configuration.MaxInputBytes
@@ -526,7 +544,19 @@ func consumeStreamInternal(ctx context.Context, input io.Reader, options *Stream
 		inputBytes++
 	}
 	feed := &streamInput{reader: bufio.NewReaderSize(io.LimitReader(input, inputBytes), streamBufferBytes), storage: storage, ownedMemory: owned, context: ctx, limit: configuration.MaxInputBytes, pending: make([]byte, 0, pendingCap)}
-	p := streamPackage{input: feed, options: configuration, context: ctx, consumeOnly: true, ownedMemory: owned, parts: make(map[string]*streamPart), seen: make(map[string]bool), onConsumeFinish: onFinish}
+	p := streamPackage{input: feed, options: configuration, context: ctx, consumeOnly: true, ownedMemory: owned, parts: make(map[string]*streamPart), seen: make(map[string]bool)}
+	if hooks != nil {
+		p.onPartReady = hooks.onPartReady
+		p.onConsumeFinish = hooks.onFinish
+		for _, key := range hooks.pinParts {
+			p.pinPart(key)
+		}
+		defer func() {
+			for _, key := range hooks.pinParts {
+				p.unpinPart(key)
+			}
+		}()
+	}
 	if owned != nil {
 		feed.onLimit = p.reclaimPendingStorage
 	}
@@ -611,18 +641,22 @@ func (p *streamPackage) consume() error {
 			return err
 		}
 		offset := p.input.count
+		if p.consumeOnly && offset != 0 && p.input.limit-p.input.count >= 4 {
+			if peeked, peekErr := p.input.reader.Peek(4); peekErr == nil {
+				sig := binary.LittleEndian.Uint32(peeked)
+				if sig == packageZIPCentralSignature || sig == packageZIPEndSignature || sig == packageZIP64EndSignature || sig == packageZIPDigitalSignature {
+					_, _ = p.input.reader.Discard(4)
+					p.input.count = offset + 4
+					return p.verifyStreamCentralDirectory(sig, offset)
+				}
+			}
+		}
 		var signature [4]byte
 		if _, err := io.ReadFull(p.input, signature[:]); err != nil {
 			return p.streamInputError("stream ZIP record", err)
 		}
 		sig := binary.LittleEndian.Uint32(signature[:])
 		if sig != packageZIPLocalSignature {
-			if p.consumeOnly && offset != 0 && (sig == packageZIPCentralSignature || sig == packageZIPEndSignature || sig == packageZIP64EndSignature || sig == packageZIPDigitalSignature) {
-				if p.ownedMemory != nil {
-					p.reclaimRangeProgress(offset, p.input.count, true)
-				}
-				return p.verifyStreamCentralDirectory(sig, offset)
-			}
 			if offset == 0 {
 				p.deferred = true
 			}
@@ -676,7 +710,7 @@ func (p *streamPackage) accept(entry *streamEntry) error {
 			}
 		}
 		if p.consumeOnly && p.ownedMemory != nil && !entry.payloadFreed {
-			p.reclaimEntryPayloadMode(entry, true)
+			p.reclaimDirectoryEntryPayload(entry)
 		}
 		return nil
 	}
@@ -1272,7 +1306,6 @@ func (p *streamPackage) readStoreDescriptorEntry(offset int64, header zip.FileHe
 	var descBuf [24]byte
 	sawBadSigned := false
 	sawEOCD := false
-	passedNextHeader := false
 	consumePayload := func(size int) (bool, error) {
 		for size > 0 {
 			step := min(size, len(buffer))
@@ -1370,9 +1403,6 @@ func (p *streamPackage) readStoreDescriptorEntry(offset int64, header zip.FileHe
 		if sigVal == packageZIPEndSignature {
 			sawEOCD = true
 		}
-		if validStreamNextZIPSignature(sigVal) {
-			passedNextHeader = true
-		}
 		if sigVal != packageZIPDescriptorSignature {
 			exceeded, err := consumePayload(1)
 			if err != nil {
@@ -1411,7 +1441,7 @@ func (p *streamPackage) readStoreDescriptorEntry(offset int64, header zip.FileHe
 				descUncomp = binary.LittleEndian.Uint64(cand[16:24])
 			}
 			if descCRC != actualCRC || descComp != count || descUncomp != count || header.CRC32 != 0 && header.CRC32 != descCRC || uncompressed != 0 && uncompressed != count {
-				if !passedNextHeader && (descComp == count && descUncomp == count || descCRC == actualCRC) {
+				if descComp == count && descUncomp == count || descCRC == actualCRC {
 					sawBadSigned = true
 				}
 				continue
@@ -1590,7 +1620,7 @@ func (s *streamInput) flushAvailable() (int64, error) {
 			break
 		}
 		chunk := int(min(int64(len(s.pending)), avail))
-		n, err := s.storage.WriteAt(s.pending[:chunk], s.count-int64(len(s.pending)))
+		n, err := s.storage.WriteAt(s.pending[:chunk], s.flushedCount)
 		if n < 0 || n > chunk {
 			return total, fmt.Errorf("%w: stream storage write count", ErrInvalid)
 		}
@@ -1600,6 +1630,7 @@ func (s *streamInput) flushAvailable() (int64, error) {
 		if n != chunk {
 			return total, io.ErrShortWrite
 		}
+		s.flushedCount += int64(n)
 		remaining := len(s.pending) - n
 		copy(s.pending, s.pending[n:])
 		s.pending = s.pending[:remaining]
@@ -1618,7 +1649,7 @@ func (s *streamInput) flush() error {
 		return nil
 	}
 	if s.ownedMemory == nil {
-		n, err := s.storage.WriteAt(s.pending, s.count-int64(len(s.pending)))
+		n, err := s.storage.WriteAt(s.pending, s.flushedCount)
 		if n < 0 || n > len(s.pending) {
 			return fmt.Errorf("%w: stream storage write count", ErrInvalid)
 		}
@@ -1628,6 +1659,7 @@ func (s *streamInput) flush() error {
 		if n != len(s.pending) {
 			return io.ErrShortWrite
 		}
+		s.flushedCount += int64(n)
 		s.pending = s.pending[:0]
 		return nil
 	}
@@ -1847,6 +1879,11 @@ func (p *streamPackage) emit(part *streamPart) error {
 		if part.reclaimPending && p.canReclaimPart(part) {
 			p.reclaimPart(key)
 		}
+		if p.onPartReady != nil {
+			if err := p.onPartReady(key); err != nil {
+				return err
+			}
+		}
 		if err := p.emitPages(part.name); err != nil {
 			return err
 		}
@@ -1870,6 +1907,11 @@ func (p *streamPackage) emit(part *streamPart) error {
 	}
 	if err := checkContext(p.context); err != nil {
 		return err
+	}
+	if p.onPartReady != nil {
+		if err := p.onPartReady(key); err != nil {
+			return err
+		}
 	}
 	if err := p.emitPages(part.name); err != nil {
 		return err
@@ -2091,7 +2133,8 @@ func (s *streamMemory) WriteAt(data []byte, offset int64) (int, error) {
 			return 0, fmt.Errorf("%w: stream memory bytes", ErrLimit)
 		}
 		if s.chunkSize <= 0 {
-			s.chunkSize = min(int64(streamBufferBytes), max(s.limit/32, min(s.limit, 4096)), max(s.limit, 1))
+			capSize := min(int64(streamBufferBytes), max(s.limit/4, 1))
+			s.chunkSize = min(capSize, max(s.limit/32, 4096))
 		}
 		if s.liveChunks == nil {
 			s.liveChunks = make(map[int][]byte)
@@ -2352,6 +2395,20 @@ func (p *streamPackage) reclaimEntryPayloadMode(entry *streamEntry, allowFlush b
 	return freed, done
 }
 
+// reclaimDirectoryEntryPayload 释放空目录条目的压缩载荷范围，未完全落盘时登记延迟重试队列以防锁死整块缓存
+// 入参: entry 已校验空目录物理条目
+func (p *streamPackage) reclaimDirectoryEntryPayload(entry *streamEntry) {
+	if p.ownedMemory == nil || entry == nil || entry.payloadFreed {
+		return
+	}
+	entry.reclaimPayload = true
+	if _, done := p.reclaimEntryPayloadMode(entry, true); !done {
+		if !slices.Contains(p.pendingEnvelopes, entry) {
+			p.pendingEnvelopes = append(p.pendingEnvelopes, entry)
+		}
+	}
+}
+
 // reclaimPendingStorage 推进全部延迟未完全释放条目与部件的已落盘前缀回收，供flush在撞限时打破死锁
 // 返回: int64 本次实际释放的块字节数
 func (p *streamPackage) reclaimPendingStorage() int64 {
@@ -2369,12 +2426,22 @@ func (p *streamPackage) reclaimPendingStorageMode(allowFlush bool) int64 {
 	if len(p.pendingEnvelopes) != 0 {
 		remaining := p.pendingEnvelopes[:0]
 		for _, entry := range p.pendingEnvelopes {
-			if entry == nil || entry.headerFreed {
+			if entry == nil {
 				continue
 			}
-			freed, done := p.reclaimEntryEnvelopeMode(entry, allowFlush)
-			total += freed
-			if !done {
+			envDone := entry.headerFreed
+			if !envDone {
+				var freed int64
+				freed, envDone = p.reclaimEntryEnvelopeMode(entry, allowFlush)
+				total += freed
+			}
+			payDone := !entry.reclaimPayload || entry.payloadFreed
+			if !payDone {
+				var freed int64
+				freed, payDone = p.reclaimEntryPayloadMode(entry, allowFlush)
+				total += freed
+			}
+			if !envDone || !payDone {
 				remaining = append(remaining, entry)
 			}
 		}
@@ -2544,6 +2611,7 @@ func (p *streamPackage) reclaimPartMode(key string, allowFlush bool) (int64, boo
 		if p.pagePkg != nil {
 			delete(p.pagePkg.parts, key)
 		}
+		p.reclaimed = true
 	}
 	if !allDone {
 		if anyProgress {
@@ -2590,6 +2658,9 @@ func (p *streamPackage) reclaimDeliveredPage(source *Reader, pagePart string, do
 			if !relsPart.relsVerified && relsPart.last >= 0 && len(relsPart.entries) == relsPart.last+1 {
 				if _, complete := p.pagePkg.parts[relsKey]; complete {
 					if verified, vErr := p.pagePkg.readRelationshipsContext(p.context, pagePart, relsPart.name); vErr == nil {
+						if err := verifyStreamRelationshipPrefix(relsPart, verified); err != nil {
+							return err
+						}
 						if err := p.recordVerifiedRelationships(pagePart, verified); err != nil {
 							return err
 						}
@@ -2643,6 +2714,9 @@ func (p *streamPackage) reclaimCompletedDocument(source *Reader, docIndex int) e
 		if !relsPart.relsVerified && relsPart.last >= 0 && len(relsPart.entries) == relsPart.last+1 {
 			if _, complete := p.pagePkg.parts[docRelsKey]; complete {
 				if verified, vErr := p.pagePkg.readRelationshipsContext(p.context, docPart, relsPart.name); vErr == nil {
+					if err := verifyStreamRelationshipPrefix(relsPart, verified); err != nil {
+						return err
+					}
 					if err := p.recordVerifiedRelationships(docPart, verified); err != nil {
 						return err
 					}
@@ -2956,7 +3030,7 @@ func (p *streamPackage) reconcileStreamDirectoryAttribute(name string, entry *st
 		}
 	}
 	if p.ownedMemory != nil && entry != nil && !entry.payloadFreed {
-		p.reclaimEntryPayloadMode(entry, true)
+		p.reclaimDirectoryEntryPayload(entry)
 	}
 	return nil
 }
@@ -3090,12 +3164,166 @@ func (p *streamPackage) finishConsume() error {
 		}
 	}
 	if p.onConsumeFinish != nil {
+		if p.ownedMemory == nil && !p.reclaimed && p.pagePkg != nil {
+			if err := p.bindVerifiedZIPFiles(); err != nil {
+				return err
+			}
+		}
 		if err := p.onConsumeFinish(p.index, !p.reclaimed); err != nil {
 			return err
 		}
 	}
 	p.closeXML()
 	return checkContext(p.context)
+}
+
+// ReadAt 按拼接后的逻辑偏移读取底层顺序存储与末尾内存中央目录
+// 入参: output 读取缓冲, offset 逻辑起始偏移
+// 返回: int 已读字节数, error 越界、底层读取或EOF错误
+func (r *streamConcatReaderAt) ReadAt(output []byte, offset int64) (int, error) {
+	if offset < 0 {
+		return 0, fmt.Errorf("%w: negative concat reader offset", ErrInvalid)
+	}
+	total := r.baseLen + int64(len(r.tail))
+	if len(output) == 0 {
+		return 0, nil
+	}
+	if offset >= total {
+		return 0, io.EOF
+	}
+	written := 0
+	if offset < r.baseLen {
+		headLen := min(int64(len(output)), r.baseLen-offset)
+		n, err := r.base.ReadAt(output[:headLen], offset)
+		written += n
+		if err != nil && err != io.EOF {
+			return written, err
+		}
+		if int64(n) < headLen {
+			return written, io.EOF
+		}
+		output = output[n:]
+		offset += int64(n)
+	}
+	if len(output) > 0 && offset >= r.baseLen {
+		tailOff := int(offset - r.baseLen)
+		if tailOff < len(r.tail) {
+			n := copy(output, r.tail[tailOff:])
+			written += n
+			output = output[n:]
+		}
+	}
+	if len(output) > 0 {
+		return written, io.EOF
+	}
+	return written, nil
+}
+
+// bindVerifiedZIPFiles 基于已落盘持久化存储与已核对条目合成标准中央目录，为完流验签绑定真实可读的zip.File视图
+// 返回: error 刷盘或ZIP视图构造错误
+func (p *streamPackage) bindVerifiedZIPFiles() error {
+	if err := p.input.flush(); err != nil {
+		return err
+	}
+	cdStart := uint64(p.input.flushedCount)
+	var cd bytes.Buffer
+	var rec [46]byte
+	var z64Extra [28]byte
+	for _, entry := range p.entries {
+		h := entry.header
+		comp32 := uint32(h.CompressedSize64)
+		uncomp32 := uint32(h.UncompressedSize64)
+		off32 := uint32(entry.offset)
+		var extra []byte
+		if h.UncompressedSize64 >= 0xffffffff || h.CompressedSize64 >= 0xffffffff || uint64(entry.offset) >= 0xffffffff {
+			uncomp32, comp32, off32 = 0xffffffff, 0xffffffff, 0xffffffff
+			binary.LittleEndian.PutUint16(z64Extra[0:2], 1)
+			binary.LittleEndian.PutUint16(z64Extra[2:4], 24)
+			binary.LittleEndian.PutUint64(z64Extra[4:12], h.UncompressedSize64)
+			binary.LittleEndian.PutUint64(z64Extra[12:20], h.CompressedSize64)
+			binary.LittleEndian.PutUint64(z64Extra[20:28], uint64(entry.offset))
+			extra = z64Extra[:]
+		}
+		binary.LittleEndian.PutUint32(rec[0:4], packageZIPCentralSignature)
+		binary.LittleEndian.PutUint16(rec[4:6], h.CreatorVersion)
+		binary.LittleEndian.PutUint16(rec[6:8], h.ReaderVersion)
+		binary.LittleEndian.PutUint16(rec[8:10], h.Flags)
+		binary.LittleEndian.PutUint16(rec[10:12], h.Method)
+		binary.LittleEndian.PutUint16(rec[12:14], h.ModifiedTime)
+		binary.LittleEndian.PutUint16(rec[14:16], h.ModifiedDate)
+		binary.LittleEndian.PutUint32(rec[16:20], h.CRC32)
+		binary.LittleEndian.PutUint32(rec[20:24], comp32)
+		binary.LittleEndian.PutUint32(rec[24:28], uncomp32)
+		binary.LittleEndian.PutUint16(rec[28:30], uint16(len(h.Name)))
+		binary.LittleEndian.PutUint16(rec[30:32], uint16(len(extra)))
+		binary.LittleEndian.PutUint16(rec[32:34], 0)
+		binary.LittleEndian.PutUint16(rec[34:36], 0)
+		binary.LittleEndian.PutUint16(rec[36:38], 0)
+		binary.LittleEndian.PutUint32(rec[38:42], 0)
+		binary.LittleEndian.PutUint32(rec[42:46], off32)
+		cd.Write(rec[:])
+		cd.WriteString(h.Name)
+		cd.Write(extra)
+	}
+	cdSize := uint64(cd.Len())
+	count := uint64(len(p.entries))
+	if count >= 0xffff || cdSize >= 0xffffffff || cdStart >= 0xffffffff {
+		z64Off := cdStart + cdSize
+		var z64 [56]byte
+		binary.LittleEndian.PutUint32(z64[0:4], packageZIP64EndSignature)
+		binary.LittleEndian.PutUint64(z64[4:12], 44)
+		binary.LittleEndian.PutUint16(z64[12:14], 45)
+		binary.LittleEndian.PutUint16(z64[14:16], 45)
+		binary.LittleEndian.PutUint64(z64[24:32], count)
+		binary.LittleEndian.PutUint64(z64[32:40], count)
+		binary.LittleEndian.PutUint64(z64[40:48], cdSize)
+		binary.LittleEndian.PutUint64(z64[48:56], cdStart)
+		cd.Write(z64[:])
+		var loc [20]byte
+		binary.LittleEndian.PutUint32(loc[0:4], packageZIP64LocatorSignature)
+		binary.LittleEndian.PutUint64(loc[8:16], z64Off)
+		binary.LittleEndian.PutUint32(loc[16:20], 1)
+		cd.Write(loc[:])
+	}
+	var eocd [22]byte
+	binary.LittleEndian.PutUint32(eocd[0:4], packageZIPEndSignature)
+	binary.LittleEndian.PutUint16(eocd[8:10], uint16(min(count, 0xffff)))
+	binary.LittleEndian.PutUint16(eocd[10:12], uint16(min(count, 0xffff)))
+	binary.LittleEndian.PutUint32(eocd[12:16], uint32(min(cdSize, 0xffffffff)))
+	binary.LittleEndian.PutUint32(eocd[16:20], uint32(min(cdStart, 0xffffffff)))
+	cd.Write(eocd[:])
+	tail := cd.Bytes()
+	concat := &streamConcatReaderAt{base: p.input.storage, baseLen: p.input.flushedCount, tail: tail}
+	zr, err := zip.NewReader(concat, p.input.flushedCount+int64(len(tail)))
+	if err != nil {
+		return err
+	}
+	if len(zr.File) != len(p.entries) {
+		return fmt.Errorf("%w: streamed zip file binding mismatch", ErrInvalid)
+	}
+	byEntry := make(map[*streamEntry]*zip.File, len(p.entries))
+	for i, entry := range p.entries {
+		byEntry[entry] = zr.File[i]
+	}
+	p.pagePkg.files = zr.File
+	for key, part := range p.parts {
+		if part == nil || part.reclaimed || part.last < 0 || len(part.entries) != part.last+1 {
+			continue
+		}
+		if _, exists := p.pagePkg.parts[key]; !exists {
+			continue
+		}
+		bound := make([]*zip.File, 0, part.last+1)
+		for index := 0; index <= part.last; index++ {
+			zf := byEntry[part.entries[index]]
+			if zf == nil {
+				return fmt.Errorf("%w: streamed zip piece binding missing", ErrInvalid)
+			}
+			bound = append(bound, zf)
+		}
+		p.pagePkg.parts[key] = bound
+	}
+	return nil
 }
 
 // verifyConsumeLayout 终审纯前向消费模式下的固定文档序列、全部固定文档与全部固定页面的存在性与媒体类型合法性

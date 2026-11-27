@@ -848,13 +848,36 @@ func (f *fontSource) loadOutline() {
 	if !f.face.cff {
 		_, hasGlyf := f.face.tables["glyf"]
 		_, hasLoca := f.face.tables["loca"]
-		_, hasBitmap := f.face.tables["EBLC"]
-		if !hasGlyf && !hasLoca && hasBitmap {
-			f.outlineErr = fmt.Errorf("%w: bitmap-only font has no scalable outline", ErrUnsupported)
-			return
+		if !hasGlyf && !hasLoca {
+			_, hasEBLC := f.face.tables["EBLC"]
+			_, hasEBDT := f.face.tables["EBDT"]
+			if hasEBLC || hasEBDT {
+				f.outlineErr = fmt.Errorf("%w: bitmap-only font has no scalable outline", ErrUnsupported)
+				return
+			}
+			_, hasCBDT := f.face.tables["CBDT"]
+			_, hasCBLC := f.face.tables["CBLC"]
+			if hasCBDT || hasCBLC {
+				f.outlineErr = fmt.Errorf("%w: CBDT/CBLC bitmap font has no scalable outline", ErrUnsupported)
+				return
+			}
+			if _, hasSbix := f.face.tables["sbix"]; hasSbix {
+				f.outlineErr = fmt.Errorf("%w: sbix bitmap font has no scalable outline", ErrUnsupported)
+				return
+			}
+			if _, hasCFF2 := f.face.tables["CFF2"]; hasCFF2 {
+				f.outlineErr = fmt.Errorf("%w: CFF2 font outline", ErrUnsupported)
+				return
+			}
 		}
 		f.trueType, f.outlineErr = parseTrueType(f.face)
 		return
+	}
+	if _, hasCFF := f.face.tables["CFF "]; !hasCFF {
+		if _, hasCFF2 := f.face.tables["CFF2"]; hasCFF2 {
+			f.outlineErr = fmt.Errorf("%w: CFF2 font outline", ErrUnsupported)
+			return
+		}
 	}
 	data, err := f.face.table("CFF ")
 	if err != nil {
@@ -877,6 +900,24 @@ func (f *fontSource) loadOutline() {
 	f.outlineErr = err
 }
 
+// trueTypeOriginShift 计算TrueType简单或复合字形按hmtx左侧留白及USE_MY_METRICS归一化水平原点的X轴平移量
+// 入参: glyph 已解析的TrueType字形
+// 返回: float64 归一化水平原点平移量, error 度量或非有限坐标错误
+func (f *fontSource) trueTypeOriginShift(glyph *trueTypeGlyph) (float64, error) {
+	_, bearing, err := f.metrics.horizontal(glyph.metricsGlyph)
+	if err != nil {
+		return 0, err
+	}
+	origin := Point{X: glyph.metricsBounds.X - float64(bearing)}
+	if !glyph.metricsPositionKnown {
+		origin = glyph.metricsTransform.Transform(origin)
+	}
+	if !geometryFinite(origin.X) {
+		return 0, fmt.Errorf("%w: non-finite composite metrics origin", ErrLimit)
+	}
+	return -origin.X, nil
+}
+
 // glyphOutline 返回以水平字符原点为基准的独立设计单位轮廓，纵轴向上且不应用页面变换或样式模拟
 // 入参: gid 当前物理字体面的字形编号
 // 返回: Geometry 未hint的非零填充轮廓, error 轮廓、矩阵或尚未支持的绘制方式错误
@@ -893,18 +934,10 @@ func (f *fontSource) glyphOutline(gid uint16) (Geometry, error) {
 		if err != nil {
 			return Geometry{}, err
 		}
-		_, bearing, err := f.metrics.horizontal(glyph.metricsGlyph)
+		x, err := f.trueTypeOriginShift(glyph)
 		if err != nil {
 			return Geometry{}, err
 		}
-		origin := Point{X: glyph.metricsBounds.X - float64(bearing)}
-		if !glyph.metricsPositionKnown {
-			origin = glyph.metricsTransform.Transform(origin)
-		}
-		if !geometryFinite(origin.X) {
-			return Geometry{}, fmt.Errorf("%w: non-finite composite metrics origin", ErrLimit)
-		}
-		x := -origin.X
 		if x != 0 {
 			if err := fontTransformOutline(&glyph.geometry, Matrix{A: 1, D: 1, E: x}); err != nil {
 				return Geometry{}, err
@@ -1006,9 +1039,15 @@ func (f *fontSource) glyphBitmapOutline(gid uint16, ppem uint16, vertical bool) 
 		bearingY = -bearingY
 		var top float64
 		if f.metrics.needsGlyphYMax() {
-			if yMax, yErr := f.glyphYMax(gid); yErr == nil {
+			yMax, yErr := f.glyphYMax(gid)
+			if yErr == nil {
 				top = yMax
-			} else if !errors.Is(yErr, ErrUnsupported) {
+			} else if errors.Is(yErr, ErrUnsupported) {
+				top, yErr = f.bitmapGlyphTop(metrics, selection)
+				if yErr != nil {
+					return nil, yErr
+				}
+			} else {
 				return nil, yErr
 			}
 		}
@@ -1025,6 +1064,47 @@ func (f *fontSource) glyphBitmapOutline(gid uint16, ppem uint16, vertical bool) 
 		return originOffset.Y + (bearingY-float64(py)*selection.scaleY)*unitsY
 	}
 	return fontBitmapMaskToGeometry(decoded.mask, designX, designY)
+}
+
+// bitmapGlyphTop 根据位图字形度量与选中strike换算设计单位顶部纵坐标，供纯位图竖排原点计算复用
+// 入参: metrics 位图字形原始度量, selection 已选中的位图strike与缩放参数
+// 返回: float64 设计单位顶部纵坐标, error 缺少定位度量错误
+func (f *fontSource) bitmapGlyphTop(metrics fontBitmapMetrics, selection fontBitmapSelection) (float64, error) {
+	unitsY := float64(f.metrics.unitsPerEm) / float64(selection.ppemY)
+	if metrics.hasHorizontal {
+		return math.Round(float64(metrics.horizontal.bearingY)*selection.scaleY) * unitsY, nil
+	}
+	if metrics.hasVertical {
+		ascender := float64(f.metrics.hhea.ascender)
+		if f.metrics.os2 != nil {
+			ascender = float64(f.metrics.os2.typoAscender)
+		}
+		return ascender - math.Round(float64(metrics.vertical.bearingY)*selection.scaleY)*unitsY, nil
+	}
+	return 0, fmt.Errorf("%w: bitmap glyph has no positioning metrics", ErrUnsupported)
+}
+
+// bitmapGlyphYMax 在纯位图字体中按竖排优先strike读取指定字形的设计单位顶部纵坐标
+// 入参: gid 字形编号
+// 返回: float64 设计单位顶部纵坐标，空或缺失字形返回零, error strike、度量或位图解码错误
+func (f *fontSource) bitmapGlyphYMax(gid uint16) (float64, error) {
+	selection, err := f.selectBitmapOutlineStrike(0, true)
+	if err != nil {
+		return 0, err
+	}
+	decoder := fontBitmapDecode{
+		font:       f.bitmaps,
+		strike:     &f.bitmaps.strikes[selection.strike],
+		path:       make(map[uint16]bool),
+		cache:      make(map[uint16]fontBitmapDecoded),
+		components: fontBitmapMaxComponents,
+		pixels:     fontBitmapMaxPixels,
+	}
+	decoded, present, err := decoder.decode(gid)
+	if err != nil || !present || decoded.mask == nil || decoded.mask.Rect.Empty() || decoded.metrics.width == 0 || decoded.metrics.height == 0 {
+		return 0, err
+	}
+	return f.bitmapGlyphTop(decoded.metrics, selection)
 }
 
 // selectBitmapOutlineStrike 按ppem与方向选择最佳位图strike，ppem为0选最大分辨率，否则精确优先、最近回退
@@ -1204,6 +1284,7 @@ func (f *fontSource) glyphDesignBox(gid uint16) (Rect, bool, error) {
 		if end-start < 10 {
 			return Rect{}, false, fmt.Errorf("%w: truncated TrueType glyph header", ErrInvalid)
 		}
+		contours := int16(binary.BigEndian.Uint16(f.trueType.glyf[start:]))
 		xMin := float64(int16(binary.BigEndian.Uint16(f.trueType.glyf[start+2:])))
 		yMin := float64(int16(binary.BigEndian.Uint16(f.trueType.glyf[start+4:])))
 		xMax := float64(int16(binary.BigEndian.Uint16(f.trueType.glyf[start+6:])))
@@ -1211,7 +1292,32 @@ func (f *fontSource) glyphDesignBox(gid uint16) (Rect, bool, error) {
 		if xMin > xMax || yMin > yMax {
 			return Rect{}, false, fmt.Errorf("%w: invalid TrueType glyph bounds", ErrInvalid)
 		}
-		return Rect{X: xMin, Y: yMin, Width: xMax - xMin, Height: yMax - yMin}, true, nil
+		if contours < 0 {
+			glyph, err := f.trueType.load(gid, &trueTypeBudget{})
+			if err != nil {
+				return Rect{}, false, err
+			}
+			if len(glyph.endPoints) == 0 {
+				return Rect{}, false, nil
+			}
+			shiftX, err := f.trueTypeOriginShift(glyph)
+			if err != nil {
+				return Rect{}, false, err
+			}
+			x := glyph.bounds.X + shiftX
+			if !geometryFinite(x) {
+				return Rect{}, false, fmt.Errorf("%w: non-finite composite glyph bounds", ErrLimit)
+			}
+			return Rect{X: x, Y: glyph.bounds.Y, Width: glyph.bounds.Width, Height: glyph.bounds.Height}, true, nil
+		}
+		if contours == 0 {
+			return Rect{}, false, nil
+		}
+		_, bearing, err := f.metrics.horizontal(gid)
+		if err != nil {
+			return Rect{}, false, err
+		}
+		return Rect{X: float64(bearing), Y: yMin, Width: xMax - xMin, Height: yMax - yMin}, true, nil
 	}
 	geometry, err := f.glyphOutline(gid)
 	if err != nil {

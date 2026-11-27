@@ -110,26 +110,18 @@ func (p *CoreProperties) MarshalXML(encoder *xml.Encoder, start xml.StartElement
 	if err != nil {
 		return err
 	}
-	root := &xmlElement{Name: xml.Name{Space: opcCoreNS, Local: "coreProperties"}, Namespaces: map[string]string{"t": dcTermsNS}}
+	type corePropertyEntry struct {
+		name       xml.Name
+		value      string
+		isKeywords bool
+	}
+	var entries [16]corePropertyEntry
+	count := 0
 	for _, name := range corePropertyNames {
 		isKeywords := name == (xml.Name{Space: opcCoreNS, Local: "keywords"})
 		if isKeywords && len(keywordValues) != 0 {
-			child := &xmlElement{Name: name, Namespaces: root.Namespaces}
-			if lang, ok := languages[name.Local]; ok {
-				child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Space: xmlNamespace, Local: "lang"}, Value: lang})
-			}
-			for _, item := range keywordValues {
-				if item.IsText {
-					child.Text += item.Value
-					continue
-				}
-				sub := &xmlElement{Name: xml.Name{Space: opcCoreNS, Local: "value"}, Text: item.Value, Namespaces: root.Namespaces}
-				if item.Language != nil {
-					sub.Attr = []xml.Attr{{Name: xml.Name{Space: xmlNamespace, Local: "lang"}, Value: *item.Language}}
-				}
-				child.Children = append(child.Children, sub)
-			}
-			root.Children = append(root.Children, child)
+			entries[count] = corePropertyEntry{name: name, isKeywords: true}
+			count++
 			continue
 		}
 		field := corePropertyField(p, name)
@@ -140,20 +132,16 @@ func (p *CoreProperties) MarshalXML(encoder *xml.Encoder, start xml.StartElement
 		if !xmlTextValid(value) {
 			return fmt.Errorf("%w: core property %s XML text", ErrInvalid, name.Local)
 		}
-		if name.Space == dcTermsNS || name == (xml.Name{Space: opcCoreNS, Local: "lastPrinted"}) {
+		date := name.Space == dcTermsNS && (name.Local == "created" || name.Local == "modified")
+		printed := name == (xml.Name{Space: opcCoreNS, Local: "lastPrinted"})
+		if date || printed {
 			value = strings.Trim(value, " \t\r\n")
+			if !xmlDateValue(value, printed) {
+				return fmt.Errorf("%w: core property %s date declaration", ErrInvalid, name.Local)
+			}
 		}
-		child := &xmlElement{Name: name, Text: value, Namespaces: root.Namespaces}
-		if name.Space == dcTermsNS {
-			child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Space: xsiNamespace, Local: "type"}, Value: "t:W3CDTF"})
-		}
-		if lang, ok := languages[name.Local]; ok {
-			child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Space: xmlNamespace, Local: "lang"}, Value: lang})
-		}
-		root.Children = append(root.Children, child)
-	}
-	if _, err := parseCorePropertiesContent(root, nil); err != nil {
-		return err
+		entries[count] = corePropertyEntry{name: name, value: value}
+		count++
 	}
 	start = xml.StartElement{Name: xml.Name{Local: "coreProperties"}, Attr: []xml.Attr{
 		{Name: xml.Name{Local: "xmlns"}, Value: opcCoreNS},
@@ -164,20 +152,20 @@ func (p *CoreProperties) MarshalXML(encoder *xml.Encoder, start xml.StartElement
 	if err := encoder.EncodeToken(start); err != nil {
 		return err
 	}
-	for _, node := range root.Children {
-		name := node.Name.Local
+	for _, entry := range entries[:count] {
+		name := entry.name.Local
 		var attributes []xml.Attr
-		if node.Name.Space == dcNamespace {
+		if entry.name.Space == dcNamespace {
 			name = "dc:" + name
-		} else if node.Name.Space == dcTermsNS {
+		} else if entry.name.Space == dcTermsNS {
 			name = "t:" + name
 			attributes = append(attributes, xml.Attr{Name: xml.Name{Local: "xsi:type"}, Value: "t:W3CDTF"})
 		}
-		if lang, ok := node.attributeNS(xmlNamespace, "lang"); ok {
+		if lang, ok := languages[entry.name.Local]; ok {
 			attributes = append(attributes, xml.Attr{Name: xml.Name{Local: "xml:lang"}, Value: lang})
 		}
 		child := xml.StartElement{Name: xml.Name{Local: name}, Attr: attributes}
-		if node.Name == (xml.Name{Space: opcCoreNS, Local: "keywords"}) && len(keywordValues) != 0 {
+		if entry.isKeywords {
 			if err := encoder.EncodeToken(child); err != nil {
 				return err
 			}
@@ -201,7 +189,7 @@ func (p *CoreProperties) MarshalXML(encoder *xml.Encoder, start xml.StartElement
 			}
 			continue
 		}
-		if err := encoder.EncodeElement(node.Text, child); err != nil {
+		if err := encoder.EncodeElement(entry.value, child); err != nil {
 			return err
 		}
 	}
@@ -350,8 +338,8 @@ func (p *Package) SetCoreProperties(props CoreProperties) error {
 		return err
 	}
 	q.commitName(pattern, part)
-	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
-	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
+	delete(q.deleted, strings.ToLower(part))
+	p.commitSigning(q)
 	return nil
 }
 

@@ -337,13 +337,24 @@ func newImageSampler(brush *Brush, source *rasterImage, transform Matrix, space 
 
 // imageSourceBitDepth 返回非JXR图像源编码的单通道位深，浮点图像返回零
 // 入参: source 源图像
-// 返回: int 编码位深（0、8或16）
+// 返回: int 编码位深（0或8至16）
 func imageSourceBitDepth(source *rasterImage) int {
 	if source.native != nil {
 		if source.native.floating != nil {
 			return 0
 		}
+		if source.bitDepth >= 8 && source.bitDepth <= 16 {
+			return source.bitDepth
+		}
 		return 16
+	}
+	if source.bitDepth > 0 {
+		if source.bitDepth <= 8 {
+			return 8
+		}
+		if source.bitDepth <= 16 {
+			return source.bitDepth
+		}
 	}
 	switch source.pixels.(type) {
 	case *image.NRGBA64, *image.RGBA64, *image.Gray16:

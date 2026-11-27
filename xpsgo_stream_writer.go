@@ -28,6 +28,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -37,19 +38,55 @@ import (
 	"github.com/xiaoqidun/jxrgo"
 )
 
+const (
+	// StreamColorUnknown 表示未指定逐行流式图像色彩模型
+	StreamColorUnknown StreamImageColorModel = iota
+	// StreamColorGray 表示每像素单通道灰度（8或16位，16位按大端字节序）
+	StreamColorGray
+	// StreamColorGrayAlpha 表示每像素灰度加非预乘Alpha双通道（8或16位，16位按大端字节序）
+	StreamColorGrayAlpha
+	// StreamColorRGB 表示每像素红绿蓝三通道（8或16位，16位按大端字节序）
+	StreamColorRGB
+	// StreamColorRGBA 表示每像素非预乘红绿蓝加Alpha四通道（8或16位，16位按大端字节序）
+	StreamColorRGBA
+	// StreamColorCMYK 表示每像素青品黄黑四通道（8或16位，16位按大端字节序，仅TIFF支持）
+	StreamColorCMYK
+	// StreamColorBilevel 表示1位MSB优先打包黑白二值位图（每行ceil(Width/8)字节，0为白1为黑，仅TIFF支持）
+	StreamColorBilevel
+)
+
+// StreamImageColorModel 表示逐行流式图像写入时的像素色彩模型
+type StreamImageColorModel uint8
+
+// StreamImageRowOptions 设置逐行流式PNG与多Strip TIFF图像写入的尺寸、位深、色彩模型、分辨率、可选ICC配置及TIFF压缩方式
+// BitDepth为零时按ColorModel取默认值（StreamColorBilevel为1，其余为8）；16位多字节样本统一按大端字节序排列
+type StreamImageRowOptions struct {
+	Width           int
+	Height          int
+	BitDepth        int
+	ColorModel      StreamImageColorModel
+	DPIX            float64
+	DPIY            float64
+	ICCProfile      []byte
+	TIFFCompression TIFFCompression
+}
+
 // StreamWriteOptions 设置前向流式写出器的压缩策略、交错分片大小、自动释放提示、前置内容类型表、紧凑编码、资源预算与固定时间戳
 // InterleaveBytes为零时按整部件直接落盘，非零时按至多8MiB分片交错落盘；AutoDiscard启用后按页生命周期自动生成DiscardControl
-// EarlyContentTypes启用后在流起始即写入包含全部标准扩展名Default映射的[Content_Types].xml并以交错分片增量推进索引、关系与释放提示，供ConsumeStream实时逐页交付
-// Compact启用后对页面与资源字典使用紧凑属性编码
+// EarlyContentTypes启用后在流起始即写入[Content_Types].xml并以交错分片增量推进索引、关系与释放提示，供ConsumeStream实时逐页交付
+// EarlyExcludePrintTicket启用后前置Default表不预声明xml打印票据类型，使无票据包在StreamTicketsStrict下零阻塞实时交付
+// EarlyDefaultTypes允许在EarlyContentTypes下扩展或覆写前置Default扩展名到媒体类型映射，Compact启用后使用紧凑属性编码
 type StreamWriteOptions struct {
-	Compression       Compression
-	InterleaveBytes   int64
-	AutoDiscard       bool
-	EarlyContentTypes bool
-	Compact           bool
-	Limits            Limits
-	MaxImagePixels    uint64
-	FixedTime         time.Time
+	Compression             Compression
+	InterleaveBytes         int64
+	AutoDiscard             bool
+	EarlyContentTypes       bool
+	EarlyExcludePrintTicket bool
+	EarlyDefaultTypes       map[string]string
+	Compact                 bool
+	Limits                  Limits
+	MaxImagePixels          uint64
+	FixedTime               time.Time
 }
 
 // streamWrittenPart 保存已落盘逻辑部件的规范名称与内容类型，不滞留部件字节载荷
@@ -95,6 +132,40 @@ type streamPageDeps struct {
 	deps      []streamResourceRef
 }
 
+// streamNavRef 记录页面内声明的NavigateUri引用及其来源固定页面URI，供Close阶段终检存在性
+type streamNavRef struct {
+	sourcePart string
+	target     string
+}
+
+// streamStoryFragmentRef 记录DocumentStructure中单条StoryFragmentReference元数据，供Close阶段交叉终检
+type streamStoryFragmentRef struct {
+	storyName    string
+	pageNumber   int
+	fragmentName *string
+}
+
+// streamDocStructInfo 记录已写入DocumentStructure的大纲目标与故事索引元数据，供Close阶段交叉终检
+type streamDocStructInfo struct {
+	part           string
+	storyNames     map[string]bool
+	storyRefs      []streamStoryFragmentRef
+	outlineTargets []string
+}
+
+// streamPageStoryFragment 记录StoryFragments中单个StoryFragment的故事与片段标识
+type streamPageStoryFragment struct {
+	storyName    *string
+	fragmentName *string
+}
+
+// streamPageStoryInfo 记录已写入页面StoryFragments的片段标识与命名元素引用列表，供Close阶段交叉终检
+type streamPageStoryInfo struct {
+	part      string
+	fragments []streamPageStoryFragment
+	namedRefs []string
+}
+
 // streamOpenPart 记录EarlyContentTypes模式下尚未闭合的OPC交错分片XML流状态
 type streamOpenPart struct {
 	part     string
@@ -130,16 +201,23 @@ type StreamWriter struct {
 	hashes             map[[32]byte][]streamHashEntry
 	relations          map[string][]Relationship
 	restrictedFaces    map[fontCacheKey]bool
+	needObfFaces       map[fontCacheKey]bool
+	prohibitedFaces    map[fontCacheKey]bool
 	dictDeps           map[string][]streamResourceRef
+	dictNavRefs        map[string][]string
 	pageDeps           []streamPageDeps
-	docStructMaxPage   map[int]int
+	pageNames          map[string]map[string]bool
+	pageNavRefs        []streamNavRef
+	docStructures      map[int]*streamDocStructInfo
+	pageStories        map[string]*streamPageStoryInfo
 	resourceLastPage   map[string]int
 	releasedAfter      map[string]int
 	openStreams        map[string]*streamOpenPart
 	emittedRelCount    map[string]int
 	emittedDiscardPage map[string]int
 	lateDictSources    map[string]bool
-	lastOpenPageRel    string
+	pendingDicts       map[string]bool
+	openPageRels       map[string]string
 	discardPart        string
 	partBytes          int64
 	entryCount         int
@@ -147,8 +225,32 @@ type StreamWriter struct {
 	closeErr           error
 	failed             error
 	optimizer          *flate.Writer
+	deflater           *flate.Writer
 	candidate          compressionBuffer
 	copyBuf            []byte
+}
+
+// String 返回逐行流式图像色彩模型的可读名称
+// 返回: string 色彩模型名称
+func (m StreamImageColorModel) String() string {
+	switch m {
+	case StreamColorUnknown:
+		return "unknown"
+	case StreamColorGray:
+		return "gray"
+	case StreamColorGrayAlpha:
+		return "grayalpha"
+	case StreamColorRGB:
+		return "rgb"
+	case StreamColorRGBA:
+		return "rgba"
+	case StreamColorCMYK:
+		return "cmyk"
+	case StreamColorBilevel:
+		return "bilevel"
+	default:
+		return fmt.Sprintf("StreamImageColorModel(%d)", m)
+	}
 }
 
 // DefaultStreamWriteOptions 返回前向流式写出器的默认配置
@@ -180,6 +282,8 @@ func NewStreamWriter(ctx context.Context, w io.Writer, format Format, options *S
 		cfg.InterleaveBytes = options.InterleaveBytes
 		cfg.AutoDiscard = options.AutoDiscard
 		cfg.EarlyContentTypes = options.EarlyContentTypes
+		cfg.EarlyExcludePrintTicket = options.EarlyExcludePrintTicket
+		cfg.EarlyDefaultTypes = options.EarlyDefaultTypes
 		cfg.Compact = options.Compact
 		cfg.Limits = mergeLimits(cfg.Limits, options.Limits)
 		if options.MaxImagePixels != 0 {
@@ -196,6 +300,14 @@ func NewStreamWriter(ctx context.Context, w io.Writer, format Format, options *S
 	if err := validateLimits(cfg.Limits); err != nil {
 		return nil, err
 	}
+	var earlyDefaults map[string]string
+	if cfg.EarlyContentTypes {
+		var err error
+		earlyDefaults, err = earlyStreamDefaultTypes(format, cfg.EarlyExcludePrintTicket, cfg.EarlyDefaultTypes)
+		if err != nil {
+			return nil, err
+		}
+	}
 	sw := &StreamWriter{
 		format:             format,
 		limits:             cfg.Limits,
@@ -204,6 +316,7 @@ func NewStreamWriter(ctx context.Context, w io.Writer, format Format, options *S
 		interleaveBytes:    cfg.InterleaveBytes,
 		autoDiscard:        cfg.AutoDiscard,
 		earlyContentTypes:  cfg.EarlyContentTypes,
+		earlyDefaults:      earlyDefaults,
 		compact:            cfg.Compact,
 		fixedTime:          cfg.FixedTime,
 		sequence:           "/FixedDocSeq.fdseq",
@@ -214,14 +327,21 @@ func NewStreamWriter(ctx context.Context, w io.Writer, format Format, options *S
 		hashes:             make(map[[32]byte][]streamHashEntry),
 		relations:          make(map[string][]Relationship),
 		restrictedFaces:    make(map[fontCacheKey]bool),
+		needObfFaces:       make(map[fontCacheKey]bool),
+		prohibitedFaces:    make(map[fontCacheKey]bool),
 		dictDeps:           make(map[string][]streamResourceRef),
-		docStructMaxPage:   make(map[int]int),
+		dictNavRefs:        make(map[string][]string),
+		pageNames:          make(map[string]map[string]bool),
+		docStructures:      make(map[int]*streamDocStructInfo),
+		pageStories:        make(map[string]*streamPageStoryInfo),
 		resourceLastPage:   make(map[string]int),
 		releasedAfter:      make(map[string]int),
 		openStreams:        make(map[string]*streamOpenPart),
 		emittedRelCount:    make(map[string]int),
 		emittedDiscardPage: make(map[string]int),
 		lateDictSources:    make(map[string]bool),
+		pendingDicts:       make(map[string]bool),
+		openPageRels:       make(map[string]string),
 		copyBuf:            make([]byte, 32<<10),
 	}
 	if cfg.Compression == CompressionOptimize {
@@ -240,6 +360,9 @@ func NewStreamWriter(ctx context.Context, w io.Writer, format Format, options *S
 		if err := sw.initEarlyStreamLocked(ctx); err != nil {
 			if sw.optimizer != nil {
 				_ = sw.optimizer.Close()
+			}
+			if sw.deflater != nil {
+				_ = sw.deflater.Close()
 			}
 			return nil, err
 		}
@@ -284,9 +407,9 @@ func (w *StreamWriter) DocumentPart(docIndex int) (string, error) {
 	return w.documents[docIndex].Part, nil
 }
 
-// BeginDocument 在当前流式包中开启新的固定文档并将其设为后续AddPage的默认目标文档
+// BeginDocument 在当前流式包中开启新的固定文档并将其设为后续AddPage的默认目标文档，EarlyContentTypes模式下自动闭合上一文档与就绪页面关系分片流
 // 入参: ctx 取消Context，nil采用Background
-// 返回: int 新固定文档的零基序号, error 状态、名称或取消错误
+// 返回: int 新固定文档的零基序号, error 状态、名称、类型、预算、取消或写出错误
 func (w *StreamWriter) BeginDocument(ctx context.Context) (int, error) {
 	ctx = normalizeContext(ctx)
 	if err := checkContext(ctx); err != nil {
@@ -299,9 +422,9 @@ func (w *StreamWriter) BeginDocument(ctx context.Context) (int, error) {
 	return w.beginDocumentLocked(ctx)
 }
 
-// beginDocumentLocked 在持有互斥锁时分配并开启新固定文档，EarlyContentTypes模式下同步推进分片流
+// beginDocumentLocked 在持有互斥锁时分配并开启新固定文档，EarlyContentTypes模式下预检预算并同步推进分片流
 // 入参: ctx 已规范化取消Context
-// 返回: int 新固定文档序号, error 名称、预算或取消错误
+// 返回: int 新固定文档序号, error 名称、类型、预算、取消或写出错误
 func (w *StreamWriter) beginDocumentLocked(ctx context.Context) (int, error) {
 	const pattern = "/Documents/%d/FixedDoc.fdoc"
 	part, err := w.newNameLocked(pattern, ctx)
@@ -312,22 +435,8 @@ func (w *StreamWriter) beginDocumentLocked(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("%w: stream package part count", ErrLimit)
 	}
 	if w.earlyContentTypes {
-		if w.lastOpenPageRel != "" && !w.lateDictSources[strings.ToLower(w.lastOpenPageRel)] {
-			if err := w.closePieceStreamLocked(ctx, createdRelationshipPart(w.lastOpenPageRel)); err != nil {
-				return 0, err
-			}
-			w.lastOpenPageRel = ""
-		}
-		if w.currentDoc >= 0 {
-			prevPart := w.documents[w.currentDoc].Part
-			if err := w.closePieceStreamLocked(ctx, prevPart); err != nil {
-				return 0, err
-			}
-			if !w.lateDictSources[strings.ToLower(prevPart)] {
-				if err := w.closePieceStreamLocked(ctx, createdRelationshipPart(prevPart)); err != nil {
-					return 0, err
-				}
-			}
+		if err := w.validateEarlyContentTypeLocked(part, fixedContentType("fixeddocument")); err != nil {
+			return 0, err
 		}
 		ns := formatNamespace(w.format)
 		docSrc, err := relativePart(w.sequence, part)
@@ -340,11 +449,43 @@ func (w *StreamWriter) beginDocumentLocked(ctx context.Context) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		if err := w.appendPieceStreamLocked(ctx, w.sequence, refXML); err != nil {
+		opening := `<FixedDocument xmlns="` + ns + `">`
+		if err := w.checkAppendStreamBudgetLocked(w.sequence, int64(len(refXML))); err != nil {
 			return 0, err
 		}
-		if err := w.openPieceStreamLocked(ctx, part, fixedContentType("fixeddocument"), `<FixedDocument xmlns="`+ns+`">`, `</FixedDocument>`); err != nil {
-			return 0, err
+		if int64(len(opening)) > w.limits.MaxPartBytes {
+			return 0, fmt.Errorf("%w: stream part exceeds MaxPartBytes", ErrLimit)
+		}
+		extraBytes := int64(len(refXML)) + int64(len(opening)) + w.pendingReadyPageRelClosingBytesLocked()
+		if w.currentDoc >= 0 {
+			prevPart := w.documents[w.currentDoc].Part
+			extraBytes += w.streamClosingBytesLocked(prevPart)
+			if !w.lateDictSources[strings.ToLower(prevPart)] {
+				extraBytes += w.streamClosingBytesLocked(createdRelationshipPart(prevPart))
+			}
+		}
+		if extraBytes > w.limits.MaxPackageBytes-w.partBytes {
+			return 0, fmt.Errorf("%w: stream package exceeds MaxPackageBytes", ErrLimit)
+		}
+		if err := w.closeReadyPageRelsLocked(ctx); err != nil {
+			return 0, w.failLocked(err)
+		}
+		if w.currentDoc >= 0 {
+			prevPart := w.documents[w.currentDoc].Part
+			if err := w.closePieceStreamLocked(ctx, prevPart); err != nil {
+				return 0, w.failLocked(err)
+			}
+			if !w.lateDictSources[strings.ToLower(prevPart)] {
+				if err := w.closePieceStreamLocked(ctx, createdRelationshipPart(prevPart)); err != nil {
+					return 0, w.failLocked(err)
+				}
+			}
+		}
+		if err := w.appendPieceStreamLocked(ctx, w.sequence, refXML); err != nil {
+			return 0, w.failLocked(err)
+		}
+		if err := w.openPieceStreamLocked(ctx, part, fixedContentType("fixeddocument"), opening, `</FixedDocument>`); err != nil {
+			return 0, w.failLocked(err)
 		}
 	}
 	w.documents = append(w.documents, Document{Part: part})
@@ -352,6 +493,72 @@ func (w *StreamWriter) beginDocumentLocked(ctx context.Context) (int, error) {
 	w.registry.register(part)
 	w.commitNameLocked(pattern, part)
 	return w.currentDoc, nil
+}
+
+// EndPage 在EarlyContentTypes模式下显式闭合当前及先前无待定远程字典的页面.fpage.rels分片流并刷新底层缓冲，推动下游零延迟交付与回收
+// 入参: ctx 取消Context，nil采用Background
+// 返回: error 状态、预算、取消或写出错误
+func (w *StreamWriter) EndPage(ctx context.Context) error {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if err := w.lock(ctx); err != nil {
+		return err
+	}
+	defer w.mu.Unlock()
+	if !w.earlyContentTypes {
+		return nil
+	}
+	if err := w.flushResolvedLateSourcesLocked(ctx); err != nil {
+		return w.failLocked(err)
+	}
+	if err := w.closeReadyPageRelsLocked(ctx); err != nil {
+		return w.failLocked(err)
+	}
+	return w.failLocked(w.archive.Flush())
+}
+
+// EndDocument 显式结束当前活动固定文档，在EarlyContentTypes模式下立即闭合就绪页面关系、当前.fdoc及其.fdoc.rels分片流并刷新底层缓冲
+// 入参: ctx 取消Context，nil采用Background
+// 返回: error 文档无页、状态、预算、取消或写出错误
+func (w *StreamWriter) EndDocument(ctx context.Context) error {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if err := w.lock(ctx); err != nil {
+		return err
+	}
+	defer w.mu.Unlock()
+	if w.currentDoc < 0 {
+		return nil
+	}
+	doc := w.documents[w.currentDoc]
+	if len(doc.Pages) == 0 {
+		return fmt.Errorf("%w: stream document %s requires at least one page", ErrInvalid, doc.Part)
+	}
+	if w.earlyContentTypes {
+		if err := w.flushResolvedLateSourcesLocked(ctx); err != nil {
+			return w.failLocked(err)
+		}
+		if err := w.closeReadyPageRelsLocked(ctx); err != nil {
+			return w.failLocked(err)
+		}
+		if err := w.closePieceStreamLocked(ctx, doc.Part); err != nil {
+			return w.failLocked(err)
+		}
+		if !w.lateDictSources[strings.ToLower(doc.Part)] {
+			if err := w.closePieceStreamLocked(ctx, createdRelationshipPart(doc.Part)); err != nil {
+				return w.failLocked(err)
+			}
+		}
+		if err := w.archive.Flush(); err != nil {
+			return w.failLocked(err)
+		}
+	}
+	w.currentDoc = -1
+	return nil
 }
 
 // AddFont 校验字体嵌入许可后按唯一GUID路径混淆并立即落盘至底层流
@@ -384,6 +591,10 @@ func (w *StreamWriter) AddFontWithOptions(ctx context.Context, data []byte, opti
 		collectionIndex = options.CollectionIndex
 	}
 	isCollection, isCFF, err := validateEmbeddedFontData(ctx, data, w.limits.MaxPartBytes, obfuscate, collectionIndex)
+	if err != nil {
+		return "", err
+	}
+	restrictedFaces, err := collectRestrictedFontFaces(data)
 	if err != nil {
 		return "", err
 	}
@@ -429,29 +640,115 @@ func (w *StreamWriter) AddFontWithOptions(ctx context.Context, data []byte, opti
 	}
 	w.commitNameLocked(pattern, part)
 	w.recordHashLocked(digest, part, media, len(data))
-	w.recordRestrictedFacesLocked(part, data)
+	w.recordRestrictedFaceIndicesLocked(part, restrictedFaces)
 	if isCollection {
 		return fmt.Sprintf("%s#%d", part, collectionIndex), nil
 	}
 	return part, nil
 }
 
-// recordRestrictedFacesLocked 按单个字体面粒度登记OS/2带有预览与打印限制标志的面索引
-// 入参: part 规范字体部件URI, raw 原始未混淆字体字节
-func (w *StreamWriter) recordRestrictedFacesLocked(part string, raw []byte) {
+// recordRestrictedFaceIndicesLocked 按预扫描结果登记OS/2带有预览与打印限制标志的面索引
+// 入参: part 规范字体部件URI, indices 需要标注RestrictedFont关系的面序号切片
+func (w *StreamWriter) recordRestrictedFaceIndicesLocked(part string, indices []uint32) {
 	partKey := strings.ToLower(part)
-	for _, index := range collectRestrictedFontFaces(raw) {
+	for _, index := range indices {
 		w.restrictedFaces[fontCacheKey{part: partKey, index: index}] = true
 	}
 }
 
-// collectRestrictedFontFaces 扫描原始SFNT/TTC字体数据并返回带有OS/2预览与打印受限标志的面索引列表
+// recordFontFaceGuardsLocked 登记通过AddPart写入的多面集合字体中单面需混淆或禁止嵌入的面索引，供页面引用时精准拦截
+// 入参: part 规范字体部件URI, needObf 需要混淆嵌入的面索引切片, prohibited 禁止嵌入的面索引切片
+func (w *StreamWriter) recordFontFaceGuardsLocked(part string, needObf, prohibited []uint32) {
+	partKey := strings.ToLower(part)
+	for _, index := range needObf {
+		w.needObfFaces[fontCacheKey{part: partKey, index: index}] = true
+	}
+	for _, index := range prohibited {
+		w.prohibitedFaces[fontCacheKey{part: partKey, index: index}] = true
+	}
+}
+
+// validateStreamAddedFontPart 校验经AddPart直接写入的字体封装、全部面OS/2表及嵌入许可
+// 单面字体严格复用validateEmbeddedFontData立即拦截禁止嵌入与未混淆限制，多面TTC逐面核验结构并放行至少含一合法可用面的集合
+// 入参: ctx 已规范化取消Context, data 原始未混淆字体字节, maxBytes 字节上限, obfuscated 是否以混淆媒体类型写入
+// 返回: []uint32 需标RestrictedFont的面索引, []uint32 未混淆时需混淆的面索引, []uint32 禁止嵌入的面索引, error 封装、许可、预算或取消错误
+func validateStreamAddedFontPart(ctx context.Context, data []byte, maxBytes int64, obfuscated bool) ([]uint32, []uint32, []uint32, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, nil, nil, err
+	}
+	if len(data) == 0 {
+		return nil, nil, nil, fmt.Errorf("%w: empty font data", ErrInvalid)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, nil, nil, fmt.Errorf("%w: font byte budget", ErrLimit)
+	}
+	firstFace, err := parseFontFace(data, 0)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if !firstFace.collection {
+		if _, _, err := validateEmbeddedFontData(ctx, data, maxBytes, obfuscated, 0); err != nil {
+			return nil, nil, nil, err
+		}
+		restricted, err := collectRestrictedFontFaces(data)
+		return restricted, nil, nil, err
+	}
+	count := binary.BigEndian.Uint32(data[8:12])
+	var restricted []uint32
+	var needObf []uint32
+	var prohibited []uint32
+	usable := 0
+	for index := uint32(0); index < count; index++ {
+		if err := checkContext(ctx); err != nil {
+			return nil, nil, nil, err
+		}
+		face := firstFace
+		if index != 0 {
+			face, err = parseFontFace(data, index)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		}
+		os2, err := parseFontOS2Metrics(face)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if os2 == nil {
+			return nil, nil, nil, fmt.Errorf("%w: producer font needs OS/2", ErrInvalid)
+		}
+		rights, err := fontEmbeddingRights(os2)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if rights&4 != 0 {
+			restricted = append(restricted, index)
+		}
+		if rights&2 != 0 {
+			prohibited = append(prohibited, index)
+			continue
+		}
+		if !obfuscated && rights&0x30c != 0 {
+			needObf = append(needObf, index)
+			continue
+		}
+		usable++
+	}
+	if usable == 0 {
+		if len(prohibited) != 0 {
+			return nil, nil, nil, fmt.Errorf("%w: font prohibits embedding", ErrRestricted)
+		}
+		return nil, nil, nil, fmt.Errorf("%w: font requires obfuscation", ErrRestricted)
+	}
+	return restricted, needObf, prohibited, nil
+}
+
+// collectRestrictedFontFaces 扫描原始SFNT/TTC字体数据并按fontEmbeddingRights语义返回带有预览与打印受限标志的面索引列表
 // 入参: data 原始未混淆字体字节
-// 返回: []uint32 需要标注RestrictedFont关系的字体面序号切片
-func collectRestrictedFontFaces(data []byte) []uint32 {
+// 返回: []uint32 需要标注RestrictedFont关系的字体面序号切片, error 字体解析或OS/2标志错误
+func collectRestrictedFontFaces(data []byte) ([]uint32, error) {
 	face, err := parseFontFace(data, 0)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	count := uint32(1)
 	if face.collection {
@@ -462,14 +759,25 @@ func collectRestrictedFontFaces(data []byte) []uint32 {
 		if index != 0 {
 			face, err = parseFontFace(data, index)
 			if err != nil {
-				return restricted
+				return nil, err
 			}
 		}
-		if os2, err := parseFontOS2Metrics(face); err == nil && os2 != nil && os2.fsType&4 != 0 {
+		os2, err := parseFontOS2Metrics(face)
+		if err != nil {
+			return nil, err
+		}
+		if os2 == nil {
+			continue
+		}
+		rights, err := fontEmbeddingRights(os2)
+		if err != nil {
+			return nil, err
+		}
+		if rights&4 != 0 {
 			restricted = append(restricted, index)
 		}
 	}
-	return restricted
+	return restricted, nil
 }
 
 // AddImage 按魔数识别图像并立即落盘至底层流
@@ -540,23 +848,13 @@ func (w *StreamWriter) AddImageFromRows(ctx context.Context, info jxrgo.Info, re
 	}
 	const pattern = "/Resources/Images/%d.jxr"
 	const media = "image/vnd.ms-photo"
-	part, err := w.newNameLocked(pattern, ctx)
+	part, maxPart, err := w.prepareStreamImagePartLocked(ctx, pattern, media)
 	if err != nil {
 		return "", err
-	}
-	if err := w.validateEarlyContentTypeLocked(part, media); err != nil {
-		return "", err
-	}
-	if w.registry.count() >= w.limits.MaxPartCount {
-		return "", fmt.Errorf("%w: stream package part count", ErrLimit)
 	}
 	var cfg jxrgo.EncodeOptions
 	if options != nil {
 		cfg = *options
-	}
-	maxPart := min(w.limits.MaxPartBytes, w.limits.MaxPackageBytes-w.partBytes)
-	if maxPart <= 0 {
-		return "", fmt.Errorf("%w: stream package exceeds MaxPackageBytes", ErrLimit)
 	}
 	if cfg.MaxOutputBytes == 0 || cfg.MaxOutputBytes > uint64(maxPart) {
 		cfg.MaxOutputBytes = uint64(maxPart)
@@ -580,6 +878,473 @@ func (w *StreamWriter) AddImageFromRows(ctx context.Context, info jxrgo.Info, re
 	w.registerPartMetaLocked(part, media, sink.written)
 	w.commitNameLocked(pattern, part)
 	return part, nil
+}
+
+// AddPNGFromRows 通过逐行扫描回调将图像直接流式编码为标准PNG并写入底层ZIP流，仅占用单扫描行与zlib窗口内存
+// 入参: ctx 取消Context，nil采用Background, options 图像尺寸、位深、色彩模型、分辨率与ICC配置, readRow 按零基行号填充单行原始像素的回调，16位样本按大端字节序
+// 返回: string 图像部件URI, error 参数、回调、编码、预算、取消或写出错误
+func (w *StreamWriter) AddPNGFromRows(ctx context.Context, options StreamImageRowOptions, readRow func(y int, dst []byte) error) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	if readRow == nil {
+		return "", fmt.Errorf("%w: missing PNG row reader", ErrInvalid)
+	}
+	if err := w.lock(ctx); err != nil {
+		return "", err
+	}
+	defer w.mu.Unlock()
+	dpix, dpiy, bitDepth, colorType, rowBytes, err := validateStreamPNGRowOptions(ctx, options, w.maxImagePixels)
+	if err != nil {
+		return "", err
+	}
+	const pattern = "/Resources/Images/%d.png"
+	const media = "image/png"
+	part, maxPart, err := w.prepareStreamImagePartLocked(ctx, pattern, media)
+	if err != nil {
+		return "", err
+	}
+	sink := &streamPieceSink{writer: w, ctx: ctx, part: part, maxBytes: maxPart}
+	enc, err := newPNGRowEncoder(ctx, sink, options.Width, options.Height, uint8(bitDepth), colorType, dpix, dpiy, options.ICCProfile)
+	if err != nil {
+		if sink.touched {
+			w.failed = err
+		}
+		return "", err
+	}
+	rowBuf := make([]byte, rowBytes)
+	for y := range options.Height {
+		if err := checkContext(ctx); err != nil {
+			if sink.touched {
+				w.failed = err
+			}
+			return "", err
+		}
+		if err := readRow(y, rowBuf); err != nil {
+			if sink.touched {
+				w.failed = err
+			}
+			return "", err
+		}
+		if err := enc.writeRow(ctx, rowBuf); err != nil {
+			if sink.touched {
+				w.failed = err
+			}
+			return "", err
+		}
+	}
+	if err := enc.close(ctx); err != nil {
+		if sink.touched {
+			w.failed = err
+		}
+		return "", err
+	}
+	if err := sink.finish(); err != nil {
+		if sink.touched {
+			w.failed = err
+		}
+		return "", err
+	}
+	w.registerPartMetaLocked(part, media, sink.written)
+	w.commitNameLocked(pattern, part)
+	return part, nil
+}
+
+// AddTIFFFromRows 通过逐行扫描回调将图像按多Strip编码为Little-Endian Baseline TIFF并写入底层ZIP流
+// 无压缩模式采用恒定单条带内存直接前向流式落盘，压缩模式逐条带压缩并严格受MaxPartBytes与MaxPackageBytes约束，落盘前失败不毒化写出器
+// 入参: ctx 取消Context，nil采用Background, options 图像尺寸、位深、色彩模型、压缩方式、分辨率与ICC配置, readRow 按零基行号填充单行原始像素的回调，16位样本按大端字节序
+// 返回: string 图像部件URI, error 参数、回调、编码、预算、取消或写出错误
+func (w *StreamWriter) AddTIFFFromRows(ctx context.Context, options StreamImageRowOptions, readRow func(y int, dst []byte) error) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	if readRow == nil {
+		return "", fmt.Errorf("%w: missing TIFF row reader", ErrInvalid)
+	}
+	if err := w.lock(ctx); err != nil {
+		return "", err
+	}
+	defer w.mu.Unlock()
+	spec, rowBytes, err := validateStreamTIFFRowOptions(ctx, options, w.maxImagePixels)
+	if err != nil {
+		return "", err
+	}
+	const pattern = "/Resources/Images/%d.tif"
+	const media = "image/tiff"
+	part, maxPart, err := w.prepareStreamImagePartLocked(ctx, pattern, media)
+	if err != nil {
+		return "", err
+	}
+	rowsPerStrip, err := tiffRowsPerStrip(rowBytes, spec.height, maxPart)
+	if err != nil {
+		return "", err
+	}
+	spec.rowsPerStrip = rowsPerStrip
+	stripCount := (spec.height + rowsPerStrip - 1) / rowsPerStrip
+	rawBuf := make([]byte, rowsPerStrip*rowBytes)
+	fillStrip := func(startY, rows int) ([]byte, error) {
+		chunk := rawBuf[:rows*rowBytes]
+		for row := range rows {
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+			dst := chunk[row*rowBytes : (row+1)*rowBytes]
+			if err := readRow(startY+row, dst); err != nil {
+				return nil, err
+			}
+			if spec.bps == 16 {
+				swapUint16Bytes(dst)
+			}
+		}
+		return chunk, nil
+	}
+	sink := &streamPieceSink{writer: w, ctx: ctx, part: part, maxBytes: maxPart}
+	if spec.compression == TIFFCompressionNone {
+		if int64(spec.height) > maxPart/int64(rowBytes) {
+			return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+		}
+		offsets := make([]uint32, stripCount)
+		counts := make([]uint32, stripCount)
+		cursor := int64(8)
+		for i := range stripCount {
+			rows := min(rowsPerStrip, spec.height-i*rowsPerStrip)
+			n := int64(rows * rowBytes)
+			if cursor+n > maxPart || cursor+n > math.MaxUint32 {
+				return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+			}
+			offsets[i] = uint32(cursor)
+			counts[i] = uint32(n)
+			cursor += n
+		}
+		pad := cursor & 1
+		ifdOffset := cursor + pad
+		if ifdOffset > math.MaxUint32 {
+			return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+		}
+		ifdBytes, err := encodeTIFFIFD(spec, offsets, counts, uint32(ifdOffset))
+		if err != nil {
+			return "", err
+		}
+		if ifdOffset+int64(len(ifdBytes)) > maxPart || ifdOffset+int64(len(ifdBytes)) > math.MaxUint32 {
+			return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+		}
+		var header [8]byte
+		copy(header[0:2], "II")
+		binary.LittleEndian.PutUint16(header[2:4], 42)
+		binary.LittleEndian.PutUint32(header[4:8], uint32(ifdOffset))
+		if _, err := sink.Write(header[:]); err != nil {
+			if sink.touched {
+				w.failed = err
+			}
+			return "", err
+		}
+		for i := range stripCount {
+			rows := min(rowsPerStrip, spec.height-i*rowsPerStrip)
+			chunk, err := fillStrip(i*rowsPerStrip, rows)
+			if err != nil {
+				if sink.touched {
+					w.failed = err
+				}
+				return "", err
+			}
+			if _, err := sink.Write(chunk); err != nil {
+				if sink.touched {
+					w.failed = err
+				}
+				return "", err
+			}
+		}
+		if pad != 0 {
+			if _, err := sink.Write([]byte{0}); err != nil {
+				if sink.touched {
+					w.failed = err
+				}
+				return "", err
+			}
+		}
+		if _, err := sink.Write(ifdBytes); err != nil {
+			if sink.touched {
+				w.failed = err
+			}
+			return "", err
+		}
+		if err := sink.finish(); err != nil {
+			if sink.touched {
+				w.failed = err
+			}
+			return "", err
+		}
+		w.registerPartMetaLocked(part, media, sink.written)
+		w.commitNameLocked(pattern, part)
+		return part, nil
+	}
+	strips := make([][]byte, 0, stripCount)
+	offsets := make([]uint32, stripCount)
+	counts := make([]uint32, stripCount)
+	cursor := int64(8)
+	for i := range stripCount {
+		rows := min(rowsPerStrip, spec.height-i*rowsPerStrip)
+		chunk, err := fillStrip(i*rowsPerStrip, rows)
+		if err != nil {
+			return "", err
+		}
+		remaining := maxPart - cursor
+		if remaining <= 0 {
+			return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+		}
+		encoded, err := encodeTIFFStripData(ctx, chunk, spec.width, rows, rowBytes, spec.compression, remaining)
+		if err != nil {
+			return "", err
+		}
+		if int64(len(encoded)) > math.MaxUint32 || cursor+int64(len(encoded)) > maxPart || cursor+int64(len(encoded)) > math.MaxUint32 {
+			return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+		}
+		offsets[i] = uint32(cursor)
+		counts[i] = uint32(len(encoded))
+		cursor += int64(len(encoded))
+		strips = append(strips, encoded)
+	}
+	pad := cursor & 1
+	ifdOffset := cursor + pad
+	if ifdOffset > math.MaxUint32 {
+		return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+	}
+	ifdBytes, err := encodeTIFFIFD(spec, offsets, counts, uint32(ifdOffset))
+	if err != nil {
+		return "", err
+	}
+	if ifdOffset+int64(len(ifdBytes)) > maxPart || ifdOffset+int64(len(ifdBytes)) > math.MaxUint32 {
+		return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+	}
+	var header [8]byte
+	copy(header[0:2], "II")
+	binary.LittleEndian.PutUint16(header[2:4], 42)
+	binary.LittleEndian.PutUint32(header[4:8], uint32(ifdOffset))
+	if _, err := sink.Write(header[:]); err != nil {
+		if sink.touched {
+			w.failed = err
+		}
+		return "", err
+	}
+	for _, strip := range strips {
+		if _, err := sink.Write(strip); err != nil {
+			if sink.touched {
+				w.failed = err
+			}
+			return "", err
+		}
+	}
+	if pad != 0 {
+		if _, err := sink.Write([]byte{0}); err != nil {
+			if sink.touched {
+				w.failed = err
+			}
+			return "", err
+		}
+	}
+	if _, err := sink.Write(ifdBytes); err != nil {
+		if sink.touched {
+			w.failed = err
+		}
+		return "", err
+	}
+	if err := sink.finish(); err != nil {
+		if sink.touched {
+			w.failed = err
+		}
+		return "", err
+	}
+	w.registerPartMetaLocked(part, media, sink.written)
+	w.commitNameLocked(pattern, part)
+	return part, nil
+}
+
+// prepareStreamImagePartLocked 为流式图像写入预检名称、前置内容类型表、逻辑部件数与剩余字节预算
+// 入参: ctx 已规范化取消Context, pattern 图像路径模板, media 目标媒体类型
+// 返回: string 分配的规范部件URI, int64 允许写出的单部件最大字节数, error 名称、类型或预算错误
+func (w *StreamWriter) prepareStreamImagePartLocked(ctx context.Context, pattern, media string) (string, int64, error) {
+	part, err := w.newNameLocked(pattern, ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	if err := w.validateEarlyContentTypeLocked(part, media); err != nil {
+		return "", 0, err
+	}
+	if w.registry.count() >= w.limits.MaxPartCount {
+		return "", 0, fmt.Errorf("%w: stream package part count", ErrLimit)
+	}
+	maxPart := min(w.limits.MaxPartBytes, w.limits.MaxPackageBytes-w.partBytes)
+	if maxPart <= 0 {
+		return "", 0, fmt.Errorf("%w: stream package exceeds MaxPackageBytes", ErrLimit)
+	}
+	return part, maxPart, nil
+}
+
+// validateStreamImageCommonOptions 校验逐行流式PNG/TIFF图像共用的尺寸、像素上限、DPI与ICC色彩空间一致性
+// 入参: ctx 已规范化取消Context, options 流式图像选项, maxPixels 像素总数上限, iccSpace 目标ICC四字节空间签名
+// 返回: float64 规范化水平DPI, float64 规范化垂直DPI, error 参数、配置或预算错误
+func validateStreamImageCommonOptions(ctx context.Context, options StreamImageRowOptions, maxPixels uint64, iccSpace string) (float64, float64, error) {
+	if options.Width < 1 || options.Height < 1 {
+		return 0, 0, fmt.Errorf("%w: invalid streaming image dimensions", ErrInvalid)
+	}
+	if maxPixels == 0 {
+		maxPixels = DefaultImageOptions().MaxPixels
+	}
+	if options.Width > rasterMaxDimension || options.Height > rasterMaxDimension || uint64(options.Width) > maxPixels/uint64(options.Height) {
+		return 0, 0, fmt.Errorf("%w: image exceeds MaxImagePixels", ErrLimit)
+	}
+	dpix, dpiy := options.DPIX, options.DPIY
+	if dpix < 0 || dpiy < 0 || math.IsNaN(dpix) || math.IsInf(dpix, 0) || math.IsNaN(dpiy) || math.IsInf(dpiy, 0) {
+		return 0, 0, fmt.Errorf("%w: invalid image DPI", ErrInvalid)
+	}
+	if dpix > 0 && dpiy == 0 {
+		dpiy = dpix
+	} else if dpiy > 0 && dpix == 0 {
+		dpix = dpiy
+	}
+	if len(options.ICCProfile) != 0 {
+		parsed, err := validateCreatedICCProfile(options.ICCProfile, ctx)
+		if err != nil {
+			return 0, 0, err
+		}
+		if parsed.class == "link" || parsed.class == "abst" {
+			return 0, 0, fmt.Errorf("%w: ICC profile class cannot be embedded in an image", ErrInvalid)
+		}
+		if iccSpace == "" || parsed.space != iccSpace {
+			return 0, 0, fmt.Errorf("%w: ICC profile color space %q is incompatible with encoded %q image", ErrInvalid, parsed.space, iccSpace)
+		}
+	}
+	return dpix, dpiy, nil
+}
+
+// validateStreamPNGRowOptions 校验逐行流式PNG写入选项并返回规范化DPI、位深、PNG色彩类型与单行字节数
+// 入参: ctx 已规范化取消Context, options 流式图像选项, maxPixels 像素总数上限
+// 返回: float64 水平DPI, float64 垂直DPI, int 采样位深, uint8 PNG色彩类型, int 单行字节数, error 参数或预算错误
+func validateStreamPNGRowOptions(ctx context.Context, options StreamImageRowOptions, maxPixels uint64) (float64, float64, int, uint8, int, error) {
+	bitDepth := options.BitDepth
+	if bitDepth == 0 {
+		bitDepth = 8
+	}
+	if bitDepth != 8 && bitDepth != 16 {
+		return 0, 0, 0, 0, 0, fmt.Errorf("%w: unsupported streaming PNG bit depth %d", ErrInvalid, bitDepth)
+	}
+	var colorType uint8
+	var channels int
+	var iccSpace string
+	switch options.ColorModel {
+	case StreamColorGray:
+		colorType, channels, iccSpace = 0, 1, "GRAY"
+	case StreamColorGrayAlpha:
+		colorType, channels, iccSpace = 4, 2, "GRAY"
+	case StreamColorRGB:
+		colorType, channels, iccSpace = 2, 3, "RGB "
+	case StreamColorRGBA:
+		colorType, channels, iccSpace = 6, 4, "RGB "
+	default:
+		return 0, 0, 0, 0, 0, fmt.Errorf("%w: unsupported streaming PNG color model %s", ErrInvalid, options.ColorModel)
+	}
+	dpix, dpiy, err := validateStreamImageCommonOptions(ctx, options, maxPixels, iccSpace)
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	if _, _, err := encodePNGPhysPixels(dpix, dpiy); err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	rowBytes64 := int64(options.Width) * int64(channels) * int64(bitDepth/8)
+	if rowBytes64 <= 0 || rowBytes64 > int64(^uint(0)>>1) {
+		return 0, 0, 0, 0, 0, fmt.Errorf("%w: streaming PNG row length overflow", ErrLimit)
+	}
+	return dpix, dpiy, bitDepth, colorType, int(rowBytes64), nil
+}
+
+// validateStreamTIFFRowOptions 校验逐行流式TIFF写入选项并构造tiffStripSpec与单行字节数
+// 入参: ctx 已规范化取消Context, options 流式图像选项, maxPixels 像素总数上限
+// 返回: tiffStripSpec TIFF条带规格, int 单行字节数, error 参数或预算错误
+func validateStreamTIFFRowOptions(ctx context.Context, options StreamImageRowOptions, maxPixels uint64) (tiffStripSpec, int, error) {
+	if options.TIFFCompression > TIFFCompressionCCITTGroup4 {
+		return tiffStripSpec{}, 0, fmt.Errorf("%w: unsupported TIFF compression %d", ErrInvalid, options.TIFFCompression)
+	}
+	bitDepth := options.BitDepth
+	if bitDepth == 0 {
+		if options.ColorModel == StreamColorBilevel {
+			bitDepth = 1
+		} else {
+			bitDepth = 8
+		}
+	}
+	if options.TIFFCompression == TIFFCompressionCCITTGroup4 && (options.ColorModel != StreamColorBilevel || bitDepth != 1) {
+		return tiffStripSpec{}, 0, fmt.Errorf("%w: CCITT Group 4 TIFF requires 1-bit StreamColorBilevel", ErrInvalid)
+	}
+	spec := tiffStripSpec{
+		width:       options.Width,
+		height:      options.Height,
+		compression: options.TIFFCompression,
+		icc:         options.ICCProfile,
+	}
+	var iccSpace string
+	var rowBytes64 int64
+	switch options.ColorModel {
+	case StreamColorBilevel:
+		if bitDepth != 1 {
+			return tiffStripSpec{}, 0, fmt.Errorf("%w: StreamColorBilevel requires 1-bit depth", ErrInvalid)
+		}
+		spec.spp, spec.bps, spec.photometric, iccSpace = 1, 1, 0, "GRAY"
+		rowBytes64 = (int64(options.Width) + 7) / 8
+	case StreamColorGray:
+		if bitDepth != 8 && bitDepth != 16 {
+			return tiffStripSpec{}, 0, fmt.Errorf("%w: unsupported TIFF gray bit depth %d", ErrInvalid, bitDepth)
+		}
+		spec.spp, spec.bps, spec.photometric, iccSpace = 1, uint16(bitDepth), 1, "GRAY"
+		rowBytes64 = int64(options.Width) * int64(bitDepth/8)
+	case StreamColorGrayAlpha:
+		if bitDepth != 8 && bitDepth != 16 {
+			return tiffStripSpec{}, 0, fmt.Errorf("%w: unsupported TIFF gray alpha bit depth %d", ErrInvalid, bitDepth)
+		}
+		spec.spp, spec.bps, spec.photometric, spec.extraSample, spec.hasExtra, iccSpace = 2, uint16(bitDepth), 1, 2, true, "GRAY"
+		rowBytes64 = int64(options.Width) * 2 * int64(bitDepth/8)
+	case StreamColorRGB:
+		if bitDepth != 8 && bitDepth != 16 {
+			return tiffStripSpec{}, 0, fmt.Errorf("%w: unsupported TIFF RGB bit depth %d", ErrInvalid, bitDepth)
+		}
+		spec.spp, spec.bps, spec.photometric, iccSpace = 3, uint16(bitDepth), 2, "RGB "
+		rowBytes64 = int64(options.Width) * 3 * int64(bitDepth/8)
+	case StreamColorRGBA:
+		if bitDepth != 8 && bitDepth != 16 {
+			return tiffStripSpec{}, 0, fmt.Errorf("%w: unsupported TIFF RGBA bit depth %d", ErrInvalid, bitDepth)
+		}
+		spec.spp, spec.bps, spec.photometric, spec.extraSample, spec.hasExtra, iccSpace = 4, uint16(bitDepth), 2, 2, true, "RGB "
+		rowBytes64 = int64(options.Width) * 4 * int64(bitDepth/8)
+	case StreamColorCMYK:
+		if bitDepth != 8 && bitDepth != 16 {
+			return tiffStripSpec{}, 0, fmt.Errorf("%w: unsupported TIFF CMYK bit depth %d", ErrInvalid, bitDepth)
+		}
+		spec.spp, spec.bps, spec.photometric, iccSpace = 4, uint16(bitDepth), 5, "CMYK"
+		rowBytes64 = int64(options.Width) * 4 * int64(bitDepth/8)
+	default:
+		return tiffStripSpec{}, 0, fmt.Errorf("%w: unsupported streaming TIFF color model %s", ErrInvalid, options.ColorModel)
+	}
+	dpix, dpiy, err := validateStreamImageCommonOptions(ctx, options, maxPixels, iccSpace)
+	if err != nil {
+		return tiffStripSpec{}, 0, err
+	}
+	spec.dpix, spec.dpiy = dpix, dpiy
+	if dpix > 0 && !(math.Round(dpix*1000) <= math.MaxUint32) || dpiy > 0 && !(math.Round(dpiy*1000) <= math.MaxUint32) {
+		return tiffStripSpec{}, 0, fmt.Errorf("%w: TIFF DPI exceeds rational range", ErrInvalid)
+	}
+	if rowBytes64 <= 0 || rowBytes64 > int64(^uint(0)>>1) {
+		return tiffStripSpec{}, 0, fmt.Errorf("%w: streaming TIFF row length overflow", ErrLimit)
+	}
+	return spec, int(rowBytes64), nil
+}
+
+// swapUint16Bytes 将16位采样行中的每对字节就地交换以在大端与小端字节序间转换
+// 入参: data 长度为偶数的16位采样字节切片
+func swapUint16Bytes(data []byte) {
+	for i := 0; i+1 < len(data); i += 2 {
+		data[i], data[i+1] = data[i+1], data[i]
+	}
 }
 
 // AddColorProfile 校验ICC颜色配置文件并立即落盘至底层流
@@ -635,7 +1400,7 @@ func (w *StreamWriter) writeDeduplicatedResourceLocked(ctx context.Context, patt
 	return part, nil
 }
 
-// AddResourceDictionary 编码共享远程资源字典并立即落盘，复用编码树记录其直接资源依赖供页面关系与释放提示追踪
+// AddResourceDictionary 编码共享远程资源字典并立即落盘，复用编码树记录其直接资源依赖与导航引用供页面关系与释放提示追踪
 // 入参: ctx 取消Context，nil采用Background, dict 资源字典模型，Source必须为空
 // 返回: string 资源字典部件URI, error 模型、编码、预算、取消或写出错误
 func (w *StreamWriter) AddResourceDictionary(ctx context.Context, dict *ResourceDictionary) (string, error) {
@@ -663,17 +1428,23 @@ func (w *StreamWriter) AddResourceDictionary(ctx context.Context, dict *Resource
 	if err != nil {
 		return "", err
 	}
+	navRefs := collectStreamNodeNavigateURIs(root)
 	if err := w.writePartLocked(ctx, part, resourceDictionaryContentType, data, true); err != nil {
 		return "", err
 	}
 	w.commitNameLocked(pattern, part)
-	w.dictDeps[strings.ToLower(part)] = deps
+	dictKey := strings.ToLower(part)
+	w.dictDeps[dictKey] = deps
+	if len(navRefs) != 0 {
+		w.dictNavRefs[dictKey] = navRefs
+	}
+	w.onLateDictWrittenLocked(dictKey)
 	return part, nil
 }
 
-// AddPart 按OPC规则与[M12.8]标准媒体类型校验并立即落盘自定义或扩展部件，遇远程资源字典或字体时同步登记依赖与受限面表
+// AddPart 按OPC规则与[M12.8]标准媒体类型校验并立即落盘自定义或扩展部件，严格校验远程资源字典与嵌入字体后同步登记依赖与受限面表
 // 入参: ctx 取消Context，nil采用Background, part 部件URI, media 内容类型, data 部件内容
-// 返回: error 名称冲突、媒体类型、预算、取消或写出错误
+// 返回: error 名称冲突、媒体类型、字典结构、字体许可、预算、取消或写出错误
 func (w *StreamWriter) AddPart(ctx context.Context, part, media string, data []byte) error {
 	ctx = normalizeContext(ctx)
 	if err := checkContext(ctx); err != nil {
@@ -700,8 +1471,12 @@ func (w *StreamWriter) AddPart(ctx context.Context, part, media string, data []b
 		return err
 	}
 	var parsedDictDeps []streamResourceRef
+	var parsedDictNavs []string
 	isDict := requiredResourceMedia(requiredDictionary, media)
 	if isDict {
+		if int64(len(data)) > w.limits.MaxPartBytes {
+			return fmt.Errorf("%w: stream part exceeds MaxPartBytes", ErrLimit)
+		}
 		root, err := decodeXML(data, w.limits)
 		if err != nil {
 			return err
@@ -711,37 +1486,66 @@ func (w *StreamWriter) AddPart(ctx context.Context, part, media string, data []b
 		if err != nil {
 			return err
 		}
-		if root.Name != (xml.Name{Space: ns, Local: "ResourceDictionary"}) {
-			return fmt.Errorf("%w: invalid resource dictionary root element", ErrInvalid)
+		if err := fixedChild(root, w.format, "ResourceDictionary"); err != nil {
+			return err
+		}
+		if err := validateFixedNames(root, w.format); err != nil {
+			return err
+		}
+		parser := &resourceParser{
+			format: w.format, limits: w.limits, context: ctx,
+			graph:  &resourceGraph{PagePart: canonical, Bindings: make(map[*xmlElement]map[string]*resourceDefinition), Parts: make(map[*xmlElement]string)},
+			remote: make(map[string]*resourceScope),
+		}
+		if _, err := parser.dictionary(root, canonical, nil, true, 1); err != nil {
+			return err
 		}
 		parsedDictDeps, err = collectStreamNodeDependencies(canonical, root)
 		if err != nil {
 			return err
 		}
+		parsedDictNavs = collectStreamNodeNavigateURIs(root)
 	}
-	var fontRaw []byte
+	var restrictedFaces []uint32
+	var needObfFaces []uint32
+	var prohibitedFaces []uint32
 	if requiredResourceMedia(requiredFont, media) {
-		if matchStandardContentType(FormatOpenXPS, media, "application/vnd.ms-package.obfuscated-opentype") {
-			if decoded, deobfErr := DeobfuscateFont(canonical, data); deobfErr == nil {
-				fontRaw = decoded
+		isObfuscated := matchStandardContentType(w.format, media, "application/vnd.ms-package.obfuscated-opentype")
+		fontRaw := data
+		if isObfuscated {
+			decoded, deobfErr := DeobfuscateFont(canonical, data)
+			if deobfErr != nil {
+				return deobfErr
 			}
-		} else {
-			fontRaw = data
+			fontRaw = decoded
+		}
+		var fontErr error
+		restrictedFaces, needObfFaces, prohibitedFaces, fontErr = validateStreamAddedFontPart(ctx, fontRaw, w.limits.MaxPartBytes, isObfuscated)
+		if fontErr != nil {
+			return fontErr
 		}
 	}
 	if err := w.writePartLocked(ctx, canonical, media, data, true); err != nil {
 		return err
 	}
 	if isDict {
-		w.dictDeps[strings.ToLower(canonical)] = parsedDictDeps
+		dictKey := strings.ToLower(canonical)
+		w.dictDeps[dictKey] = parsedDictDeps
+		if len(parsedDictNavs) != 0 {
+			w.dictNavRefs[dictKey] = parsedDictNavs
+		}
+		w.onLateDictWrittenLocked(dictKey)
 	}
-	if len(fontRaw) != 0 {
-		w.recordRestrictedFacesLocked(canonical, fontRaw)
+	if len(restrictedFaces) != 0 {
+		w.recordRestrictedFaceIndicesLocked(canonical, restrictedFaces)
+	}
+	if len(needObfFaces) != 0 || len(prohibitedFaces) != 0 {
+		w.recordFontFaceGuardsLocked(canonical, needObfFaces, prohibitedFaces)
 	}
 	return nil
 }
 
-// AddPage 编码单页模型并立即落盘至底层流，复用编码树消除二次解码并自动维护依赖、受限字体关系与前向交错索引
+// AddPage 编码单页模型并立即落盘至底层流，写前完成全部可预判预算校验，复用编码树记录依赖、名称与导航引用并推进交错索引
 // 入参: ctx 取消Context，nil采用Background, page 页面模型，Part为空时自动分配
 // 返回: string 写入的固定页面部件URI, error 模型、链接目标、编码、预算、取消或写出错误
 func (w *StreamWriter) AddPage(ctx context.Context, page *Page) (string, error) {
@@ -768,9 +1572,6 @@ func (w *StreamWriter) AddPage(ctx context.Context, page *Page) (string, error) 
 		if err != nil {
 			return "", err
 		}
-		if w.registry.count()+1 >= w.limits.MaxPartCount {
-			return "", fmt.Errorf("%w: stream package part count", ErrLimit)
-		}
 		docIdx = len(w.documents)
 	} else {
 		docIdx = w.currentDoc
@@ -794,13 +1595,6 @@ func (w *StreamWriter) AddPage(ctx context.Context, page *Page) (string, error) 
 	if err := w.availableLocked(part); err != nil {
 		return "", err
 	}
-	if implicitDoc {
-		probe := w.registry.clone()
-		probe.register(docPart)
-		if err := probe.available(part); err != nil {
-			return "", err
-		}
-	}
 	if err := w.validateEarlyContentTypeLocked(part, fixedContentType("fixedpage")); err != nil {
 		return "", err
 	}
@@ -809,7 +1603,11 @@ func (w *StreamWriter) AddPage(ctx context.Context, page *Page) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	targets, err := validateExplicitLinkTargetsForPage(w.format, w.documents, value.LinkTargets, createdPageTargets(root), docIdx, -1)
+	if int64(len(data)) > w.limits.MaxPartBytes {
+		return "", fmt.Errorf("%w: stream part exceeds MaxPartBytes", ErrLimit)
+	}
+	pageTargetNames := createdPageTargets(root)
+	targets, err := validateExplicitLinkTargetsForPage(w.format, w.documents, value.LinkTargets, pageTargetNames, docIdx, -1)
 	if err != nil {
 		return "", err
 	}
@@ -818,24 +1616,92 @@ func (w *StreamWriter) AddPage(ctx context.Context, page *Page) (string, error) 
 		return "", err
 	}
 	expandedDeps := w.expandDependenciesRecursiveLocked(deps)
+	hasRestricted := false
 	for _, dep := range expandedDeps {
-		if _, discarded := w.emittedDiscardPage[strings.ToLower(dep.part)]; discarded {
+		depKey := strings.ToLower(dep.part)
+		if _, discarded := w.emittedDiscardPage[depKey]; discarded {
 			return "", fmt.Errorf("%w: resource %s was already discarded", ErrInvalid, dep.part)
 		}
+		if dep.hasFace {
+			faceKey := fontCacheKey{part: depKey, index: dep.faceIndex}
+			if w.prohibitedFaces[faceKey] {
+				return "", fmt.Errorf("%w: font %s#%d prohibits embedding", ErrRestricted, dep.part, dep.faceIndex)
+			}
+			if w.needObfFaces[faceKey] {
+				return "", fmt.Errorf("%w: font %s#%d requires obfuscation", ErrRestricted, dep.part, dep.faceIndex)
+			}
+			if w.restrictedFaces[faceKey] {
+				hasRestricted = true
+			}
+		}
 	}
+	neededParts := 1
+	if implicitDoc {
+		neededParts++
+	}
+	pageRelPart := createdRelationshipPart(part)
+	docRelPart := createdRelationshipPart(docPart)
 	if len(expandedDeps) != 0 {
 		if err := w.canReserveRelationPartLocked(part); err != nil {
 			return "", err
 		}
-		for _, dep := range expandedDeps {
-			if dep.hasFace && w.restrictedFaces[fontCacheKey{part: strings.ToLower(dep.part), index: dep.faceIndex}] {
-				if err := w.canReserveRelationPartLocked(docPart); err != nil {
-					return "", err
-				}
-				break
+		if !w.registry.has(pageRelPart) {
+			neededParts++
+		}
+	}
+	if hasRestricted {
+		if err := w.canReserveRelationPartLocked(docPart); err != nil {
+			return "", err
+		}
+		if !w.registry.has(docRelPart) {
+			neededParts++
+		}
+	}
+	if w.registry.count()+neededParts > w.limits.MaxPartCount {
+		return "", fmt.Errorf("%w: stream package part count", ErrLimit)
+	}
+	if implicitDoc {
+		probe := w.registry.clone()
+		probe.register(docPart)
+		if err := probe.available(part); err != nil {
+			return "", err
+		}
+		probe.register(part)
+		if len(expandedDeps) != 0 {
+			if err := probe.available(pageRelPart); err != nil {
+				return "", err
+			}
+			probe.register(pageRelPart)
+		}
+		if hasRestricted {
+			if err := probe.available(docRelPart); err != nil {
+				return "", err
 			}
 		}
 	}
+	ref := PageReference{Part: part, Width: value.Width, Height: value.Height, LinkTargets: targets}
+	var pageContentXML []byte
+	if w.earlyContentTypes {
+		pageContentNode, err := buildFixedDocumentPageContentNode(w.format, docPart, ref)
+		if err != nil {
+			return "", err
+		}
+		pageContentXML, err = encodeStreamChildXML(ctx, pageContentNode, w.limits.MaxPartBytes)
+		if err != nil {
+			return "", err
+		}
+		if !implicitDoc {
+			if err := w.checkAppendStreamBudgetLocked(docPart, int64(len(pageContentXML))); err != nil {
+				return "", err
+			}
+		}
+		if int64(len(data))+int64(len(pageContentXML)) > w.limits.MaxPackageBytes-w.partBytes {
+			return "", fmt.Errorf("%w: stream package exceeds MaxPackageBytes", ErrLimit)
+		}
+	} else if int64(len(data)) > w.limits.MaxPackageBytes-w.partBytes {
+		return "", fmt.Errorf("%w: stream package exceeds MaxPackageBytes", ErrLimit)
+	}
+	pageNavs := collectStreamNodeNavigateURIs(root)
 	if implicitDoc {
 		if docIdx, err = w.beginDocumentLocked(ctx); err != nil {
 			return "", err
@@ -843,25 +1709,32 @@ func (w *StreamWriter) AddPage(ctx context.Context, page *Page) (string, error) 
 		docPart = w.documents[docIdx].Part
 	}
 	if w.earlyContentTypes {
-		if w.lastOpenPageRel != "" && !w.lateDictSources[strings.ToLower(w.lastOpenPageRel)] {
-			if err := w.closePieceStreamLocked(ctx, createdRelationshipPart(w.lastOpenPageRel)); err != nil {
-				return "", err
-			}
-			w.lastOpenPageRel = ""
+		if err := w.closeReadyPageRelsLocked(ctx); err != nil {
+			return "", w.failLocked(err)
 		}
 		if err := w.flushEarlyDiscardsForNextPageLocked(ctx, part, expandedDeps); err != nil {
-			return "", err
+			return "", w.failLocked(err)
 		}
 	}
 	if err := w.writePartLocked(ctx, part, fixedContentType("fixedpage"), data, true); err != nil {
+		if implicitDoc || w.earlyContentTypes {
+			return "", w.failLocked(err)
+		}
 		return "", err
 	}
 	w.commitNameLocked(pattern, part)
 	pageIndex := len(w.allPages)
 	w.allPages = append(w.allPages, part)
-	ref := PageReference{Part: part, Width: value.Width, Height: value.Height, LinkTargets: targets}
 	w.documents[docIdx].Pages = append(w.documents[docIdx].Pages, ref)
 	w.pageDeps = append(w.pageDeps, streamPageDeps{docPart: docPart, pagePart: part, pageIndex: pageIndex, deps: deps})
+	nameSet := make(map[string]bool, len(pageTargetNames))
+	for _, name := range pageTargetNames {
+		nameSet[name] = true
+	}
+	w.pageNames[strings.ToLower(part)] = nameSet
+	for _, navTarget := range pageNavs {
+		w.pageNavRefs = append(w.pageNavRefs, streamNavRef{sourcePart: part, target: navTarget})
+	}
 	reqType := formatNamespace(w.format) + "/required-resource"
 	resType := formatNamespace(w.format) + "/restricted-font"
 	hasPendingDict := false
@@ -870,18 +1743,19 @@ func (w *StreamWriter) AddPage(ctx context.Context, page *Page) (string, error) 
 		depKey := strings.ToLower(dep.part)
 		w.resourceLastPage[depKey] = pageIndex
 		if err := w.appendRelationLocked(part, reqType, dep.part, false); err != nil {
-			return "", err
+			return "", w.failLocked(err)
 		}
 		if _, written := w.parts[depKey]; !written {
 			if dep.kind == requiredDictionary {
 				hasPendingDict = true
+				w.pendingDicts[depKey] = true
 			} else if dep.kind == requiredFont {
 				hasPendingFont = true
 			}
 		}
 		if dep.hasFace && w.restrictedFaces[fontCacheKey{part: depKey, index: dep.faceIndex}] {
 			if err := w.appendRelationLocked(docPart, resType, dep.part, false); err != nil {
-				return "", err
+				return "", w.failLocked(err)
 			}
 		}
 	}
@@ -893,30 +1767,23 @@ func (w *StreamWriter) AddPage(ctx context.Context, page *Page) (string, error) 
 	}
 	if w.earlyContentTypes {
 		if err := w.flushStreamRelationsLocked(ctx, part); err != nil {
-			return "", err
+			return "", w.failLocked(err)
 		}
-		if w.openStreams[strings.ToLower(createdRelationshipPart(part))] != nil {
-			w.lastOpenPageRel = part
-		}
+		w.trackOpenPageRelLocked(part)
 		if err := w.flushStreamRelationsLocked(ctx, docPart); err != nil {
-			return "", err
-		}
-		pageContentNode, err := buildFixedDocumentPageContentNode(w.format, docPart, ref)
-		if err != nil {
-			return "", err
-		}
-		pageContentXML, err := encodeStreamChildXML(ctx, pageContentNode, w.limits.MaxPartBytes)
-		if err != nil {
-			return "", err
+			return "", w.failLocked(err)
 		}
 		if err := w.appendPieceStreamLocked(ctx, docPart, pageContentXML); err != nil {
-			return "", err
+			return "", w.failLocked(err)
+		}
+		if err := w.archive.Flush(); err != nil {
+			return "", w.failLocked(err)
 		}
 	}
 	return part, nil
 }
 
-// ReleaseResource 标记指定资源在当前已提交页面之后不再被引用，在Close时自动生成合规DiscardControl提示
+// ReleaseResource 标记指定资源在当前已提交页面之后不再被引用，EarlyContentTypes下于后续页面提交时即时落盘，其余模式在Close时生成合规DiscardControl提示
 // 入参: part 已写入的资源部件URI
 // 返回: error 部件名错误或流式写出器已关闭错误
 func (w *StreamWriter) ReleaseResource(part string) error {
@@ -951,6 +1818,9 @@ func (w *StreamWriter) SetCoreProperties(ctx context.Context, props CoreProperti
 	if w.hasRelationLocked("/", opcCoreRel) {
 		return fmt.Errorf("%w: stream core properties already set", ErrInvalid)
 	}
+	if err := w.canReserveRelationPartLocked("/"); err != nil {
+		return err
+	}
 	var buf bytes.Buffer
 	encoder := xml.NewEncoder(&buf)
 	if err := props.MarshalXML(encoder, xml.StartElement{}); err != nil {
@@ -978,15 +1848,18 @@ func (w *StreamWriter) SetCoreProperties(ctx context.Context, props CoreProperti
 			return err
 		}
 	}
+	if err := w.canWritePartWithRelLocked(part, "/", opcCoreType, int64(len(data))); err != nil {
+		return err
+	}
 	if err := w.writePartLocked(ctx, part, opcCoreType, data, true); err != nil {
 		return err
 	}
 	w.commitNameLocked(pattern, part)
 	if err := w.appendRelationLocked("/", opcCoreRel, part, false); err != nil {
-		return err
+		return w.failLocked(err)
 	}
 	if w.earlyContentTypes {
-		return w.flushStreamRelationsLocked(ctx, "/")
+		return w.failLocked(w.flushStreamRelationsLocked(ctx, "/"))
 	}
 	return nil
 }
@@ -1025,9 +1898,6 @@ func (w *StreamWriter) SetRawPrintTicket(ctx context.Context, targetPart, conten
 	if err := checkContext(ctx); err != nil {
 		return "", err
 	}
-	if len(data) == 0 {
-		return "", fmt.Errorf("%w: empty print ticket data", ErrInvalid)
-	}
 	if err := w.lock(ctx); err != nil {
 		return "", err
 	}
@@ -1036,37 +1906,11 @@ func (w *StreamWriter) SetRawPrintTicket(ctx context.Context, targetPart, conten
 	if err != nil {
 		return "", err
 	}
-	if contentType == "" {
-		contentType = printTicketType
-	}
-	if err := validatePackageMediaForFormat(w.format, contentType); err != nil {
+	resolvedType, err := validatePrintTicketPayload(ctx, w.format, scope, contentType, data, w.limits)
+	if err != nil {
 		return "", err
 	}
-	if w.format == FormatXPS && !matchStandardContentType(FormatXPS, contentType, printTicketType) {
-		return "", fmt.Errorf("%w: XPS print ticket content type", ErrInvalid)
-	}
-	baseType := opcMediaTypeBase(contentType)
-	known, capabilities := printResourceMedia(baseType)
-	if known && !capabilities {
-		if int64(len(data)) > min(w.limits.MaxMetadataBytes, w.limits.MaxPartBytes) {
-			return "", fmt.Errorf("%w: print ticket byte budget", ErrLimit)
-		}
-		cfg, err := printSettingsOptions(ctx, &PrintSettingsOptions{Limits: w.limits, Scope: scope})
-		if err != nil {
-			return "", err
-		}
-		root, err := decodeXML(data, cfg.Limits)
-		if err != nil {
-			return "", err
-		}
-		if _, err := parsePrintSettings(root, cfg); err != nil {
-			return "", err
-		}
-		if err := xmlNamespaceTreeOutput(root, ctx); err != nil {
-			return "", err
-		}
-	}
-	return w.writeBoundPrintTicketLocked(ctx, canonical, contentType, data)
+	return w.writeBoundPrintTicketLocked(ctx, canonical, resolvedType, data)
 }
 
 // validatePrintTicketTargetLocked 校验流式打印票据目标归属、单值不重复及伴生关系部件无派生冲突
@@ -1095,17 +1939,32 @@ func (w *StreamWriter) validatePrintTicketTargetLocked(targetPart string) (strin
 	return canonical, scope, nil
 }
 
-// writeBoundPrintTicketLocked 分配票据路径、落盘载荷并绑定对应目标的printticket关系
+// writeBoundPrintTicketLocked 分配票据路径、写前预检预算、落盘载荷并绑定对应目标的printticket关系
 // 入参: ctx 已规范化取消Context, canonical 已校验目标来源URI, contentType 媒体类型, data 票据原始载荷
 // 返回: string 写入的打印票据部件URI, error 分配、类型、预算、取消或写出错误
 func (w *StreamWriter) writeBoundPrintTicketLocked(ctx context.Context, canonical, contentType string, data []byte) (string, error) {
 	baseType := strings.ToLower(opcMediaTypeBase(contentType))
-	pattern := "/Metadata/PrintTicket%d.xml"
+	preferredExt := "xml"
 	if !strings.EqualFold(baseType, printTicketType) && !strings.HasSuffix(baseType, "+xml") && baseType != "application/xml" && baseType != "text/xml" {
-		pattern = "/Metadata/PrintTicket%d.bin"
+		preferredExt = "bin"
 	}
+	ext := preferredExt
+	if w.earlyContentTypes {
+		if expected, ok := w.earlyDefaults[preferredExt]; !ok || !matchEarlyDefaultContentType(w.format, contentType, expected) {
+			for _, candidateExt := range slices.Sorted(maps.Keys(w.earlyDefaults)) {
+				if matchEarlyDefaultContentType(w.format, contentType, w.earlyDefaults[candidateExt]) {
+					ext = candidateExt
+					break
+				}
+			}
+		}
+	}
+	pattern := "/Metadata/PrintTicket%d." + ext
 	part, err := w.newNameLocked(pattern, ctx)
 	if err != nil {
+		return "", err
+	}
+	if err := w.canWritePartWithRelLocked(part, canonical, contentType, int64(len(data))); err != nil {
 		return "", err
 	}
 	if err := w.writePartLocked(ctx, part, contentType, data, true); err != nil {
@@ -1113,15 +1972,16 @@ func (w *StreamWriter) writeBoundPrintTicketLocked(ctx context.Context, canonica
 	}
 	w.commitNameLocked(pattern, part)
 	if err := w.appendRelationLocked(canonical, formatNamespace(w.format)+"/printticket", part, false); err != nil {
-		return "", err
+		return "", w.failLocked(err)
 	}
 	if w.earlyContentTypes {
 		if err := w.flushStreamRelationsLocked(ctx, canonical); err != nil {
-			return "", err
+			return "", w.failLocked(err)
 		}
+		w.trackOpenPageRelLocked(canonical)
 		if strings.EqualFold(canonical, w.sequence) {
 			if err := w.closePieceStreamLocked(ctx, createdRelationshipPart(canonical)); err != nil {
-				return "", err
+				return "", w.failLocked(err)
 			}
 		}
 	}
@@ -1135,9 +1995,6 @@ func (w *StreamWriter) SetThumbnail(ctx context.Context, targetPart string, data
 	ctx = normalizeContext(ctx)
 	if err := checkContext(ctx); err != nil {
 		return "", err
-	}
-	if len(data) == 0 {
-		return "", fmt.Errorf("%w: empty thumbnail image data", ErrInvalid)
 	}
 	if err := w.lock(ctx); err != nil {
 		return "", err
@@ -1164,14 +2021,8 @@ func (w *StreamWriter) SetThumbnail(ctx context.Context, targetPart string, data
 	if err := w.canReserveRelationPartLocked(source); err != nil {
 		return "", err
 	}
-	media, ext, err := detectImageFormat(data)
-	if err != nil || !thumbnailMedia(media) {
-		return "", fmt.Errorf("%w: thumbnail requires JPEG or PNG image", ErrInvalid)
-	}
-	if int64(len(data)) > w.limits.MaxPartBytes {
-		return "", fmt.Errorf("%w: thumbnail byte budget", ErrLimit)
-	}
-	if _, err := decodeRasterImageContext(ctx, data, media, w.maxImagePixels); err != nil {
+	media, ext, err := validateThumbnailPayload(ctx, data, w.limits.MaxPartBytes, w.maxImagePixels)
+	if err != nil {
 		return "", err
 	}
 	pattern := "/Metadata/Thumbnail%d." + ext
@@ -1179,22 +2030,26 @@ func (w *StreamWriter) SetThumbnail(ctx context.Context, targetPart string, data
 	if err != nil {
 		return "", err
 	}
+	if err := w.canWritePartWithRelLocked(part, source, media, int64(len(data))); err != nil {
+		return "", err
+	}
 	if err := w.writePartLocked(ctx, part, media, data, true); err != nil {
 		return "", err
 	}
 	w.commitNameLocked(pattern, part)
 	if err := w.appendRelationLocked(source, thumbnailRelationship, part, false); err != nil {
-		return "", err
+		return "", w.failLocked(err)
 	}
 	if w.earlyContentTypes {
 		if err := w.flushStreamRelationsLocked(ctx, source); err != nil {
-			return "", err
+			return "", w.failLocked(err)
 		}
+		w.trackOpenPageRelLocked(source)
 	}
 	return part, nil
 }
 
-// SetDocumentStructure 编码指定固定文档的目录与故事结构、立即落盘并绑定documentstructure关系，关闭时终检故事页码上界，同一文档重复设置返回ErrInvalid
+// SetDocumentStructure 编码指定固定文档的目录与故事结构、立即落盘并绑定documentstructure关系，关闭时终检大纲目标与故事交叉对应，同一文档重复设置返回ErrInvalid
 // 入参: ctx 取消Context，nil采用Background, docIndex 固定文档序号, structure 文档结构模型
 // 返回: error 序号、重复设置、编码、预算、取消或写出错误
 func (w *StreamWriter) SetDocumentStructure(ctx context.Context, docIndex int, structure *DocumentStructure) error {
@@ -1220,14 +2075,24 @@ func (w *StreamWriter) SetDocumentStructure(ctx context.Context, docIndex int, s
 	if err := w.canReserveRelationPartLocked(source); err != nil {
 		return err
 	}
-	maxPage := 0
+	info := &streamDocStructInfo{storyNames: make(map[string]bool, len(structure.Stories))}
 	for _, story := range structure.Stories {
+		info.storyNames[story.Name] = true
 		for _, ref := range story.Fragments {
 			if ref.PageNumber < 1 {
 				return fmt.Errorf("%w: invalid story fragment page number %d", ErrInvalid, ref.PageNumber)
 			}
-			if ref.PageNumber > maxPage {
-				maxPage = ref.PageNumber
+			info.storyRefs = append(info.storyRefs, streamStoryFragmentRef{
+				storyName:    story.Name,
+				pageNumber:   ref.PageNumber,
+				fragmentName: cloneOptionalString(ref.FragmentName),
+			})
+		}
+	}
+	if structure.Outline != nil {
+		for _, entry := range structure.Outline.Entries {
+			if entry.Target != "" {
+				info.outlineTargets = append(info.outlineTargets, entry.Target)
 			}
 		}
 	}
@@ -1253,21 +2118,25 @@ func (w *StreamWriter) SetDocumentStructure(ctx context.Context, docIndex int, s
 			return err
 		}
 	}
+	if err := w.canWritePartWithRelLocked(part, source, fixedContentType("documentstructure"), int64(len(data))); err != nil {
+		return err
+	}
 	if err := w.writePartLocked(ctx, part, fixedContentType("documentstructure"), data, true); err != nil {
 		return err
 	}
 	w.commitNameLocked(usedPattern, part)
-	w.docStructMaxPage[docIndex] = maxPage
+	info.part = part
+	w.docStructures[docIndex] = info
 	if err := w.appendRelationLocked(source, relType, part, false); err != nil {
-		return err
+		return w.failLocked(err)
 	}
 	if w.earlyContentTypes {
-		return w.flushStreamRelationsLocked(ctx, source)
+		return w.failLocked(w.flushStreamRelationsLocked(ctx, source))
 	}
 	return nil
 }
 
-// SetStoryFragments 编码指定页面的故事片段、立即落盘并绑定storyfragments关系，同一页面重复设置返回ErrInvalid
+// SetStoryFragments 编码指定页面的故事片段、立即落盘并绑定storyfragments关系，关闭时终检故事归属与命名元素存在性，同一页面重复设置返回ErrInvalid
 // 入参: ctx 取消Context，nil采用Background, docIndex 文档序号, pageIndex 文档内页面序号, fragments 故事片段模型
 // 返回: error 序号、重复设置、编码、预算、取消或写出错误
 func (w *StreamWriter) SetStoryFragments(ctx context.Context, docIndex, pageIndex int, fragments *StoryFragments) error {
@@ -1293,6 +2162,18 @@ func (w *StreamWriter) SetStoryFragments(ctx context.Context, docIndex, pageInde
 	if err := w.canReserveRelationPartLocked(source); err != nil {
 		return err
 	}
+	storyInfo := &streamPageStoryInfo{fragments: make([]streamPageStoryFragment, 0, len(fragments.Fragments))}
+	for _, frag := range fragments.Fragments {
+		storyInfo.fragments = append(storyInfo.fragments, streamPageStoryFragment{
+			storyName:    cloneOptionalString(frag.StoryName),
+			fragmentName: cloneOptionalString(frag.FragmentName),
+		})
+		refs, err := collectStreamStoryNamedRefs(frag.Content, w.limits.MaxXMLDepth)
+		if err != nil {
+			return err
+		}
+		storyInfo.namedRefs = append(storyInfo.namedRefs, refs...)
+	}
 	data, err := createdStoryFragments(fragments, w.format, w.limits, ctx)
 	if err != nil {
 		return err
@@ -1315,22 +2196,30 @@ func (w *StreamWriter) SetStoryFragments(ctx context.Context, docIndex, pageInde
 			return err
 		}
 	}
+	if err := w.canWritePartWithRelLocked(part, source, fixedContentType("storyfragments"), int64(len(data))); err != nil {
+		return err
+	}
 	if err := w.writePartLocked(ctx, part, fixedContentType("storyfragments"), data, true); err != nil {
 		return err
 	}
 	w.commitNameLocked(usedPattern, part)
+	storyInfo.part = part
+	w.pageStories[strings.ToLower(source)] = storyInfo
 	if err := w.appendRelationLocked(source, relType, part, false); err != nil {
-		return err
+		return w.failLocked(err)
 	}
 	if w.earlyContentTypes {
-		return w.flushStreamRelationsLocked(ctx, source)
+		if err := w.flushStreamRelationsLocked(ctx, source); err != nil {
+			return w.failLocked(err)
+		}
+		w.trackOpenPageRelLocked(source)
 	}
 	return nil
 }
 
-// Close 幂等完成流式包收尾：终检依赖与页码上界，补齐或闭合固定布局、释放提示、全部.rels与[Content_Types].xml并关闭ZIP容器
+// Close 幂等完成流式包收尾：终检依赖、导航目标与故事结构，补齐或闭合固定布局、释放提示、全部.rels与[Content_Types].xml并关闭ZIP容器
 // 入参: ctx 取消Context，nil采用Background
-// 返回: error 结构、依赖、编码、预算、取消或ZIP关闭错误
+// 返回: error 结构、依赖、导航、故事、编码、预算、取消或ZIP关闭错误
 func (w *StreamWriter) Close(ctx context.Context) error {
 	ctx = normalizeContext(ctx)
 	if w == nil {
@@ -1344,6 +2233,9 @@ func (w *StreamWriter) Close(ctx context.Context) error {
 	w.closed = true
 	if w.optimizer != nil {
 		defer w.optimizer.Close()
+	}
+	if w.deflater != nil {
+		defer w.deflater.Close()
 	}
 	if w.failed != nil {
 		w.closeErr = w.failed
@@ -1361,21 +2253,18 @@ func (w *StreamWriter) Close(ctx context.Context) error {
 
 // finalizeLocked 在Close期间执行终检、展开后置字典依赖、写出或闭合剩余索引、释放提示、关系与内容类型表并关闭ZIP
 // 入参: ctx 已规范化取消Context
-// 返回: error 结构、依赖、页码、编码或写出错误
+// 返回: error 结构、依赖、导航、故事、编码或写出错误
 func (w *StreamWriter) finalizeLocked(ctx context.Context) error {
 	if len(w.documents) == 0 {
 		return fmt.Errorf("%w: stream package requires at least one document", ErrInvalid)
 	}
 	ns := formatNamespace(w.format)
-	for docIdx, doc := range w.documents {
+	for _, doc := range w.documents {
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
 		if len(doc.Pages) == 0 {
 			return fmt.Errorf("%w: stream document %s requires at least one page", ErrInvalid, doc.Part)
-		}
-		if maxPage := w.docStructMaxPage[docIdx]; maxPage > len(doc.Pages) {
-			return fmt.Errorf("%w: document %d structure story page %d exceeds page count %d", ErrInvalid, docIdx, maxPage, len(doc.Pages))
 		}
 	}
 	reqType := ns + "/required-resource"
@@ -1403,12 +2292,24 @@ func (w *StreamWriter) finalizeLocked(ctx context.Context) error {
 			if err := w.appendRelationLocked(rec.pagePart, reqType, dep.part, false); err != nil {
 				return err
 			}
-			if dep.hasFace && w.restrictedFaces[fontCacheKey{part: depKey, index: dep.faceIndex}] {
-				if err := w.appendRelationLocked(rec.docPart, resType, dep.part, false); err != nil {
-					return err
+			if dep.hasFace {
+				faceKey := fontCacheKey{part: depKey, index: dep.faceIndex}
+				if w.prohibitedFaces[faceKey] {
+					return fmt.Errorf("%w: font %s#%d prohibits embedding", ErrRestricted, dep.part, dep.faceIndex)
+				}
+				if w.needObfFaces[faceKey] {
+					return fmt.Errorf("%w: font %s#%d requires obfuscation", ErrRestricted, dep.part, dep.faceIndex)
+				}
+				if w.restrictedFaces[faceKey] {
+					if err := w.appendRelationLocked(rec.docPart, resType, dep.part, false); err != nil {
+						return err
+					}
 				}
 			}
 		}
+	}
+	if err := w.validateStreamNavigationAndStoriesLocked(ctx); err != nil {
+		return err
 	}
 	if w.earlyContentTypes {
 		return w.finalizeEarlyLocked(ctx)
@@ -1741,22 +2642,76 @@ func (w *StreamWriter) writeRawEntryLocked(ctx context.Context, part string, dat
 	return nil
 }
 
-// writeZIPPayloadLocked 写入单个物理ZIP条目，复用共享writeZIPBufferEntry支持Store、Deflate与无损Optimize压缩模式
+// streamMaxPhysicalEntries 计算与逻辑MaxPartCount解耦的物理ZIP条目安全上限，避免交错分片与EarlyContentTypes多片提前耗尽逻辑部件配额
+// 入参: maxPartCount 逻辑部件数量上限
+// 返回: int 物理ZIP条目数量安全上限
+func streamMaxPhysicalEntries(maxPartCount int) int {
+	limit := int64(maxPartCount) * 64
+	if limit < 65536 {
+		limit = 65536
+	}
+	if limit > int64(^uint(0)>>1) {
+		return int(^uint(0) >> 1)
+	}
+	return int(limit)
+}
+
+// writeZIPPayloadLocked 写入单个物理ZIP条目，EarlyContentTypes的Deflate条目走预压缩CreateRaw以消除尾条挂起延迟并支持即时Flush
 // 入参: ctx 取消Context, entryName 物理ZIP条目路径, data 未压缩载荷
 // 返回: error 条目计数、压缩、取消或写出错误
 func (w *StreamWriter) writeZIPPayloadLocked(ctx context.Context, entryName string, data []byte) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
-	if w.entryCount >= w.limits.MaxPartCount {
+	if w.entryCount >= streamMaxPhysicalEntries(w.limits.MaxPartCount) {
 		return fmt.Errorf("%w: stream ZIP entry count", ErrLimit)
 	}
 	w.entryCount++
 	header := zip.FileHeader{Name: entryName, Method: zip.Deflate, Modified: w.fixedTime}
+	if w.earlyContentTypes && w.compression == CompressionDeflate && len(data) <= compressionBufferLimit {
+		if w.deflater == nil {
+			fw, err := flate.NewWriter(io.Discard, flate.DefaultCompression)
+			if err != nil {
+				return err
+			}
+			w.deflater = fw
+		}
+		w.candidate.reset(compressionBufferLimit)
+		w.deflater.Reset(&w.candidate)
+		copyErr := writeCompressionInput(w.deflater, bytes.NewReader(data), w.copyBuf, ctx)
+		closeErr := w.deflater.Close()
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		if copyErr == nil && closeErr == nil {
+			crc, err := zipChunkedCRC32(ctx, data, len(w.copyBuf))
+			if err != nil {
+				return err
+			}
+			payload := w.candidate.Bytes()
+			header.Method = zip.Deflate
+			header.CRC32 = crc
+			header.UncompressedSize64 = uint64(len(data))
+			header.CompressedSize64 = uint64(len(payload))
+			header.UncompressedSize, header.CompressedSize = 0, 0
+			if header.UncompressedSize64 < uint64(^uint32(0)) && header.CompressedSize64 < uint64(^uint32(0)) {
+				header.UncompressedSize = uint32(len(data))
+				header.CompressedSize = uint32(len(payload))
+			}
+			header.Flags &^= 0xe
+			header.ReaderVersion, header.CreatorVersion = 20, header.CreatorVersion&0xff00|20
+			prepareRawZIPHeader(&header)
+			writer, err := w.archive.CreateRaw(&header)
+			if err != nil {
+				return err
+			}
+			return writeCompressionInput(writer, bytes.NewReader(payload), w.copyBuf, ctx)
+		}
+	}
 	return writeZIPBufferEntry(ctx, w.archive, header, data, w.compression, w.optimizer, &w.candidate, w.copyBuf)
 }
 
-// Write 接收流式编码器输出的字节块，按整部件直写或定长分片落盘至底层ZIP流，落盘后方置touched标志
+// Write 接收流式编码器输出的字节块，无分片Deflate直写、无分片Store/Optimize受控缓冲走CreateRaw、分片模式滞后冲刷上一满片消除0字节尾片
 // 入参: p 待写字节切片
 // 返回: int 已接收字节数, error 预算、取消或ZIP写出错误
 func (s *streamPieceSink) Write(p []byte) (int, error) {
@@ -1766,17 +2721,13 @@ func (s *streamPieceSink) Write(p []byte) (int, error) {
 	if int64(len(p)) > s.maxBytes-s.written {
 		return 0, fmt.Errorf("%w: streaming image exceeds byte budget", ErrLimit)
 	}
-	if s.writer.interleaveBytes == 0 && s.writer.compression != CompressionOptimize {
+	if s.writer.interleaveBytes == 0 && s.writer.compression == CompressionDeflate {
 		if s.direct == nil {
-			if s.writer.entryCount >= s.writer.limits.MaxPartCount {
+			if s.writer.entryCount >= streamMaxPhysicalEntries(s.writer.limits.MaxPartCount) {
 				return 0, fmt.Errorf("%w: stream ZIP entry count", ErrLimit)
 			}
 			s.writer.entryCount++
-			method := zip.Deflate
-			if s.writer.compression == CompressionStore {
-				method = zip.Store
-			}
-			header := zip.FileHeader{Name: strings.TrimPrefix(s.part, "/"), Method: method, Modified: s.writer.fixedTime}
+			header := zip.FileHeader{Name: strings.TrimPrefix(s.part, "/"), Method: zip.Deflate, Modified: s.writer.fixedTime}
 			s.touched = true
 			out, err := s.writer.archive.CreateHeader(&header)
 			if err != nil {
@@ -1817,14 +2768,14 @@ func (s *streamPieceSink) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-// finish 刷写剩余分片或Optimize整部件缓冲至底层ZIP流
+// finish 刷写剩余分片或Store/Optimize整部件缓冲至底层ZIP流，复用writeZIPBufferEntry与prepareRawZIPHeader保持时间戳和UTF-8标志一致
 // 返回: error 写出错误
 func (s *streamPieceSink) finish() error {
 	if s.finalized {
 		return nil
 	}
 	s.finalized = true
-	if s.writer.interleaveBytes == 0 && s.writer.compression != CompressionOptimize {
+	if s.writer.interleaveBytes == 0 && s.writer.compression == CompressionDeflate {
 		if s.direct == nil {
 			s.touched = true
 			return s.writer.writeZIPPayloadLocked(s.ctx, strings.TrimPrefix(s.part, "/"), nil)
@@ -1906,6 +2857,59 @@ func collectStreamNodeDependencies(sourcePart string, root *xmlElement) ([]strea
 	return result, nil
 }
 
+// collectStreamNodeNavigateURIs 扫描页面或远程字典XML树中所有Canvas、Path、Glyphs元素的FixedPage.NavigateUri属性
+// 入参: root XML根节点
+// 返回: []string 原始NavigateUri属性值切片
+func collectStreamNodeNavigateURIs(root *xmlElement) []string {
+	var refs []string
+	var walk func(*xmlElement)
+	walk = func(node *xmlElement) {
+		if node == nil {
+			return
+		}
+		if node.Name.Local == "Canvas" || node.Name.Local == "Path" || node.Name.Local == "Glyphs" {
+			if target, present := node.attribute("FixedPage.NavigateUri"); present {
+				refs = append(refs, target)
+			}
+		}
+		for _, child := range node.Children {
+			walk(child)
+		}
+	}
+	walk(root)
+	return refs
+}
+
+// collectStreamStoryNamedRefs 递归收集StoryFragment语义树中全部NamedElement与列表Marker引用的页面元素名称
+// 入参: content 故事语义结构节点切片, maxDepth 允许的最大递归深度
+// 返回: []string 引用的页面元素名称切片, error 深度超限错误
+func collectStreamStoryNamedRefs(content []ContentStructure, maxDepth int) ([]string, error) {
+	var refs []string
+	var walk func(nodes []ContentStructure, depth int) error
+	walk = func(nodes []ContentStructure, depth int) error {
+		if depth >= maxDepth {
+			return fmt.Errorf("%w: story link depth", ErrLimit)
+		}
+		for _, node := range nodes {
+			if node.Kind == StructureNamedElement {
+				refs = append(refs, node.NameReference)
+			} else if node.Marker != nil {
+				refs = append(refs, *node.Marker)
+			}
+			if len(node.Children) != 0 {
+				if err := walk(node.Children, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walk(content, 0); err != nil {
+		return nil, err
+	}
+	return refs, nil
+}
+
 // expandDependenciesRecursiveLocked 递归展开页面或远程字典的全部传递资源依赖并防环去重
 // 入参: direct 直接资源引用列表
 // 返回: []streamResourceRef 展开去重后的完整依赖列表
@@ -1948,10 +2952,10 @@ func (w *StreamWriter) expandDependenciesRecursiveLocked(direct []streamResource
 	return result
 }
 
-// earlyStreamDefaultTypes 按OPC§10.1.2.2返回指定方言全部标准扩展名的默认内容类型映射表
-// 入参: format 文档方言
-// 返回: map[string]string 小写扩展名到无参数标准内容类型的映射
-func earlyStreamDefaultTypes(format Format) map[string]string {
+// earlyStreamDefaultTypes 按OPC§10.1.2.2构建指定方言前置Default内容类型表，支持排除默认xml打印票据映射及合并用户自定义映射
+// 入参: format 文档方言, excludePrintTicket 是否不预声明默认xml打印票据映射, custom 可选用户扩展或覆写映射
+// 返回: map[string]string 小写扩展名到合法内容类型的映射, error 扩展名或内容类型非法错误
+func earlyStreamDefaultTypes(format Format, excludePrintTicket bool, custom map[string]string) (map[string]string, error) {
 	defaults := map[string]string{
 		"rels":    opcRelsType,
 		"fdseq":   fixedContentType("fixeddocumentsequence"),
@@ -1983,10 +2987,34 @@ func earlyStreamDefaultTypes(format Format) map[string]string {
 		defaults["x3d"] = "model/x3d+xml"
 		defaults["x3db"] = "model/x3d+binary"
 	}
-	return defaults
+	if excludePrintTicket {
+		delete(defaults, "xml")
+	}
+	for _, rawExt := range slices.Sorted(maps.Keys(custom)) {
+		media := custom[rawExt]
+		ext, ok := opcNormalizeExtension(strings.TrimPrefix(rawExt, "."))
+		if !ok {
+			return nil, fmt.Errorf("%w: invalid early default extension %q", ErrInvalid, rawExt)
+		}
+		if err := validatePackageMediaForFormat(format, media); err != nil {
+			return nil, err
+		}
+		defaults[ext] = media
+	}
+	return defaults, nil
 }
 
-// validateEarlyContentTypeLocked 校验EarlyContentTypes模式下目标部件扩展名与预声明Default类型完全一致
+// matchEarlyDefaultContentType 按方言与OPC规则判断部件媒体类型是否与前置Default表声明一致，OpenXPS下放行带合法MIME参数的非禁参媒体类型
+// 入参: format 文档方言, media 待写部件实际媒体类型, expected 前置Default声明的媒体类型
+// 返回: bool 媒体类型是否兼容
+func matchEarlyDefaultContentType(format Format, media, expected string) bool {
+	if format == FormatOpenXPS && !strings.Contains(expected, ";") {
+		return matchStandardContentType(format, media, expected)
+	}
+	return strings.EqualFold(media, expected)
+}
+
+// validateEarlyContentTypeLocked 校验EarlyContentTypes模式下目标部件扩展名与预声明Default类型一致
 // 入参: part 已规范化部件URI, media 目标内容类型
 // 返回: error 扩展名缺失、未预声明或内容类型冲突错误
 func (w *StreamWriter) validateEarlyContentTypeLocked(part, media string) error {
@@ -2003,7 +3031,7 @@ func (w *StreamWriter) validateEarlyContentTypeLocked(part, media string) error 
 	if !exists {
 		return fmt.Errorf("%w: extension %q of %s is not declared in early [Content_Types].xml", ErrUnsupported, ext, part)
 	}
-	if !strings.EqualFold(media, expected) {
+	if !matchEarlyDefaultContentType(w.format, media, expected) {
 		return fmt.Errorf("%w: part %s content type %q conflicts with early default %q", ErrInvalid, part, media, expected)
 	}
 	return nil
@@ -2013,7 +3041,6 @@ func (w *StreamWriter) validateEarlyContentTypeLocked(part, media string) error 
 // 入参: ctx 已规范化取消Context
 // 返回: error 编码、预算、取消或写出错误
 func (w *StreamWriter) initEarlyStreamLocked(ctx context.Context) error {
-	w.earlyDefaults = earlyStreamDefaultTypes(w.format)
 	typesRoot := createdNode(opcTypesNS, "Types")
 	for _, ext := range slices.Sorted(maps.Keys(w.earlyDefaults)) {
 		child := createdNode(opcTypesNS, "Default")
@@ -2030,16 +3057,16 @@ func (w *StreamWriter) initEarlyStreamLocked(ctx context.Context) error {
 	}
 	ns := formatNamespace(w.format)
 	if err := w.appendRelationLocked("/", ns+"/fixedrepresentation", w.sequence, false); err != nil {
-		return err
+		return w.failLocked(err)
 	}
 	if w.autoDiscard {
 		if err := w.ensureEarlyDiscardStreamLocked(ctx); err != nil {
-			return err
+			return w.failLocked(err)
 		}
 	} else if err := w.flushStreamRelationsLocked(ctx, "/"); err != nil {
-		return err
+		return w.failLocked(err)
 	}
-	return w.openPieceStreamLocked(ctx, w.sequence, fixedContentType("fixeddocumentsequence"), `<FixedDocumentSequence xmlns="`+ns+`">`, `</FixedDocumentSequence>`)
+	return w.failLocked(w.openPieceStreamLocked(ctx, w.sequence, fixedContentType("fixeddocumentsequence"), `<FixedDocumentSequence xmlns="`+ns+`">`, `</FixedDocumentSequence>`))
 }
 
 // ensureEarlyDiscardStreamLocked 在EarlyContentTypes模式下按需打开/DiscardControl.discard分片流并刷出包根关系
@@ -2094,15 +3121,25 @@ func (w *StreamWriter) appendEarlyDiscardHintsLocked(ctx context.Context, hints 
 }
 
 // flushEarlyDiscardsForNextPageLocked 在EarlyContentTypes模式下对已显式ReleaseResource且不受新页及全局关系保护的资源立即落盘Discard分片
+// 当存在尚未落盘的后置远程资源字典时暂缓刷出该批早释放提示，避免违反ECMA-388§10.2.3提前释放传递依赖资源
 // 入参: ctx 已规范化取消Context, sentinelPage 即将落盘的新页面URI, nextPageDeps 新页面展开依赖集合
 // 返回: error 编码、预算、取消或写出错误
 func (w *StreamWriter) flushEarlyDiscardsForNextPageLocked(ctx context.Context, sentinelPage string, nextPageDeps []streamResourceRef) error {
 	if len(w.releasedAfter) == 0 {
 		return nil
 	}
+	if len(w.pendingDicts) != 0 {
+		return nil
+	}
 	nextUsed := make(map[string]bool, len(nextPageDeps))
 	for _, dep := range nextPageDeps {
-		nextUsed[strings.ToLower(dep.part)] = true
+		depKey := strings.ToLower(dep.part)
+		if dep.kind == requiredDictionary {
+			if _, written := w.parts[depKey]; !written {
+				return nil
+			}
+		}
+		nextUsed[depKey] = true
 	}
 	protected := make(map[string]bool)
 	ns := formatNamespace(w.format)
@@ -2138,7 +3175,11 @@ func (w *StreamWriter) flushEarlyDiscardsForNextPageLocked(ctx context.Context, 
 		if _, emitted := w.emittedDiscardPage[key]; emitted {
 			continue
 		}
-		if w.releasedAfter[key] >= nextPageIdx || nextUsed[key] || protected[key] {
+		effective := w.releasedAfter[key]
+		if lastIdx, used := w.resourceLastPage[key]; used && lastIdx > effective {
+			effective = lastIdx
+		}
+		if effective >= nextPageIdx || nextUsed[key] || protected[key] {
 			continue
 		}
 		part, exists := w.parts[key]
@@ -2158,6 +3199,382 @@ func (w *StreamWriter) flushEarlyDiscardsForNextPageLocked(ctx context.Context, 
 	}
 	for _, hint := range ready {
 		w.emittedDiscardPage[strings.ToLower(hint.Target)] = nextPageIdx
+	}
+	return nil
+}
+
+// failLocked 在已触碰底层ZIP流或持久状态后记录首个失败错误以毒化写出器，防止半残流继续写入
+// 入参: err 操作返回的错误
+// 返回: error 原样透传的错误
+func (w *StreamWriter) failLocked(err error) error {
+	if err != nil && w.failed == nil {
+		w.failed = err
+	}
+	return err
+}
+
+// checkAppendStreamBudgetLocked 预检向已打开分片流追加指定字节数是否满足单部件与整包字节预算
+// 入参: part 目标分片流部件URI, addBytes 待追加字节数
+// 返回: error 状态或预算超限错误
+func (w *StreamWriter) checkAppendStreamBudgetLocked(part string, addBytes int64) error {
+	if addBytes <= 0 {
+		return nil
+	}
+	stream := w.openStreams[strings.ToLower(part)]
+	if stream == nil || stream.closed {
+		return fmt.Errorf("%w: stream part %s is not open", ErrInvalid, part)
+	}
+	maxPart := w.limits.MaxPartBytes
+	if opcRelationshipName(stream.part) {
+		maxPart = min(maxPart, w.limits.MaxMetadataBytes)
+	}
+	if addBytes > maxPart-stream.bytes {
+		return fmt.Errorf("%w: stream part exceeds MaxPartBytes", ErrLimit)
+	}
+	if addBytes > w.limits.MaxPackageBytes-w.partBytes {
+		return fmt.Errorf("%w: stream package exceeds MaxPackageBytes", ErrLimit)
+	}
+	return nil
+}
+
+// streamClosingBytesLocked 返回指定打开分片流闭合尾标签所需的字节长度，未打开或已闭合返回0
+// 入参: part 目标部件URI
+// 返回: int64 闭合尾标签字节数
+func (w *StreamWriter) streamClosingBytesLocked(part string) int64 {
+	stream := w.openStreams[strings.ToLower(part)]
+	if stream == nil || stream.closed {
+		return 0
+	}
+	return int64(len(stream.closing))
+}
+
+// pendingReadyPageRelClosingBytesLocked 统计当前全部可立即闭合页面.fpage.rels尾标签总字节数
+// 返回: int64 待闭合页面关系尾标签总字节数
+func (w *StreamWriter) pendingReadyPageRelClosingBytesLocked() int64 {
+	var total int64
+	for key, pagePart := range w.openPageRels {
+		if !w.lateDictSources[key] {
+			total += w.streamClosingBytesLocked(createdRelationshipPart(pagePart))
+		}
+	}
+	return total
+}
+
+// canWritePartWithRelLocked 写前统一预检新部件及伴生.rels逻辑部件总数、单部件与整包字节预算及前置内容类型表
+// 入参: part 目标新部件URI, relSource 关系源部件URI或/, media 新部件内容类型, size 新部件字节长度
+// 返回: error 类型、预算或部件上限错误
+func (w *StreamWriter) canWritePartWithRelLocked(part, relSource, media string, size int64) error {
+	if err := validatePackageMediaForFormat(w.format, media); err != nil {
+		return err
+	}
+	if err := w.validateEarlyContentTypeLocked(part, media); err != nil {
+		return err
+	}
+	if size > w.limits.MaxPartBytes {
+		return fmt.Errorf("%w: stream part exceeds MaxPartBytes", ErrLimit)
+	}
+	if size > w.limits.MaxPackageBytes-w.partBytes {
+		return fmt.Errorf("%w: stream package exceeds MaxPackageBytes", ErrLimit)
+	}
+	needed := 0
+	if !w.registry.has(part) {
+		needed++
+	}
+	relPart := createdRelationshipPart(relSource)
+	if !w.registry.has(relPart) && !strings.EqualFold(relPart, part) {
+		needed++
+	}
+	if w.registry.count()+needed > w.limits.MaxPartCount {
+		return fmt.Errorf("%w: stream package part count", ErrLimit)
+	}
+	return nil
+}
+
+// trackOpenPageRelLocked 在EarlyContentTypes模式下将已打开的页面.fpage.rels登记至待闭合集合，确保无依赖页后补元数据可及时闭合
+// 入参: source 关系源部件URI
+func (w *StreamWriter) trackOpenPageRelLocked(source string) {
+	if !w.earlyContentTypes || w.partScopeLocked(source) != PrintScopePage {
+		return
+	}
+	relKey := strings.ToLower(createdRelationshipPart(source))
+	if stream := w.openStreams[relKey]; stream != nil && !stream.closed {
+		w.openPageRels[strings.ToLower(source)] = source
+	}
+}
+
+// closeReadyPageRelsLocked 闭合全部不再等待后置远程字典的已打开页面.fpage.rels分片流
+// 入参: ctx 已规范化取消Context
+// 返回: error 预算、取消或写出错误
+func (w *StreamWriter) closeReadyPageRelsLocked(ctx context.Context) error {
+	for _, key := range slices.Sorted(maps.Keys(w.openPageRels)) {
+		if w.lateDictSources[key] {
+			continue
+		}
+		pagePart := w.openPageRels[key]
+		if err := w.closePieceStreamLocked(ctx, createdRelationshipPart(pagePart)); err != nil {
+			return err
+		}
+		delete(w.openPageRels, key)
+	}
+	return nil
+}
+
+// onLateDictWrittenLocked 在后置远程资源字典落盘后清理待定标记并更新依赖该字典的已提交页面资源最后使用页号
+// 入参: dictKey 小写远程字典部件URI键
+func (w *StreamWriter) onLateDictWrittenLocked(dictKey string) {
+	delete(w.pendingDicts, dictKey)
+	for _, rec := range w.pageDeps {
+		expanded := w.expandDependenciesRecursiveLocked(rec.deps)
+		for _, dep := range expanded {
+			depKey := strings.ToLower(dep.part)
+			if prev, seen := w.resourceLastPage[depKey]; !seen || rec.pageIndex > prev {
+				w.resourceLastPage[depKey] = rec.pageIndex
+			}
+			if dep.kind == requiredDictionary {
+				if _, written := w.parts[depKey]; !written {
+					w.pendingDicts[depKey] = true
+				}
+			}
+		}
+	}
+}
+
+// flushResolvedLateSourcesLocked 检查已落盘后置远程字典或字体所解除阻塞的延迟页面与文档，刷出新增关系并解除延迟标记
+// 入参: ctx 已规范化取消Context
+// 返回: error 关系或写出错误
+func (w *StreamWriter) flushResolvedLateSourcesLocked(ctx context.Context) error {
+	if len(w.lateDictSources) == 0 {
+		return nil
+	}
+	ns := formatNamespace(w.format)
+	reqType := ns + "/required-resource"
+	resType := ns + "/restricted-font"
+	docStillPending := make(map[string]bool)
+	for _, rec := range w.pageDeps {
+		pageKey := strings.ToLower(rec.pagePart)
+		docKey := strings.ToLower(rec.docPart)
+		if !w.lateDictSources[pageKey] && !w.lateDictSources[docKey] {
+			continue
+		}
+		expanded := w.expandDependenciesRecursiveLocked(rec.deps)
+		pagePendingDict := false
+		docPending := false
+		for _, dep := range expanded {
+			depKey := strings.ToLower(dep.part)
+			if _, written := w.parts[depKey]; !written {
+				if dep.kind == requiredDictionary {
+					pagePendingDict = true
+					docPending = true
+				} else if dep.kind == requiredFont {
+					docPending = true
+				}
+			}
+			if err := w.appendRelationLocked(rec.pagePart, reqType, dep.part, false); err != nil {
+				return err
+			}
+			if dep.hasFace {
+				faceKey := fontCacheKey{part: depKey, index: dep.faceIndex}
+				if w.prohibitedFaces[faceKey] {
+					return fmt.Errorf("%w: font %s#%d prohibits embedding", ErrRestricted, dep.part, dep.faceIndex)
+				}
+				if w.needObfFaces[faceKey] {
+					return fmt.Errorf("%w: font %s#%d requires obfuscation", ErrRestricted, dep.part, dep.faceIndex)
+				}
+				if w.restrictedFaces[faceKey] {
+					if err := w.appendRelationLocked(rec.docPart, resType, dep.part, false); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if err := w.flushStreamRelationsLocked(ctx, rec.pagePart); err != nil {
+			return err
+		}
+		w.trackOpenPageRelLocked(rec.pagePart)
+		if err := w.flushStreamRelationsLocked(ctx, rec.docPart); err != nil {
+			return err
+		}
+		if !pagePendingDict {
+			delete(w.lateDictSources, pageKey)
+		}
+		if docPending {
+			docStillPending[docKey] = true
+		}
+	}
+	for _, doc := range w.documents {
+		docKey := strings.ToLower(doc.Part)
+		if w.lateDictSources[docKey] && !docStillPending[docKey] {
+			delete(w.lateDictSources, docKey)
+		}
+	}
+	return nil
+}
+
+// validateStreamNavigationAndStoriesLocked 在Close阶段终检页面与字典NavigateUri、目录OutlineEntry.Target、StoryFragmentReference与NamedElement交叉存在性
+// 入参: ctx 已规范化取消Context
+// 返回: error 导航目标、目录锚点、故事片段或命名元素缺失错误
+func (w *StreamWriter) validateStreamNavigationAndStoriesLocked(ctx context.Context) error {
+	navParts := make(map[string]createdNavigationKind, len(w.documents)+len(w.allPages)+1)
+	docIndexByKey := make(map[string]int, len(w.documents))
+	docTargets := make([]map[string]bool, len(w.documents))
+	allTargets := make(map[string]bool)
+	navParts[strings.ToLower(w.sequence)] = createdNavigationSequence
+	for docIdx, doc := range w.documents {
+		docKey := strings.ToLower(doc.Part)
+		navParts[docKey] = createdNavigationDocument
+		docIndexByKey[docKey] = docIdx
+		targets := make(map[string]bool)
+		for _, page := range doc.Pages {
+			pageKey := strings.ToLower(page.Part)
+			navParts[pageKey] = createdNavigationPage
+			for _, name := range page.LinkTargets {
+				targets[name] = true
+				allTargets[name] = true
+			}
+			for name := range w.pageNames[pageKey] {
+				targets[name] = true
+				allTargets[name] = true
+			}
+		}
+		docTargets[docIdx] = targets
+	}
+	validateTarget := func(sourcePart, raw string, allowEmpty bool) error {
+		value := structureURI(raw)
+		if value == "" {
+			if allowEmpty {
+				return nil
+			}
+			return fmt.Errorf("%w: empty navigation URI on %s", ErrInvalid, sourcePart)
+		}
+		if linkExternal(value) {
+			return nil
+		}
+		uri, err := url.Parse(value)
+		if err != nil {
+			return fmt.Errorf("%w: navigation URI: %w", ErrInvalid, err)
+		}
+		targetPart := sourcePart
+		if uri.Path != "" {
+			targetPart, err = resolvePart(sourcePart, uri.EscapedPath())
+			if err != nil {
+				return err
+			}
+		}
+		targetKey := strings.ToLower(targetPart)
+		kind := navParts[targetKey]
+		if kind == createdNavigationOther {
+			if _, exists := w.parts[targetKey]; !exists {
+				return fmt.Errorf("%w: navigation target part %s does not exist", ErrInvalid, targetPart)
+			}
+		}
+		if uri.Fragment == "" {
+			return nil
+		}
+		if linkPageNumber(uri.Fragment) {
+			if kind != createdNavigationSequence {
+				return fmt.Errorf("%w: M9.8 page address must target the fixed document sequence", ErrInvalid)
+			}
+			number, parseErr := strconv.ParseUint(uri.Fragment, 10, 64)
+			if parseErr != nil || number < 1 || number > uint64(len(w.allPages)) {
+				return fmt.Errorf("%w: navigation page number #%s out of range (1..%d)", ErrInvalid, uri.Fragment, len(w.allPages))
+			}
+			return nil
+		}
+		if kind == createdNavigationPage {
+			return fmt.Errorf("%w: M9.4 named address must target a fixed document or sequence", ErrInvalid)
+		}
+		if kind == createdNavigationDocument {
+			docIdx := docIndexByKey[targetKey]
+			if !docTargets[docIdx][uri.Fragment] {
+				return fmt.Errorf("%w: navigation LinkTarget %q does not exist in %s", ErrInvalid, uri.Fragment, targetPart)
+			}
+		} else if kind == createdNavigationSequence {
+			if !allTargets[uri.Fragment] {
+				return fmt.Errorf("%w: navigation LinkTarget %q does not exist in %s", ErrInvalid, uri.Fragment, targetPart)
+			}
+		}
+		return nil
+	}
+	for _, ref := range w.pageNavRefs {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		if err := validateTarget(ref.sourcePart, ref.target, false); err != nil {
+			return &PartError{Part: ref.sourcePart, Err: fmt.Errorf("FixedPage.NavigateUri: %w", err)}
+		}
+	}
+	for _, rec := range w.pageDeps {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		expanded := w.expandDependenciesRecursiveLocked(rec.deps)
+		for _, dep := range expanded {
+			if dep.kind != requiredDictionary {
+				continue
+			}
+			for _, navTarget := range w.dictNavRefs[strings.ToLower(dep.part)] {
+				if err := validateTarget(rec.pagePart, navTarget, false); err != nil {
+					return &PartError{Part: dep.part, Err: fmt.Errorf("FixedPage.NavigateUri: %w", err)}
+				}
+			}
+		}
+	}
+	for docIdx, doc := range w.documents {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		docStruct := w.docStructures[docIdx]
+		if docStruct != nil {
+			for _, outlineTarget := range docStruct.outlineTargets {
+				if err := validateTarget(docStruct.part, outlineTarget, true); err != nil {
+					return &PartError{Part: docStruct.part, Element: "OutlineEntry", Err: err}
+				}
+			}
+		}
+		locations := make(map[contentFragmentKey]int)
+		fragmentNames := make(map[contentFragmentKey]bool)
+		for local, page := range doc.Pages {
+			pageKey := strings.ToLower(page.Part)
+			pageStory := w.pageStories[pageKey]
+			if pageStory == nil {
+				continue
+			}
+			for _, frag := range pageStory.fragments {
+				if frag.storyName != nil {
+					if docStruct == nil || !docStruct.storyNames[*frag.storyName] {
+						return &PartError{Part: pageStory.part, Element: "StoryFragment", Err: fmt.Errorf("%w: story %q is not defined in its fixed document", ErrInvalid, *frag.storyName)}
+					}
+					key := contentFragmentKey{page: local, story: *frag.storyName}
+					locations[key]++
+					if frag.fragmentName != nil {
+						key.named, key.name = true, *frag.fragmentName
+						locations[key]++
+						identity := contentFragmentKey{story: key.story, name: key.name, named: true}
+						if fragmentNames[identity] {
+							return &PartError{Part: pageStory.part, Element: "StoryFragment", Err: fmt.Errorf("%w: duplicate fragment name %q in story %q", ErrInvalid, key.name, key.story)}
+						}
+						fragmentNames[identity] = true
+					}
+				}
+			}
+			names := w.pageNames[pageKey]
+			for _, namedRef := range pageStory.namedRefs {
+				if !names[namedRef] {
+					return &PartError{Part: pageStory.part, Element: "StoryFragment", Err: fmt.Errorf("%w: named element %q is absent from page %s", ErrInvalid, namedRef, page.Part)}
+				}
+			}
+		}
+		if docStruct != nil {
+			for _, ref := range docStruct.storyRefs {
+				key := contentFragmentKey{page: ref.pageNumber - 1, story: ref.storyName}
+				if ref.fragmentName != nil {
+					key.named, key.name = true, *ref.fragmentName
+				}
+				if ref.pageNumber < 1 || ref.pageNumber > len(doc.Pages) || locations[key] != 1 {
+					return &PartError{Part: docStruct.part, Element: "StoryFragmentReference", Err: fmt.Errorf("%w: story %q page %d identifies %d fragments", ErrInvalid, ref.storyName, ref.pageNumber, locations[key])}
+				}
+			}
+		}
 	}
 	return nil
 }

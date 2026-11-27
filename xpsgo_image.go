@@ -193,29 +193,31 @@ type ImageResource struct {
 
 // pngHeaderState 保存PNG单遍头与辅助块解析状态，供ImageInfo、元数据校验与非隔行流式逐行解码共用
 type pngHeaderState struct {
-	width       int
-	height      int
-	rawBitDepth int
-	colorType   byte
-	interlace   byte
-	hasIHDR     bool
-	paletteSeen bool
-	imageSeen   bool
-	physSeen    bool
-	profileSeen bool
-	srgbSeen    bool
-	cicpSeen    bool
-	gamaSeen    bool
-	chrmSeen    bool
-	mdcvSeen    bool
-	clliSeen    bool
-	trnsSeen    bool
-	palette     []byte
-	trns        []byte
-	gammaChroma imageGammaChroma
-	mdcvMaxNits float64
-	clliMaxNits float64
-	metadata    rasterMetadata
+	width                int
+	height               int
+	rawBitDepth          int
+	colorType            byte
+	interlace            byte
+	hasIHDR              bool
+	paletteSeen          bool
+	imageSeen            bool
+	idatClosed           bool
+	allowUnknownCritical bool
+	physSeen             bool
+	profileSeen          bool
+	srgbSeen             bool
+	cicpSeen             bool
+	gamaSeen             bool
+	chrmSeen             bool
+	mdcvSeen             bool
+	clliSeen             bool
+	trnsSeen             bool
+	palette              []byte
+	trns                 []byte
+	gammaChroma          imageGammaChroma
+	mdcvMaxNits          float64
+	clliMaxNits          float64
+	metadata             rasterMetadata
 }
 
 // jpegHeaderState 保存JPEG单遍标记段解析状态，供ImageInfo与解码元数据提取共用
@@ -632,6 +634,10 @@ func (r *Reader) DecodeImageRows(ctx context.Context, part string, options *Imag
 		return nil
 	}
 	rowBudget := min(uint64(imgCfg.MaxBytes), maxConvertBytes)
+	var explicitStripBudget uint64
+	if convert != nil && (convert.Limits.MaxPartBytes > 0 || convert.Limits.MaxPackageBytes > 0) {
+		explicitStripBudget = maxConvertBytes
+	}
 	switch strings.ToLower(media) {
 	case "image/vnd.ms-photo":
 		handled, jxrErr := decodeJXRImageRows(ctx, data, imgCfg.MaxPixels, rowBudget, cfg, rowFn)
@@ -656,7 +662,7 @@ func (r *Reader) DecodeImageRows(ctx context.Context, part string, options *Imag
 			return nil
 		}
 	case "image/tiff":
-		handled, tiffErr := decodeTIFFImageRows(ctx, data, imgCfg.MaxPixels, rowBudget, cfg, rowFn)
+		handled, tiffErr := decodeTIFFImageRows(ctx, data, imgCfg.MaxPixels, rowBudget, explicitStripBudget, cfg, rowFn)
 		if callbackErr != nil {
 			return callbackErr
 		}
@@ -970,29 +976,8 @@ func (r *ImageResource) ToNRGBA(ctx context.Context, opts *ImageConvertOptions) 
 			return nil, err
 		}
 		rowOff := (y - bounds.Min.Y) * out.Stride
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			if (x-bounds.Min.X)&1023 == 0 {
-				if err := checkContext(ctx); err != nil {
-					return nil, err
-				}
-			}
-			c, err := sampler.pixelColorWithCache(x, y, &jxrCache)
-			if err != nil {
-				return nil, err
-			}
-			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode)
-			if err != nil {
-				return nil, err
-			}
-			a8 := colorQuantize8(alpha)
-			if a8 == 0 {
-				continue
-			}
-			off := rowOff + (x-bounds.Min.X)*4
-			out.Pix[off] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[0])))
-			out.Pix[off+1] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[1])))
-			out.Pix[off+2] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[2])))
-			out.Pix[off+3] = a8
+		if err := convertSamplerRowToNRGBA(ctx, sampler, &jxrCache, bounds.Min.X, y, width, false, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode, out.Pix[rowOff:rowOff+width*4]); err != nil {
+			return nil, err
 		}
 	}
 	return out, checkContext(ctx)
@@ -1562,6 +1547,42 @@ func finishLinearRowToNRGBA64(src []float64, width int, toneMapPeak float64, has
 	return nil
 }
 
+// convertSamplerRowToNRGBA 使用采样器将单行源像素执行色彩管理、色调映射、背景合成及打印色彩变换并写入八位NRGBA行缓冲
+// 入参: ctx 已规范化取消Context, sampler 图像采样器, jxrCache JXR行缓存, srcMinX 源起始横坐标, srcY 源纵坐标, width 行像素宽度, flipX 是否水平翻转采样, hasBG 是否启用背景合成, bgLinear 线性背景色, bgAlpha 背景Alpha, negative 是否反相, mode 打印色彩模式, dst 长度为4*width的目标八位NRGBA行缓冲
+// 返回: error 采样、数值或取消错误
+func convertSamplerRowToNRGBA(ctx context.Context, sampler *imageSampler, jxrCache *jxrRowCache, srcMinX, srcY, width int, flipX, hasBG bool, bgLinear [3]float64, bgAlpha float64, negative bool, mode PrintColorMode, dst []byte) error {
+	clear(dst[:width*4])
+	for x := range width {
+		if x&1023 == 0 {
+			if err := checkContext(ctx); err != nil {
+				return err
+			}
+		}
+		srcX := srcMinX + x
+		if flipX {
+			srcX = srcMinX + width - 1 - x
+		}
+		c, err := sampler.pixelColorWithCache(srcX, srcY, jxrCache)
+		if err != nil {
+			return err
+		}
+		lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, bgAlpha, negative, mode)
+		if err != nil {
+			return err
+		}
+		a8 := colorQuantize8(alpha)
+		if a8 == 0 {
+			continue
+		}
+		off := x * 4
+		dst[off] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[0])))
+		dst[off+1] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[1])))
+		dst[off+2] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[2])))
+		dst[off+3] = a8
+	}
+	return nil
+}
+
 // exportRowsNRGBA 使用单行缓冲将已解码图像逐行色彩管理后回调给调用方，无需分配整帧NRGBA输出
 // 入参: ctx 已规范化取消Context, cfg 已校验转换选项, maxBytes 内存字节预算, fn 逐行回调
 // 返回: error 采样、转换、回调或取消错误
@@ -1587,36 +1608,73 @@ func (r *ImageResource) exportRowsNRGBA(ctx context.Context, cfg ImageConvertOpt
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
-		clear(rowBuf)
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			if (x-bounds.Min.X)&1023 == 0 {
-				if err := checkContext(ctx); err != nil {
-					return err
-				}
-			}
-			c, err := sampler.pixelColorWithCache(x, y, &jxrCache)
-			if err != nil {
-				return err
-			}
-			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode)
-			if err != nil {
-				return err
-			}
-			a8 := colorQuantize8(alpha)
-			if a8 == 0 {
-				continue
-			}
-			off := (x - bounds.Min.X) * 4
-			rowBuf[off] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[0])))
-			rowBuf[off+1] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[1])))
-			rowBuf[off+2] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[2])))
-			rowBuf[off+3] = a8
+		if err := convertSamplerRowToNRGBA(ctx, sampler, &jxrCache, bounds.Min.X, y, width, false, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode, rowBuf); err != nil {
+			return err
 		}
 		if err := fn(y-bounds.Min.Y, rowBuf); err != nil {
 			return err
 		}
 	}
 	return checkContext(ctx)
+}
+
+// pngValidateChunkType 按ISO/IEC 15948 §5.4校验四字节PNG块名均为ASCII字母且第三字节保留位必须为大写
+// 入参: kind 四字节块类型
+// 返回: error 非法块名或非法保留位错误
+func pngValidateChunkType(kind []byte) error {
+	if len(kind) != 4 {
+		return fmt.Errorf("%w: PNG chunk type", ErrInvalid)
+	}
+	for _, value := range kind {
+		if value < 'A' || value > 'Z' && value < 'a' || value > 'z' {
+			return fmt.Errorf("%w: PNG chunk type", ErrInvalid)
+		}
+	}
+	if kind[2]&32 != 0 {
+		return fmt.Errorf("%w: PNG reserved chunk bit", ErrInvalid)
+	}
+	return nil
+}
+
+// walkPNGChunks 统一校验PNG签名、每块长度、CRC32、块类型保留位及IEND结束结构，并顺序分发每个块给回调
+// 入参: ctx 可选取消Context, data 完整PNG字节, fn 逐块处理回调，接收块起始偏移、四字节块名与载荷切片
+// 返回: error 签名、块结构、CRC、块名、取消或回调错误
+func walkPNGChunks(ctx context.Context, data []byte, fn func(pos uint64, kind string, payload []byte) error) error {
+	if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
+		return fmt.Errorf("%w: PNG signature", ErrInvalid)
+	}
+	for pos := uint64(8); pos < uint64(len(data)); {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		if uint64(len(data))-pos < 12 {
+			return fmt.Errorf("%w: truncated PNG chunk", ErrInvalid)
+		}
+		size := uint64(binary.BigEndian.Uint32(data[pos:]))
+		if size > uint64(len(data))-pos-12 {
+			return fmt.Errorf("%w: PNG chunk size", ErrInvalid)
+		}
+		chunk := data[pos+4 : pos+8+size]
+		if crc32.ChecksumIEEE(chunk) != binary.BigEndian.Uint32(data[pos+8+size:]) {
+			return fmt.Errorf("%w: PNG chunk checksum", ErrInvalid)
+		}
+		if err := pngValidateChunkType(chunk[:4]); err != nil {
+			return err
+		}
+		kind := string(chunk[:4])
+		payload := chunk[4:]
+		if kind == "IEND" {
+			if size != 0 || pos+12 != uint64(len(data)) {
+				return fmt.Errorf("%w: PNG ending", ErrInvalid)
+			}
+			return fn(pos, kind, payload)
+		}
+		if err := fn(pos, kind, payload); err != nil {
+			return err
+		}
+		pos += size + 12
+	}
+	return fmt.Errorf("%w: missing PNG ending", ErrInvalid)
 }
 
 // newPNGHeaderState 初始化带默认96 DPI的PNG头与元数据解析状态
@@ -1626,12 +1684,15 @@ func newPNGHeaderState() pngHeaderState {
 }
 
 // consumeChunk 统一校验并吸收PNG单个非像素元数据块，供ImageInfo、元数据解析及流式逐行解码共用
-// 入参: kind 四字节块类型, payload 块载荷字节（不含长度、类型与CRC）
+// 入参: kind 已前置校验的四字节块类型, payload 块载荷字节（不含长度、类型与CRC）
 // 返回: error 块顺序、长度、数值范围或组合非法错误
 func (s *pngHeaderState) consumeChunk(kind string, payload []byte) error {
 	size := uint64(len(payload))
 	if !s.hasIHDR && kind != "IHDR" {
 		return fmt.Errorf("%w: PNG header placement", ErrInvalid)
+	}
+	if kind != "IDAT" && s.imageSeen {
+		s.idatClosed = true
 	}
 	switch kind {
 	case "IHDR":
@@ -1723,6 +1784,9 @@ func (s *pngHeaderState) consumeChunk(kind string, payload []byte) error {
 		s.trns = payload
 		s.metadata.hasAlpha = true
 	case "IDAT":
+		if s.idatClosed {
+			return fmt.Errorf("%w: non-contiguous PNG IDAT", ErrInvalid)
+		}
 		if s.colorType == 3 && !s.paletteSeen {
 			return fmt.Errorf("%w: PNG missing PLTE", ErrInvalid)
 		}
@@ -1836,6 +1900,10 @@ func (s *pngHeaderState) consumeChunk(kind string, payload []byte) error {
 		s.gammaChroma.redX, s.gammaChroma.redY = rx, ry
 		s.gammaChroma.greenX, s.gammaChroma.greenY = gx, gy
 		s.gammaChroma.blueX, s.gammaChroma.blueY = bx, by
+	default:
+		if kind[0]&32 == 0 && !s.allowUnknownCritical {
+			return fmt.Errorf("%w: unknown critical PNG chunk %s", ErrInvalid, kind)
+		}
 	}
 	return nil
 }
@@ -1873,8 +1941,14 @@ func readPNGImageInfo(ctx context.Context, stream io.Reader, part, media string,
 		if _, err := io.ReadFull(stream, header[:]); err != nil {
 			return nil, fmt.Errorf("%w: truncated PNG chunk", ErrInvalid)
 		}
+		if err := pngValidateChunkType(header[4:8]); err != nil {
+			return nil, err
+		}
 		size := uint64(binary.BigEndian.Uint32(header[:4]))
 		kind := string(header[4:8])
+		if kind != "IHDR" && kind != "PLTE" && kind != "IDAT" && kind != "IEND" && header[4]&32 == 0 {
+			return nil, fmt.Errorf("%w: unknown critical PNG chunk %s", ErrInvalid, kind)
+		}
 		if maxBytes > 0 && size > uint64(maxBytes) {
 			return nil, fmt.Errorf("%w: PNG chunk size", ErrLimit)
 		}
@@ -1937,59 +2011,26 @@ func decodePNGImageRows(ctx context.Context, data []byte, maxPixels, maxBytes ui
 	if err := checkContext(ctx); err != nil {
 		return false, err
 	}
-	if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
-		return false, fmt.Errorf("%w: PNG signature", ErrInvalid)
-	}
 	state := newPNGHeaderState()
 	idatStart, idatEnd := 0, 0
-	idatClosed := false
-	iendSeen := false
-	for pos := uint64(8); pos < uint64(len(data)); {
-		if err := checkContext(ctx); err != nil {
-			return false, err
+	if err := walkPNGChunks(ctx, data, func(pos uint64, kind string, payload []byte) error {
+		if kind == "IEND" {
+			return nil
 		}
-		if uint64(len(data))-pos < 12 {
-			return false, fmt.Errorf("%w: truncated PNG chunk", ErrInvalid)
+		if err := state.consumeChunk(kind, payload); err != nil {
+			return err
 		}
-		size := uint64(binary.BigEndian.Uint32(data[pos:]))
-		if size > uint64(len(data))-pos-12 {
-			return false, fmt.Errorf("%w: PNG chunk size", ErrInvalid)
-		}
-		chunk := data[pos+4 : pos+8+size]
-		if crc32.ChecksumIEEE(chunk) != binary.BigEndian.Uint32(data[pos+8+size:]) {
-			return false, fmt.Errorf("%w: PNG chunk checksum", ErrInvalid)
-		}
-		kind := string(chunk[:4])
-		payload := chunk[4:]
 		if kind == "IDAT" {
-			if idatClosed {
-				return false, fmt.Errorf("%w: non-contiguous PNG IDAT", ErrInvalid)
-			}
 			if idatStart == 0 {
-				if err := state.consumeChunk("IDAT", payload); err != nil {
-					return false, err
-				}
 				idatStart = int(pos)
 			}
-			idatEnd = int(pos + size + 12)
-		} else {
-			if idatStart != 0 {
-				idatClosed = true
-			}
-			if kind == "IEND" {
-				if size != 0 || pos+12 != uint64(len(data)) {
-					return false, fmt.Errorf("%w: PNG ending", ErrInvalid)
-				}
-				iendSeen = true
-				break
-			}
-			if err := state.consumeChunk(kind, payload); err != nil {
-				return false, err
-			}
+			idatEnd = int(pos + uint64(len(payload)) + 12)
 		}
-		pos += size + 12
+		return nil
+	}); err != nil {
+		return false, err
 	}
-	if !state.hasIHDR || idatStart == 0 || !iendSeen {
+	if !state.hasIHDR || idatStart == 0 {
 		return false, fmt.Errorf("%w: incomplete PNG stream", ErrInvalid)
 	}
 	if state.interlace != 0 {
@@ -2069,30 +2110,8 @@ func decodePNGImageRows(ctx context.Context, data []byte, maxPixels, maxBytes ui
 		if err := pngUnpackRowToNRGBA64(curRow, rowOut, w, state.colorType, state.rawBitDepth, state.palette, state.trns); err != nil {
 			return true, err
 		}
-		clear(rowBuf)
-		for x := range w {
-			if x&1023 == 0 {
-				if err := checkContext(ctx); err != nil {
-					return true, err
-				}
-			}
-			c, err := sampler.pixelColorWithCache(x, 0, &jxrCache)
-			if err != nil {
-				return true, err
-			}
-			lin, alphaVal, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode)
-			if err != nil {
-				return true, err
-			}
-			a8 := colorQuantize8(alphaVal)
-			if a8 == 0 {
-				continue
-			}
-			off := x * 4
-			rowBuf[off] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[0])))
-			rowBuf[off+1] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[1])))
-			rowBuf[off+2] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[2])))
-			rowBuf[off+3] = a8
+		if err := convertSamplerRowToNRGBA(ctx, sampler, &jxrCache, 0, 0, w, false, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode, rowBuf); err != nil {
+			return true, err
 		}
 		if err := fn(y, rowBuf); err != nil {
 			return true, err
@@ -2105,6 +2124,9 @@ func decodePNGImageRows(ctx context.Context, data []byte, maxPixels, maxBytes ui
 	}
 	if err := zr.Close(); err != nil {
 		return true, fmt.Errorf("%w: PNG zlib checksum: %w", ErrInvalid, err)
+	}
+	if _, err := idat.ReadByte(); err != io.EOF {
+		return true, fmt.Errorf("%w: trailing PNG IDAT data", ErrInvalid)
 	}
 	return true, checkContext(ctx)
 }
@@ -2823,35 +2845,19 @@ func (r *ImageResource) Sample(x, y int, components []float64) (float64, error) 
 // 入参: data 完整PNG数据
 // 返回: rasterMetadata 图像元数据, error 数据或资源错误
 func pngImageMetadata(data []byte) (rasterMetadata, error) {
-	if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
-		return rasterMetadata{}, fmt.Errorf("%w: PNG signature", ErrInvalid)
-	}
 	state := newPNGHeaderState()
-	for pos := uint64(8); pos < uint64(len(data)); {
-		if uint64(len(data))-pos < 12 {
-			return rasterMetadata{}, fmt.Errorf("%w: truncated PNG chunk", ErrInvalid)
-		}
-		size := uint64(binary.BigEndian.Uint32(data[pos:]))
-		if size > uint64(len(data))-pos-12 {
-			return rasterMetadata{}, fmt.Errorf("%w: PNG chunk size", ErrInvalid)
-		}
-		chunk := data[pos+4 : pos+8+size]
-		if crc32.ChecksumIEEE(chunk) != binary.BigEndian.Uint32(data[pos+8+size:]) {
-			return rasterMetadata{}, fmt.Errorf("%w: PNG chunk checksum", ErrInvalid)
-		}
-		kind := string(chunk[:4])
+	if err := walkPNGChunks(nil, data, func(_ uint64, kind string, payload []byte) error {
 		if kind == "IEND" {
-			if size != 0 || pos+12 != uint64(len(data)) {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG ending", ErrInvalid)
+			if !state.hasIHDR {
+				return fmt.Errorf("%w: PNG header placement", ErrInvalid)
 			}
-			return state.finalize(), nil
+			return nil
 		}
-		if err := state.consumeChunk(kind, chunk[4:]); err != nil {
-			return rasterMetadata{}, err
-		}
-		pos += size + 12
+		return state.consumeChunk(kind, payload)
+	}); err != nil {
+		return rasterMetadata{}, err
 	}
-	return rasterMetadata{}, fmt.Errorf("%w: missing PNG ending", ErrInvalid)
+	return state.finalize(), nil
 }
 
 // jpegImageMetadata 按绝对物理单位EXIF优先于JFIF解析分辨率与方向，并按片段序号合并内嵌ICC配置文件
@@ -3439,7 +3445,8 @@ func recompressPNG(data []byte, maxPixels uint64, budget *resourceMergeBudget, c
 	if err := budget.charge(1 + max(0, len(data)-1)/4096); err != nil {
 		return nil, err
 	}
-	if _, err := pngImageMetadata(data); err != nil {
+	layout, err := pngCompressionChunks(data, budget)
+	if err != nil {
 		return nil, err
 	}
 	config, err := png.DecodeConfig(bytes.NewReader(data))
@@ -3448,10 +3455,6 @@ func recompressPNG(data []byte, maxPixels uint64, budget *resourceMergeBudget, c
 	}
 	if config.Width < 1 || config.Height < 1 || config.Width > rasterMaxDimension || config.Height > rasterMaxDimension || uint64(config.Width)*uint64(config.Height) > maxPixels {
 		return nil, fmt.Errorf("%w: PNG recompression pixels", ErrLimit)
-	}
-	layout, err := pngCompressionChunks(data, budget)
-	if err != nil {
-		return nil, err
 	}
 	candidate.buffer.reset(min(compressionBufferLimit, layout.end-layout.start-12))
 	candidate.full = false
@@ -3494,55 +3497,41 @@ func recompressPNG(data []byte, maxPixels uint64, budget *resourceMergeBudget, c
 	return output, nil
 }
 
-// pngCompressionChunks 校验IDAT连续性及编辑器复制规则，未知不可安全复制块阻止修改而非被删除
-// 入参: data 已校验块长度及CRC的PNG, budget 遍历预算
+// pngCompressionChunks 通过共享块遍历校验PNG结构、元数据、IDAT连续性及编辑器复制规则，未知不可安全复制块阻止修改而非被删除
+// 入参: data 完整PNG字节, budget 遍历预算
 // 返回: pngCompressionLayout IDAT范围, error 块顺序、能力或预算错误
 func pngCompressionChunks(data []byte, budget *resourceMergeBudget) (pngCompressionLayout, error) {
 	var layout pngCompressionLayout
-	ended, palette := false, false
-	for position := 8; position < len(data); {
+	state := newPNGHeaderState()
+	state.allowUnknownCritical = true
+	if err := walkPNGChunks(nil, data, func(pos uint64, kind string, payload []byte) error {
 		if err := budget.charge(1); err != nil {
-			return pngCompressionLayout{}, err
+			return err
 		}
-		size := int(binary.BigEndian.Uint32(data[position:]))
-		kind := data[position+4 : position+8]
-		for _, value := range kind {
-			if value < 'A' || value > 'Z' && value < 'a' || value > 'z' {
-				return pngCompressionLayout{}, fmt.Errorf("%w: PNG chunk type", ErrInvalid)
+		if kind == "IEND" {
+			if !state.hasIHDR {
+				return fmt.Errorf("%w: PNG header placement", ErrInvalid)
 			}
+			return nil
 		}
-		if kind[2]&32 != 0 {
-			return pngCompressionLayout{}, fmt.Errorf("%w: PNG reserved chunk bit", ErrInvalid)
+		if err := state.consumeChunk(kind, payload); err != nil {
+			return err
 		}
-		end := position + size + 12
-		if string(kind) == "IDAT" {
-			if ended {
-				return pngCompressionLayout{}, fmt.Errorf("%w: nonconsecutive PNG image chunks", ErrInvalid)
-			}
+		switch kind {
+		case "IDAT":
 			if layout.start == 0 {
-				layout.start = position
+				layout.start = int(pos)
 			}
-			layout.end = end
-		} else {
-			ended = layout.start != 0
-			switch string(kind) {
-			case "IHDR":
-				if position != 8 {
-					return pngCompressionLayout{}, fmt.Errorf("%w: repeated PNG header", ErrInvalid)
-				}
-			case "IEND":
-			case "PLTE":
-				if palette || ended {
-					return pngCompressionLayout{}, fmt.Errorf("%w: PNG palette placement", ErrInvalid)
-				}
-				palette = true
-			default:
-				if kind[0]&32 == 0 || kind[3]&32 == 0 && !slices.Contains([]string{"tRNS", "cHRM", "gAMA", "iCCP", "sBIT", "sRGB", "cICP", "mDCv", "cLLi", "mDCV", "cLLI", "bKGD", "hIST", "pHYs", "sPLT", "tIME"}, string(kind)) {
-					return pngCompressionLayout{}, fmt.Errorf("%w: PNG preserved chunk %s", ErrUnsupported, kind)
-				}
+			layout.end = int(pos + uint64(len(payload)) + 12)
+		case "IHDR", "PLTE":
+		default:
+			if kind[0]&32 == 0 || kind[3]&32 == 0 && !slices.Contains([]string{"tRNS", "cHRM", "gAMA", "iCCP", "sBIT", "sRGB", "cICP", "mDCv", "cLLi", "mDCV", "cLLI", "bKGD", "hIST", "pHYs", "sPLT", "tIME"}, kind) {
+				return fmt.Errorf("%w: PNG preserved chunk %s", ErrUnsupported, kind)
 			}
 		}
-		position = end
+		return nil
+	}); err != nil {
+		return pngCompressionLayout{}, err
 	}
 	if layout.start == 0 {
 		return pngCompressionLayout{}, fmt.Errorf("%w: missing PNG image data", ErrInvalid)

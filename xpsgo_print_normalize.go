@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"math"
 	"math/big"
-	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -199,13 +198,55 @@ func normalizePrintSettingsInternal(base, delta, capabilities *PrintSettings, ca
 	if err != nil {
 		return nil, nil, err
 	}
-	normalizedFeatures = normalizer.resolveCrossFeatureConflicts(normalizedFeatures, capModel.Elements, paramValues)
 	referenced := make(map[xml.Name]bool)
 	printCollectParameterRefs(normalizedFeatures, referenced)
 	normalizedParams, err := normalizer.normalizeParameters(capModel.Elements, paramInits, referenced)
 	if err != nil {
 		return nil, nil, err
 	}
+	effectiveParams := make(map[xml.Name]*PrintValue, len(normalizedParams)+len(normalizer.domains))
+	for key, domain := range normalizer.domains {
+		valCopy := domain.defaultValue
+		effectiveParams[key] = &valCopy
+	}
+	for _, param := range normalizedParams {
+		if len(param.Children) == 1 && param.Children[0].Value != nil {
+			effectiveParams[printCanonicalKey(param.Name)] = param.Children[0].Value
+		}
+	}
+	normalizedFeatures = normalizer.resolveCrossFeatureConflicts(normalizedFeatures, capModel.Elements, effectiveParams)
+	finalReferenced := make(map[xml.Name]bool)
+	printCollectParameterRefs(normalizedFeatures, finalReferenced)
+	keptParams := make([]PrintSetting, 0, len(normalizedParams))
+	keptParamKeys := make(map[xml.Name]bool, len(normalizedParams))
+	for _, param := range normalizedParams {
+		key := printCanonicalKey(param.Name)
+		domain := normalizer.domains[key]
+		_, hadInit := paramInits[key]
+		if hadInit || finalReferenced[key] || domain != nil && domain.mandatory == "Unconditional" {
+			keptParams = append(keptParams, param)
+			keptParamKeys[key] = true
+		}
+	}
+	for _, element := range capModel.Elements {
+		if element.Kind != PrintSettingParameterDef {
+			continue
+		}
+		key := printCanonicalKey(element.Name)
+		if !finalReferenced[key] || keptParamKeys[key] {
+			continue
+		}
+		if domain := normalizer.domains[key]; domain != nil {
+			defaultCopy := domain.defaultValue
+			keptParams = append(keptParams, PrintSetting{
+				Kind:     PrintSettingParameterInit,
+				Name:     element.Name,
+				Children: []PrintSetting{{Kind: PrintSettingValue, Value: &defaultCopy}},
+			})
+			keptParamKeys[key] = true
+		}
+	}
+	normalizedParams = keptParams
 	resultElements := make([]PrintSetting, 0, len(normalizedFeatures)+len(rootProperties)+len(normalizedParams))
 	usedKeys := make(map[xml.Name]bool, len(normalizedFeatures)+len(normalizedParams))
 	for _, feature := range normalizedFeatures {
@@ -385,8 +426,8 @@ func (n *printNormalizer) featurePriority(key xml.Name) int {
 	return 0
 }
 
-// resolveCrossFeatureConflicts 消解Booklet与NUp、Poster、OneSided及NUp与Poster的跨Feature冲突并记录诊断
-// 入参: features 已规范化的根级Feature列表, capElements 能力根元素, paramValues 参数初值映射
+// resolveCrossFeatureConflicts 消解Booklet与OneSided、NUp、Poster、PageForceFrontSide及连续作业拼版与DocumentCollate=Uncollated等跨Feature冲突并记录诊断
+// 入参: features 已规范化的根级Feature列表, capElements 能力根元素, paramValues 已规范化及默认补全的参数值映射
 // 返回: []PrintSetting 冲突消解后的根级Feature列表
 func (n *printNormalizer) resolveCrossFeatureConflicts(features, capElements []PrintSetting, paramValues map[xml.Name]*PrintValue) []PrintSetting {
 	capByKey := make(map[xml.Name]PrintSetting)
@@ -437,23 +478,26 @@ func (n *printNormalizer) resolveCrossFeatureConflicts(features, capElements []P
 		}
 		return nil
 	}
-	isBooklet := func(idx int) bool {
+	hasOptionKeyword := func(idx int, local string) bool {
 		if idx < 0 || removed[idx] {
 			return false
 		}
 		for _, child := range features[idx].Children {
-			if child.Kind == PrintSettingOption && printPublicKeywordSpace(child.Name.Space) && child.Name.Local == "Booklet" {
+			if child.Kind == PrintSettingOption && printPublicKeywordSpace(child.Name.Space) && child.Name.Local == local {
 				return true
 			}
 		}
 		return false
+	}
+	isBooklet := func(idx int) bool {
+		return hasOptionKeyword(idx, "Booklet")
 	}
 	activeNUp := func(idx int) bool {
 		if idx < 0 || removed[idx] {
 			return false
 		}
 		for _, child := range features[idx].Children {
-			if child.Kind == PrintSettingOption && printOptionScoredIntValue(child, "PagesPerSheet", paramValues) > 1 {
+			if child.Kind == PrintSettingOption && printOptionScoredInt(child, "PagesPerSheet", paramValues) > 1 {
 				return true
 			}
 		}
@@ -464,22 +508,14 @@ func (n *printNormalizer) resolveCrossFeatureConflicts(features, capElements []P
 			return false
 		}
 		for _, child := range features[idx].Children {
-			if child.Kind == PrintSettingOption && printOptionScoredIntValue(child, "SheetsPerPage", paramValues) > 1 {
+			if child.Kind == PrintSettingOption && printOptionScoredInt(child, "SheetsPerPage", paramValues) > 1 {
 				return true
 			}
 		}
 		return false
 	}
 	isOneSided := func(idx int) bool {
-		if idx < 0 || removed[idx] {
-			return false
-		}
-		for _, child := range features[idx].Children {
-			if child.Kind == PrintSettingOption && printPublicKeywordSpace(child.Name.Space) && child.Name.Local == "OneSided" {
-				return true
-			}
-		}
-		return false
+		return hasOptionKeyword(idx, "OneSided")
 	}
 	dropBooklet := func(bindIdx int, rival string) {
 		fallback := findCapOption(features[bindIdx], func(o PrintSetting) bool {
@@ -494,20 +530,41 @@ func (n *printNormalizer) resolveCrossFeatureConflicts(features, capElements []P
 	}
 	dropNUp := func(nupIdx int, rival string) {
 		fallback := findCapOption(features[nupIdx], func(o PrintSetting) bool {
-			return printOptionScoredIntValue(o, "PagesPerSheet", paramValues) == 1
+			return printOptionScoredInt(o, "PagesPerSheet", paramValues) == 1
 		})
 		replaceOrDrop(nupIdx, fallback, fmt.Sprintf("conflicting print Feature %s resolved in favor of %s", features[nupIdx].Name.Local, rival))
 	}
 	dropPoster := func(posterIdx int, rival string) {
 		fallback := findCapOption(features[posterIdx], func(o PrintSetting) bool {
-			return printOptionScoredIntValue(o, "SheetsPerPage", paramValues) == 1
+			return printOptionScoredInt(o, "SheetsPerPage", paramValues) == 1
 		})
 		replaceOrDrop(posterIdx, fallback, fmt.Sprintf("conflicting print Feature %s resolved in favor of %s", features[posterIdx].Name.Local, rival))
+	}
+	dropKeywordOption := func(idx int, fallbackLocal, rival string) {
+		fallback := findCapOption(features[idx], func(o PrintSetting) bool {
+			return printPublicKeywordSpace(o.Name.Space) && o.Name.Local == fallbackLocal
+		})
+		replaceOrDrop(idx, fallback, fmt.Sprintf("conflicting print Feature %s resolved in favor of %s", features[idx].Name.Local, rival))
 	}
 	bindIdx := findIdx("JobBindAllDocuments", "DocumentBinding")
 	nupIdx := findIdx("JobNUpAllDocumentsContiguously", "DocumentNUp")
 	posterIdx := findIdx("PagePoster")
 	duplexIdx := findIdx("JobDuplexAllDocumentsContiguously", "DocumentDuplex")
+	forceIdx := findIdx("PageForceFrontSide")
+	var bookletTwoSided *PrintSetting
+	if isBooklet(bindIdx) && isOneSided(duplexIdx) {
+		bookletTwoSided = findCapOption(features[duplexIdx], func(o PrintSetting) bool {
+			return printPublicKeywordSpace(o.Name.Space) && o.Name.Local == "TwoSidedShortEdge"
+		})
+		if bookletTwoSided == nil {
+			bookletTwoSided = findCapOption(features[duplexIdx], func(o PrintSetting) bool {
+				return printPublicKeywordSpace(o.Name.Space) && o.Name.Local == "TwoSidedLongEdge"
+			})
+		}
+		if bookletTwoSided == nil || n.featurePriority(printCanonicalKey(features[duplexIdx].Name)) > n.featurePriority(printCanonicalKey(features[bindIdx].Name)) {
+			dropBooklet(bindIdx, features[duplexIdx].Name.Local)
+		}
+	}
 	if isBooklet(bindIdx) && activeNUp(nupIdx) {
 		if n.featurePriority(printCanonicalKey(features[nupIdx].Name)) > n.featurePriority(printCanonicalKey(features[bindIdx].Name)) {
 			dropBooklet(bindIdx, features[nupIdx].Name.Local)
@@ -522,6 +579,16 @@ func (n *printNormalizer) resolveCrossFeatureConflicts(features, capElements []P
 			dropPoster(posterIdx, features[bindIdx].Name.Local)
 		}
 	}
+	if isBooklet(bindIdx) && hasOptionKeyword(forceIdx, "ForceFrontSide") {
+		if n.featurePriority(printCanonicalKey(features[forceIdx].Name)) > n.featurePriority(printCanonicalKey(features[bindIdx].Name)) {
+			dropBooklet(bindIdx, features[forceIdx].Name.Local)
+		} else {
+			dropKeywordOption(forceIdx, "None", features[bindIdx].Name.Local)
+		}
+	}
+	if isBooklet(bindIdx) && isOneSided(duplexIdx) && bookletTwoSided != nil {
+		replaceOrDrop(duplexIdx, bookletTwoSided, fmt.Sprintf("conflicting print Feature %s OneSided upgraded for Booklet", features[duplexIdx].Name.Local))
+	}
 	if activeNUp(nupIdx) && activePoster(posterIdx) {
 		if n.featurePriority(printCanonicalKey(features[posterIdx].Name)) > n.featurePriority(printCanonicalKey(features[nupIdx].Name)) {
 			dropNUp(nupIdx, features[posterIdx].Name.Local)
@@ -529,23 +596,21 @@ func (n *printNormalizer) resolveCrossFeatureConflicts(features, capElements []P
 			dropPoster(posterIdx, features[nupIdx].Name.Local)
 		}
 	}
-	if isBooklet(bindIdx) && isOneSided(duplexIdx) {
-		if n.featurePriority(printCanonicalKey(features[duplexIdx].Name)) > n.featurePriority(printCanonicalKey(features[bindIdx].Name)) {
-			dropBooklet(bindIdx, features[duplexIdx].Name.Local)
+	jobNUpIdx := findIdx("JobNUpAllDocumentsContiguously")
+	jobDuplexIdx := findIdx("JobDuplexAllDocumentsContiguously")
+	docCollateIdx := findIdx("DocumentCollate")
+	if hasOptionKeyword(docCollateIdx, "Uncollated") && activeNUp(jobNUpIdx) {
+		if n.featurePriority(printCanonicalKey(features[docCollateIdx].Name)) > n.featurePriority(printCanonicalKey(features[jobNUpIdx].Name)) {
+			dropNUp(jobNUpIdx, features[docCollateIdx].Name.Local)
 		} else {
-			twoSided := findCapOption(features[duplexIdx], func(o PrintSetting) bool {
-				return printPublicKeywordSpace(o.Name.Space) && o.Name.Local == "TwoSidedShortEdge"
-			})
-			if twoSided == nil {
-				twoSided = findCapOption(features[duplexIdx], func(o PrintSetting) bool {
-					return printPublicKeywordSpace(o.Name.Space) && o.Name.Local == "TwoSidedLongEdge"
-				})
-			}
-			if twoSided != nil {
-				replaceOrDrop(duplexIdx, twoSided, fmt.Sprintf("conflicting print Feature %s OneSided upgraded for Booklet", features[duplexIdx].Name.Local))
-			} else {
-				dropBooklet(bindIdx, features[duplexIdx].Name.Local)
-			}
+			dropKeywordOption(docCollateIdx, "Collated", features[jobNUpIdx].Name.Local)
+		}
+	}
+	if hasOptionKeyword(docCollateIdx, "Uncollated") && jobDuplexIdx >= 0 && !removed[jobDuplexIdx] && !isOneSided(jobDuplexIdx) {
+		if n.featurePriority(printCanonicalKey(features[docCollateIdx].Name)) > n.featurePriority(printCanonicalKey(features[jobDuplexIdx].Name)) {
+			dropKeywordOption(jobDuplexIdx, "OneSided", features[docCollateIdx].Name.Local)
+		} else {
+			dropKeywordOption(docCollateIdx, "Collated", features[jobDuplexIdx].Name.Local)
 		}
 	}
 	result := make([]PrintSetting, 0, len(features))
@@ -555,30 +620,6 @@ func (n *printNormalizer) resolveCrossFeatureConflicts(features, capElements []P
 		}
 	}
 	return result
-}
-
-// printOptionScoredIntValue 读取Option下指定公共ScoredProperty的整数值，支持ParameterRef查找
-// 入参: option 选项节点, local 公共关键字本地名, paramValues 参数初值映射
-// 返回: int 整数值，缺失或非整数返回0
-func printOptionScoredIntValue(option PrintSetting, local string, paramValues map[xml.Name]*PrintValue) int {
-	for _, prop := range option.Children {
-		if prop.Kind != PrintSettingScoredProperty || !printPublicKeywordSpace(prop.Name.Space) || prop.Name.Local != local {
-			continue
-		}
-		val, ref := printScoredValue(prop.Children)
-		if ref != (xml.Name{}) {
-			val = paramValues[printCanonicalKey(ref)]
-		}
-		if val == nil {
-			return 0
-		}
-		n, err := strconv.Atoi(strings.Trim(val.Text, " \t\r\n"))
-		if err != nil {
-			return 0
-		}
-		return n
-	}
-	return 0
 }
 
 // normalizeFeatureList 在同一父级层级规范化Feature集合，移除未声明项、执行互斥跳过并对缺失项执行Defaulting
@@ -701,13 +742,27 @@ func (n *printNormalizer) normalizeFeature(requested *PrintSetting, capability P
 	}
 	var selectedOptions []PrintSetting
 	var selectedCaps []PrintSetting
+	selectDefaultOptions := func() {
+		if selection == PrintSelectionMany {
+			for _, candidate := range unconstrained {
+				if candidate.Default {
+					selectedOptions = append(selectedOptions, printTicketOptionFromCapability(candidate))
+					selectedCaps = append(selectedCaps, candidate)
+				}
+			}
+			if len(selectedOptions) > 0 {
+				return
+			}
+		}
+		selectedOptions = append(selectedOptions, printTicketOptionFromCapability(unconstrained[defaultIndex]))
+		selectedCaps = append(selectedCaps, unconstrained[defaultIndex])
+	}
 	if requested == nil {
 		if len(allOptions) > 0 {
 			if defaultIndex < 0 {
 				return PrintSetting{}, false, nil
 			}
-			selectedOptions = append(selectedOptions, printTicketOptionFromCapability(unconstrained[defaultIndex]))
-			selectedCaps = append(selectedCaps, unconstrained[defaultIndex])
+			selectDefaultOptions()
 		}
 		var children []PrintSetting
 		children = append(children, selectedOptions...)
@@ -742,8 +797,7 @@ func (n *printNormalizer) normalizeFeature(requested *PrintSetting, capability P
 			return PrintSetting{}, false, nil
 		}
 		if len(reqOptions) == 0 {
-			selectedOptions = append(selectedOptions, printTicketOptionFromCapability(unconstrained[defaultIndex]))
-			selectedCaps = append(selectedCaps, unconstrained[defaultIndex])
+			selectDefaultOptions()
 		} else {
 			if selection == PrintSelectionOne && len(reqOptions) > 1 {
 				n.addDiagnostic("Feature", "name", fmt.Sprintf("multiple options on PickOne print Feature %s resolved", capability.Name.Local))

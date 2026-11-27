@@ -183,6 +183,7 @@ type colorResolverEntry struct {
 // ColorResolver 提供并发安全且有界的ICC配置与变换缓存，用于高频复用ContextColor颜色解析
 type ColorResolver struct {
 	reader     *Reader
+	view       *streamPageView
 	mu         sync.RWMutex
 	entries    map[string]*colorResolverEntry
 	order      []string
@@ -313,11 +314,33 @@ func (r *Reader) NewColorResolver() *ColorResolver {
 	}
 }
 
+// newStreamColorResolver 创建绑定流式视图生命周期守卫的并发安全有界ICC缓存颜色解析器
+// 入参: view 临时流式视图状态，回调结束后将关闭
+// 返回: *ColorResolver 受视图生命周期守卫保护的颜色解析器
+func newStreamColorResolver(view *streamPageView) *ColorResolver {
+	return &ColorResolver{
+		view:       view,
+		entries:    make(map[string]*colorResolverEntry),
+		maxEntries: colorResolverMaxProfiles,
+	}
+}
+
 // ResolveColor 经有界ICC缓存解析sRGB、scRGB或ContextColor，避免重复读取和构建同一配置文件变换
 // 入参: ctx 取消Context，nil采用Background, basePart 源部件包根URI, value 待解析颜色, opts 色彩解析选项，nil采用默认值
-// 返回: ResolvedColor 解析后的多空间颜色及专色元数据, error 状态、参数、部件、配置、转换或取消错误
+// 返回: ResolvedColor 解析后的多空间颜色及专色元数据, error 状态、参数、部件、配置、转换、关闭或取消错误
 func (c *ColorResolver) ResolveColor(ctx context.Context, basePart string, value Color, opts *ColorResolveOptions) (ResolvedColor, error) {
-	if c == nil || c.reader == nil {
+	if c == nil {
+		return ResolvedColor{}, fmt.Errorf("%w: color resolver has no reader", ErrInvalid)
+	}
+	if c.view != nil {
+		r, resolveCtx, cleanup, err := c.view.prepareCall(ctx)
+		if err != nil {
+			return ResolvedColor{}, err
+		}
+		defer cleanup()
+		return r.resolveColorWithCache(resolveCtx, basePart, value, opts, c)
+	}
+	if c.reader == nil {
 		return ResolvedColor{}, fmt.Errorf("%w: color resolver has no reader", ErrInvalid)
 	}
 	return c.reader.resolveColorWithCache(ctx, basePart, value, opts, c)
@@ -526,19 +549,7 @@ func (r *Reader) resolveColorWithCache(ctx context.Context, basePart string, val
 	if len(value.Components) != transform.inputChannels() {
 		return ResolvedColor{}, wrapPartError(part, "", fmt.Errorf("%w: context color channel count", ErrInvalid))
 	}
-	input := value.Components
-	var scaled [iccMaxChannels]float64
-	if transform.pipeline != nil && transform.pipeline.inputPrecision != 0 {
-		scale := 255.0
-		if transform.pipeline.inputPrecision == 2 {
-			scale = 65535
-		}
-		for i, component := range input {
-			scaled[i] = math.Floor(colorClamp(component)*scale+0.5) / scale
-		}
-		input = scaled[:len(input)]
-	}
-	linear, err := transform.linearRGB(input, false)
+	linear, err := transform.linearRGB(value.Components, false)
 	if err != nil {
 		return ResolvedColor{}, wrapPartError(part, "", err)
 	}
@@ -549,12 +560,15 @@ func (r *Reader) resolveColorWithCache(ctx context.Context, basePart string, val
 	result.ProfileSpace = profile.space
 	result.ColorSpace = strings.TrimSpace(profile.space)
 	result.Components = slices.Clone(value.Components)
+	postProcessed := cfg.Negative || cfg.PrintColor == PrintColorGrayscale || cfg.PrintColor == PrintColorMonochrome
 	if profile.class == "nmcl" && len(transform.named) > 0 {
-		result.SpotName, result.DeviceComponents, result.SpotColors = resolveICCNamedSpotMetadata(transform.named, value.Components)
-	} else {
+		if !postProcessed {
+			result.SpotName, result.DeviceComponents, result.SpotColors = resolveICCNamedSpotMetadata(profile.space, transform.named, value.Components)
+		}
+	} else if !postProcessed {
 		result.DeviceComponents = slices.Clone(value.Components)
 	}
-	if profile.space == "CMYK" && profile.class != "nmcl" && len(value.Components) == 4 && !cfg.Negative && cfg.PrintColor != PrintColorGrayscale && cfg.PrintColor != PrintColorMonochrome {
+	if profile.space == "CMYK" && profile.class != "nmcl" && len(value.Components) == 4 && !postProcessed {
 		result.CMYK = [4]float64{
 			colorClamp(value.Components[0]),
 			colorClamp(value.Components[1]),
@@ -566,17 +580,22 @@ func (r *Reader) resolveColorWithCache(ctx context.Context, basePart string, val
 	return result, nil
 }
 
-// resolveICCNamedSpotMetadata 根据命名色配置与各色调分量提取完整专色名、当前色调有效设备坐标及结构化专色列表
-// 当tint为零时有效设备坐标清零，满墨参考设备坐标始终保留在对应ResolvedSpotColor.FullDevice中
-// 入参: named 命名色表条目, tints 各命名色色调分量
+// resolveICCNamedSpotMetadata 根据命名色配置、源色彩空间与各色调分量提取完整专色名、当前色调有效设备坐标及结构化专色列表
+// 加色空间（RGB/GRAY）按1-tint*(1-value)向纸白缩放，减色空间按value*tint缩放；全零tint时保留全部专色条目与对应有效设备坐标
+// 入参: space 命名色配置色彩空间标识, named 命名色表条目, tints 各命名色色调分量
 // 返回: string 命中的完整专色名, []float64 单专色当前色调有效设备坐标或nil, []ResolvedSpotColor 结构化专色列表
-func resolveICCNamedSpotMetadata(named []iccNamedColor, tints []float64) (string, []float64, []ResolvedSpotColor) {
+func resolveICCNamedSpotMetadata(space string, named []iccNamedColor, tints []float64) (string, []float64, []ResolvedSpotColor) {
+	additive := space == "RGB " || space == "GRAY"
 	makeSpot := func(entry iccNamedColor, tint float64) ResolvedSpotColor {
 		var fullDev, effDev []float64
 		if len(entry.device) > 0 {
 			fullDev = slices.Clone(entry.device)
 			effDev = make([]float64, len(entry.device))
-			if tint > 0 {
+			if additive {
+				for i, value := range entry.device {
+					effDev[i] = 1 - tint*(1-value)
+				}
+			} else if tint > 0 {
 				for i, value := range entry.device {
 					effDev[i] = value * tint
 				}
@@ -598,12 +617,16 @@ func resolveICCNamedSpotMetadata(named []iccNamedColor, tints []float64) (string
 			}
 		}
 	}
+	if len(spots) == 0 {
+		spots = make([]ResolvedSpotColor, 0, len(named))
+		for i, entry := range named {
+			if i < len(tints) {
+				spots = append(spots, makeSpot(entry, 0))
+			}
+		}
+	}
 	if len(spots) == 1 {
 		return spots[0].Name, slices.Clone(spots[0].Device), spots
-	}
-	if len(spots) == 0 && len(named) == 1 {
-		spot := makeSpot(named[0], 0)
-		return spot.Name, slices.Clone(spot.Device), []ResolvedSpotColor{spot}
 	}
 	if len(spots) > 1 {
 		names := make([]string, len(spots))
@@ -972,48 +995,10 @@ func parseICCNamedColor(profile *iccProfile) ([]iccNamedColor, error) {
 	if profile == nil || profile.pcs != "XYZ " && profile.pcs != "Lab " {
 		return nil, fmt.Errorf("%w: ICC named connection space", ErrInvalid)
 	}
-	data := profile.tag("ncl2")
-	if len(data) < 84 || string(data[:4]) != "ncl2" || binary.BigEndian.Uint32(data[4:]) != 0 {
-		return nil, fmt.Errorf("%w: ICC named color header", ErrInvalid)
-	}
-	count, device := uint64(binary.BigEndian.Uint32(data[12:])), uint64(binary.BigEndian.Uint32(data[16:]))
-	if device != 0 && device != uint64(profile.channels) {
-		return nil, fmt.Errorf("%w: ICC named device coordinates", ErrInvalid)
-	}
-	stride := uint64(38) + 2*device
-	if count == 0 || count > (uint64(len(data))-84)/stride {
-		return nil, fmt.Errorf("%w: ICC named color size", ErrInvalid)
-	}
-	end := uint64(84) + count*stride
-	if uint64(len(data))-end > 3 {
-		return nil, fmt.Errorf("%w: ICC named color size", ErrInvalid)
-	}
-	for _, value := range data[end:] {
-		if value != 0 {
-			return nil, fmt.Errorf("%w: ICC named color padding", ErrInvalid)
-		}
-	}
-	if count > iccMaxNamedColors {
-		return nil, fmt.Errorf("%w: ICC named color count", ErrLimit)
-	}
-	prefix, err := iccNamedASCIIText(data[20:52])
-	if err != nil {
-		return nil, err
-	}
-	suffix, err := iccNamedASCIIText(data[52:84])
-	if err != nil {
-		return nil, err
-	}
-	colors := make([]iccNamedColor, int(count))
-	for i := range count {
-		row := data[84+i*stride : 84+(i+1)*stride]
-		name, err := iccNamedASCIIText(row[:32])
-		if err != nil {
-			return nil, err
-		}
-		var pcs [3]uint16
-		for axis := range 3 {
-			pcs[axis] = binary.BigEndian.Uint16(row[32+axis*2:])
+	var colors []iccNamedColor
+	err := walkICCNamedColor(profile, nil, true, iccMaxNamedColors, func(count int, prefix, suffix, name string, pcs [3]uint16, devBytes []byte) error {
+		if colors == nil {
+			colors = make([]iccNamedColor, 0, count)
 		}
 		var pcsCoord, xyz [3]float64
 		if profile.pcs == "XYZ " {
@@ -1029,41 +1014,41 @@ func parseICCNamedColor(profile *iccProfile) ([]iccNamedColor, error) {
 			xyz = iccLabToXYZ(pcsCoord)
 		}
 		var dev []float64
-		if device != 0 {
-			dev = make([]float64, int(device))
-			for axis := range int(device) {
-				dev[axis] = float64(binary.BigEndian.Uint16(row[38+axis*2:])) / 65535
+		if len(devBytes) != 0 {
+			device := len(devBytes) / 2
+			dev = make([]float64, device)
+			for axis := range device {
+				dev[axis] = float64(binary.BigEndian.Uint16(devBytes[axis*2:])) / 65535
 			}
 		}
-		colors[i] = iccNamedColor{name: name, prefix: prefix, suffix: suffix, pcs: pcsCoord, xyz: xyz, device: dev}
+		colors = append(colors, iccNamedColor{name: name, prefix: prefix, suffix: suffix, pcs: pcsCoord, xyz: xyz, device: dev})
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return colors, nil
 }
 
-// iccNamedASCIIText 校验并提取零终止的7位ASCII命名色文本
+// iccNamedASCIIText 校验并提取零终止的7位ASCII命名色文本及NUL后全零填充，不解释名称为文件或资源引用
 // 入参: data 固定长度原始字段
-// 返回: string 去除终止符的ASCII文本, error 编码或终止错误
+// 返回: string 去除终止符的ASCII文本, error 编码、终止或填充错误
 func iccNamedASCIIText(data []byte) (string, error) {
-	if err := iccNamedASCII(data); err != nil {
-		return "", err
-	}
-	return string(data[:bytes.IndexByte(data, 0)]), nil
-}
-
-// iccNamedASCII 校验固定长度的零终止7位ASCII字段，不解释名称为文件或资源引用
-// 入参: data 完整名称字段
-// 返回: error 编码或终止错误
-func iccNamedASCII(data []byte) error {
 	end := bytes.IndexByte(data, 0)
 	if end < 0 {
-		return fmt.Errorf("%w: ICC named ASCII termination", ErrInvalid)
+		return "", fmt.Errorf("%w: ICC named ASCII termination", ErrInvalid)
 	}
 	for _, value := range data[:end] {
 		if value > 127 {
-			return fmt.Errorf("%w: ICC named ASCII encoding", ErrInvalid)
+			return "", fmt.Errorf("%w: ICC named ASCII encoding", ErrInvalid)
 		}
 	}
-	return nil
+	for _, value := range data[end:] {
+		if value != 0 {
+			return "", fmt.Errorf("%w: ICC named ASCII padding", ErrInvalid)
+		}
+	}
+	return string(data[:end]), nil
 }
 
 // inputChannels 取得转换所需分量数，命名色色调数量独立于可选设备坐标数量

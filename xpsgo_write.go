@@ -25,10 +25,12 @@ import (
 	"hash/crc32"
 	"io"
 	"maps"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -997,6 +999,7 @@ func writeZIPBufferEntry(ctx context.Context, archive zipEntryWriter, header zip
 		}
 		header.Flags &^= 0xe
 		header.ReaderVersion, header.CreatorVersion = 20, header.CreatorVersion&0xff00|20
+		prepareRawZIPHeader(&header)
 		writer, err := archive.CreateRaw(&header)
 		if err != nil {
 			return err
@@ -1016,6 +1019,7 @@ func writeZIPBufferEntry(ctx context.Context, archive zipEntryWriter, header zip
 		}
 		header.Flags &^= 0xe
 		header.ReaderVersion, header.CreatorVersion = 20, header.CreatorVersion&0xff00|20
+		prepareRawZIPHeader(&header)
 		writer, err := archive.CreateRaw(&header)
 		if err != nil {
 			return err
@@ -1027,6 +1031,78 @@ func writeZIPBufferEntry(ctx context.Context, archive zipEntryWriter, header zip
 		return err
 	}
 	return writeCompressionInput(writer, bytes.NewReader(data), buffer, ctx)
+}
+
+// prepareRawZIPHeader 在CreateRaw前按PKWARE与Go archive/zip规则补齐DOS时间、0x5455扩展时间戳及UTF-8标志位
+// 入参: header 待写出的ZIP条目头指针
+func prepareRawZIPHeader(header *zip.FileHeader) {
+	if !header.NonUTF8 && (zipNeedsUTF8(header.Name) || zipNeedsUTF8(header.Comment)) {
+		header.Flags |= 0x800
+	}
+	if header.Modified.IsZero() {
+		return
+	}
+	if header.ModifiedDate == 0 && header.ModifiedTime == 0 {
+		t := header.Modified
+		year := t.Year()
+		if year < 1980 {
+			header.ModifiedDate = uint16(1<<5 | 1)
+			header.ModifiedTime = 0
+		} else if year > 2107 {
+			header.ModifiedDate = uint16((2107-1980)<<9 | 12<<5 | 31)
+			header.ModifiedTime = uint16(23<<11 | 59<<5 | 29)
+		} else {
+			header.ModifiedDate = uint16((year-1980)<<9 | int(t.Month())<<5 | t.Day())
+			header.ModifiedTime = uint16(t.Hour()<<11 | t.Minute()<<5 | t.Second()/2)
+		}
+	}
+	if zipExtraHasTag(header.Extra, 0x5455) {
+		return
+	}
+	unix := header.Modified.Unix()
+	if unix < math.MinInt32 || unix > math.MaxInt32 {
+		return
+	}
+	extra := make([]byte, len(header.Extra), len(header.Extra)+9)
+	copy(extra, header.Extra)
+	extra = binary.LittleEndian.AppendUint16(extra, 0x5455)
+	extra = binary.LittleEndian.AppendUint16(extra, 5)
+	extra = append(extra, 1)
+	extra = binary.LittleEndian.AppendUint32(extra, uint32(int32(unix)))
+	header.Extra = extra
+}
+
+// zipNeedsUTF8 判断字符串是否为包含非ASCII字节的合法UTF-8序列，用于设置ZIP通用标志位Bit 11
+// 入参: text 待检查文件名或注释
+// 返回: bool 是否需要置位UTF-8标志
+func zipNeedsUTF8(text string) bool {
+	if !utf8.ValidString(text) {
+		return false
+	}
+	for i := range len(text) {
+		if text[i] >= 0x80 {
+			return true
+		}
+	}
+	return false
+}
+
+// zipExtraHasTag 检查ZIP扩展字段缓冲区中是否已存在指定标识块，避免重复追加时间戳等扩展记录
+// 入参: extra 原始扩展字段字节, target 目标两字节扩展块标识
+// 返回: bool 是否已包含目标标识块
+func zipExtraHasTag(extra []byte, target uint16) bool {
+	for len(extra) >= 4 {
+		tag := binary.LittleEndian.Uint16(extra[:2])
+		size := int(binary.LittleEndian.Uint16(extra[2:4]))
+		if 4+size > len(extra) {
+			return false
+		}
+		if tag == target {
+			return true
+		}
+		extra = extra[4+size:]
+	}
+	return false
 }
 
 // zipChunkedCRC32 分块计算内存载荷的IEEE CRC32并在块间响应取消信号

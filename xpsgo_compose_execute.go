@@ -17,10 +17,12 @@ package xpsgo
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"net/url"
 	"slices"
 	"strings"
@@ -51,6 +53,15 @@ type compositionExecution struct {
 	rawDocs           map[int]bool
 	docParts          map[compositionOrigin][]int
 	rawSequence       int
+	dedupResources    map[compositionResourceDigest]string
+	digestCache       map[compositionOrigin]compositionResourceDigest
+	pageTransformed   map[int]bool
+}
+
+// compositionResourceDigest 以规范内容类型与内容SHA-256摘要唯一标识可跨源复用的静态二进制资源
+type compositionResourceDigest struct {
+	media string
+	hash  [32]byte
 }
 
 // compositionExecutionPart 保存输出部件的实际页面归属及派生主序列角色
@@ -101,6 +112,18 @@ func executeCompositionPlan(plan *compositionPlan, names *compositionNames, root
 		return nil, fmt.Errorf("%w: composition dialect conversion", ErrUnsupported)
 	}
 	x := &compositionExecution{plan: plan, names: names, protected: make([]map[string]bool, len(plan.sources)), targets: make(map[compositionExecutionPart]string), generated: make(map[compositionPartKey][]byte), originals: make(map[compositionPartKey]packagePart), tickets: make(map[string][]string), storyParts: make(map[string]string), owners: make(map[string]compositionOrigin), rawDocs: make(map[int]bool), docParts: make(map[compositionOrigin][]int)}
+	if plan.deduplicateResources {
+		x.dedupResources = make(map[compositionResourceDigest]string)
+		x.digestCache = make(map[compositionOrigin]compositionResourceDigest)
+	}
+	if len(plan.transforms) == len(plan.pages) {
+		x.pageTransformed = make(map[int]bool)
+		for i, tr := range plan.transforms {
+			if tr.rotate != 0 || tr.cropBox != nil || tr.targetWidth > 0 || tr.targetHeight > 0 {
+				x.pageTransformed[i] = true
+			}
+		}
+	}
 	for source, value := range plan.sources {
 		if plan.indices[source] == nil {
 			continue
@@ -161,7 +184,33 @@ func executeCompositionPlan(plan *compositionPlan, names *compositionNames, root
 	clear(p.layout)
 	p.sequence, p.pageCount = plan.sequence, len(plan.pages)
 	p.original, p.originalRels = make(map[string]packagePart), make(map[string][]Relationship)
-	p.documents = slices.Clone(x.navigation.output.source.documents)
+	p.documents = make([]Document, len(x.navigation.output.source.documents))
+	for docIdx, doc := range x.navigation.output.source.documents {
+		doc.Pages = slices.Clone(doc.Pages)
+		p.documents[docIdx] = doc
+	}
+	if len(x.pageTransformed) != 0 {
+		for i := range plan.pages {
+			if !x.pageTransformed[i] {
+				continue
+			}
+			instance := plan.pages[i]
+			src := plan.sources[instance.source]
+			pagePart := src.parts[strings.ToLower(src.pages[instance.index].Part)]
+			origW, origH, err := readCompositionPageDimensions(pagePart, src, src.format, plan.budget.limits, plan.budget.context)
+			if err != nil {
+				return nil, &PartError{Part: pagePart.name, Err: err}
+			}
+			geom, err := computeCompositionPageGeometry(origW, origH, plan.transforms[i])
+			if err != nil {
+				return nil, err
+			}
+			p.documents[instance.document].Pages[instance.position].Width = geom.newWidth
+			p.documents[instance.document].Pages[instance.position].Height = geom.newHeight
+			x.navigation.output.source.documents[instance.document].Pages[instance.position].Width = geom.newWidth
+			x.navigation.output.source.documents[instance.document].Pages[instance.position].Height = geom.newHeight
+		}
+	}
 	x.documents = make([][]compositionOrigin, len(plan.documents))
 	x.localPages = make([]map[compositionPageKey]int, len(plan.documents))
 	p.registerName(p.sequence)
@@ -206,7 +255,7 @@ func executeCompositionPlan(plan *compositionPlan, names *compositionNames, root
 			if source.retained[part] {
 				identity := true
 				for _, page := range document.pages {
-					if len(names.droppedTargets[page]) != 0 {
+					if len(names.droppedTargets[page]) != 0 || x.pageTransformed[page] {
 						identity = false
 						break
 					}
@@ -417,6 +466,20 @@ func (x *compositionExecution) resourceTarget(owner compositionExecutionPart, pa
 	if name, exists := x.targets[item]; exists {
 		return name, nil
 	}
+	var dedupDigest compositionResourceDigest
+	dedupEligible := false
+	if x.plan.deduplicateResources && key.document < 0 && key.page < 0 {
+		var err error
+		dedupDigest, dedupEligible, err = x.resourceDigest(key.source, key.part, value)
+		if err != nil {
+			return "", err
+		}
+		if dedupEligible && !x.protected[key.source][key.part] {
+			if existing, hit := x.dedupResources[dedupDigest]; hit {
+				return existing, nil
+			}
+		}
+	}
 	var name string
 	var err error
 	if strings.EqualFold(value.media, resourceDictionaryContentType) && key.page < 0 && item.owner != "" {
@@ -437,8 +500,47 @@ func (x *compositionExecution) resourceTarget(owner compositionExecutionPart, pa
 		if err := x.schedulePart(item, name); err != nil {
 			return "", err
 		}
+		if dedupEligible {
+			if _, exists := x.dedupResources[dedupDigest]; !exists {
+				x.dedupResources[dedupDigest] = name
+			}
+		}
 	}
 	return name, nil
+}
+
+// resourceDigest 为无差异关系的图像、ICC配置及普通或解混淆字体计算跨源复用内容摘要
+// 入参: source 源快照序号, key 小写部件键, value 原部件字节与媒体类型
+// 返回: compositionResourceDigest 规范媒体类型与SHA-256摘要, bool 是否允许跨源摘要去重, error 解混淆或扫描预算错误
+func (x *compositionExecution) resourceDigest(source int, key string, value packagePart) (compositionResourceDigest, bool, error) {
+	if !compositionDeduplicableMedia(value.media) || compositionHasRelationships(x.plan.sources[source], key) {
+		return compositionResourceDigest{}, false, nil
+	}
+	origin := compositionOrigin{source: source, part: key}
+	if cached, hit := x.digestCache[origin]; hit {
+		return cached, true, nil
+	}
+	if err := x.plan.budget.scan(int64(len(value.data))); err != nil {
+		return compositionResourceDigest{}, false, err
+	}
+	payload := value.data
+	if strings.EqualFold(value.media, "application/vnd.ms-package.obfuscated-opentype") {
+		decoded, err := DeobfuscateFont(value.name, value.data)
+		if err != nil {
+			return compositionResourceDigest{}, false, nil
+		}
+		payload = decoded
+	}
+	digest := compositionResourceDigest{media: strings.ToLower(value.media), hash: sha256.Sum256(payload)}
+	x.digestCache[origin] = digest
+	return digest, true, nil
+}
+
+// compositionDeduplicableMedia 判断内容类型是否属于支持内容摘要去重的静态二进制资源
+// 入参: media 部件内容类型
+// 返回: bool 是否为图像、ICC色彩配置或字体二进制资源
+func compositionDeduplicableMedia(media string) bool {
+	return requiredResourceMedia(requiredImage, media) || requiredResourceMedia(requiredProfile, media) || requiredResourceMedia(requiredFont, media)
 }
 
 // originalPage 查询源索引中的部件身份，不以同名的其他包页面补齐引用
@@ -535,24 +637,60 @@ func (x *compositionExecution) part(item compositionExecutionPart) error {
 					names = x.names.pages[key.page]
 					owner = source.pages[x.plan.pages[key.page].index].Part
 				}
-				data, err = rewriteCompositionMarkup(value, compositionMarkupOptions{format: source.format, destination: target, owner: owner, names: names, index: index, budget: x.plan.budget, resource: func(part string) (string, error) {
-					return x.resourceFor(item, part)
-				}, navigation: func(base, uri string) (string, bool, error) {
-					destination := target
+				resolveDestination := func() (string, error) {
 					if key.page >= 0 && strings.EqualFold(value.media, resourceDictionaryContentType) {
-						destination = x.plan.pages[key.page].reference.Part
-					} else if strings.EqualFold(value.media, resourceDictionaryContentType) && item.owner != "" {
+						return x.plan.pages[key.page].reference.Part, nil
+					}
+					if strings.EqualFold(value.media, resourceDictionaryContentType) && item.owner != "" {
 						page := x.instance(compositionPartKey{key.source, strings.ToLower(item.owner), key.document, -1})
 						if output, exists := x.targets[page]; exists {
-							destination = output
-						} else {
-							return "", false, fmt.Errorf("%w: composition dictionary output page", ErrUnsupported)
+							return output, nil
 						}
+						return "", fmt.Errorf("%w: composition dictionary output page", ErrUnsupported)
 					}
-					return x.navigate(item, base, destination, uri)
-				}})
+					return target, nil
+				}
+				opts := compositionMarkupOptions{
+					format:      source.format,
+					destination: target,
+					owner:       owner,
+					names:       names,
+					index:       index,
+					source:      source,
+					budget:      x.plan.budget,
+					resource: func(part string) (string, error) {
+						return x.resourceFor(item, part)
+					},
+					navigation: func(base, uri string) (string, bool, error) {
+						destination, err := resolveDestination()
+						if err != nil {
+							return "", false, err
+						}
+						return x.navigate(item, base, destination, uri)
+					},
+				}
+				if x.plan.stripDanglingNavigateUri {
+					opts.navigationOptional = func(base, uri string) (string, bool, bool, error) {
+						destination, err := resolveDestination()
+						if err != nil {
+							return "", false, false, err
+						}
+						return x.navigateOptional(item, base, destination, uri, true)
+					}
+				}
+				data, err = rewriteCompositionMarkup(value, opts)
 				if err != nil {
 					return err
+				}
+				if key.page >= 0 && x.pageTransformed[key.page] {
+					if x.protected[key.source][key.part] {
+						return fmt.Errorf("%w: composition protected page transform", ErrRestricted)
+					}
+					maximum := min(x.plan.budget.limits.MaxPartBytes, x.plan.budget.limits.MaxPackageBytes, int64(math.MaxInt))
+					data, err = transformCompositionPageMarkup(data, source.format, x.plan.transforms[key.page], maximum, x.plan.budget)
+					if err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -573,18 +711,27 @@ func (x *compositionExecution) part(item compositionExecutionPart) error {
 // 入参: key 引用归属, base 原基准, target 输出基准, uri 原URI
 // 返回: string 输出URI, bool 是否改变, error 引用、未支持作用域、预算或取消错误
 func (x *compositionExecution) navigate(key compositionExecutionPart, base, target, uri string) (string, bool, error) {
+	result, changed, _, err := x.navigateOptional(key, base, target, uri, false)
+	return result, changed, err
+}
+
+// navigateOptional 迁移导航地址，开启allowOmitted时将指向未选中页面的内部布局导航标记为可剥离/剪枝
+// 入参: key 引用归属, base 原基准, target 输出基准, uri 原URI, allowOmitted 是否允许将指向未选中页面的内部布局链接标记为省略
+// 返回: string 输出URI, bool 是否改变, bool 是否指向未选中布局而省略, error 引用、未支持作用域、预算或取消错误
+func (x *compositionExecution) navigateOptional(key compositionExecutionPart, base, target, uri string, allowOmitted bool) (string, bool, bool, error) {
 	if value, handled, err := x.navigateRawScope(key, base, target, uri); handled || err != nil {
-		return value, value != uri, err
+		return value, value != uri, false, err
 	}
 	binding, err := x.navigation.sources[key.source].resolve(base, uri)
 	if err != nil {
-		return "", false, err
+		return "", false, false, err
 	}
 	if binding.external {
-		return uri, false, nil
+		return uri, false, false, nil
 	}
 	if document, exists := x.rawDocumentTarget(key.source, binding.part, key.document); exists {
-		return rewriteCompositionScopeURI(target, uri, document, x.plan.budget)
+		result, changed, err := rewriteCompositionScopeURI(target, uri, document, x.plan.budget)
+		return result, changed, false, err
 	}
 	aliases := make(map[string]string)
 	if binding.page < 0 && !binding.scoped {
@@ -595,13 +742,16 @@ func (x *compositionExecution) navigate(key compositionExecutionPart, base, targ
 				name = x.targets[x.instance(compositionPartKey{key.source, strings.ToLower(binding.part), -1, -1})]
 			}
 			if name == "" {
-				return "", false, fmt.Errorf("%w: unmaterialized auxiliary composition navigation", ErrUnsupported)
+				if allowOmitted {
+					return "", false, true, nil
+				}
+				return "", false, false, fmt.Errorf("%w: unmaterialized auxiliary composition navigation", ErrUnsupported)
 			}
 			aliases[strings.ToLower(binding.part)] = name
 		} else {
 			name, err := x.resourceFor(key, binding.part)
 			if err != nil {
-				return "", false, err
+				return "", false, false, err
 			}
 			aliases[strings.ToLower(binding.part)] = name
 		}
@@ -612,7 +762,20 @@ func (x *compositionExecution) navigate(key compositionExecutionPart, base, targ
 			current = page
 		}
 	}
-	return x.navigation.rewrite(key.source, base, target, uri, current, aliases)
+	if allowOmitted && binding.scoped {
+		if binding.page < 0 {
+			return "", false, true, nil
+		}
+		mappedPage, targetErr := x.plan.target(key.source, binding.page, current)
+		if targetErr != nil {
+			return "", false, false, targetErr
+		}
+		if mappedPage < 0 {
+			return "", false, true, nil
+		}
+	}
+	result, changed, err := x.navigation.rewrite(key.source, base, target, uri, current, aliases)
+	return result, changed, false, err
 }
 
 // prepareSequence 为单一来源的完整原序输出保留原始序列标记，不用消费后的索引替换其他兼容分支
@@ -683,15 +846,10 @@ func (x *compositionExecution) rootRelationships(source int) error {
 		return x.relationships("/", []compositionOrigin{{source, "/"}}, owner, false, "")
 	}
 	b := x.plan.budget
-	filtered, err := filterCompositionRootRelationships(original, value.format, b)
+	relations, edited, err := filterCompositionRootRelationshipsRecords(original, value.format, b)
 	if err != nil {
 		return err
 	}
-	relations, err := compositionRelationshipRecords("/", packagePart{data: filtered}, b)
-	if err != nil {
-		return err
-	}
-	edited := !bytes.Equal(filtered, original.data)
 	for index := range relations {
 		if err := b.step(1); err != nil {
 			return err
@@ -744,39 +902,58 @@ func (x *compositionExecution) rootRelationships(source int) error {
 // 入参: value 原包根关系, format 包格式, budget 共享预算
 // 返回: []byte 原编码结果，无修改时借用原字节, error XML、关系、预算或取消错误
 func filterCompositionRootRelationships(value packagePart, format Format, budget *compositionBudget) ([]byte, error) {
-	if budget == nil || formatNamespace(format) == "" {
-		return nil, fmt.Errorf("%w: composition root relationship input", ErrInvalid)
-	}
-	relations, err := compositionRelationshipRecords("/", value, budget)
+	relations, edited, err := filterCompositionRootRelationshipsRecords(value, format, budget)
 	if err != nil {
 		return nil, err
 	}
-	edited := false
-	if err := budget.scan(int64(len(value.data))); err != nil {
-		return nil, err
+	return compositionRelationshipMarkup(value, relations, edited, budget)
+}
+
+// filterCompositionRootRelationshipsRecords 单遍解码并过滤包根关系中的签名与释放提示关联，返回有效关系切片与修改标记
+// 入参: value 原包根关系, format 包格式, budget 共享预算
+// 返回: []Relationship 过滤后的有效关系, bool 是否触发过滤编辑, error XML、关系、预算或取消错误
+func filterCompositionRootRelationshipsRecords(value packagePart, format Format, budget *compositionBudget) ([]Relationship, bool, error) {
+	if budget == nil || formatNamespace(format) == "" {
+		return nil, false, fmt.Errorf("%w: composition root relationship input", ErrInvalid)
 	}
-	if _, err := decodeXMLVisit(value.data, budget.limits, func(token xml.Token, node *xmlElement) error {
-		if err := budget.step(1); err != nil {
+	if int64(len(value.data)) > min(budget.limits.MaxMetadataBytes, budget.limits.MaxPartBytes, budget.limits.MaxPackageBytes) {
+		return nil, false, fmt.Errorf("%w: composition relationship capacity", ErrLimit)
+	}
+	if err := budget.scan(int64(len(value.data))); err != nil {
+		return nil, false, err
+	}
+	discardType := formatNamespace(format) + "/discard-control"
+	edited := false
+	root, err := decodeXMLVisit(value.data, budget.limits, func(token xml.Token, node *xmlElement) error {
+		if node == nil {
+			return budget.step(1)
+		}
+		if err := budget.step(len(node.Attr) + 1); err != nil {
 			return err
 		}
 		if _, start := token.(xml.StartElement); start && node.Name == (xml.Name{Space: opcRelsNS, Local: "Relationship"}) {
 			kind, _ := node.attribute("Type")
-			edited = edited || kind == opcSignatureOriginRel || kind == formatNamespace(format)+"/discard-control"
+			edited = edited || kind == opcSignatureOriginRel || kind == discardType
 		}
 		return nil
-	}); err != nil {
-		return nil, err
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	relations, err := parseCompositionRelationshipRoot("/", root, budget.context)
+	if err != nil {
+		return nil, false, err
 	}
 	var kept []Relationship
 	for _, relation := range relations {
 		if err := budget.step(1); err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		if relation.Type != opcSignatureOriginRel && relation.Type != formatNamespace(format)+"/discard-control" {
+		if relation.Type != opcSignatureOriginRel && relation.Type != discardType {
 			kept = append(kept, relation)
 		}
 	}
-	return compositionRelationshipMarkup(value, kept, edited, budget)
+	return kept, edited, nil
 }
 
 // rawDocumentTarget 为完整原文档保留所有分支的名称作用域，不将未选分支的名称提前降为当前首页
@@ -1042,14 +1219,15 @@ func (x *compositionExecution) prepareMarkup(item compositionExecutionPart, valu
 	if err := b.scan(int64(len(value.data))); err != nil {
 		return err
 	}
-	format := x.plan.sources[item.source].format
+	source := x.plan.sources[item.source]
+	format := source.format
 	var tracker *resourceMarkupScopeTracker
 	if compositionIndexRoot(value.media) != "" {
 		tracker = newResourceMarkupIgnoreTracker(format, format == FormatOpenXPS, b.context)
 	} else {
 		tracker = newResourceMarkupScopeTracker(format, format == FormatOpenXPS, b.context)
 	}
-	_, err := decodeXMLVisit(value.data, b.limits, func(token xml.Token, node *xmlElement) error {
+	visit := func(token xml.Token, node *xmlElement) error {
 		if err := b.step(1); err != nil {
 			return err
 		}
@@ -1102,7 +1280,11 @@ func (x *compositionExecution) prepareMarkup(item compositionExecutionPart, valu
 			}
 		}
 		return nil
-	})
+	}
+	if cached := source.cachedXML(value, b.limits); cached != nil {
+		return visitXMLElementTree(cached, visit)
+	}
+	_, err := decodeXMLVisit(value.data, b.limits, visit)
 	return err
 }
 
@@ -1236,6 +1418,9 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 	var firstTicket compositionOrigin
 	firstTicketTarget := ""
 	hasTicketRelation := false
+	var firstThumbOrigin compositionOrigin
+	var firstThumbPart packagePart
+	hasThumbRelation := false
 	hasRaw := false
 	storyAssigned := false
 	for _, origin := range origins {
@@ -1245,14 +1430,19 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 		if context.page >= 0 && x.plan.pages[context.page].source != origin.source {
 			return fmt.Errorf("%w: composition relationship page context", ErrInvalid)
 		}
-		value, raw := source.parts[strings.ToLower(createdRelationshipPart(origin.part))]
+		relKey := strings.ToLower(createdRelationshipPart(origin.part))
+		value, raw := source.parts[relKey]
 		hasRaw = hasRaw || raw
 		records := source.relationships[strings.ToLower(origin.part)]
 		if raw {
-			var err error
-			records, err = compositionRelationshipRecords(origin.part, value, b)
-			if err != nil {
-				return err
+			if cached, hit := source.parsedRels[relKey]; hit {
+				records = cached
+			} else {
+				var err error
+				records, err = compositionRelationshipRecords(origin.part, value, b)
+				if err != nil {
+					return err
+				}
 			}
 		}
 		if len(origins) == 1 {
@@ -1270,6 +1460,10 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 			if ticket && relation.TargetMode != TargetModeInternal {
 				return fmt.Errorf("%w: external composition ticket", ErrInvalid)
 			}
+			thumb := len(origins) > 1 && relation.Type == thumbnailRelationship
+			if thumb && relation.TargetMode != TargetModeInternal {
+				return fmt.Errorf("%w: external composition thumbnail", ErrInvalid)
+			}
 			mapped := relation
 			projected := project && (relation.Type == formatNamespace(source.format)+"/documentstructure" || relation.Type == formatNamespace(source.format)+"/storyfragments")
 			if projected {
@@ -1282,6 +1476,26 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 				part, err := resolvePart(origin.part, relation.Target)
 				if err != nil {
 					return err
+				}
+				if thumb {
+					partKey := strings.ToLower(part)
+					cand, present := source.parts[partKey]
+					if !present {
+						return &PartError{Part: part, Err: fmt.Errorf("%w: missing composition thumbnail", ErrInvalid)}
+					}
+					if hasThumbRelation {
+						equal, err := x.sameRawThumbnail(firstThumbOrigin, firstThumbPart, compositionOrigin{origin.source, part}, cand)
+						if err != nil {
+							return err
+						}
+						if !equal {
+							return fmt.Errorf("%w: conflicting composition document thumbnails", ErrUnsupported)
+						}
+						continue
+					}
+					firstThumbOrigin = compositionOrigin{origin.source, part}
+					firstThumbPart = cand
+					hasThumbRelation = true
 				}
 				if ticket && len(origins) > 1 && firstTicketTarget != "" {
 					equal, err := x.sameRawTicket(firstTicket, compositionOrigin{origin.source, part})
@@ -1368,9 +1582,9 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 	if err := x.put(original, part, data); err != nil {
 		return err
 	}
-	parsed, err := parseRelationshipMarkup(target, data, b.limits, b.context)
-	if err != nil {
-		return err
+	parsed := relations
+	if !edited && original.data != nil && len(origins) == 1 {
+		parsed = slices.Clone(previous)
 	}
 	var explicit []Relationship
 	for _, relation := range parsed {
@@ -1386,6 +1600,28 @@ func (x *compositionExecution) relationships(target string, origins []compositio
 	}
 	x.relationshipsDone[instance] = true
 	return nil
+}
+
+// sameRawThumbnail 比较合并作用域中多源缩略图部件的媒体类型、字节内容及关系是否存在差异
+// 入参: left 首个缩略图来源, leftPart 首个缩略图部件, right 后续缩略图来源, rightPart 后续缩略图部件
+// 返回: bool 两份缩略图是否完全等价可去重, error 扫描预算或取消错误
+func (x *compositionExecution) sameRawThumbnail(left compositionOrigin, leftPart packagePart, right compositionOrigin, rightPart packagePart) (bool, error) {
+	if !strings.EqualFold(leftPart.media, rightPart.media) || len(leftPart.data) != len(rightPart.data) {
+		return false, nil
+	}
+	if left.source == right.source && strings.EqualFold(left.part, right.part) {
+		return true, nil
+	}
+	if compositionHasRelationships(x.plan.sources[left.source], left.part) || compositionHasRelationships(x.plan.sources[right.source], right.part) {
+		return false, nil
+	}
+	if err := x.plan.budget.scan(int64(len(leftPart.data))); err != nil {
+		return false, err
+	}
+	if err := x.plan.budget.scan(int64(len(rightPart.data))); err != nil {
+		return false, err
+	}
+	return bytes.Equal(leftPart.data, rightPart.data), nil
 }
 
 // compositionRelationshipElement 限定可保留关系标记的语义，不接受未知属性中的潜在引用
@@ -1469,6 +1705,8 @@ func (x *compositionExecution) validateTickets() error {
 			continue
 		}
 		needsMerge := false
+		hasScopeRels := len(x.output.originalRels[scope]) != 0 || len(x.output.relations[scope]) != 0
+		var sameCopies []string
 		for _, ticket := range active[1:] {
 			key := strings.ToLower(ticket)
 			value, present := x.output.parts[key]
@@ -1490,6 +1728,9 @@ func (x *compositionExecution) validateTickets() error {
 				b = b.root()
 			}
 			if a != nil && a == b {
+				if hasScopeRels {
+					sameCopies = append(sameCopies, key)
+				}
 				continue
 			}
 			if err := x.plan.budget.scan(int64(len(first.data))); err != nil {
@@ -1501,6 +1742,16 @@ func (x *compositionExecution) validateTickets() error {
 			if !bytes.Equal(first.data, value.data) {
 				needsMerge = true
 				continue
+			}
+			relsEqual, err := x.equalTicketRelationships(firstKey, key)
+			if err != nil {
+				return err
+			}
+			if !relsEqual {
+				return fmt.Errorf("%w: conflicting composition print-ticket relationships", ErrUnsupported)
+			}
+			if hasScopeRels {
+				sameCopies = append(sameCopies, key)
 			}
 			if classes == nil {
 				classes = make(map[string]*compositionTicketClass)
@@ -1530,12 +1781,140 @@ func (x *compositionExecution) validateTickets() error {
 					orphans[key] = true
 				}
 			}
+		} else if len(sameCopies) != 0 {
+			if orphans == nil {
+				orphans = make(map[string]bool, len(sameCopies))
+			}
+			for _, key := range sameCopies {
+				orphans[key] = true
+			}
 		}
 	}
 	if len(orphans) != 0 {
 		return x.cleanupOrphanTickets(orphans)
 	}
 	return checkContext(x.plan.budget.context)
+}
+
+// ticketRelationships 返回输出包中指定票据部件的规范关系列表及是否存在关系部件
+// 入参: key 小写票据部件键
+// 返回: []Relationship 有效关系列表, bool 是否存在非空关系或关系部件
+func (x *compositionExecution) ticketRelationships(key string) ([]Relationship, bool) {
+	if rels := x.output.originalRels[key]; len(rels) != 0 {
+		return rels, true
+	}
+	if rels := x.output.relations[key]; len(rels) != 0 {
+		return rels, true
+	}
+	if part, exists := x.output.parts[key]; exists {
+		if _, relExists := x.output.parts[strings.ToLower(createdRelationshipPart(part.name))]; relExists {
+			return nil, true
+		}
+	}
+	return nil, false
+}
+
+// equalTicketRelationships 校验两份同字节打印票据的伴生关系是否语义等价，避免静默丢弃关系差异
+// 入参: leftKey 保留票据小写键, rightKey 冗余票据小写键
+// 返回: bool 两份票据关系是否完全等价, error 解析、预算或取消错误
+func (x *compositionExecution) equalTicketRelationships(leftKey, rightKey string) (bool, error) {
+	leftRels, leftHas := x.ticketRelationships(leftKey)
+	rightRels, rightHas := x.ticketRelationships(rightKey)
+	if !leftHas && !rightHas {
+		return true, nil
+	}
+	if len(leftRels) != len(rightRels) {
+		return false, nil
+	}
+	if len(leftRels) == 0 {
+		return leftHas == rightHas, nil
+	}
+	leftPart, okLeft := x.output.parts[leftKey]
+	rightPart, okRight := x.output.parts[rightKey]
+	if !okLeft || !okRight {
+		return false, nil
+	}
+	type normRel struct {
+		typ      string
+		mode     TargetMode
+		target   string
+		resolved string
+	}
+	normalize := func(owner string, rels []Relationship) ([]normRel, error) {
+		out := make([]normRel, len(rels))
+		for i, rel := range rels {
+			mode := rel.TargetMode
+			if mode == "" {
+				mode = TargetModeInternal
+			}
+			item := normRel{typ: rel.Type, mode: mode, target: rel.Target}
+			if mode == TargetModeInternal {
+				resolved, err := resolvePart(owner, rel.Target)
+				if err != nil {
+					return nil, err
+				}
+				item.resolved = strings.ToLower(resolved)
+			}
+			out[i] = item
+		}
+		slices.SortFunc(out, func(a, b normRel) int {
+			if v := strings.Compare(a.typ, b.typ); v != 0 {
+				return v
+			}
+			if v := strings.Compare(string(a.mode), string(b.mode)); v != 0 {
+				return v
+			}
+			if v := strings.Compare(a.resolved, b.resolved); v != 0 {
+				return v
+			}
+			return strings.Compare(a.target, b.target)
+		})
+		return out, nil
+	}
+	leftNorm, err := normalize(leftPart.name, leftRels)
+	if err != nil {
+		return false, err
+	}
+	rightNorm, err := normalize(rightPart.name, rightRels)
+	if err != nil {
+		return false, err
+	}
+	for i := range leftNorm {
+		l, r := leftNorm[i], rightNorm[i]
+		if l.typ != r.typ || l.mode != r.mode {
+			return false, nil
+		}
+		if l.mode != TargetModeInternal {
+			if l.target != r.target {
+				return false, nil
+			}
+			continue
+		}
+		if l.resolved == r.resolved {
+			continue
+		}
+		lp, lok := x.output.parts[l.resolved]
+		rp, rok := x.output.parts[r.resolved]
+		if !lok || !rok || !strings.EqualFold(lp.media, rp.media) || len(lp.data) != len(rp.data) {
+			return false, nil
+		}
+		if _, lh := x.ticketRelationships(l.resolved); lh {
+			return false, nil
+		}
+		if _, rh := x.ticketRelationships(r.resolved); rh {
+			return false, nil
+		}
+		if err := x.plan.budget.scan(int64(len(lp.data))); err != nil {
+			return false, err
+		}
+		if err := x.plan.budget.scan(int64(len(rp.data))); err != nil {
+			return false, err
+		}
+		if !bytes.Equal(lp.data, rp.data) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // mergeScopeTickets 对同级无冲突标准打印票据执行语义合并，同级设置值冲突显式报错，返回被替换的旧票据键
@@ -1586,6 +1965,9 @@ func (x *compositionExecution) mergeScopeTickets(scope string, tickets []string,
 			continue
 		}
 		seen[key] = true
+		if rels, _ := x.ticketRelationships(key); len(rels) != 0 {
+			return nil, fmt.Errorf("%w: cannot merge print tickets with relationships", ErrUnsupported)
+		}
 		replaced = append(replaced, key)
 		parsed, err := ParsePrintSettings(x.plan.budget.context, part.data, options)
 		if err != nil {
@@ -1857,55 +2239,75 @@ func (x *compositionExecution) cleanupOrphanTickets(orphans map[string]bool) err
 			protected[key] = true
 		}
 	}
-	referenced := make(map[string]bool)
-	collect := func(sourceKey string, rels []Relationship) error {
-		if orphans[sourceKey] {
+	for len(orphans) != 0 {
+		referenced := make(map[string]bool)
+		collect := func(sourceKey string, rels []Relationship) error {
+			if orphans[sourceKey] {
+				return nil
+			}
+			sourceName := x.output.sourcePartName(sourceKey)
+			if sourceName == "" {
+				sourceName = "/"
+			}
+			for _, rel := range rels {
+				if err := checkContext(x.plan.budget.context); err != nil {
+					return err
+				}
+				if rel.TargetMode != "" && rel.TargetMode != TargetModeInternal {
+					continue
+				}
+				target, err := resolvePart(sourceName, rel.Target)
+				if err == nil {
+					referenced[strings.ToLower(target)] = true
+				}
+			}
 			return nil
 		}
-		sourceName := x.output.sourcePartName(sourceKey)
-		if sourceName == "" {
-			sourceName = "/"
+		for _, sourceKey := range slices.Sorted(maps.Keys(x.output.originalRels)) {
+			if err := collect(sourceKey, x.output.originalRels[sourceKey]); err != nil {
+				return err
+			}
 		}
-		for _, rel := range rels {
+		for _, sourceKey := range slices.Sorted(maps.Keys(x.output.relations)) {
+			if err := collect(sourceKey, x.output.relations[sourceKey]); err != nil {
+				return err
+			}
+		}
+		var nextOrphans map[string]bool
+		for _, key := range slices.Sorted(maps.Keys(orphans)) {
 			if err := checkContext(x.plan.budget.context); err != nil {
 				return err
 			}
-			if rel.TargetMode != "" && rel.TargetMode != TargetModeInternal {
+			if referenced[key] || protected[key] {
 				continue
 			}
-			target, err := resolvePart(sourceName, rel.Target)
-			if err == nil {
-				referenced[strings.ToLower(target)] = true
+			part, exists := x.output.parts[key]
+			if !exists {
+				continue
 			}
+			if rels, _ := x.ticketRelationships(key); len(rels) != 0 {
+				for _, rel := range rels {
+					if rel.TargetMode != "" && rel.TargetMode != TargetModeInternal {
+						continue
+					}
+					if target, err := resolvePart(part.name, rel.Target); err == nil {
+						targetKey := strings.ToLower(target)
+						if !orphans[targetKey] && !protected[targetKey] {
+							if nextOrphans == nil {
+								nextOrphans = make(map[string]bool)
+							}
+							nextOrphans[targetKey] = true
+						}
+					}
+				}
+			}
+			relKey := strings.ToLower(createdRelationshipPart(part.name))
+			x.output.removePart(part.name)
+			delete(x.output.originalRels, key)
+			delete(x.output.original, key)
+			delete(x.output.original, relKey)
 		}
-		return nil
-	}
-	for _, sourceKey := range slices.Sorted(maps.Keys(x.output.originalRels)) {
-		if err := collect(sourceKey, x.output.originalRels[sourceKey]); err != nil {
-			return err
-		}
-	}
-	for _, sourceKey := range slices.Sorted(maps.Keys(x.output.relations)) {
-		if err := collect(sourceKey, x.output.relations[sourceKey]); err != nil {
-			return err
-		}
-	}
-	for _, key := range slices.Sorted(maps.Keys(orphans)) {
-		if err := checkContext(x.plan.budget.context); err != nil {
-			return err
-		}
-		if referenced[key] || protected[key] {
-			continue
-		}
-		part, exists := x.output.parts[key]
-		if !exists {
-			continue
-		}
-		relKey := strings.ToLower(createdRelationshipPart(part.name))
-		x.output.removePart(part.name)
-		delete(x.output.originalRels, key)
-		delete(x.output.original, key)
-		delete(x.output.original, relKey)
+		orphans = nextOrphans
 	}
 	return checkContext(x.plan.budget.context)
 }
@@ -1949,7 +2351,7 @@ func (x *compositionExecution) structureRelationships(document int, target strin
 	return x.relationships(target, origins, x.instance(owner), false, "")
 }
 
-// compositionRelationshipRecords 按原关系部件自身的兼容性作用域读取有效关联，不消费未选分支
+// compositionRelationshipRecords 按原关系部件自身的兼容性作用域读取有效关联，单遍解码不消费未选分支
 // 入参: source 关系源部件, value 原始关系XML, budget 共享预算
 // 返回: []Relationship 有效关系, error XML、关系、预算或取消错误
 func compositionRelationshipRecords(source string, value packagePart, budget *compositionBudget) ([]Relationship, error) {
@@ -1959,18 +2361,16 @@ func compositionRelationshipRecords(source string, value packagePart, budget *co
 	if err := budget.scan(int64(len(value.data))); err != nil {
 		return nil, err
 	}
-	if _, err := decodeXMLVisit(value.data, budget.limits, func(_ xml.Token, node *xmlElement) error {
+	root, err := decodeXMLVisit(value.data, budget.limits, func(_ xml.Token, node *xmlElement) error {
 		if node == nil {
 			return budget.step(1)
 		}
 		return budget.step(len(node.Attr) + 1)
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
-	if err := budget.scan(int64(len(value.data))); err != nil {
-		return nil, err
-	}
-	return parseRelationshipMarkup(source, value.data, budget.limits, budget.context)
+	return parseCompositionRelationshipRoot(source, root, budget.context)
 }
 
 // retainRelationshipTargets 为原样透传的关系保留各分支闭包，目标身份改变时改用有效视图输出
@@ -2201,29 +2601,44 @@ func (x *compositionExecution) projectStories() error {
 	return nil
 }
 
-// finishStories 在依赖闭包确定后改写目录导航，保留原始兼容分支及相应的保护约束
+// finishStories 在依赖闭包确定后改写目录导航，支持按开关剪除指向未选中页面的目录条目并省略空DocumentOutline
 // 返回: error 目录、导航、保护、预算或取消错误
 func (x *compositionExecution) finishStories() error {
 	for _, pending := range x.storyQueue {
 		key, target, index := pending.key, pending.target, pending.index
 		value := x.stories.documents[index]
+		pruned := false
 		if value.Outline != nil {
+			kept := make([]OutlineEntry, 0, len(value.Outline.Entries))
 			for i, origin := range x.stories.outlines[index] {
 				context := compositionPartKey{origin.source, strings.ToLower(origin.part), index, -1}
-				entry := &value.Outline.Entries[i]
-				uri, changed, err := x.navigate(x.instance(context), origin.part, target, entry.Target)
+				entry := value.Outline.Entries[i]
+				uri, changed, dropped, err := x.navigateOptional(x.instance(context), origin.part, target, entry.Target, x.plan.pruneUnselectedOutlines)
 				if err != nil {
 					return err
+				}
+				if dropped {
+					if x.protected[origin.source][strings.ToLower(origin.part)] {
+						return fmt.Errorf("%w: protected composition outline prune", ErrRestricted)
+					}
+					pruned = true
+					continue
 				}
 				if changed && x.protected[origin.source][strings.ToLower(origin.part)] {
 					return fmt.Errorf("%w: protected composition outline rewrite", ErrRestricted)
 				}
 				entry.Target = uri
+				kept = append(kept, entry)
+			}
+			if pruned && len(kept) == 0 {
+				value.Outline = nil
+			} else {
+				value.Outline.Entries = kept
 			}
 		}
 		var data []byte
 		var err error
-		if x.stories.keepDocuments[index] {
+		if x.stories.keepDocuments[index] && !pruned {
 			original := x.plan.sources[key.source].parts[key.part]
 			rewriteTracker := newResourceMarkupScopeTracker(x.plan.format, x.plan.format == FormatOpenXPS, x.plan.budget.context)
 			data, err = rewriteExtractMarkup(original.data, x.plan.budget.limits, x.plan.budget.context, func(token xml.Token, node *xmlElement) (bool, error) {

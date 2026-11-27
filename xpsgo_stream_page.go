@@ -27,16 +27,17 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
 )
 
 // StreamPage 表示前向流读取中资源已就绪的临时页面视图，Index为零基全局页号，DocumentPart为所属文档URI
-// Page、PageHeader、Walk、WalkPrint、Font、Image、ImageInfo、ReadPart、ColorProfile、StoryFragments、Resources、ResolveColor、PrintTicketHierarchy、PrintSettings、PrintColorPlan、PrintLayout、CoreProperties、DocumentStructure、Render、RenderDevice、RenderElement、RenderElementMapped、RenderBrushTile与RenderBrushTileWithState仅在OnPage回调期间可用
+// Page、PageHeader、Walk、WalkPrint、Font、Image、ImageInfo、DecodeImageRows、ReadPart、ColorProfile、StoryFragments、Resources、ResolveColor、ResolveGradientStops、NewColorResolver、PrintTicketHierarchy、PrintSettings、PrintColorPlan、PrintLayout、CoreProperties、DocumentStructure、Render、RenderDevice、RenderElement、RenderElementMapped、RenderBrushTile与RenderBrushTileWithState仅在OnPage回调期间可用
 // 回调结束后视图自动关闭，返回的页面数据、资源及图像独立于视图；Read或ConsumeStream成功前均为临时结果
 type StreamPage struct {
 	Index        int
 	DocumentPart string
 	Reference    PageReference
-	view         *streamPageView
+	streamReaderView
 }
 
 // StreamPrintWalkOptions 设置流式单页打印遍历的基础票据、物理介质、票据解析预算与未支持Feature忽略策略
@@ -47,18 +48,30 @@ type StreamPrintWalkOptions struct {
 	IgnoreUnsupportedFeatures bool
 }
 
-// streamPageView 保存临时页面视图的只读阅读器、方言、页号、文档位置、资源清单、读取进度、未完流标志、所属流状态与流取消Context
+// streamReaderView 为流式页面与流式纸张视图提供共享的视图锁校验、Context合并与只读阅读器访问能力
+type streamReaderView struct {
+	view *streamPageView
+}
+
+// streamPageView 保存临时流式视图的生命周期锁、关闭标记、只读阅读器、方言、页号、文档位置、模式、资源清单、读取进度、签名验证状态、未完流标志、所属流状态与流取消Context
 type streamPageView struct {
-	reader           *Reader
-	owner            *streamPackage
-	format           Format
-	index            int
-	documentIndex    int
-	pageIndex        int
-	resources        []string
-	progress         StreamProgress
-	streamIncomplete bool
-	context          context.Context
+	mu                sync.RWMutex
+	closed            bool
+	reader            *Reader
+	owner             *streamPackage
+	format            Format
+	mode              PrintStreamMode
+	index             int
+	documentIndex     int
+	pageIndex         int
+	resources         []string
+	progress          StreamProgress
+	signaturePolicy   PrintSignaturePolicy
+	sigVerified       bool
+	sigVerifiedPolicy PrintSignaturePolicy
+	sigVerifiedOpts   *PrintSignatureOptions
+	streamIncomplete  bool
+	context           context.Context
 }
 
 // streamPartialPage 保存跨分片解析的页面标记与已校验根内容
@@ -173,29 +186,145 @@ func (p *StreamPage) PageHeader(ctx context.Context) (*PageHeader, error) {
 	}, nil
 }
 
-// lockReader 校验临时页面视图、获取读锁、合并并检查Context，成功时调用方须立即通过Defer执行清理函数
+// close 关闭临时流式视图并标记关闭状态，等待进行中的读锁调用完成后生效
+func (v *streamPageView) close() {
+	if v == nil {
+		return
+	}
+	v.mu.Lock()
+	v.closed = true
+	v.mu.Unlock()
+}
+
+// lockReader 校验视图状态、获取视图与阅读器读锁并合并检查Context，成功时调用方须立即通过Defer执行清理函数
 // 入参: ctx 取消Context，nil沿用流读取Context
 // 返回: *Reader 有效只读阅读器, context.Context 合并后的Context, func() 释放清理函数, error 关闭或取消错误
-func (p *StreamPage) lockReader(ctx context.Context) (*Reader, context.Context, func(), error) {
-	if p == nil || p.view == nil || p.view.reader == nil {
+func (v *streamPageView) lockReader(ctx context.Context) (*Reader, context.Context, func(), error) {
+	if v == nil {
 		return nil, nil, nil, ErrClosed
 	}
-	r := p.view.reader
+	v.mu.RLock()
+	if v.closed || v.reader == nil {
+		v.mu.RUnlock()
+		return nil, nil, nil, ErrClosed
+	}
+	r := v.reader
 	r.mu.RLock()
 	if r.closed {
 		r.mu.RUnlock()
+		v.mu.RUnlock()
 		return nil, nil, nil, ErrClosed
 	}
-	merged, stop := mergeContext(ctx, p.view.context)
+	merged, stop := mergeContext(ctx, v.context)
 	if err := checkContext(merged); err != nil {
 		stop()
 		r.mu.RUnlock()
+		v.mu.RUnlock()
 		return nil, nil, nil, err
 	}
 	return r, merged, func() {
 		stop()
 		r.mu.RUnlock()
+		v.mu.RUnlock()
 	}, nil
+}
+
+// prepareCall 校验视图与底层阅读器未关闭并合并检查流取消Context，仅持有视图读锁而不持有阅读器读锁
+// 入参: ctx 取消Context，nil沿用流读取Context
+// 返回: *Reader 有效只读阅读器, context.Context 合并后的Context, func() 取消与视图读锁清理函数, error 关闭或取消错误
+func (v *streamPageView) prepareCall(ctx context.Context) (*Reader, context.Context, func(), error) {
+	if v == nil {
+		return nil, nil, nil, ErrClosed
+	}
+	v.mu.RLock()
+	if v.closed || v.reader == nil {
+		v.mu.RUnlock()
+		return nil, nil, nil, ErrClosed
+	}
+	r := v.reader
+	r.mu.RLock()
+	closed := r.closed
+	r.mu.RUnlock()
+	if closed {
+		v.mu.RUnlock()
+		return nil, nil, nil, ErrClosed
+	}
+	merged, cleanup := mergeContext(ctx, v.context)
+	if err := checkContext(merged); err != nil {
+		cleanup()
+		v.mu.RUnlock()
+		return nil, nil, nil, err
+	}
+	return r, merged, func() {
+		cleanup()
+		v.mu.RUnlock()
+	}, nil
+}
+
+// lockReader 委托底层视图获取读锁并合并检查Context
+// 入参: ctx 取消Context，nil沿用流读取Context
+// 返回: *Reader 有效只读阅读器, context.Context 合并后的Context, func() 释放清理函数, error 关闭或取消错误
+func (v *streamReaderView) lockReader(ctx context.Context) (*Reader, context.Context, func(), error) {
+	if v == nil {
+		return nil, nil, nil, ErrClosed
+	}
+	return v.view.lockReader(ctx)
+}
+
+// prepareCall 委托底层视图获取无阅读器锁的调用Context
+// 入参: ctx 取消Context，nil沿用流读取Context
+// 返回: *Reader 有效只读阅读器, context.Context 合并后的Context, func() 释放清理函数, error 关闭或取消错误
+func (v *streamReaderView) prepareCall(ctx context.Context) (*Reader, context.Context, func(), error) {
+	if v == nil {
+		return nil, nil, nil, ErrClosed
+	}
+	return v.view.prepareCall(ctx)
+}
+
+// newColorResolver 创建绑定当前流式视图生命周期守卫的有界ICC缓存颜色解析器
+// 返回: *ColorResolver 受视图生命周期守卫保护的颜色解析器
+func (v *streamReaderView) newColorResolver() *ColorResolver {
+	if v == nil || v.view == nil {
+		return newStreamColorResolver(&streamPageView{closed: true})
+	}
+	return newStreamColorResolver(v.view)
+}
+
+// colorProfile 相对基准部件解析URI并读取已到达ICC配置部件原始字节
+// 入参: ctx 取消Context，nil沿用流读取Context, basePart 基准部件URI, uri 相对或包根ICC配置URI
+// 返回: []byte 独立ICC配置字节, error URI、类型、不存在、预算、取消或关闭错误
+func (v *streamReaderView) colorProfile(ctx context.Context, basePart, uri string) ([]byte, error) {
+	r, profileCtx, release, err := v.lockReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	part, err := resolvePart(basePart, uri)
+	if err != nil {
+		return nil, err
+	}
+	media, err := r.pkg.contentType(part)
+	if err != nil {
+		return nil, &PartError{Part: part, Err: err}
+	}
+	if !requiredResourceMedia(requiredProfile, media) {
+		return nil, &PartError{Part: part, Err: fmt.Errorf("%w: unexpected color profile content type %q", ErrInvalid, media)}
+	}
+	data, err := r.pkg.readPartContext(profileCtx, part)
+	if err != nil {
+		return nil, &PartError{Part: part, Err: err}
+	}
+	return data, nil
+}
+
+// lockReader 校验临时页面视图、获取读锁、合并并检查Context，成功时调用方须立即通过Defer执行清理函数
+// 入参: ctx 取消Context，nil沿用流读取Context
+// 返回: *Reader 有效只读阅读器, context.Context 合并后的Context, func() 释放清理函数, error 关闭或取消错误
+func (p *StreamPage) lockReader(ctx context.Context) (*Reader, context.Context, func(), error) {
+	if p == nil {
+		return nil, nil, nil, ErrClosed
+	}
+	return p.streamReaderView.lockReader(ctx)
 }
 
 // Page 解析当前临时页面及资源绑定，不访问未到达部件或外部地址
@@ -228,22 +357,10 @@ func (p *StreamPage) PrintTicketHierarchy(ctx context.Context) ([]PrintTicket, e
 // 入参: ctx 取消Context，nil沿用流读取Context
 // 返回: *Reader 有效只读阅读器, context.Context 合并后的Context, func() 取消监听清理函数, error 关闭或取消错误
 func (p *StreamPage) prepareCall(ctx context.Context) (*Reader, context.Context, func(), error) {
-	if p == nil || p.view == nil || p.view.reader == nil {
+	if p == nil {
 		return nil, nil, nil, ErrClosed
 	}
-	r := p.view.reader
-	r.mu.RLock()
-	closed := r.closed
-	r.mu.RUnlock()
-	if closed {
-		return nil, nil, nil, ErrClosed
-	}
-	merged, cleanup := mergeContext(ctx, p.view.context)
-	if err := checkContext(merged); err != nil {
-		cleanup()
-		return nil, nil, nil, err
-	}
-	return r, merged, cleanup, nil
+	return p.streamReaderView.prepareCall(ctx)
 }
 
 // Walk 在前向读取回调期间按严格绘制顺序遍历当前临时页面场景
@@ -313,6 +430,22 @@ func (p *StreamPage) ImageInfo(ctx context.Context, part string) (*ImageInfo, er
 	return r.ImageInfo(imageCtx, resolved)
 }
 
+// DecodeImageRows 在前向读取回调期间按行流式解码并色彩管理导出已到达图像为八位非预乘sRGB行字节，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context, part 相对或包根图像部件URI, options 图像解码选项，nil采用默认值, convert 色彩转换选项，nil采用默认值, fn 逐行消费回调
+// 返回: error 状态、参数、URI、媒体类型、解码、色彩、回调、关闭或取消错误
+func (p *StreamPage) DecodeImageRows(ctx context.Context, part string, options *ImageOptions, convert *ImageConvertOptions, fn func(y int, nrgba []byte) error) error {
+	r, imageCtx, cleanup, err := p.prepareCall(ctx)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	resolved, err := resolvePart(p.Reference.Part, part)
+	if err != nil {
+		return err
+	}
+	return r.DecodeImageRows(imageCtx, resolved, options, convert, fn)
+}
+
 // StoryFragments 返回当前页已关联且已到达的故事片段独立副本，未关联或尚未到达时返回nil，回调完成后返回ErrClosed
 // 入参: ctx 取消Context，nil沿用流读取Context
 // 返回: *StoryFragments 独立片段数据或nil, error 关系、媒体类型、结构、预算、取消或关闭错误
@@ -349,6 +482,31 @@ func (p *StreamPage) ResolveColor(ctx context.Context, value Color, options *Col
 	return r.ResolveColor(colorCtx, p.Reference.Part, value, options)
 }
 
+// ResolveGradientStops 在前向读取回调期间以当前页为默认基准规范化解算渐变停靠点与几何，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context, brush 线性或径向渐变画刷, state 当前图形与打印色彩状态, options 可选解算参数
+// 返回: *ResolvedGradient 规范化渐变模型, error 参数、色彩、几何、数值、关闭或取消错误
+func (p *StreamPage) ResolveGradientStops(ctx context.Context, brush *Brush, state WalkState, options *GradientResolveOptions) (*ResolvedGradient, error) {
+	r, gradCtx, cleanup, err := p.prepareCall(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	basePart := state.PagePart
+	if basePart == "" {
+		basePart = p.Reference.Part
+	}
+	return ResolveGradientStops(gradCtx, r, brush, basePart, state, options)
+}
+
+// NewColorResolver 创建绑定当前临时页面视图生命周期的有界ICC缓存颜色解析器，回调结束后调用安全返回ErrClosed
+// 返回: *ColorResolver 受视图生命周期守卫保护的颜色解析器
+func (p *StreamPage) NewColorResolver() *ColorResolver {
+	if p == nil {
+		return newStreamColorResolver(&streamPageView{closed: true})
+	}
+	return p.streamReaderView.newColorResolver()
+}
+
 // ReadPart 按安全受限方式读取已到达的任意包内部件原始字节，未到达部件返回ErrNotFound，回调完成后返回ErrClosed
 // 入参: ctx 取消Context，nil沿用流读取Context, name 部件包根URI
 // 返回: []byte 独立部件字节, error URI、不存在、预算、取消或关闭错误
@@ -365,27 +523,10 @@ func (p *StreamPage) ReadPart(ctx context.Context, name string) ([]byte, error) 
 // 入参: ctx 取消Context，nil沿用流读取Context, uri 相对或包根ICC配置URI
 // 返回: []byte 独立ICC配置字节, error URI、类型、不存在、预算、取消或关闭错误
 func (p *StreamPage) ColorProfile(ctx context.Context, uri string) ([]byte, error) {
-	r, profileCtx, release, err := p.lockReader(ctx)
-	if err != nil {
-		return nil, err
+	if p == nil {
+		return nil, ErrClosed
 	}
-	defer release()
-	part, err := resolvePart(p.Reference.Part, uri)
-	if err != nil {
-		return nil, err
-	}
-	media, err := r.pkg.contentType(part)
-	if err != nil {
-		return nil, &PartError{Part: part, Err: err}
-	}
-	if !requiredResourceMedia(requiredProfile, media) {
-		return nil, &PartError{Part: part, Err: fmt.Errorf("%w: unexpected color profile content type %q", ErrInvalid, media)}
-	}
-	data, err := r.pkg.readPartContext(profileCtx, part)
-	if err != nil {
-		return nil, &PartError{Part: part, Err: err}
-	}
-	return data, nil
+	return p.streamReaderView.colorProfile(ctx, p.Reference.Part, uri)
 }
 
 // PrintSettings 在回调期间合并基础设置与当前临时页的三级PrintTicket，不修改输入设置
@@ -619,7 +760,6 @@ func (p *StreamPage) buildStreamPrintSide(r *Reader, ctx context.Context, option
 	if err != nil {
 		return nil, nil, err
 	}
-	settingsCfg.ignoreUnsupported = configuration.IgnoreUnsupportedFeatures
 	model, err := r.streamReadPrintSettingsCached(ctx, p.view.index, configuration.Defaults, &configuration.Settings, p.view.owner)
 	if err != nil {
 		return nil, nil, err
@@ -700,6 +840,7 @@ func (p *StreamPage) buildStreamPrintSide(r *Reader, ctx context.Context, option
 		Height:          state.layout.Height,
 		MediaClip:       state.layout.MediaClip,
 		Color:           state.outputColor,
+		Resolution:      clonePrintResolution(state.resolution),
 		SignaturePolicy: sigPolicy,
 		Pages: []PrintPlacement{{
 			Page:          p.view.index,
@@ -710,6 +851,7 @@ func (p *StreamPage) buildStreamPrintSide(r *Reader, ctx context.Context, option
 			Watermark:     state.watermark,
 			Negative:      state.negative,
 			Color:         state.colorPlan,
+			Resolution:    clonePrintResolution(state.resolution),
 		}},
 	}
 	side.Gutter = printBindingGutter(finishing, *side, PrintSimplex, false)
@@ -1000,13 +1142,19 @@ func (p *streamPackage) notifyPage(source *Reader, index int, parsed *Page) erro
 		return err
 	}
 	view := &Reader{pkg: source.pkg, limits: source.limits, format: source.format, sequence: source.sequence, documents: source.documents, pages: source.pages, fixedXML: source.fixedXML}
-	defer view.Close()
+	pageView := &streamPageView{reader: view, owner: p, format: source.format, index: index, streamIncomplete: source == p.index && (!p.centralVerified || p.reclaimed), context: p.context}
+	defer func() {
+		pageView.close()
+		view.Close()
+	}()
 	reference := source.pages[index]
 	reference.LinkTargets = append([]string(nil), reference.LinkTargets...)
 	docPart, docIndex, pageIndex := source.pageLocation(index)
 	if docPart == "" {
 		return fmt.Errorf("%w: streamed page document", ErrInvalid)
 	}
+	pageView.documentIndex = docIndex
+	pageView.pageIndex = pageIndex
 	if err := p.ensureDocumentStarted(source, docIndex); err != nil {
 		return err
 	}
@@ -1034,7 +1182,9 @@ func (p *streamPackage) notifyPage(source *Reader, index int, parsed *Page) erro
 		DiscoveredPages:    len(source.pages),
 		DeliveredDocuments: p.deliveredDocuments,
 	}
-	page := &StreamPage{Index: index, DocumentPart: docPart, Reference: reference, view: &streamPageView{reader: view, owner: p, format: source.format, index: index, documentIndex: docIndex, pageIndex: pageIndex, resources: resources, progress: progress, streamIncomplete: source == p.index && (!p.centralVerified || p.reclaimed), context: p.context}}
+	pageView.resources = resources
+	pageView.progress = progress
+	page := &StreamPage{Index: index, DocumentPart: docPart, Reference: reference, streamReaderView: streamReaderView{view: pageView}}
 	if err := p.options.OnPage(p.context, page); err != nil {
 		return err
 	}
@@ -1903,8 +2053,18 @@ func (r *Reader) streamReadJobPrintSettingsIfPresent(ctx context.Context, owner 
 	if err := r.readPrintTicketData(&ticket, min(r.limits.MaxMetadataBytes, r.limits.MaxPartBytes, r.limits.MaxPackageBytes), ctx); err != nil {
 		return nil, target, false, err
 	}
-	settings, err := ticket.Settings(ctx, &normalized.PrintSettingsOptions)
+	if known, capabilities := printResourceMedia(ticket.ContentType); !known || capabilities {
+		return nil, target, false, &PartError{Part: ticket.Part, Err: fmt.Errorf("%w: print ticket format %s", ErrUnsupported, ticket.ContentType)}
+	}
+	root, err := decodeXML(ticket.Data, normalized.Limits)
 	if err != nil {
+		return nil, target, false, &PartError{Part: ticket.Part, Err: err}
+	}
+	settings, err := parsePrintSettings(root, normalized)
+	if err != nil {
+		return nil, target, false, &PartError{Part: ticket.Part, Err: err}
+	}
+	if err := xmlNamespaceTreeOutput(root, ctx); err != nil {
 		return nil, target, false, &PartError{Part: ticket.Part, Err: err}
 	}
 	if owner != nil {

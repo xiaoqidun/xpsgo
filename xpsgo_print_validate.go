@@ -15,12 +15,12 @@
 package xpsgo
 
 import (
-	"bytes"
 	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"slices"
 	"strconv"
@@ -60,6 +60,7 @@ type PrintResolutionSummary struct {
 	Name        xml.Name
 	X           int
 	Y           int
+	Qualitative string
 	Default     bool
 	Constrained PrintConstraint
 }
@@ -76,35 +77,46 @@ type PrintParameterSummary struct {
 	DefaultValue string
 }
 
-// PrintFeatureSummary 保存能力文档中标准或自定义Feature的选择方式与选项只读摘要
+// PrintFeatureSummary 保存能力文档中标准或自定义Feature的选择方式、选项及递归子Feature只读摘要
 type PrintFeatureSummary struct {
 	Name           xml.Name
 	Selection      PrintSelection
 	Options        []xml.Name
 	DefaultOptions []xml.Name
+	SubFeatures    []PrintFeatureSummary
 }
 
 // PrintCapabilitiesSummary 保存PrintCapabilities的通用只读能力摘要视图
 type PrintCapabilitiesSummary struct {
-	Version          uint32
-	ImageableArea    *PrintImageableAreaSummary
-	MediaSizes       []PrintMediaSummary
-	Resolutions      []PrintResolutionSummary
-	Orientations     []string
-	DuplexModes      []PrintDuplex
-	NUpCounts        []int
-	ColorModes       []PrintColorMode
-	ColorManagements []string
-	RenderingIntents []string
-	OutputQualities  []string
-	Bindings         []PrintBinding
-	Staples          []string
-	HolePunches      []string
-	Folds            []string
-	Borderless       bool
-	Watermark        bool
-	Parameters       []PrintParameterSummary
-	Features         []PrintFeatureSummary
+	Version              uint32
+	ImageableArea        *PrintImageableAreaSummary
+	MediaSizes           []PrintMediaSummary
+	Resolutions          []PrintResolutionSummary
+	Orientations         []string
+	Scalings             []string
+	MirrorImage          []string
+	PageOrders           []string
+	CollateModes         []string
+	DuplexModes          []PrintDuplex
+	NUpCounts            []int
+	PosterCounts         []int
+	MaxCopies            int
+	ColorModes           []PrintColorMode
+	ColorManagements     []string
+	RenderingIntents     []string
+	OutputQualities      []string
+	PhotoPrintingIntents []string
+	InputBins            []string
+	OutputBins           []string
+	MediaTypes           []string
+	Bindings             []PrintBinding
+	Staples              []string
+	HolePunches          []string
+	Folds                []string
+	Borderless           bool
+	Watermark            bool
+	Parameters           []PrintParameterSummary
+	Features             []PrintFeatureSummary
 }
 
 // printParameterDomain 保存一个参数的基础域、步进及默认值，不解释私有单位或设备间约束
@@ -131,20 +143,9 @@ type printSelectionChecker struct {
 type printModelValidator struct {
 	options      printSettingsConfig
 	capabilities bool
+	strictURI    bool
 	limit        int64
 	nodes        int
-	bytes        int64
-}
-
-// printBudgetEstimator 在纯内存中按XML序列化与转义规则精确核算输出字节预算与命名空间URI
-type printBudgetEstimator struct {
-	options      printSettingsConfig
-	capabilities bool
-	framework    string
-	limit        int64
-	prefixes     map[string]string
-	scope        map[string]string
-	nextPrefix   int
 	bytes        int64
 }
 
@@ -206,17 +207,7 @@ func EncodePrintCapabilities(ctx context.Context, output io.Writer, capabilities
 	if err != nil {
 		return 0, err
 	}
-	root, err := printDocumentRoot(validated.Version, validated.Elements, configuration, true)
-	if err != nil {
-		return 0, err
-	}
-	var buffer bytes.Buffer
-	if _, err := writePrintSettingsMarkup(&buffer, root, configuration); err != nil {
-		return 0, err
-	}
-	counted := packageOutput{writer: output, context: configuration.context, limit: min(configuration.Limits.MaxMetadataBytes, configuration.Limits.MaxPartBytes, configuration.Limits.MaxPackageBytes)}
-	_, err = counted.Write(buffer.Bytes())
-	return counted.count, err
+	return writeEncodedPrintSettings(output, validated, configuration, printDocumentCapabilities)
 }
 
 // printConstraint 解析约束枚举属性及其关键字QName并要求属于Print Schema公共关键字命名空间
@@ -414,12 +405,7 @@ func (p *printParameterDomain) value(value *PrintValue, options printSettingsCon
 	if err != nil {
 		return nil, err
 	}
-	normalized := *value
-	normalized.Type, normalized.Text = parsed.Type, parsed.Text
-	if kind.Local == "QName" {
-		normalized.QName = parsed.QName
-	}
-	value = &normalized
+	value = parsed
 	var measure *big.Rat
 	if kind.Local == "integer" || kind.Local == "decimal" {
 		text := strings.Trim(value.Text, " \t\r\n")
@@ -450,10 +436,14 @@ func (p *printParameterDomain) value(value *PrintValue, options printSettingsCon
 		}
 		measure = big.NewRat(int64(utf8.RuneCountInString(value.Text)), 1)
 	} else {
-		if !xmlNCName(value.QName.Local) || !xmlTextValid(value.QName.Space) {
+		if !xmlNCName(value.QName.Local) || !xmlTextValid(value.QName.Space) || value.QName.Space != "" && !uriReference(value.QName.Space) {
 			return nil, fmt.Errorf("%w: unresolved print parameter QName", ErrInvalid)
 		}
-		measure = big.NewRat(int64(utf8.RuneCountInString(strings.Trim(value.Text, " \t\r\n"))), 1)
+		trimmed := strings.Trim(value.Text, " \t\r\n")
+		if trimmed == "" {
+			trimmed = value.QName.Local
+		}
+		measure = big.NewRat(int64(utf8.RuneCountInString(trimmed)), 1)
 	}
 	if measure.Cmp(p.minimum) < 0 || measure.Cmp(p.maximum) > 0 {
 		return nil, fmt.Errorf("%w: print parameter value outside range", ErrInvalid)
@@ -506,11 +496,11 @@ func ResolvePrintParameters(ctx context.Context, settings *PrintSettings, capabi
 	if capabilities == nil {
 		return nil, fmt.Errorf("%w: nil print capabilities", ErrInvalid)
 	}
-	model, err := validatePrintSettingsModel(settings, configuration, printDocumentTicket)
+	model, err := validatePrintSettingsModelMode(settings, configuration, printDocumentTicket, false)
 	if err != nil {
 		return nil, err
 	}
-	capModel, err := validatePrintSettingsModel(&PrintSettings{Version: capabilities.Version, Elements: capabilities.Elements}, configuration, printDocumentCapabilities)
+	capModel, err := validatePrintSettingsModelMode(&PrintSettings{Version: capabilities.Version, Elements: capabilities.Elements}, configuration, printDocumentCapabilities, false)
 	if err != nil {
 		return nil, err
 	}
@@ -623,11 +613,11 @@ func ValidatePrintSelection(ctx context.Context, settings *PrintSettings, capabi
 	if capabilities == nil {
 		return nil, fmt.Errorf("%w: nil print capabilities", ErrInvalid)
 	}
-	model, err := validatePrintSettingsModel(settings, configuration, printDocumentTicket)
+	model, err := validatePrintSettingsModelMode(settings, configuration, printDocumentTicket, false)
 	if err != nil {
 		return nil, err
 	}
-	capModel, err := validatePrintSettingsModel(&PrintSettings{Version: capabilities.Version, Elements: capabilities.Elements}, configuration, printDocumentCapabilities)
+	capModel, err := validatePrintSettingsModelMode(&PrintSettings{Version: capabilities.Version, Elements: capabilities.Elements}, configuration, printDocumentCapabilities, false)
 	if err != nil {
 		return nil, err
 	}
@@ -980,23 +970,20 @@ func EncodePrintDeviceCapabilities(ctx context.Context, output io.Writer, settin
 	if err != nil {
 		return 0, err
 	}
-	root, err := printDocumentRootWithChangeID(validated.Version, validated.CapabilitiesChangeID, validated.Elements, configuration, printDocumentDeviceCapabilities)
-	if err != nil {
-		return 0, err
-	}
-	var buffer bytes.Buffer
-	if _, err := writePrintSettingsMarkup(&buffer, root, configuration); err != nil {
-		return 0, err
-	}
-	counted := packageOutput{writer: output, context: configuration.context, limit: min(configuration.Limits.MaxMetadataBytes, configuration.Limits.MaxPartBytes, configuration.Limits.MaxPackageBytes)}
-	_, err = counted.Write(buffer.Bytes())
-	return counted.count, err
+	return writeEncodedPrintSettings(output, validated, configuration, printDocumentDeviceCapabilities)
 }
 
-// validatePrintSettingsModel 在纯内存中校验PrintSettings结构、版本、作用域过滤、嵌套层数、重复冲突与参数定义并返回独立副本
+// validatePrintSettingsModel 在纯内存中校验PrintSettings结构、版本、作用域过滤、嵌套层数、重复冲突、命名空间URI与参数定义并返回独立副本
 // 入参: settings 待校验设置模型, options 已校验预算与作用域配置, mode 文档类别模式
 // 返回: *PrintSettings 校验通过后的独立规范副本, error 结构、版本、预算或取消错误
 func validatePrintSettingsModel(settings *PrintSettings, options printSettingsConfig, mode printDocumentMode) (*PrintSettings, error) {
+	return validatePrintSettingsModelMode(settings, options, mode, true)
+}
+
+// validatePrintSettingsModelMode 在纯内存中校验PrintSettings结构，strictURI控制是否按RFC3986强制校验命名空间URI引用语法
+// 入参: settings 待校验设置模型, options 已校验预算与作用域配置, mode 文档类别模式, strictURI 是否强制校验命名空间uriReference
+// 返回: *PrintSettings 校验通过后的独立规范副本, error 结构、版本、预算或取消错误
+func validatePrintSettingsModelMode(settings *PrintSettings, options printSettingsConfig, mode printDocumentMode, strictURI bool) (*PrintSettings, error) {
 	if err := checkContext(options.context); err != nil {
 		return nil, err
 	}
@@ -1024,6 +1011,7 @@ func validatePrintSettingsModel(settings *PrintSettings, options printSettingsCo
 	validator := printModelValidator{
 		options:      options,
 		capabilities: capabilities,
+		strictURI:    strictURI,
 		limit:        limit,
 		nodes:        1,
 	}
@@ -1060,7 +1048,7 @@ func validatePrintSettingsModel(settings *PrintSettings, options printSettingsCo
 		if int64(len(element.Name.Space)) > limit-int64(len(element.Name.Local)) {
 			return nil, fmt.Errorf("%w: print settings name byte budget", ErrLimit)
 		}
-		if element.Name.Space == "" || !xmlNCName(element.Name.Local) || !xmlTextValid(element.Name.Space) || element.Name.Space == xmlnsNamespace {
+		if element.Name.Space == "" || !xmlNCName(element.Name.Local) || !xmlTextValid(element.Name.Space) || element.Name.Space == xmlnsNamespace || strictURI && !uriReference(element.Name.Space) {
 			return nil, fmt.Errorf("%w: print settings name", ErrInvalid)
 		}
 		scope := printKeywordScope(element.Name)
@@ -1087,8 +1075,10 @@ func validatePrintSettingsModel(settings *PrintSettings, options printSettingsCo
 		}
 		result.Elements = append(result.Elements, validated)
 	}
-	if err := printSettingsPrefixConflicts(result.Elements); err != nil {
-		return nil, err
+	if !capabilities {
+		if err := printSettingsPrefixConflicts(result.Elements); err != nil {
+			return nil, err
+		}
 	}
 	if err := validatePrintCommon(result.Elements, PrintSettingUnknown, capabilities); err != nil {
 		return nil, err
@@ -1107,14 +1097,14 @@ func (v *printModelValidator) reserve(size int64) error {
 	return nil
 }
 
-// validateName 校验展开名称的本地名、命名空间合法性及字节预算
+// validateName 校验展开名称的本地名、命名空间URI合法性及字节预算
 // 入参: name 待校验展开名称
 // 返回: error 名称非法或预算超限错误
 func (v *printModelValidator) validateName(name xml.Name) error {
 	if int64(len(name.Space)) > v.limit-int64(len(name.Local)) {
 		return fmt.Errorf("%w: print settings expanded name byte budget", ErrLimit)
 	}
-	if !xmlNCName(name.Local) || !xmlTextValid(name.Space) || name.Space == xmlnsNamespace {
+	if !xmlNCName(name.Local) || !xmlTextValid(name.Space) || name.Space == xmlnsNamespace || v.strictURI && name.Space != "" && !uriReference(name.Space) {
 		return fmt.Errorf("%w: print settings expanded name", ErrInvalid)
 	}
 	return nil
@@ -1163,7 +1153,7 @@ func (v *printModelValidator) settingV1(value PrintSetting, depth int, nesting [
 		if value.Value == nil || value.Name != (xml.Name{}) || len(value.Children) != 0 {
 			return PrintSetting{}, fmt.Errorf("%w: print settings Value structure", ErrInvalid)
 		}
-		validatedVal, err := validatePrintValueModel(value.Value, false, v.options)
+		validatedVal, err := validatePrintValueModelMode(value.Value, false, v.strictURI, v.options)
 		if err != nil {
 			return PrintSetting{}, err
 		}
@@ -1250,7 +1240,7 @@ func (v *printModelValidator) settingV1(value PrintSetting, depth int, nesting [
 		return PrintSetting{}, fmt.Errorf("%w: print settings %s child count", ErrInvalid, out.Kind.String())
 	}
 	if out.Kind == PrintSettingParameterDef {
-		if err := validatePrintParameterDefaultQName(&out); err != nil {
+		if err := validatePrintParameterDefaultQName(&out, v.strictURI); err != nil {
 			return PrintSetting{}, err
 		}
 	}
@@ -1313,24 +1303,33 @@ func (v *printModelValidator) settingV2(value PrintSetting, depth int, nesting [
 			if selectionIndex >= 0 {
 				return PrintSetting{}, fmt.Errorf("%w: duplicate print settings SelectionType", ErrInvalid)
 			}
-			selVal, err := printCommonValue(child)
-			if err != nil || selVal.Type != (xml.Name{Space: printValueNS, Local: "QName"}) || !printPublicKeywordSpace(selVal.QName.Space) || (selVal.QName.Local != "PickOne" && selVal.QName.Local != "PickMany") {
-				return PrintSetting{}, fmt.Errorf("%w: print settings SelectionType value", ErrInvalid)
+			if child.Value != nil || child.Constraint != PrintConstraintUnknown || child.HasDefault || child.Default || len(child.Children) != 1 {
+				return PrintSetting{}, fmt.Errorf("%w: print settings SelectionType structure", ErrInvalid)
 			}
-			selText, err := printCanonicalValueQName(*selVal)
+			if err := v.validateName(child.Name); err != nil {
+				return PrintSetting{}, err
+			}
+			valChild := child.Children[0]
+			if valChild.Kind != PrintSettingValue || valChild.Value == nil || valChild.Name != (xml.Name{}) || len(valChild.Children) != 0 || valChild.Constraint != PrintConstraintUnknown || valChild.HasDefault || valChild.Default {
+				return PrintSetting{}, fmt.Errorf("%w: print settings SelectionType value structure", ErrInvalid)
+			}
+			validatedSel, err := validatePrintValueModel(valChild.Value, false, v.options)
 			if err != nil {
 				return PrintSetting{}, err
+			}
+			if validatedSel.Type != (xml.Name{Space: printValueNS, Local: "QName"}) || !printPublicKeywordSpace(validatedSel.QName.Space) || (validatedSel.QName.Local != "PickOne" && validatedSel.QName.Local != "PickMany") {
+				return PrintSetting{}, fmt.Errorf("%w: print settings SelectionType value", ErrInvalid)
 			}
 			prop := PrintSetting{
 				Kind: PrintSettingProperty,
 				Name: xml.Name{Space: printFrameworkNS, Local: "SelectionType"},
 				Children: []PrintSetting{{
 					Kind:  PrintSettingValue,
-					Value: &PrintValue{Type: xml.Name{Space: printValueNS, Local: "QName"}, Text: selText, QName: selVal.QName},
+					Value: validatedSel,
 				}},
 			}
 			selectionProp = &prop
-			cost += int64(len(selText)) + 22
+			cost += int64(len(valChild.Value.Text)) + int64(len(validatedSel.QName.Local)) + 26
 			selectionIndex = index
 			continue
 		}
@@ -1381,7 +1380,7 @@ func (v *printModelValidator) settingV2(value PrintSetting, depth int, nesting [
 		if valChild.Value == nil || valChild.Name != (xml.Name{}) || len(valChild.Children) != 0 || valChild.Constraint != PrintConstraintUnknown || valChild.HasDefault || valChild.Default {
 			return PrintSetting{}, fmt.Errorf("%w: print settings Value structure", ErrInvalid)
 		}
-		validatedVal, err := validatePrintValueModel(valChild.Value, v.capabilities, v.options)
+		validatedVal, err := validatePrintValueModelMode(valChild.Value, v.capabilities, v.strictURI, v.options)
 		if err != nil {
 			return PrintSetting{}, err
 		}
@@ -1444,17 +1443,24 @@ func (v *printModelValidator) settingV2(value PrintSetting, depth int, nesting [
 		return PrintSetting{}, fmt.Errorf("%w: print settings %s child count", ErrInvalid, out.Kind.String())
 	}
 	if out.Kind == PrintSettingParameterDef {
-		if err := validatePrintParameterDefaultQName(&out); err != nil {
+		if err := validatePrintParameterDefaultQName(&out, v.strictURI); err != nil {
 			return PrintSetting{}, err
 		}
 	}
 	return out, nil
 }
 
-// validatePrintValueModel 在纯内存中校验单个PrintValue的类型、词法、QName与字节预算，不构造临时XML节点
+// validatePrintValueModel 在纯内存中校验单个PrintValue的类型、词法、QName、命名空间URI与字节预算，不构造临时XML节点
 // 入参: value 待校验标量值, allowPSF2 是否允许PSF2能力专属ImageableAreaType, options 已校验资源预算参数
 // 返回: *PrintValue 校验并规范化后的独立值副本, error 类型、词法、命名空间或预算错误
 func validatePrintValueModel(value *PrintValue, allowPSF2 bool, options printSettingsConfig) (*PrintValue, error) {
+	return validatePrintValueModelMode(value, allowPSF2, true, options)
+}
+
+// validatePrintValueModelMode 在纯内存中校验单个PrintValue，strictURI控制是否按RFC3986强制校验命名空间URI引用
+// 入参: value 待校验标量值, allowPSF2 是否允许PSF2能力专属ImageableAreaType, strictURI 是否强制校验命名空间uriReference, options 已校验资源预算参数
+// 返回: *PrintValue 校验并规范化后的独立值副本, error 类型、词法、命名空间或预算错误
+func validatePrintValueModelMode(value *PrintValue, allowPSF2, strictURI bool, options printSettingsConfig) (*PrintValue, error) {
 	if value == nil {
 		return nil, fmt.Errorf("%w: nil print settings value", ErrInvalid)
 	}
@@ -1469,7 +1475,7 @@ func validatePrintValueModel(value *PrintValue, allowPSF2 bool, options printSet
 	if int64(len(kind.Space)) > limit-int64(len(kind.Local)) {
 		return nil, fmt.Errorf("%w: print settings expanded name byte budget", ErrLimit)
 	}
-	if !xmlNCName(kind.Local) || !xmlTextValid(kind.Space) || kind.Space == xmlnsNamespace {
+	if !xmlNCName(kind.Local) || !xmlTextValid(kind.Space) || kind.Space == xmlnsNamespace || strictURI && kind.Space != "" && !uriReference(kind.Space) {
 		return nil, fmt.Errorf("%w: print settings Value type", ErrInvalid)
 	}
 	if allowPSF2 && kind == (xml.Name{Space: printFramework2NS, Local: "ImageableAreaType"}) {
@@ -1490,7 +1496,7 @@ func validatePrintValueModel(value *PrintValue, allowPSF2 bool, options printSet
 			if int64(len(value.QName.Space)) > limit-int64(len(value.QName.Local)) {
 				return nil, fmt.Errorf("%w: print settings expanded name byte budget", ErrLimit)
 			}
-			text, err := printCanonicalValueQName(*out)
+			text, err := validatePrintValueQName(*out, strictURI)
 			if err != nil {
 				return nil, err
 			}
@@ -1521,14 +1527,17 @@ func validatePrintValueModel(value *PrintValue, allowPSF2 bool, options printSet
 	return out, nil
 }
 
-// printCanonicalValueQName 在纯内存中校验含QName的值并返回可安全保留或规范化的词法QName文本
-// 入参: value 含非空QName的值
-// 返回: string 词法QName文本, error 名称或命名空间错误
-func printCanonicalValueQName(value PrintValue) (string, error) {
-	if !xmlNCName(value.QName.Local) || !xmlTextValid(value.QName.Space) || value.QName.Space == xmlnsNamespace {
+// validatePrintValueQName 在纯内存中校验含QName的值并保留匹配词法文本，不伪造合成前缀写回空Text
+// 入参: value 含非空QName的值, strictURI 是否强制校验命名空间uriReference
+// 返回: string 可安全保留的词法文本，未提供或不匹配时为空字符串, error 名称或命名空间错误
+func validatePrintValueQName(value PrintValue, strictURI bool) (string, error) {
+	if !xmlNCName(value.QName.Local) || !xmlTextValid(value.QName.Space) || value.QName.Space == xmlnsNamespace || strictURI && value.QName.Space != "" && !uriReference(value.QName.Space) {
 		return "", fmt.Errorf("%w: print settings QName value", ErrInvalid)
 	}
 	text := strings.Trim(value.Text, " \t\r\n")
+	if text == "" {
+		return "", nil
+	}
 	prefix, local, qualified := strings.Cut(text, ":")
 	if !qualified && text == value.QName.Local && xmlNCName(text) {
 		if value.QName.Space == xmlNamespace {
@@ -1537,19 +1546,12 @@ func printCanonicalValueQName(value PrintValue) (string, error) {
 		return text, nil
 	}
 	if qualified && xmlNCName(prefix) && xmlNCName(local) && prefix != "xmlns" && local == value.QName.Local && value.QName.Space != "" && (prefix != "xml" || value.QName.Space == xmlNamespace) {
-		if (prefix == "xml") != (value.QName.Space == xmlNamespace) {
+		if value.QName.Space == xmlNamespace && prefix != "xml" {
 			return "", fmt.Errorf("%w: print value namespace", ErrInvalid)
 		}
 		return text, nil
 	}
-	if value.QName.Space == "" {
-		return value.QName.Local, nil
-	}
-	known := printKnownNamespacePrefix(value.QName.Space)
-	if known == "" {
-		known = "n1"
-	}
-	return known + ":" + value.QName.Local, nil
+	return "", nil
 }
 
 // printKnownNamespacePrefix 返回标准Print Schema及XML已知命名空间的默认推荐前缀
@@ -1581,9 +1583,9 @@ func printKnownNamespacePrefix(uri string) string {
 }
 
 // validatePrintParameterDefaultQName 校验QName类型ParameterDef的字符串默认值并补全无前缀展开名
-// 入参: value 已完成基础结构校验的ParameterDef节点指针
+// 入参: value 已完成基础结构校验的ParameterDef节点指针, strictURI 是否强制校验命名空间uriReference
 // 返回: error 默认值类型或QName错误
-func validatePrintParameterDefaultQName(value *PrintSetting) error {
+func validatePrintParameterDefaultQName(value *PrintSetting, strictURI bool) error {
 	kind := xml.Name{}
 	defaultIndex := -1
 	for index, child := range value.Children {
@@ -1604,7 +1606,7 @@ func validatePrintParameterDefaultQName(value *PrintSetting) error {
 		return fmt.Errorf("%w: QName parameter default value type", ErrInvalid)
 	}
 	if item.QName != (xml.Name{}) {
-		if !xmlNCName(item.QName.Local) || !xmlTextValid(item.QName.Space) || item.QName.Space == xmlnsNamespace {
+		if !xmlNCName(item.QName.Local) || !xmlTextValid(item.QName.Space) || item.QName.Space == xmlnsNamespace || strictURI && item.QName.Space != "" && !uriReference(item.QName.Space) {
 			return fmt.Errorf("%w: print settings QName value", ErrInvalid)
 		}
 		return nil
@@ -1617,451 +1619,12 @@ func validatePrintParameterDefaultQName(value *PrintSetting) error {
 	return fmt.Errorf("%w: print settings QName %q", ErrInvalid, item.Text)
 }
 
-// validatePrintSettingsOutputBudget 在纯内存中按XML序列化与转义规则精确核算输出字节数与命名空间URI合法性，不构造DOM树
+// validatePrintSettingsOutputBudget 在纯内存中按与流式编码完全一致的规则精确核算输出字节数与命名空间URI合法性
 // 入参: settings 已校验打印设置模型, options 已校验资源预算配置, mode 文档类别模式
 // 返回: error 命名空间URI非法、字节预算超限或取消错误
 func validatePrintSettingsOutputBudget(settings *PrintSettings, options printSettingsConfig, mode printDocumentMode) error {
-	if err := checkContext(options.context); err != nil {
-		return err
-	}
-	capabilities := mode != printDocumentTicket
-	version := settings.Version
-	if version == 0 {
-		if mode == printDocumentDeviceCapabilities {
-			version = 2
-		} else {
-			version = 1
-		}
-	}
-	framework, prefix := printFrameworkNS, "psf"
-	if version == 2 {
-		framework, prefix = printFramework2NS, "psf2"
-	}
-	rootName := "PrintTicket"
-	if mode == printDocumentCapabilities {
-		rootName = "PrintCapabilities"
-	} else if mode == printDocumentDeviceCapabilities {
-		rootName = "PrintDeviceCapabilities"
-	}
-	estimator := printBudgetEstimator{
-		options:      options,
-		capabilities: capabilities,
-		framework:    framework,
-		limit:        min(options.Limits.MaxMetadataBytes, options.Limits.MaxPartBytes, options.Limits.MaxPackageBytes),
-		prefixes:     map[string]string{framework: prefix},
-		scope:        map[string]string{prefix: framework},
-	}
-	rootTagLen := int64(len(prefix) + 1 + len(rootName))
-	versionText := strconv.FormatUint(uint64(version), 10)
-	if err := estimator.add(2*rootTagLen + 5 + int64(len(` version="`)+len(versionText)+1)); err != nil {
-		return err
-	}
-	if mode == printDocumentDeviceCapabilities && settings.CapabilitiesChangeID != "" {
-		typeText, err := estimator.qname(xml.Name{Space: printValueNS, Local: "string"})
-		if err != nil {
-			return err
-		}
-		if _, err := estimator.qname(xml.Name{Space: xsiNamespace, Local: "type"}); err != nil {
-			return err
-		}
-		tagLen := int64(len(prefix) + 1 + len("CapabilitiesChangeID"))
-		attrLen := int64(len(" xsi:type=\"")) + printXMLEscapedLen(typeText, true) + 1
-		if err := estimator.add(2*tagLen + 5 + attrLen + printXMLEscapedLen(settings.CapabilitiesChangeID, false)); err != nil {
-			return err
-		}
-	}
-	for _, setting := range settings.Elements {
-		if err := checkContext(options.context); err != nil {
-			return err
-		}
-		scope := printKeywordScope(setting.Name)
-		if !capabilities && options.Scope != PrintScopeUnknown && scope != PrintScopeUnknown && scope < options.Scope {
-			continue
-		}
-		var err error
-		if version == 2 && !(mode == printDocumentDeviceCapabilities && setting.Kind == PrintSettingParameterDef) {
-			err = estimator.elementV2(setting)
-		} else {
-			err = estimator.elementV1(setting)
-		}
-		if err != nil {
-			return err
-		}
-	}
-	prefixes := make([]string, 0, len(estimator.scope))
-	for p := range estimator.scope {
-		prefixes = append(prefixes, p)
-	}
-	slices.Sort(prefixes)
-	for _, p := range prefixes {
-		uri := estimator.scope[p]
-		if err := xmlNamespaceOutput(p, uri); err != nil {
-			return err
-		}
-		nameLen := int64(len("xmlns"))
-		if p != "" {
-			nameLen += 1 + int64(len(p))
-		}
-		if err := estimator.add(1 + nameLen + 2 + printXMLEscapedLen(uri, true) + 1); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// add 向精确字节估算器累加字节数并校验预算上限
-// 入参: size 新增字节数
-// 返回: error 字节预算超限错误
-func (e *printBudgetEstimator) add(size int64) error {
-	if size > e.limit-e.bytes {
-		return fmt.Errorf("%w: print settings byte budget", ErrLimit)
-	}
-	e.bytes += size
-	return nil
-}
-
-// qname 复刻printSettingsBuilder的前缀分配规则并返回确定性QName文本
-// 入参: name 展开名称
-// 返回: string 词法QName, error 名称或命名空间错误
-func (e *printBudgetEstimator) qname(name xml.Name) (string, error) {
-	if name.Space == "" {
-		return name.Local, nil
-	}
-	prefix, exists := e.prefixes[name.Space]
-	if !exists {
-		if name.Space == xmlnsNamespace {
-			return "", fmt.Errorf("%w: reserved print settings namespace", ErrInvalid)
-		}
-		prefix = printKnownNamespacePrefix(name.Space)
-		if prefix == "" || e.scope[prefix] != "" && e.scope[prefix] != name.Space {
-			for {
-				e.nextPrefix++
-				prefix = "n" + strconv.Itoa(e.nextPrefix)
-				if e.scope[prefix] == "" || e.scope[prefix] == name.Space {
-					break
-				}
-			}
-		}
-		e.prefixes[name.Space] = prefix
-		e.scope[prefix] = name.Space
-	}
-	return prefix + ":" + name.Local, nil
-}
-
-// valueQNameCost 计算含QName标量值的文本、局部命名空间附加属性字节数及局部命名空间作用域映射
-// 入参: value 含QName的标量值, nodeSpace 所在元素命名空间, hasChildren 所在元素是否含XML子节点
-// 返回: string 最终文本, int64 局部命名空间额外字节, map[string]string 若局部重绑定则返回局部命名空间作用域映射, error 命名空间或预算错误
-func (e *printBudgetEstimator) valueQNameCost(value PrintValue, nodeSpace string, hasChildren bool) (string, int64, map[string]string, error) {
-	text := strings.Trim(value.Text, " \t\r\n")
-	prefix, local, qualified := strings.Cut(text, ":")
-	if !qualified && text == value.QName.Local && xmlNCName(text) {
-		if value.QName.Space != "" {
-			if hasChildren {
-				qn, err := e.qname(value.QName)
-				return qn, 0, nil, err
-			}
-			extra, localScope, err := e.localNamespaceCost(nodeSpace, "", value.QName.Space)
-			return text, extra, localScope, err
-		}
-		return text, 0, nil, nil
-	}
-	if qualified && xmlNCName(prefix) && xmlNCName(local) && prefix != "xmlns" && local == value.QName.Local && value.QName.Space != "" && (prefix != "xml" || value.QName.Space == xmlNamespace) {
-		if bound := e.scope[prefix]; bound == "" || bound == value.QName.Space {
-			if !xmlTextValid(value.QName.Space) || value.QName.Space == xmlnsNamespace || (prefix == "xml") != (value.QName.Space == xmlNamespace) {
-				return "", 0, nil, fmt.Errorf("%w: print value namespace", ErrInvalid)
-			}
-			if bound == "" {
-				e.scope[prefix] = value.QName.Space
-			}
-			return text, 0, nil, nil
-		}
-		if hasChildren {
-			qn, err := e.qname(value.QName)
-			return qn, 0, nil, err
-		}
-		extra, localScope, err := e.localNamespaceCost(nodeSpace, prefix, value.QName.Space)
-		return text, extra, localScope, err
-	}
-	qn, err := e.qname(value.QName)
-	return qn, 0, nil, err
-}
-
-// localNamespaceCost 复刻printSettingsBuilder.localNamespace逻辑并核算局部xmlns属性字节与输出URI校验
-// 入参: nodeSpace 元素命名空间, prefix 局部前缀或空默认前缀, uri 局部命名空间URI
-// 返回: int64 局部xmlns属性总字节数, map[string]string 局部作用域映射, error URI非法错误
-func (e *printBudgetEstimator) localNamespaceCost(nodeSpace, prefix, uri string) (int64, map[string]string, error) {
-	if err := xmlNamespaceOutput(prefix, uri); err != nil {
-		return 0, nil, err
-	}
-	scope := make(map[string]string, len(e.scope)+5)
-	for k, v := range e.scope {
-		scope[k] = v
-	}
-	var extra int64
-	addLocal := func(name, namespace string) error {
-		if err := xmlNamespaceOutput(name, namespace); err != nil {
-			return err
-		}
-		scope[name] = namespace
-		attrNameLen := int64(len("xmlns"))
-		if name != "" {
-			attrNameLen += 1 + int64(len(name))
-		}
-		extra += 1 + attrNameLen + 2 + printXMLEscapedLen(namespace, true) + 1
-		return nil
-	}
-	if err := addLocal(prefix, uri); err != nil {
-		return 0, nil, err
-	}
-	required := []string{e.framework, xsiNamespace, printValueNS}
-	if nodeSpace != "" && nodeSpace != e.framework && nodeSpace != xsiNamespace && nodeSpace != printValueNS {
-		required = append(required, nodeSpace)
-	}
-	for _, namespace := range required {
-		if printSettingsPrefix(scope, namespace) != "" {
-			continue
-		}
-		index := 1
-		name := "p1"
-		for scope[name] != "" {
-			index++
-			name = "p" + strconv.Itoa(index)
-		}
-		if err := addLocal(name, namespace); err != nil {
-			return 0, nil, err
-		}
-	}
-	return extra, scope, nil
-}
-
-// elementV1 按PSF1编码格式精确核算单个节点及其子树的序列化字节数
-// 入参: value 已校验设置元素
-// 返回: error 命名空间、预算或取消错误
-func (e *printBudgetEstimator) elementV1(value PrintSetting) error {
-	if err := checkContext(e.options.context); err != nil {
-		return err
-	}
-	local := printSettingNames[value.Kind]
-	tag, err := e.qname(xml.Name{Space: printFrameworkNS, Local: local})
-	if err != nil {
-		return err
-	}
-	var attrsLen int64
-	if value.Constraint != PrintConstraintUnknown {
-		cText, err := e.qname(xml.Name{Space: printKeywordsNS, Local: printConstraintNames[value.Constraint]})
-		if err != nil {
-			return err
-		}
-		attrsLen += int64(len(` constrained="`)) + printXMLEscapedLen(cText, true) + 1
-	}
-	if value.Kind == PrintSettingValue {
-		kind := value.Value.Type
-		if kind == (xml.Name{}) {
-			kind = xml.Name{Space: printValueNS, Local: "string"}
-		}
-		typeText, err := e.qname(kind)
-		if err != nil {
-			return err
-		}
-		e.prefixes[xsiNamespace] = "xsi"
-		e.scope["xsi"] = xsiNamespace
-		text := value.Value.Text
-		var localScope map[string]string
-		if kind == (xml.Name{Space: printValueNS, Local: "QName"}) || kind == (xml.Name{Space: printValueNS, Local: "string"}) && value.Value.QName != (xml.Name{}) {
-			if value.Value.QName != (xml.Name{}) {
-				normalized := *value.Value
-				normalized.Type = kind
-				var extra int64
-				text, extra, localScope, err = e.valueQNameCost(normalized, printFrameworkNS, false)
-				if err != nil {
-					return err
-				}
-				attrsLen += extra
-			}
-		}
-		xsiPrefix := "xsi"
-		nodeTag := tag
-		if localScope != nil {
-			xsiPrefix = printSettingsPrefix(localScope, xsiNamespace)
-			typeText = printSettingsPrefix(localScope, kind.Space) + ":" + kind.Local
-			nodeTag = printSettingsPrefix(localScope, printFrameworkNS) + ":" + local
-		}
-		attrsLen += 1 + int64(len(xsiPrefix)+len(":type")) + 2 + printXMLEscapedLen(typeText, true) + 1
-		return e.add(2*int64(len(nodeTag)) + 5 + attrsLen + printXMLEscapedLen(text, false))
-	}
-	if value.Name != (xml.Name{}) {
-		nameText, err := e.qname(value.Name)
-		if err != nil {
-			return err
-		}
-		attrsLen += int64(len(` name="`)) + printXMLEscapedLen(nameText, true) + 1
-	}
-	if err := e.add(2*int64(len(tag)) + 5 + attrsLen); err != nil {
-		return err
-	}
-	for _, child := range value.Children {
-		if err := e.elementV1(child); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// elementV2 按PSF2编码格式精确核算单个直接关键字节点及其子树的序列化字节数
-// 入参: value 已校验设置元素
-// 返回: error 命名空间、预算或取消错误
-func (e *printBudgetEstimator) elementV2(value PrintSetting) error {
-	if err := checkContext(e.options.context); err != nil {
-		return err
-	}
-	tag, err := e.qname(value.Name)
-	if err != nil {
-		return err
-	}
-	local := printSettingNames[value.Kind]
-	psf2Prefix := e.prefixes[printFramework2NS]
-	attrsLen := 1 + int64(len(psf2Prefix)+len(":psftype")) + 2 + printXMLEscapedLen(local, true) + 1
-	if value.Kind == PrintSettingOption {
-		if value.HasDefault || value.Default {
-			flag := strconv.FormatBool(value.Default)
-			attrsLen += 1 + int64(len(psf2Prefix)+len(":default")) + 2 + int64(len(flag)) + 1
-		}
-		if value.Constraint != PrintConstraintUnknown {
-			cText, err := e.qname(xml.Name{Space: printKeywordsNS, Local: printConstraintNames[value.Constraint]})
-			if err != nil {
-				return err
-			}
-			attrsLen += 1 + int64(len(psf2Prefix)+len(":constrained")) + 2 + printXMLEscapedLen(cText, true) + 1
-		}
-	}
-	selectionIndex, valueIndex, refIndex := -1, -1, -1
-	xmlChildCount := 0
-	for index, child := range value.Children {
-		if e.capabilities && value.Kind == PrintSettingFeature && child.Kind == PrintSettingProperty && printFrameworkSpace(child.Name.Space) && child.Name.Local == "SelectionType" {
-			selVal, err := printCommonValue(child)
-			if err != nil {
-				return err
-			}
-			selText, err := e.qname(selVal.QName)
-			if err != nil {
-				return err
-			}
-			attrsLen += 1 + int64(len(psf2Prefix)+len(":selectiontype")) + 2 + printXMLEscapedLen(selText, true) + 1
-			selectionIndex = index
-			continue
-		}
-		if child.Kind == PrintSettingValue {
-			valueIndex = index
-			continue
-		}
-		if child.Kind == PrintSettingParameterRef {
-			refIndex = index
-			continue
-		}
-		xmlChildCount++
-	}
-	for index, child := range value.Children {
-		if index == selectionIndex || index == valueIndex || index == refIndex {
-			continue
-		}
-		if err := e.elementV2(child); err != nil {
-			return err
-		}
-	}
-	var textLen int64
-	var localScope map[string]string
-	if refIndex >= 0 {
-		refChild := value.Children[refIndex]
-		typeText, err := e.qname(xml.Name{Space: printFrameworkNS, Local: "ParameterRef"})
-		if err != nil {
-			return err
-		}
-		if _, err := e.qname(xml.Name{Space: xsiNamespace, Local: "type"}); err != nil {
-			return err
-		}
-		refText, err := e.qname(refChild.Name)
-		if err != nil {
-			return err
-		}
-		xsiPrefix := e.prefixes[xsiNamespace]
-		attrsLen += 1 + int64(len(xsiPrefix)+len(":type")) + 2 + printXMLEscapedLen(typeText, true) + 1
-		textLen = printXMLEscapedLen(refText, false)
-	}
-	if valueIndex >= 0 {
-		valChild := value.Children[valueIndex]
-		kind := valChild.Value.Type
-		if kind == (xml.Name{}) {
-			kind = xml.Name{Space: printValueNS, Local: "string"}
-		}
-		typeText, err := e.qname(kind)
-		if err != nil {
-			return err
-		}
-		if _, err := e.qname(xml.Name{Space: xsiNamespace, Local: "type"}); err != nil {
-			return err
-		}
-		text := valChild.Value.Text
-		if kind == (xml.Name{Space: printValueNS, Local: "QName"}) || kind == (xml.Name{Space: printValueNS, Local: "string"}) && valChild.Value.QName != (xml.Name{}) {
-			if valChild.Value.QName != (xml.Name{}) {
-				normalized := *valChild.Value
-				normalized.Type = kind
-				var extra int64
-				text, extra, localScope, err = e.valueQNameCost(normalized, value.Name.Space, xmlChildCount > 0)
-				if err != nil {
-					return err
-				}
-				attrsLen += extra
-			}
-		}
-		xsiPrefix := e.prefixes[xsiNamespace]
-		if localScope != nil {
-			xsiPrefix = printSettingsPrefix(localScope, xsiNamespace)
-			typeText = printSettingsPrefix(localScope, kind.Space) + ":" + kind.Local
-		}
-		attrsLen += 1 + int64(len(xsiPrefix)+len(":type")) + 2 + printXMLEscapedLen(typeText, true) + 1
-		textLen = printXMLEscapedLen(text, false)
-	}
-	nodeTag := tag
-	if localScope != nil {
-		nodeTag = printSettingsPrefix(localScope, value.Name.Space) + ":" + value.Name.Local
-		newPSF2 := printSettingsPrefix(localScope, printFramework2NS)
-		if newPSF2 != psf2Prefix {
-			diff := int64(len(newPSF2) - len(psf2Prefix))
-			attrsLen += diff
-			if value.Kind == PrintSettingOption {
-				if value.HasDefault || value.Default {
-					attrsLen += diff
-				}
-				if value.Constraint != PrintConstraintUnknown {
-					attrsLen += diff
-				}
-			}
-			if selectionIndex >= 0 {
-				attrsLen += diff
-			}
-		}
-	}
-	return e.add(2*int64(len(nodeTag)) + 5 + attrsLen + textLen)
-}
-
-// printXMLEscapedLen 按Go标准encoding/xml转义规则计算字符串序列化后的精确字节数
-// 入参: text 待转义字符串, attr 是否作为XML属性值转义
-// 返回: int64 转义后的精确字节长度
-func printXMLEscapedLen(text string, attr bool) int64 {
-	total := int64(len(text))
-	for i := range len(text) {
-		switch text[i] {
-		case '"', '\'', '&', '\t', '\r':
-			total += 4
-		case '<', '>':
-			total += 3
-		case '\n':
-			if attr {
-				total += 4
-			}
-		}
-	}
-	return total
+	_, err := printSettingsEncodedSize(settings, options, mode)
+	return err
 }
 
 // Summary 提取PrintCapabilities的通用只读能力摘要视图，涵盖可打印区、支持纸型微米表、DPI列表、参数域与标准/自定义Feature
@@ -2079,16 +1642,36 @@ func (p *PrintCapabilities) Summary() (PrintCapabilitiesSummary, error) {
 		return PrintCapabilitiesSummary{}, err
 	}
 	summary := PrintCapabilitiesSummary{Version: model.Version}
-	paramDefaults := make(map[xml.Name]int64)
+	paramDefaults := make(map[xml.Name]*PrintValue)
+	copiesPriority := 0
 	for _, el := range model.Elements {
 		if el.Kind != PrintSettingParameterDef {
 			continue
 		}
 		param := printExtractParameterSummary(el)
 		summary.Parameters = append(summary.Parameters, param)
-		if param.DataType == "integer" {
-			if n, err := strconv.ParseInt(strings.TrimSpace(param.DefaultValue), 10, 64); err == nil {
-				paramDefaults[printCanonicalKey(el.Name)] = n
+		for _, prop := range el.Children {
+			if prop.Kind == PrintSettingProperty && printFrameworkSpace(prop.Name.Space) && prop.Name.Local == "DefaultValue" && len(prop.Children) == 1 && prop.Children[0].Value != nil {
+				valCopy := *prop.Children[0].Value
+				paramDefaults[printCanonicalKey(el.Name)] = &valCopy
+				break
+			}
+		}
+		if printPublicKeywordSpace(el.Name.Space) && param.DataType == "integer" {
+			priority := 0
+			switch el.Name.Local {
+			case "JobCopiesAllDocuments":
+				priority = 3
+			case "DocumentCopiesAllPages":
+				priority = 2
+			case "PageCopies":
+				priority = 1
+			}
+			if priority > copiesPriority {
+				if maxVal, err := strconv.ParseInt(strings.TrimSpace(param.MaxValue), 10, 64); err == nil && maxVal > 0 && maxVal <= int64(math.MaxInt) {
+					summary.MaxCopies = int(maxVal)
+					copiesPriority = priority
+				}
 			}
 		}
 	}
@@ -2126,8 +1709,8 @@ func (p *PrintCapabilities) Summary() (PrintCapabilitiesSummary, error) {
 				if printPublicKeywordSpace(child.Name.Space) {
 					media.StandardName = child.Name.Local
 				}
-				media.WidthMicrons = printOptionInt64ScoredOrDefault(child, "MediaSizeWidth", paramDefaults)
-				media.HeightMicrons = printOptionInt64ScoredOrDefault(child, "MediaSizeHeight", paramDefaults)
+				media.WidthMicrons = printOptionScoredInt64(child, "MediaSizeWidth", paramDefaults)
+				media.HeightMicrons = printOptionScoredInt64(child, "MediaSizeHeight", paramDefaults)
 				if (media.WidthMicrons == 0 || media.HeightMicrons == 0) && media.StandardName != "" {
 					if dims, ok := printMediaSizes[media.StandardName]; ok {
 						if media.WidthMicrons == 0 {
@@ -2163,8 +1746,9 @@ func (p *PrintCapabilities) Summary() (PrintCapabilitiesSummary, error) {
 				}
 				summary.Resolutions = append(summary.Resolutions, PrintResolutionSummary{
 					Name:        child.Name,
-					X:           printOptionIntScored(child, "ResolutionX"),
-					Y:           printOptionIntScored(child, "ResolutionY"),
+					X:           printOptionScoredInt(child, "ResolutionX", paramDefaults),
+					Y:           printOptionScoredInt(child, "ResolutionY", paramDefaults),
+					Qualitative: printOptionScoredKeyword(child, "QualitativeResolution", paramDefaults),
 					Default:     optIdx == defaultIdx,
 					Constrained: child.Constraint,
 				})
@@ -2172,6 +1756,14 @@ func (p *PrintCapabilities) Summary() (PrintCapabilitiesSummary, error) {
 			}
 		case "PageOrientation":
 			summary.Orientations = printCollectPublicOptionKeywords(el, summary.Orientations)
+		case "PageScaling":
+			summary.Scalings = printCollectPublicOptionKeywords(el, summary.Scalings)
+		case "PageMirrorImage":
+			summary.MirrorImage = printCollectPublicOptionKeywords(el, summary.MirrorImage)
+		case "JobPageOrder":
+			summary.PageOrders = printCollectPublicOptionKeywords(el, summary.PageOrders)
+		case "JobCollateAllDocuments", "DocumentCollate":
+			summary.CollateModes = printCollectPublicOptionKeywords(el, summary.CollateModes)
 		case "DocumentDuplex", "JobDuplexAllDocumentsContiguously":
 			for _, child := range el.Children {
 				if child.Kind != PrintSettingOption || !printOptionUnconstrained(child) || !printPublicKeywordSpace(child.Name.Space) {
@@ -2197,8 +1789,17 @@ func (p *PrintCapabilities) Summary() (PrintCapabilitiesSummary, error) {
 				if child.Kind != PrintSettingOption || !printOptionUnconstrained(child) {
 					continue
 				}
-				if count := printOptionIntScored(child, "PagesPerSheet"); count > 0 && !slices.Contains(summary.NUpCounts, count) {
+				if count := printOptionScoredInt(child, "PagesPerSheet", paramDefaults); count > 0 && !slices.Contains(summary.NUpCounts, count) {
 					summary.NUpCounts = append(summary.NUpCounts, count)
+				}
+			}
+		case "PagePoster":
+			for _, child := range el.Children {
+				if child.Kind != PrintSettingOption || !printOptionUnconstrained(child) {
+					continue
+				}
+				if count := printOptionScoredInt(child, "SheetsPerPage", paramDefaults); count > 0 && !slices.Contains(summary.PosterCounts, count) {
+					summary.PosterCounts = append(summary.PosterCounts, count)
 				}
 			}
 		case "PageOutputColor":
@@ -2227,6 +1828,14 @@ func (p *PrintCapabilities) Summary() (PrintCapabilitiesSummary, error) {
 			summary.RenderingIntents = printCollectPublicOptionKeywords(el, summary.RenderingIntents)
 		case "PageOutputQuality":
 			summary.OutputQualities = printCollectPublicOptionKeywords(el, summary.OutputQualities)
+		case "PagePhotoPrintingIntent":
+			summary.PhotoPrintingIntents = printCollectPublicOptionKeywords(el, summary.PhotoPrintingIntents)
+		case "JobInputBin", "DocumentInputBin", "PageInputBin":
+			summary.InputBins = printCollectPublicOptionKeywords(el, summary.InputBins)
+		case "JobOutputBin", "DocumentOutputBin", "PageOutputBin":
+			summary.OutputBins = printCollectPublicOptionKeywords(el, summary.OutputBins)
+		case "PageMediaType":
+			summary.MediaTypes = printCollectPublicOptionKeywords(el, summary.MediaTypes)
 		case "DocumentBinding", "JobBindAllDocuments":
 			for _, child := range el.Children {
 				if child.Kind != PrintSettingOption || !printOptionUnconstrained(child) || !printPublicKeywordSpace(child.Name.Space) {
@@ -2395,7 +2004,7 @@ func printExtractPageImageableSummary(prop PrintSetting) (PrintImageableAreaSumm
 	return out, got == 63
 }
 
-// printExtractFeatureSummary 从单个能力Feature节点提取选择方式、可用选项与默认选项摘要
+// printExtractFeatureSummary 从单个能力Feature节点递归提取选择方式、可用选项、默认选项与子Feature摘要
 // 入参: feature 能力Feature节点, version 文档框架版本号
 // 返回: PrintFeatureSummary Feature摘要, error 选择属性非法错误
 func printExtractFeatureSummary(feature PrintSetting, version uint32) (PrintFeatureSummary, error) {
@@ -2407,13 +2016,23 @@ func printExtractFeatureSummary(feature PrintSetting, version uint32) (PrintFeat
 	defaultIdx := printCapabilityDefaultOptionIndex(feature, version)
 	optIdx := 0
 	for _, child := range feature.Children {
+		if child.Kind == PrintSettingFeature {
+			sub, err := printExtractFeatureSummary(child, version)
+			if err != nil {
+				return PrintFeatureSummary{}, err
+			}
+			out.SubFeatures = append(out.SubFeatures, sub)
+			continue
+		}
 		if child.Kind != PrintSettingOption {
 			continue
 		}
 		if printOptionUnconstrained(child) {
 			out.Options = append(out.Options, child.Name)
-			if version == 2 && selection == PrintSelectionMany && child.Default {
-				out.DefaultOptions = append(out.DefaultOptions, child.Name)
+			if version == 2 && selection == PrintSelectionMany {
+				if child.HasDefault && child.Default {
+					out.DefaultOptions = append(out.DefaultOptions, child.Name)
+				}
 			} else if optIdx == defaultIdx {
 				out.DefaultOptions = append(out.DefaultOptions, child.Name)
 			}
@@ -2423,26 +2042,83 @@ func printExtractFeatureSummary(feature PrintSetting, version uint32) (PrintFeat
 	return out, nil
 }
 
-// printOptionInt64ScoredOrDefault 读取Option指定公共ScoredProperty的64位整数值，遇ParameterRef时回退参数默认值
-// 入参: option 能力Option节点, local 公共关键字本地名称, paramDefaults 整数参数默认值映射
-// 返回: int64 整数值，不可得时为0
-func printOptionInt64ScoredOrDefault(option PrintSetting, local string, paramDefaults map[xml.Name]int64) int64 {
+// printOptionScoredValue 读取Option下指定公共ScoredProperty的标量值，支持通过参数表解析ParameterRef
+// 入参: option 选项节点, local 公共关键字本地名称, paramValues 参数值映射，可为nil
+// 返回: *PrintValue 命中的标量值，未找到或未初始化为nil
+func printOptionScoredValue(option PrintSetting, local string, paramValues map[xml.Name]*PrintValue) *PrintValue {
 	for _, child := range option.Children {
 		if child.Kind != PrintSettingScoredProperty || !printPublicKeywordSpace(child.Name.Space) || child.Name.Local != local {
 			continue
 		}
 		val, ref := printScoredValue(child.Children)
 		if ref != (xml.Name{}) {
-			return paramDefaults[printCanonicalKey(ref)]
+			if paramValues == nil {
+				return nil
+			}
+			return paramValues[printCanonicalKey(ref)]
 		}
-		if val == nil {
-			return 0
-		}
-		parsed, err := strconv.ParseInt(strings.Trim(val.Text, " \t\r\n"), 10, 64)
-		if err != nil {
-			return 0
-		}
+		return val
+	}
+	return nil
+}
+
+// printOptionScoredInt64 读取Option指定公共ScoredProperty的64位整数值，支持ParameterRef、xs:integer及xs:decimal数值
+// 入参: option 选项节点, local 公共关键字本地名称, paramValues 参数值映射，可为nil
+// 返回: int64 数值结果，不可解析或超限时为0
+func printOptionScoredInt64(option PrintSetting, local string, paramValues map[xml.Name]*PrintValue) int64 {
+	val := printOptionScoredValue(option, local, paramValues)
+	if val == nil {
+		return 0
+	}
+	trimmed := strings.Trim(val.Text, " \t\r\n")
+	if trimmed == "" {
+		return 0
+	}
+	if parsed, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
 		return parsed
 	}
-	return 0
+	if !printDecimal(trimmed) {
+		return 0
+	}
+	rat, ok := new(big.Rat).SetString(trimmed)
+	if !ok {
+		return 0
+	}
+	f, _ := rat.Float64()
+	if !geometryFinite(f) {
+		return 0
+	}
+	rounded := math.Round(f)
+	if rounded < float64(math.MinInt64) || rounded >= float64(math.MaxInt64) {
+		return 0
+	}
+	return int64(rounded)
+}
+
+// printOptionScoredInt 读取Option指定公共ScoredProperty的int数值，支持ParameterRef、xs:integer及xs:decimal
+// 入参: option 选项节点, local 公共关键字本地名称, paramValues 参数值映射，可为nil
+// 返回: int 数值结果，不可解析或超限时为0
+func printOptionScoredInt(option PrintSetting, local string, paramValues map[xml.Name]*PrintValue) int {
+	v := printOptionScoredInt64(option, local, paramValues)
+	if v < int64(math.MinInt) || v > int64(math.MaxInt) {
+		return 0
+	}
+	return int(v)
+}
+
+// printOptionScoredKeyword 读取Option指定公共ScoredProperty的公共关键字或字符串值
+// 入参: option 选项节点, local 公共关键字本地名称, paramValues 参数值映射，可为nil
+// 返回: string 关键字或文本值，未声明时为空字符串
+func printOptionScoredKeyword(option PrintSetting, local string, paramValues map[xml.Name]*PrintValue) string {
+	val := printOptionScoredValue(option, local, paramValues)
+	if val == nil {
+		return ""
+	}
+	if val.QName != (xml.Name{}) && printPublicKeywordSpace(val.QName.Space) {
+		return val.QName.Local
+	}
+	if val.Type == (xml.Name{}) || val.Type == (xml.Name{Space: printValueNS, Local: "string"}) {
+		return strings.TrimSpace(val.Text)
+	}
+	return ""
 }

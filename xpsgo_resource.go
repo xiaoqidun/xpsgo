@@ -157,15 +157,16 @@ type resourceAlternateState struct {
 
 // resourceMarkupScopeTracker 在词元遍历期间维护MCE作用域栈，识别合法可忽略及保留扩展
 type resourceMarkupScopeTracker struct {
-	format          Format
-	models          bool
-	selectAlternate bool
-	ignoreOnly      bool
-	processor       compatibilityProcessor
-	scopes          []compatibilityScope
-	ignoredDepth    int
-	preservedDepth  int
-	alternates      []resourceAlternateState
+	format             Format
+	models             bool
+	selectAlternate    bool
+	ignoreOnly         bool
+	processor          compatibilityProcessor
+	scopes             []compatibilityScope
+	ignoredDepth       int
+	preservedDepth     int
+	preservedSkipDepth int
+	alternates         []resourceAlternateState
 }
 
 // ResourceRemoval 记录移除的标准资源及其逻辑字节数，包含一并移除的附属关系标记
@@ -497,28 +498,8 @@ func (r *Reader) ResourceDictionary(ctx context.Context, part string) (*Resource
 		return nil, err
 	}
 	scene := newSceneParser(r.format, parser.graph)
-	for _, definition := range parser.graph.Definitions {
-		if err := checkContext(ctx); err != nil {
-			return nil, err
-		}
-		switch resourceKind(definition.Kind) {
-		case "geometry":
-			if _, err := scene.geometry(definition.Element, true); err != nil {
-				return nil, err
-			}
-		case "matrix":
-			if _, err := scene.matrix(definition.Element, true); err != nil {
-				return nil, err
-			}
-		case "brush":
-			if _, err := scene.brush(definition.Element, true); err != nil {
-				return nil, err
-			}
-		case "visual":
-			if _, err := scene.elementValue(definition.Element); err != nil {
-				return nil, err
-			}
-		}
+	if err := scene.parseDefinitions(ctx); err != nil {
+		return nil, err
 	}
 	keyNS := formatNamespace(r.format) + "/resourcedictionary-key"
 	entries := make([]ResourceEntry, 0, len(root.Children))
@@ -1855,13 +1836,16 @@ func (t *resourceMarkupScopeTracker) visit(token xml.Token, node *xmlElement) (b
 	if _, end := token.(xml.EndElement); end {
 		if len(t.scopes) != 0 {
 			curDepth := len(t.scopes)
+			if t.preservedSkipDepth == curDepth {
+				t.preservedSkipDepth = 0
+			}
 			if t.ignoredDepth == curDepth {
 				t.ignoredDepth = 0
 			}
 			if t.preservedDepth == curDepth {
 				t.preservedDepth = 0
 			}
-			if t.selectAlternate && len(t.alternates) != 0 {
+			if len(t.alternates) != 0 && t.preservedSkipDepth == 0 {
 				top := &t.alternates[len(t.alternates)-1]
 				if top.depth == curDepth {
 					choices := top.choices
@@ -1881,7 +1865,7 @@ func (t *resourceMarkupScopeTracker) visit(token xml.Token, node *xmlElement) (b
 		return true, compatibilityScope{}, nil
 	}
 	if data, ok := token.(xml.CharData); ok {
-		if t.selectAlternate && t.ignoredDepth == 0 && len(t.alternates) != 0 {
+		if (t.selectAlternate && t.ignoredDepth == 0 || t.preservedDepth > 0 && t.preservedSkipDepth == 0) && len(t.alternates) != 0 {
 			top := &t.alternates[len(t.alternates)-1]
 			if len(t.scopes) == top.contentDepths[len(top.contentDepths)-1] && len(compatibilityWords(string(data))) != 0 {
 				return false, compatibilityScope{}, fmt.Errorf("%w: text directly inside AlternateContent", ErrInvalid)
@@ -1897,102 +1881,39 @@ func (t *resourceMarkupScopeTracker) visit(token xml.Token, node *xmlElement) (b
 		inherited = t.scopes[len(t.scopes)-1]
 	}
 	if t.ignoredDepth > 0 {
-		scope := inherited
-		if t.preservedDepth > 0 {
-			isControl := node.Name.Space == mcNamespace
-			isBranch := isControl && (node.Name.Local == "Choice" || node.Name.Local == "Fallback")
-			var err error
-			scope, err = t.processor.rulesChecked(node, inherited, !isBranch)
-			if err != nil {
-				return false, scope, err
-			}
-			if isControl && node.Name.Local != "AlternateContent" && !isBranch {
-				return false, scope, fmt.Errorf("%w: unexpected MCE element %s", ErrInvalid, node.Name.Local)
-			}
-			if err := t.processor.validateAttributes(node, scope, isControl); err != nil {
-				return false, scope, err
+		if t.preservedDepth == 0 || t.preservedSkipDepth > 0 {
+			t.scopes = append(t.scopes, inherited)
+			return true, inherited, nil
+		}
+		if len(t.alternates) != 0 {
+			top := &t.alternates[len(t.alternates)-1]
+			if len(t.scopes) == top.contentDepths[len(top.contentDepths)-1] {
+				return t.visitAlternateChild(node, inherited, top, true)
 			}
 		}
+		isControl := node.Name.Space == mcNamespace
+		isBranch := isControl && (node.Name.Local == "Choice" || node.Name.Local == "Fallback")
+		scope, err := t.processor.rulesChecked(node, inherited, !isBranch)
+		if err != nil {
+			return false, scope, err
+		}
+		if isControl && node.Name.Local != "AlternateContent" && !isBranch {
+			return false, scope, fmt.Errorf("%w: unexpected MCE element %s", ErrInvalid, node.Name.Local)
+		}
+		allowSelfSpace := !isControl && !t.processor.understood[node.Name.Space] && node.Name.Space != ""
+		if err := t.processor.validateAttributesMode(node, scope, isControl, allowSelfSpace); err != nil {
+			return false, scope, err
+		}
 		t.scopes = append(t.scopes, scope)
+		if isControl && node.Name.Local == "AlternateContent" {
+			t.alternates = append(t.alternates, resourceAlternateState{depth: len(t.scopes), contentDepths: []int{len(t.scopes)}})
+		}
 		return true, scope, nil
 	}
 	if t.selectAlternate && len(t.alternates) != 0 {
 		top := &t.alternates[len(t.alternates)-1]
 		if len(t.scopes) == top.contentDepths[len(top.contentDepths)-1] {
-			isBranch := node.Name.Space == mcNamespace && (node.Name.Local == "Choice" || node.Name.Local == "Fallback")
-			scope, err := t.processor.rulesChecked(node, inherited, !isBranch)
-			if err != nil {
-				return false, scope, err
-			}
-			t.scopes = append(t.scopes, scope)
-			if !t.processor.understood[node.Name.Space] {
-				if !scope.ignorable[node.Name.Space] {
-					return false, scope, fmt.Errorf("%w: AlternateContent child namespace %q", ErrUnsupported, node.Name.Space)
-				}
-				if scope.processes(node.Name) {
-					if err := compatibilityNoXMLContext(node); err != nil {
-						return false, scope, err
-					}
-					if err := t.processor.validateAttributes(node, scope, false); err != nil {
-						return false, scope, err
-					}
-					top.contentDepths = append(top.contentDepths, len(t.scopes))
-					return true, scope, nil
-				}
-				if scope.preservesElement(node.Name) {
-					if err := t.processor.validateAttributes(node, scope, false); err != nil {
-						return false, scope, err
-					}
-					t.preservedDepth = len(t.scopes)
-				}
-				t.ignoredDepth = len(t.scopes)
-				return true, scope, nil
-			}
-			if !isBranch {
-				return false, scope, fmt.Errorf("%w: unexpected AlternateContent child %s", ErrInvalid, node.Name.Local)
-			}
-			if err := t.processor.validateAttributes(node, scope, true); err != nil {
-				return false, scope, err
-			}
-			selectable := true
-			if node.Name.Local == "Choice" {
-				if top.sawFallback {
-					return false, scope, fmt.Errorf("%w: Choice follows Fallback", ErrInvalid)
-				}
-				top.choices++
-				requires, ok := node.attributeNS("", "Requires")
-				if !ok {
-					return false, scope, fmt.Errorf("%w: Choice requires an unqualified Requires attribute", ErrInvalid)
-				}
-				uris, err := compatibilityPrefixes(node, requires)
-				if err != nil {
-					return false, scope, err
-				}
-				if len(uris) == 0 {
-					return false, scope, fmt.Errorf("%w: empty Choice Requires", ErrInvalid)
-				}
-				for _, uri := range uris {
-					if !t.processor.understood[uri] {
-						selectable = false
-					}
-				}
-			} else {
-				if top.sawFallback || top.choices == 0 {
-					return false, scope, fmt.Errorf("%w: Fallback must occur once after all Choices", ErrInvalid)
-				}
-				top.sawFallback = true
-			}
-			if !top.selected && selectable {
-				if value, ok := node.attributeNS(mcNamespace, "MustUnderstand"); ok {
-					if err := t.processor.checkMustUnderstand(node, value); err != nil {
-						return false, scope, err
-					}
-				}
-				top.selected = true
-				return true, scope, nil
-			}
-			t.ignoredDepth = len(t.scopes)
-			return true, scope, nil
+			return t.visitAlternateChild(node, inherited, top, false)
 		}
 	}
 	if t.selectAlternate && node.Name.Space == mcNamespace {
@@ -2046,6 +1967,71 @@ func (t *resourceMarkupScopeTracker) visit(token xml.Token, node *xmlElement) (b
 		return false, scope, err
 	}
 	return false, scope, nil
+}
+
+// visitAlternateChild 校验AlternateContent直接子元素、ProcessContent包装及分支选择，并在保留子树内跳过未选分支后代
+// 入参: node 当前元素, inherited 祖先兼容性作用域, top 栈顶AlternateContent状态, preserved 是否处于PreserveElements保留子树内
+// 返回: bool 是否应跳过消费标记语义扫描, compatibilityScope 当前元素生效作用域, error 兼容性或未支持语义错误
+func (t *resourceMarkupScopeTracker) visitAlternateChild(node *xmlElement, inherited compatibilityScope, top *resourceAlternateState, preserved bool) (bool, compatibilityScope, error) {
+	isBranch := node.Name.Space == mcNamespace && (node.Name.Local == "Choice" || node.Name.Local == "Fallback")
+	scope, err := t.processor.rulesChecked(node, inherited, !isBranch)
+	if err != nil {
+		return false, scope, err
+	}
+	t.scopes = append(t.scopes, scope)
+	if !t.processor.understood[node.Name.Space] {
+		if !scope.ignorable[node.Name.Space] {
+			return false, scope, fmt.Errorf("%w: AlternateContent child namespace %q", ErrUnsupported, node.Name.Space)
+		}
+		if scope.processes(node.Name) {
+			if err := compatibilityNoXMLContext(node); err != nil {
+				return false, scope, err
+			}
+			if err := t.processor.validateAttributes(node, scope, false); err != nil {
+				return false, scope, err
+			}
+			top.contentDepths = append(top.contentDepths, len(t.scopes))
+			return true, scope, nil
+		}
+		if scope.preservesElement(node.Name) {
+			if err := t.processor.validateAttributes(node, scope, false); err != nil {
+				return false, scope, err
+			}
+			if !preserved {
+				t.preservedDepth = len(t.scopes)
+				t.ignoredDepth = len(t.scopes)
+			}
+			return true, scope, nil
+		}
+		if preserved {
+			t.preservedSkipDepth = len(t.scopes)
+		} else {
+			t.ignoredDepth = len(t.scopes)
+		}
+		return true, scope, nil
+	}
+	if !isBranch {
+		return false, scope, fmt.Errorf("%w: unexpected AlternateContent child %s", ErrInvalid, node.Name.Local)
+	}
+	selectable, err := t.processor.checkAlternateBranch(node, scope, &top.choices, &top.sawFallback)
+	if err != nil {
+		return false, scope, err
+	}
+	if !top.selected && selectable {
+		if value, ok := node.attributeNS(mcNamespace, "MustUnderstand"); ok {
+			if err := t.processor.checkMustUnderstand(node, value); err != nil {
+				return false, scope, err
+			}
+		}
+		top.selected = true
+		return true, scope, nil
+	}
+	if preserved {
+		t.preservedSkipDepth = len(t.scopes)
+	} else {
+		t.ignoredDepth = len(t.scopes)
+	}
+	return true, scope, nil
 }
 
 // validateResourceMarkupScope 在已知MCE作用域下校验原始布局标记，放行当前作用域合法可忽略扩展属性与元素

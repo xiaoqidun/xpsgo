@@ -30,6 +30,7 @@ import (
 	"math"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -54,9 +55,56 @@ const (
 	TIFFCompressionNone TIFFCompression = iota
 	// TIFFCompressionPackBits 表示采用TIFF PackBits字节游程无损压缩
 	TIFFCompressionPackBits
-	// TIFFCompressionDeflate 表示采用Adobe Deflate无损压缩
+	// TIFFCompressionDeflate 表示采用Adobe Deflate无损压缩，部分老旧Windows XPS消费者兼容性弱于TIFFCompressionLZW与TIFFCompressionPackBits
 	TIFFCompressionDeflate
+	// TIFFCompressionLZW 表示采用TIFF 6.0标准MSB优先LZW无损压缩
+	TIFFCompressionLZW
+	// TIFFCompressionCCITTGroup4 表示采用ITU-T T.6二维游程无损压缩，输出1位二值黑白TIFF图像
+	TIFFCompressionCCITTGroup4
 )
+
+// tiffTargetStripBytes 定义多Strip TIFF写出时单条带的目标未压缩字节数
+const tiffTargetStripBytes = 64 << 10
+
+// pngStreamIDATChunk 定义逐行流式PNG编码器的单个IDAT块目标载荷长度
+const pngStreamIDATChunk = 32 << 10
+
+// ColorCMYK16Model 表示每通道16位无符号CMYK图像的标准颜色转换模型
+var ColorCMYK16Model color.Model = color.ModelFunc(cmyk16Model)
+
+// tiffFaxWhiteEncode 保存ITU-T T.4/T.6白色游程的编码表，高16位为位宽，低16位为MSB码字
+var tiffFaxWhiteEncode = buildTIFFFaxEncodeTable([]string{
+	"00110101", "000111", "0111", "1000", "1011", "1100", "1110", "1111",
+	"10011", "10100", "00111", "01000", "001000", "000011", "110100", "110101",
+	"101010", "101011", "0100111", "0001100", "0001000", "0010111", "0000011", "0000100",
+	"0101000", "0101011", "0010011", "0100100", "0011000", "00000010", "00000011", "00011010",
+	"00011011", "00010010", "00010011", "00010100", "00010101", "00010110", "00010111", "00101000",
+	"00101001", "00101010", "00101011", "00101100", "00101101", "00000100", "00000101", "00001010",
+	"00001011", "01010010", "01010011", "01010100", "01010101", "00100100", "00100101", "01011000",
+	"01011001", "01011010", "01011011", "01001010", "01001011", "00110010", "00110011", "00110100",
+	"11011", "10010", "010111", "0110111", "00110110", "00110111", "01100100", "01100101",
+	"01101000", "01100111", "011001100", "011001101", "011010010", "011010011", "011010100", "011010101",
+	"011010110", "011010111", "011011000", "011011001", "011011010", "011011011", "010011000", "010011001",
+	"010011010", "011000", "010011011", "00000001000", "00000001100", "00000001101", "000000010010", "000000010011",
+	"000000010100", "000000010101", "000000010110", "000000010111", "000000011100", "000000011101", "000000011110", "000000011111",
+})
+
+// tiffFaxBlackEncode 保存ITU-T T.4/T.6黑色游程的编码表，高16位为位宽，低16位为MSB码字
+var tiffFaxBlackEncode = buildTIFFFaxEncodeTable([]string{
+	"0000110111", "010", "11", "10", "011", "0011", "0010", "00011",
+	"000101", "000100", "0000100", "0000101", "0000111", "00000100", "00000111", "000011000",
+	"0000010111", "0000011000", "0000001000", "00001100111", "00001101000", "00001101100", "00000110111", "00000101000",
+	"00000010111", "00000011000", "000011001010", "000011001011", "000011001100", "000011001101", "000001101000", "000001101001",
+	"000001101010", "000001101011", "000011010010", "000011010011", "000011010100", "000011010101", "000011010110", "000011010111",
+	"000001101100", "000001101101", "000011011010", "000011011011", "000001010100", "000001010101", "000001010110", "000001010111",
+	"000001100100", "000001100101", "000001010010", "000001010011", "000000100100", "000000110111", "000000111000", "000000100111",
+	"000000101000", "000001011000", "000001011001", "000000101011", "000000101100", "000001011010", "000001100110", "000001100111",
+	"0000001111", "000011001000", "000011001001", "000001011011", "000000110011", "000000110100", "000000110101", "0000001101100",
+	"0000001101101", "0000001001010", "0000001001011", "0000001001100", "0000001001101", "0000001110010", "0000001110011", "0000001110100",
+	"0000001110101", "0000001110110", "0000001110111", "0000001010010", "0000001010011", "0000001010100", "0000001010101", "0000001011010",
+	"0000001011011", "0000001100100", "0000001100101", "00000001000", "00000001100", "00000001101", "000000010010", "000000010011",
+	"000000010100", "000000010101", "000000010110", "000000010111", "000000011100", "000000011101", "000000011110", "000000011111",
+})
 
 // ImageEncodeFormat 表示写侧嵌入Go图像时使用的编码格式
 type ImageEncodeFormat uint8
@@ -155,6 +203,89 @@ type GeometryBuilder struct {
 	err               error
 }
 
+// ColorCMYK16 表示每通道16位无符号精度的CMYK颜色
+type ColorCMYK16 struct {
+	C uint16
+	M uint16
+	Y uint16
+	K uint16
+}
+
+// ImageCMYK16 表示每通道16位无符号精度的CMYK内存图像，Pix按大端C、M、Y、K顺序存放每像素8字节
+type ImageCMYK16 struct {
+	Pix    []uint8
+	Stride int
+	Rect   image.Rectangle
+}
+
+// OutlineBuilderOptions 设置目录书签构建器的默认目录语言及基准部件路径
+// DocumentPart为空默认使用/Documents/1/FixedDoc.fdoc，SequencePart为空默认使用/FixedDocSeq.fdseq，StructurePart为空默认取DocumentPart同目录下的Structure1.struct
+type OutlineBuilderOptions struct {
+	Language      string
+	StructurePart string
+	DocumentPart  string
+	SequencePart  string
+}
+
+// OutlineEntryOptions 设置单个目录书签节点的可选xml:lang语言覆盖
+type OutlineEntryOptions struct {
+	Language string
+}
+
+// OutlineBuilder 协同构建合标的XPS DocumentOutline目录树并自动为目标Page补齐与去重LinkTargets
+type OutlineBuilder struct {
+	language      string
+	structurePart string
+	documentPart  string
+	sequencePart  string
+	entries       []OutlineEntry
+	stories       []Story
+	usedAnchors   map[string]*Page
+	autoSeq       int
+	err           error
+}
+
+// tiffStripSpec 描述多Strip TIFF的像素布局、压缩方式、分辨率与可选ICC配置
+type tiffStripSpec struct {
+	width        int
+	height       int
+	rowsPerStrip int
+	spp          uint16
+	bps          uint16
+	photometric  uint16
+	extraSample  uint16
+	hasExtra     bool
+	compression  TIFFCompression
+	dpix         float64
+	dpiy         float64
+	icc          []byte
+}
+
+// tiffBitWriter 按MSB优先顺序向有界缓冲写出变长位码流
+type tiffBitWriter struct {
+	out   []byte
+	acc   uint64
+	bits  uint
+	limit int64
+}
+
+// pngIDATWriter 将zlib压缩流分块封装为标准PNG IDAT数据块写入底层输出流
+type pngIDATWriter struct {
+	w   io.Writer
+	buf []byte
+}
+
+// pngRowEncoder 逐行接收原始扫描行并流式写出合规PNG字节流，不缓冲整幅未压缩图像
+type pngRowEncoder struct {
+	w        io.Writer
+	idat     pngIDATWriter
+	zw       *zlib.Writer
+	height   int
+	rowBytes int
+	rows     int
+	closed   bool
+}
+
 // String 返回图像编码格式的可读名称
 // 返回: string 格式名称
 func (f ImageEncodeFormat) String() string {
@@ -184,9 +315,369 @@ func (c TIFFCompression) String() string {
 		return "packbits"
 	case TIFFCompressionDeflate:
 		return "deflate"
+	case TIFFCompressionLZW:
+		return "lzw"
+	case TIFFCompressionCCITTGroup4:
+		return "ccitt-group4"
 	default:
 		return fmt.Sprintf("TIFFCompression(%d)", c)
 	}
+}
+
+// RGBA 将16位CMYK颜色转换为标准Go预乘16位RGBA四元组，实现color.Color标准Interface
+// 返回: uint32 红色分量, uint32 绿色分量, uint32 蓝色分量, uint32 不透明Alpha分量
+func (c ColorCMYK16) RGBA() (uint32, uint32, uint32, uint32) {
+	w := uint32(65535 - c.K)
+	r := uint32(65535-c.C) * w / 65535
+	g := uint32(65535-c.M) * w / 65535
+	b := uint32(65535-c.Y) * w / 65535
+	return r, g, b, 0xffff
+}
+
+// cmyk16Model 将任意Go颜色转换为16位CMYK颜色
+// 入参: c 源Go颜色
+// 返回: color.Color 转换后的ColorCMYK16颜色
+func cmyk16Model(c color.Color) color.Color {
+	if value, ok := c.(ColorCMYK16); ok {
+		return value
+	}
+	if value, ok := c.(color.CMYK); ok {
+		return ColorCMYK16{C: uint16(value.C) * 257, M: uint16(value.M) * 257, Y: uint16(value.Y) * 257, K: uint16(value.K) * 257}
+	}
+	r, g, b, _ := c.RGBA()
+	w := max(r, g, b)
+	if w == 0 {
+		return ColorCMYK16{K: 0xffff}
+	}
+	return ColorCMYK16{
+		C: uint16((w - r) * 65535 / w),
+		M: uint16((w - g) * 65535 / w),
+		Y: uint16((w - b) * 65535 / w),
+		K: uint16(65535 - w),
+	}
+}
+
+// NewImageCMYK16 创建指定矩形范围的16位CMYK内存图像
+// 入参: r 像素矩形范围
+// 返回: *ImageCMYK16 初始化完成的16位CMYK图像
+func NewImageCMYK16(r image.Rectangle) *ImageCMYK16 {
+	w, h := r.Dx(), r.Dy()
+	stride := 8 * w
+	return &ImageCMYK16{Pix: make([]uint8, stride*h), Stride: stride, Rect: r}
+}
+
+// ColorModel 返回16位CMYK图像的颜色模型
+// 返回: color.Model 16位CMYK颜色模型
+func (p *ImageCMYK16) ColorModel() color.Model {
+	return ColorCMYK16Model
+}
+
+// Bounds 返回16位CMYK图像的像素边界矩形
+// 返回: image.Rectangle 图像边界矩形
+func (p *ImageCMYK16) Bounds() image.Rectangle {
+	return p.Rect
+}
+
+// At 返回指定坐标处的16位CMYK颜色
+// 入参: x 横坐标, y 纵坐标
+// 返回: color.Color 像素颜色
+func (p *ImageCMYK16) At(x, y int) color.Color {
+	return p.CMYK16At(x, y)
+}
+
+// CMYK16At 读取指定坐标处的强类型16位CMYK颜色，越界时返回零值
+// 入参: x 横坐标, y 纵坐标
+// 返回: ColorCMYK16 像素16位CMYK颜色
+func (p *ImageCMYK16) CMYK16At(x, y int) ColorCMYK16 {
+	if !(image.Point{X: x, Y: y}.In(p.Rect)) {
+		return ColorCMYK16{}
+	}
+	off := p.PixOffset(x, y)
+	return ColorCMYK16{
+		C: binary.BigEndian.Uint16(p.Pix[off:]),
+		M: binary.BigEndian.Uint16(p.Pix[off+2:]),
+		Y: binary.BigEndian.Uint16(p.Pix[off+4:]),
+		K: binary.BigEndian.Uint16(p.Pix[off+6:]),
+	}
+}
+
+// SetCMYK16 写入指定坐标处的16位CMYK颜色，越界时忽略
+// 入参: x 横坐标, y 纵坐标, c 目标16位CMYK颜色
+func (p *ImageCMYK16) SetCMYK16(x, y int, c ColorCMYK16) {
+	if !(image.Point{X: x, Y: y}.In(p.Rect)) {
+		return
+	}
+	off := p.PixOffset(x, y)
+	binary.BigEndian.PutUint16(p.Pix[off:], c.C)
+	binary.BigEndian.PutUint16(p.Pix[off+2:], c.M)
+	binary.BigEndian.PutUint16(p.Pix[off+4:], c.Y)
+	binary.BigEndian.PutUint16(p.Pix[off+6:], c.K)
+}
+
+// PixOffset 计算指定坐标在Pix缓冲中的起始字节偏移
+// 入参: x 横坐标, y 纵坐标
+// 返回: int 字节偏移量
+func (p *ImageCMYK16) PixOffset(x, y int) int {
+	return (y-p.Rect.Min.Y)*p.Stride + (x-p.Rect.Min.X)*8
+}
+
+// Opaque 报告16位CMYK图像恒为完全不透明
+// 返回: bool 恒为true
+func (p *ImageCMYK16) Opaque() bool {
+	return true
+}
+
+// NewOutlineBuilder 创建通用XPS目录书签构建器，自动协调相对OutlineTarget URI与页面LinkTargets
+// 入参: language 目录默认xml:lang语言标签，为空时依次取options.Language或"und", options 可选部件基准路径配置，nil采用默认路径
+// 返回: *OutlineBuilder 目录书签构建器
+func NewOutlineBuilder(language string, options *OutlineBuilderOptions) *OutlineBuilder {
+	b := &OutlineBuilder{
+		language:     language,
+		documentPart: "/Documents/1/FixedDoc.fdoc",
+		sequencePart: "/FixedDocSeq.fdseq",
+		usedAnchors:  make(map[string]*Page),
+	}
+	if options != nil {
+		if b.language == "" && options.Language != "" {
+			b.language = options.Language
+		}
+		if options.DocumentPart != "" {
+			part, err := opcPartName(options.DocumentPart)
+			if err != nil {
+				b.err = err
+				return b
+			}
+			b.documentPart = part
+		}
+		if options.SequencePart != "" {
+			part, err := opcPartName(options.SequencePart)
+			if err != nil {
+				b.err = err
+				return b
+			}
+			b.sequencePart = part
+		}
+		if options.StructurePart != "" {
+			part, err := opcPartName(options.StructurePart)
+			if err != nil {
+				b.err = err
+				return b
+			}
+			b.structurePart = part
+		}
+	}
+	if b.language == "" {
+		b.language = "und"
+	}
+	if !fixedLanguageTag(b.language) {
+		b.err = fmt.Errorf("%w: invalid outline language %q", ErrInvalid, b.language)
+		return b
+	}
+	if b.structurePart == "" {
+		b.structurePart = b.documentPart[:strings.LastIndexByte(b.documentPart, '/')+1] + "Structure1.struct"
+	}
+	return b
+}
+
+// AddPage 添加指向目标Page及可选锚点的目录书签节点，自动为Page补齐页级锚点名与去重后的LinkTargets
+// anchor为空时复用Page.Name或自动生成唯一页级锚点名；anchor非空且页内不存在同名元素时在Page.Name为空的情况下自动绑定至Page.Name
+// 入参: page 目标页面指针, anchor 可选页内元素或页级锚点名称, description 书签标题文本, level 目录层级，0或1表示一级书签, options 可选语言覆盖配置，nil继承目录语言
+// 返回: *OutlineBuilder 当前构建器
+func (b *OutlineBuilder) AddPage(page *Page, anchor, description string, level int32, options *OutlineEntryOptions) *OutlineBuilder {
+	if b == nil || b.err != nil {
+		return b
+	}
+	if page == nil {
+		b.err = fmt.Errorf("%w: outline target page is nil", ErrInvalid)
+		return b
+	}
+	lang, err := b.validateEntryArgs(description, level, options)
+	if err != nil {
+		b.err = err
+		return b
+	}
+	resolved := anchor
+	if resolved == "" {
+		if page.Name != "" {
+			resolved = page.Name
+		} else {
+			for {
+				b.autoSeq++
+				candidate := "OutlineTarget" + strconv.Itoa(b.autoSeq)
+				if _, taken := b.usedAnchors[candidate]; taken {
+					continue
+				}
+				if pageHasNamedElement(page.Elements, candidate, 0) {
+					continue
+				}
+				resolved = candidate
+				page.Name = candidate
+				break
+			}
+		}
+	}
+	if !fixedNamePattern(resolved) {
+		b.err = fmt.Errorf("%w: invalid outline anchor name %q", ErrInvalid, resolved)
+		return b
+	}
+	if page.Name != resolved && !pageHasNamedElement(page.Elements, resolved, 0) {
+		if page.Name != "" {
+			b.err = fmt.Errorf("%w: outline anchor %q not found on page with existing Name %q", ErrInvalid, resolved, page.Name)
+			return b
+		}
+		page.Name = resolved
+	}
+	if owner, exists := b.usedAnchors[resolved]; exists && owner != page {
+		b.err = fmt.Errorf("%w: duplicate outline anchor %q across different pages", ErrInvalid, resolved)
+		return b
+	}
+	b.usedAnchors[resolved] = page
+	if !slices.Contains(page.LinkTargets, resolved) {
+		page.LinkTargets = append(page.LinkTargets, resolved)
+	}
+	target, err := InternalNavigateURI(b.structurePart, b.documentPart, resolved)
+	if err != nil {
+		b.err = err
+		return b
+	}
+	if level == 0 {
+		level = 1
+	}
+	b.entries = append(b.entries, OutlineEntry{Level: level, Target: target, Description: description, Language: lang})
+	return b
+}
+
+// AddPageNumber 添加按一基全局页号定位的目录书签节点，遵循ECMA-388 [M9.8]指向FixedDocumentSequence
+// 入参: pageNumber 一基全局页号, description 书签标题文本, level 目录层级，0或1表示一级书签, options 可选语言覆盖配置，nil继承目录语言
+// 返回: *OutlineBuilder 当前构建器
+func (b *OutlineBuilder) AddPageNumber(pageNumber int, description string, level int32, options *OutlineEntryOptions) *OutlineBuilder {
+	if b == nil || b.err != nil {
+		return b
+	}
+	if pageNumber < 1 {
+		b.err = fmt.Errorf("%w: outline page number must be positive: %d", ErrInvalid, pageNumber)
+		return b
+	}
+	lang, err := b.validateEntryArgs(description, level, options)
+	if err != nil {
+		b.err = err
+		return b
+	}
+	target, err := InternalNavigateURI(b.structurePart, b.sequencePart, strconv.Itoa(pageNumber))
+	if err != nil {
+		b.err = err
+		return b
+	}
+	if level == 0 {
+		level = 1
+	}
+	b.entries = append(b.entries, OutlineEntry{Level: level, Target: target, Description: description, Language: lang})
+	return b
+}
+
+// SetStories 附加有序故事定义以便与目录书签一同产出完整DocumentStructure
+// 入参: stories 故事列表，空切片清空已有故事
+// 返回: *OutlineBuilder 当前构建器
+func (b *OutlineBuilder) SetStories(stories []Story) *OutlineBuilder {
+	if b == nil || b.err != nil {
+		return b
+	}
+	b.stories = make([]Story, len(stories))
+	for i, story := range stories {
+		copied := Story{Name: story.Name, Fragments: make([]StoryFragmentReference, len(story.Fragments))}
+		for j, ref := range story.Fragments {
+			if ref.FragmentName != nil {
+				name := *ref.FragmentName
+				ref.FragmentName = &name
+			}
+			copied.Fragments[j] = ref
+		}
+		b.stories[i] = copied
+	}
+	return b
+}
+
+// Build 校验累计状态并返回可直接传入Package.SetDocumentStructure或StreamWriter.SetDocumentStructure的独立DocumentStructure
+// 返回: *DocumentStructure 合规文档结构模型, error 构建过程中记录的参数、语言、锚点或空目录错误
+func (b *OutlineBuilder) Build() (*DocumentStructure, error) {
+	if b == nil {
+		return nil, fmt.Errorf("%w: nil outline builder", ErrInvalid)
+	}
+	if b.err != nil {
+		return nil, b.err
+	}
+	if len(b.entries) == 0 {
+		return nil, fmt.Errorf("%w: outline requires at least one entry", ErrInvalid)
+	}
+	entries := make([]OutlineEntry, len(b.entries))
+	for i, entry := range b.entries {
+		if entry.Language != nil {
+			lang := *entry.Language
+			entry.Language = &lang
+		}
+		entries[i] = entry
+	}
+	var stories []Story
+	if len(b.stories) != 0 {
+		stories = make([]Story, len(b.stories))
+		for i, story := range b.stories {
+			copied := Story{Name: story.Name, Fragments: make([]StoryFragmentReference, len(story.Fragments))}
+			for j, ref := range story.Fragments {
+				if ref.FragmentName != nil {
+					name := *ref.FragmentName
+					ref.FragmentName = &name
+				}
+				copied.Fragments[j] = ref
+			}
+			stories[i] = copied
+		}
+	}
+	return &DocumentStructure{
+		Part:    b.structurePart,
+		Outline: &DocumentOutline{Language: b.language, Entries: entries},
+		Stories: stories,
+	}, nil
+}
+
+// validateEntryArgs 校验目录书签条目的描述文本、层级及可选语言标签
+// 入参: description 书签标题, level 目录层级, options 可选语言覆盖选项
+// 返回: *string 可选语言指针，继承默认语言时为nil, error 参数或语言标签错误
+func (b *OutlineBuilder) validateEntryArgs(description string, level int32, options *OutlineEntryOptions) (*string, error) {
+	if description == "" || !xmlTextValid(description) {
+		return nil, fmt.Errorf("%w: invalid outline description", ErrInvalid)
+	}
+	if level < 0 {
+		return nil, fmt.Errorf("%w: invalid outline level %d", ErrInvalid, level)
+	}
+	if options == nil || options.Language == "" {
+		return nil, nil
+	}
+	if !fixedLanguageTag(options.Language) {
+		return nil, fmt.Errorf("%w: invalid outline entry language %q", ErrInvalid, options.Language)
+	}
+	lang := options.Language
+	return &lang, nil
+}
+
+// pageHasNamedElement 递归检查页面直接视觉元素树中是否存在指定Name，不进入VisualBrush与资源字典
+// 入参: elements 待检索绘制元素列表, target 目标Name, depth 当前嵌套深度
+// 返回: bool 是否存在同名元素
+func pageHasNamedElement(elements []Element, target string, depth int) bool {
+	if depth >= 256 {
+		return false
+	}
+	for _, elem := range elements {
+		props := contentProperties(elem)
+		if props != nil && props.Name == target {
+			return true
+		}
+		if canvas, ok := elem.(*Canvas); ok && len(canvas.Elements) != 0 {
+			if pageHasNamedElement(canvas.Elements, target, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // EncodeCaretStops 将逻辑光标停靠标志切片编码为符合ECMA-388规范的十六进制CaretStops属性字符串
@@ -904,7 +1395,7 @@ func encodeGoImageWithLimits(ctx context.Context, img image.Image, options *Imag
 	if options != nil {
 		cfg = *options
 	}
-	if cfg.Format > ImageFormatJXR || cfg.TIFFCompression > TIFFCompressionDeflate || cfg.Quality < 0 || cfg.Quality > 100 {
+	if cfg.Format > ImageFormatJXR || cfg.TIFFCompression > TIFFCompressionCCITTGroup4 || cfg.Quality < 0 || cfg.Quality > 100 {
 		return nil, "", "", fmt.Errorf("%w: invalid image encode format, TIFF compression or quality", ErrInvalid)
 	}
 	if cfg.DPIX < 0 || cfg.DPIY < 0 || math.IsNaN(cfg.DPIX) || math.IsInf(cfg.DPIX, 0) || math.IsNaN(cfg.DPIY) || math.IsInf(cfg.DPIY, 0) {
@@ -927,7 +1418,7 @@ func encodeGoImageWithLimits(ctx context.Context, img image.Image, options *Imag
 		if parsed.class == "link" || parsed.class == "abst" {
 			return nil, "", "", fmt.Errorf("%w: ICC profile class cannot be embedded in an image", ErrInvalid)
 		}
-		if targetSpace := encodedGoImageColorSpace(img, format); targetSpace == "" || parsed.space != targetSpace {
+		if targetSpace := encodedGoImageColorSpace(img, format, cfg.TIFFCompression); targetSpace == "" || parsed.space != targetSpace {
 			return nil, "", "", fmt.Errorf("%w: ICC profile color space %q is incompatible with encoded %q image", ErrInvalid, parsed.space, targetSpace)
 		}
 	}
@@ -949,10 +1440,10 @@ func encodeGoImageWithLimits(ctx context.Context, img image.Image, options *Imag
 	}
 }
 
-// encodedGoImageColorSpace 推导源Go图像按选定输出格式编码后的ICC色彩空间标识
-// 入参: img 源Go图像, format 已确定的输出格式
+// encodedGoImageColorSpace 推导源Go图像按选定输出格式与压缩方式编码后的ICC色彩空间标识
+// 入参: img 源Go图像, format 已确定的输出格式, tiffComp TIFF压缩方式
 // 返回: string 目标编码图像对应的四字节ICC色彩空间签名
-func encodedGoImageColorSpace(img image.Image, format ImageEncodeFormat) string {
+func encodedGoImageColorSpace(img image.Image, format ImageEncodeFormat, tiffComp TIFFCompression) string {
 	switch format {
 	case ImageFormatPNG:
 		switch img.(type) {
@@ -966,7 +1457,19 @@ func encodedGoImageColorSpace(img image.Image, format ImageEncodeFormat) string 
 			return "GRAY"
 		}
 		return "RGB "
-	case ImageFormatTIFF, ImageFormatJXR:
+	case ImageFormatTIFF:
+		if tiffComp == TIFFCompressionCCITTGroup4 {
+			return "GRAY"
+		}
+		switch img.(type) {
+		case *image.Gray, *image.Gray16:
+			return "GRAY"
+		case *image.CMYK, *ImageCMYK16:
+			return "CMYK"
+		default:
+			return "RGB "
+		}
+	case ImageFormatJXR:
 		switch img.(type) {
 		case *image.Gray, *image.Gray16:
 			return "GRAY"
@@ -984,6 +1487,9 @@ func encodedGoImageColorSpace(img image.Image, format ImageEncodeFormat) string 
 // 入参: img 源Go图像, quality 编码质量参数
 // 返回: ImageEncodeFormat 选定格式
 func chooseAutoImageFormat(img image.Image, quality int) ImageEncodeFormat {
+	if _, ok := img.(*ImageCMYK16); ok {
+		return ImageFormatTIFF
+	}
 	if _, ok := img.(*image.CMYK); ok {
 		return ImageFormatJXR
 	}
@@ -1029,21 +1535,8 @@ func encodeGoImagePNG(ctx context.Context, img image.Image, dpix, dpiy float64, 
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	var px, py uint32
-	if dpix > 0 && dpiy > 0 {
-		pxf := math.Round(dpix / 0.0254)
-		pyf := math.Round(dpiy / 0.0254)
-		if !(pxf <= 0x7fffffff && pyf <= 0x7fffffff) {
-			return nil, fmt.Errorf("%w: PNG DPI exceeds pHYs limit", ErrInvalid)
-		}
-		px = uint32(pxf)
-		py = uint32(pyf)
-		if px == 0 {
-			px = 1
-		}
-		if py == 0 {
-			py = 1
-		}
+	if _, _, err := encodePNGPhysPixels(dpix, dpiy); err != nil {
+		return nil, err
 	}
 	var raw bytes.Buffer
 	counted := packageOutput{writer: &raw, context: ctx, limit: maxBytes}
@@ -1067,37 +1560,213 @@ func encodeGoImagePNG(ctx context.Context, img image.Image, dpix, dpiy float64, 
 	if _, err := outCounted.Write(data[:insertPos]); err != nil {
 		return nil, err
 	}
-	if len(icc) != 0 {
-		var compressed bytes.Buffer
-		zw := zlib.NewWriter(&compressed)
-		if _, err := zw.Write(icc); err != nil {
-			_ = zw.Close()
-			return nil, err
-		}
-		if err := zw.Close(); err != nil {
-			return nil, err
-		}
-		payload := make([]byte, 0, 13+compressed.Len())
-		payload = append(payload, []byte("ICC Profile")...)
-		payload = append(payload, 0, 0)
-		payload = append(payload, compressed.Bytes()...)
-		if err := writePNGChunk(&outCounted, "iCCP", payload); err != nil {
-			return nil, err
-		}
-	}
-	if dpix > 0 && dpiy > 0 {
-		var phys [9]byte
-		binary.BigEndian.PutUint32(phys[0:4], px)
-		binary.BigEndian.PutUint32(phys[4:8], py)
-		phys[8] = 1
-		if err := writePNGChunk(&outCounted, "pHYs", phys[:]); err != nil {
-			return nil, err
-		}
+	if err := encodePNGMetaChunks(&outCounted, dpix, dpiy, icc); err != nil {
+		return nil, err
 	}
 	if _, err := outCounted.Write(data[insertPos:]); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil
+}
+
+// encodePNGPhysPixels 校验并将浮点DPI换算为PNG pHYs块使用的每米像素数
+// 入参: dpix 水平DPI, dpiy 垂直DPI
+// 返回: uint32 水平每米像素数, uint32 垂直每米像素数, error 越界错误
+func encodePNGPhysPixels(dpix, dpiy float64) (uint32, uint32, error) {
+	if dpix <= 0 || dpiy <= 0 {
+		return 0, 0, nil
+	}
+	pxf := math.Round(dpix / 0.0254)
+	pyf := math.Round(dpiy / 0.0254)
+	if !(pxf <= 0x7fffffff && pyf <= 0x7fffffff) {
+		return 0, 0, fmt.Errorf("%w: PNG DPI exceeds pHYs limit", ErrInvalid)
+	}
+	px, py := uint32(pxf), uint32(pyf)
+	if px == 0 {
+		px = 1
+	}
+	if py == 0 {
+		py = 1
+	}
+	return px, py, nil
+}
+
+// encodePNGMetaChunks 按标准块顺序向输出流写入可选的iCCP色彩配置块与pHYs物理分辨率块
+// 入参: w 输出流, dpix 水平DPI, dpiy 垂直DPI, icc 可选ICC配置字节
+// 返回: error 压缩、校验或写出错误
+func encodePNGMetaChunks(w io.Writer, dpix, dpiy float64, icc []byte) error {
+	if len(icc) != 0 {
+		var compressed bytes.Buffer
+		zw := zlib.NewWriter(&compressed)
+		if _, err := zw.Write(icc); err != nil {
+			_ = zw.Close()
+			return err
+		}
+		if err := zw.Close(); err != nil {
+			return err
+		}
+		payload := make([]byte, 0, 13+compressed.Len())
+		payload = append(payload, []byte("ICC Profile")...)
+		payload = append(payload, 0, 0)
+		payload = append(payload, compressed.Bytes()...)
+		if err := writePNGChunk(w, "iCCP", payload); err != nil {
+			return err
+		}
+	}
+	if dpix > 0 && dpiy > 0 {
+		px, py, err := encodePNGPhysPixels(dpix, dpiy)
+		if err != nil {
+			return err
+		}
+		var phys [9]byte
+		binary.BigEndian.PutUint32(phys[0:4], px)
+		binary.BigEndian.PutUint32(phys[4:8], py)
+		phys[8] = 1
+		if err := writePNGChunk(w, "pHYs", phys[:]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// newPNGRowEncoder 初始化逐行流式PNG编码器并写出PNG文件签名、IHDR及可选iCCP和pHYs块
+// 入参: ctx 取消Context, w 目标输出流, width 图像宽度, height 图像高度, bitDepth 采样位深，支持8或16, colorType PNG色彩类型，支持0、2、4或6, dpix 水平DPI, dpiy 垂直DPI, icc 可选ICC配置字节
+// 返回: *pngRowEncoder 逐行PNG编码器, error 参数、预算、取消或写出错误
+func newPNGRowEncoder(ctx context.Context, w io.Writer, width, height int, bitDepth, colorType uint8, dpix, dpiy float64, icc []byte) (*pngRowEncoder, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if w == nil || width < 1 || height < 1 || width > rasterMaxDimension || height > rasterMaxDimension {
+		return nil, fmt.Errorf("%w: invalid streaming PNG dimensions or writer", ErrInvalid)
+	}
+	if bitDepth != 8 && bitDepth != 16 {
+		return nil, fmt.Errorf("%w: unsupported streaming PNG bit depth %d", ErrInvalid, bitDepth)
+	}
+	var channels int
+	switch colorType {
+	case 0:
+		channels = 1
+	case 2:
+		channels = 3
+	case 4:
+		channels = 2
+	case 6:
+		channels = 4
+	default:
+		return nil, fmt.Errorf("%w: unsupported streaming PNG color type %d", ErrInvalid, colorType)
+	}
+	rowBytes64 := int64(width) * int64(channels) * int64(bitDepth/8)
+	if rowBytes64 <= 0 || rowBytes64 > int64(^uint(0)>>1) {
+		return nil, fmt.Errorf("%w: streaming PNG row length overflow", ErrLimit)
+	}
+	if _, _, err := encodePNGPhysPixels(dpix, dpiy); err != nil {
+		return nil, err
+	}
+	if _, err := w.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}); err != nil {
+		return nil, err
+	}
+	var ihdr [13]byte
+	binary.BigEndian.PutUint32(ihdr[0:4], uint32(width))
+	binary.BigEndian.PutUint32(ihdr[4:8], uint32(height))
+	ihdr[8] = bitDepth
+	ihdr[9] = colorType
+	if err := writePNGChunk(w, "IHDR", ihdr[:]); err != nil {
+		return nil, err
+	}
+	if err := encodePNGMetaChunks(w, dpix, dpiy, icc); err != nil {
+		return nil, err
+	}
+	enc := &pngRowEncoder{
+		w:        w,
+		idat:     pngIDATWriter{w: w, buf: make([]byte, 0, pngStreamIDATChunk)},
+		height:   height,
+		rowBytes: int(rowBytes64),
+	}
+	enc.zw = zlib.NewWriter(&enc.idat)
+	return enc, nil
+}
+
+// Write 接收zlib压缩数据并在缓冲达到块上限时封装为标准IDAT块写出
+// 入参: p 压缩数据切片
+// 返回: int 已接收字节数, error 写出错误
+func (w *pngIDATWriter) Write(p []byte) (int, error) {
+	total := len(p)
+	for len(p) > 0 {
+		space := cap(w.buf) - len(w.buf)
+		if space == 0 {
+			if err := w.flush(); err != nil {
+				return total - len(p), err
+			}
+			space = cap(w.buf)
+		}
+		take := min(len(p), space)
+		w.buf = append(w.buf, p[:take]...)
+		p = p[take:]
+	}
+	return total, nil
+}
+
+// flush 将缓冲区中尚未落盘的压缩字节写出为单个IDAT块
+// 返回: error 写出错误
+func (w *pngIDATWriter) flush() error {
+	if len(w.buf) == 0 {
+		return nil
+	}
+	err := writePNGChunk(w.w, "IDAT", w.buf)
+	w.buf = w.buf[:0]
+	return err
+}
+
+// writeRow 写入单条未滤波扫描行并推进流式zlib压缩
+// 入参: ctx 取消Context, row 原始扫描行字节，长度必须等于rowBytes
+// 返回: error 行数、长度、取消或写出错误
+func (e *pngRowEncoder) writeRow(ctx context.Context, row []byte) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if e.closed {
+		return fmt.Errorf("%w: streaming PNG encoder is closed", ErrClosed)
+	}
+	if e.rows >= e.height {
+		return fmt.Errorf("%w: streaming PNG row count exceeds height", ErrInvalid)
+	}
+	if len(row) != e.rowBytes {
+		return fmt.Errorf("%w: streaming PNG row length mismatch: got %d want %d", ErrInvalid, len(row), e.rowBytes)
+	}
+	var filter [1]byte
+	if _, err := e.zw.Write(filter[:]); err != nil {
+		return err
+	}
+	if _, err := e.zw.Write(row); err != nil {
+		return err
+	}
+	e.rows++
+	return nil
+}
+
+// close 校验已写入行数与高度匹配、刷新尾块IDAT并写出IEND结束块
+// 入参: ctx 取消Context
+// 返回: error 行数不足、压缩、取消或写出错误
+func (e *pngRowEncoder) close(ctx context.Context) error {
+	if e.closed {
+		return nil
+	}
+	e.closed = true
+	if err := checkContext(ctx); err != nil {
+		_ = e.zw.Close()
+		return err
+	}
+	if e.rows != e.height {
+		_ = e.zw.Close()
+		return fmt.Errorf("%w: streaming PNG wrote %d of %d rows", ErrInvalid, e.rows, e.height)
+	}
+	if err := e.zw.Close(); err != nil {
+		return err
+	}
+	if err := e.idat.flush(); err != nil {
+		return err
+	}
+	return writePNGChunk(e.w, "IEND", nil)
 }
 
 // writePNGChunk 写入带长度、类型标识与CRC32的标准PNG数据块
@@ -1233,13 +1902,303 @@ func encodeJPEGDPI(value float64) (uint16, error) {
 	return uint16(rounded), nil
 }
 
-// encodeGoImageTIFF 编码标准Little-Endian Baseline TIFF，支持无压缩、PackBits与Adobe Deflate无损压缩以及灰度、RGB、RGBA、16位、CMYK、DPI和ICC标签
+// encodeGoImageTIFF 编码标准Little-Endian多Strip Baseline TIFF，支持无压缩、PackBits、Adobe Deflate、LZW与1位CCITT Group 4压缩及灰度、RGB、RGBA、16位、8/16位CMYK、DPI与ICC标签
+// 压缩模式下按目标Strip大小逐条带编码并约束中间像素缓冲，防止低maxBytes预算下的无界大内存分配
 // 入参: ctx 取消Context, img 源Go图像, compression 无损压缩方式, dpix 水平DPI, dpiy 垂直DPI, icc 可选ICC配置字节, maxBytes 字节上限, maxPixels 像素总数上限
 // 返回: []byte TIFF字节, error 编码、预算或取消错误
 func encodeGoImageTIFF(ctx context.Context, img image.Image, compression TIFFCompression, dpix, dpiy float64, icc []byte, maxBytes int64, maxPixels uint64) ([]byte, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
+	bounds := img.Bounds()
+	w, h := bounds.Dx(), bounds.Dy()
+	if w <= 0 || h <= 0 || w > rasterMaxDimension || h > rasterMaxDimension || maxPixels > 0 && uint64(w) > maxPixels/uint64(h) {
+		return nil, fmt.Errorf("%w: encoded TIFF exceeds pixel budget", ErrLimit)
+	}
+	spec := tiffStripSpec{
+		width:       w,
+		height:      h,
+		compression: compression,
+		dpix:        dpix,
+		dpiy:        dpiy,
+		icc:         icc,
+	}
+	var rowBytes int
+	var fillRow func(dst []byte, y int)
+	if compression == TIFFCompressionCCITTGroup4 {
+		spec.spp, spec.bps, spec.photometric = 1, 1, 0
+		rowBytes = (w + 7) / 8
+		fillRow = func(dst []byte, y int) {
+			clear(dst)
+			sy := bounds.Min.Y + y
+			switch typed := img.(type) {
+			case *image.Gray:
+				rowOff := typed.PixOffset(bounds.Min.X, sy)
+				for x := range w {
+					if typed.Pix[rowOff+x] < 128 {
+						dst[x>>3] |= 1 << uint(7-x&7)
+					}
+				}
+			case *image.Gray16:
+				for x := range w {
+					if typed.Gray16At(bounds.Min.X+x, sy).Y < 32768 {
+						dst[x>>3] |= 1 << uint(7-x&7)
+					}
+				}
+			default:
+				for x := range w {
+					if color.GrayModel.Convert(img.At(bounds.Min.X+x, sy)).(color.Gray).Y < 128 {
+						dst[x>>3] |= 1 << uint(7-x&7)
+					}
+				}
+			}
+		}
+	} else {
+		switch typed := img.(type) {
+		case *image.Gray:
+			spec.spp, spec.bps, spec.photometric = 1, 8, 1
+			rowBytes = w
+			fillRow = func(dst []byte, y int) {
+				rowOff := typed.PixOffset(bounds.Min.X, bounds.Min.Y+y)
+				copy(dst, typed.Pix[rowOff:rowOff+w])
+			}
+		case *image.Gray16:
+			spec.spp, spec.bps, spec.photometric = 1, 16, 1
+			rowBytes = w * 2
+			fillRow = func(dst []byte, y int) {
+				sy := bounds.Min.Y + y
+				for x := range w {
+					binary.LittleEndian.PutUint16(dst[x*2:], typed.Gray16At(bounds.Min.X+x, sy).Y)
+				}
+			}
+		case *image.CMYK:
+			spec.spp, spec.bps, spec.photometric = 4, 8, 5
+			rowBytes = w * 4
+			fillRow = func(dst []byte, y int) {
+				rowOff := typed.PixOffset(bounds.Min.X, bounds.Min.Y+y)
+				copy(dst, typed.Pix[rowOff:rowOff+w*4])
+			}
+		case *ImageCMYK16:
+			spec.spp, spec.bps, spec.photometric = 4, 16, 5
+			rowBytes = w * 8
+			fillRow = func(dst []byte, y int) {
+				sy := bounds.Min.Y + y
+				for x := range w {
+					c := typed.CMYK16At(bounds.Min.X+x, sy)
+					off := x * 8
+					binary.LittleEndian.PutUint16(dst[off:], c.C)
+					binary.LittleEndian.PutUint16(dst[off+2:], c.M)
+					binary.LittleEndian.PutUint16(dst[off+4:], c.Y)
+					binary.LittleEndian.PutUint16(dst[off+6:], c.K)
+				}
+			}
+		case *image.NRGBA64:
+			spec.spp, spec.bps, spec.photometric, spec.extraSample, spec.hasExtra = 4, 16, 2, 2, true
+			rowBytes = w * 8
+			fillRow = func(dst []byte, y int) {
+				sy := bounds.Min.Y + y
+				for x := range w {
+					c := typed.NRGBA64At(bounds.Min.X+x, sy)
+					off := x * 8
+					binary.LittleEndian.PutUint16(dst[off:], c.R)
+					binary.LittleEndian.PutUint16(dst[off+2:], c.G)
+					binary.LittleEndian.PutUint16(dst[off+4:], c.B)
+					binary.LittleEndian.PutUint16(dst[off+6:], c.A)
+				}
+			}
+		case *image.RGBA64:
+			spec.spp, spec.bps, spec.photometric, spec.extraSample, spec.hasExtra = 4, 16, 2, 1, true
+			rowBytes = w * 8
+			fillRow = func(dst []byte, y int) {
+				sy := bounds.Min.Y + y
+				for x := range w {
+					c := typed.RGBA64At(bounds.Min.X+x, sy)
+					off := x * 8
+					binary.LittleEndian.PutUint16(dst[off:], c.R)
+					binary.LittleEndian.PutUint16(dst[off+2:], c.G)
+					binary.LittleEndian.PutUint16(dst[off+4:], c.B)
+					binary.LittleEndian.PutUint16(dst[off+6:], c.A)
+				}
+			}
+		default:
+			if goImageIsOpaque(img) {
+				spec.spp, spec.bps, spec.photometric = 3, 8, 2
+				rowBytes = w * 3
+				fillRow = func(dst []byte, y int) {
+					sy := bounds.Min.Y + y
+					for x := range w {
+						c := color.NRGBAModel.Convert(img.At(bounds.Min.X+x, sy)).(color.NRGBA)
+						off := x * 3
+						dst[off], dst[off+1], dst[off+2] = c.R, c.G, c.B
+					}
+				}
+			} else {
+				spec.spp, spec.bps, spec.photometric, spec.extraSample, spec.hasExtra = 4, 8, 2, 2, true
+				rowBytes = w * 4
+				fillRow = func(dst []byte, y int) {
+					sy := bounds.Min.Y + y
+					for x := range w {
+						c := color.NRGBAModel.Convert(img.At(bounds.Min.X+x, sy)).(color.NRGBA)
+						off := x * 4
+						dst[off], dst[off+1], dst[off+2], dst[off+3] = c.R, c.G, c.B, c.A
+					}
+				}
+			}
+		}
+	}
+	if compression == TIFFCompressionNone && int64(h) > maxBytes/int64(rowBytes) {
+		return nil, fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+	}
+	rowsPerStrip, err := tiffRowsPerStrip(rowBytes, h, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	spec.rowsPerStrip = rowsPerStrip
+	stripCount := (h + rowsPerStrip - 1) / rowsPerStrip
+	strips := make([][]byte, 0, stripCount)
+	rawBuf := make([]byte, rowsPerStrip*rowBytes)
+	usedBytes := int64(8)
+	for y := 0; y < h; y += rowsPerStrip {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		rows := min(rowsPerStrip, h-y)
+		chunk := rawBuf[:rows*rowBytes]
+		for row := range rows {
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+			fillRow(chunk[row*rowBytes:(row+1)*rowBytes], y+row)
+		}
+		remaining := maxBytes - usedBytes
+		if remaining <= 0 {
+			return nil, fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+		}
+		encoded, err := encodeTIFFStripData(ctx, chunk, w, rows, rowBytes, compression, remaining)
+		if err != nil {
+			return nil, err
+		}
+		if compression == TIFFCompressionNone {
+			encoded = bytes.Clone(encoded)
+		}
+		usedBytes += int64(len(encoded))
+		if usedBytes > maxBytes || usedBytes > math.MaxUint32 {
+			return nil, fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+		}
+		strips = append(strips, encoded)
+	}
+	return encodeTIFFStrips(ctx, spec, strips, maxBytes)
+}
+
+// tiffRowsPerStrip 按单条带64KiB目标大小及maxBytes预算计算多Strip TIFF每条带行数
+// 入参: rowBytes 单扫描行字节长度, height 图像总行数, maxBytes 输出与中间缓冲字节上限
+// 返回: int 每条带行数, error 参数或预算错误
+func tiffRowsPerStrip(rowBytes, height int, maxBytes int64) (int, error) {
+	if rowBytes <= 0 || height <= 0 || maxBytes <= 0 {
+		return 0, fmt.Errorf("%w: invalid TIFF strip dimensions or budget", ErrInvalid)
+	}
+	if int64(rowBytes) > maxBytes || int64(rowBytes) > math.MaxUint32 {
+		return 0, fmt.Errorf("%w: encoded TIFF row exceeds byte budget", ErrLimit)
+	}
+	budget := min(int64(tiffTargetStripBytes), maxBytes)
+	rows := int(budget / int64(rowBytes))
+	if rows < 1 {
+		rows = 1
+	}
+	if rows > height {
+		rows = height
+	}
+	return rows, nil
+}
+
+// encodeTIFFStripData 将单个TIFF条带的原始未压缩像素按指定压缩算法编码
+// 入参: ctx 取消Context, raw 单条带未压缩像素字节, width 图像像素宽度, rows 条带行数, rowBytes 单行字节数, compression 无损压缩方式, maxBytes 输出字节上限
+// 返回: []byte 条带编码字节, error 压缩、预算或取消错误
+func encodeTIFFStripData(ctx context.Context, raw []byte, width, rows, rowBytes int, compression TIFFCompression, maxBytes int64) ([]byte, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if rowBytes <= 0 || rows <= 0 || len(raw) != rows*rowBytes {
+		return nil, fmt.Errorf("%w: invalid TIFF strip raw size", ErrInvalid)
+	}
+	switch compression {
+	case TIFFCompressionNone:
+		if int64(len(raw)) > maxBytes || int64(len(raw)) > math.MaxUint32 {
+			return nil, fmt.Errorf("%w: encoded TIFF strip exceeds byte budget", ErrLimit)
+		}
+		return raw, nil
+	case TIFFCompressionPackBits:
+		return encodeTIFFPackBits(ctx, raw, rowBytes, maxBytes)
+	case TIFFCompressionDeflate:
+		return encodeTIFFDeflate(ctx, raw, maxBytes)
+	case TIFFCompressionLZW:
+		return encodeTIFFLZW(ctx, raw, maxBytes)
+	case TIFFCompressionCCITTGroup4:
+		return encodeTIFFCCITTGroup4(ctx, raw, width, rows, maxBytes)
+	default:
+		return nil, fmt.Errorf("%w: unsupported TIFF compression %d", ErrInvalid, compression)
+	}
+}
+
+// encodeTIFFStrips 将已压缩的一个或多个TIFF条带与IFD目录装配为完整Little-Endian Baseline TIFF字节
+// 入参: ctx 取消Context, spec 图像与条带规格, strips 已编码条带切片, maxBytes 总输出字节上限
+// 返回: []byte 完整TIFF字节, error 参数、偏移、预算或取消错误
+func encodeTIFFStrips(ctx context.Context, spec tiffStripSpec, strips [][]byte, maxBytes int64) ([]byte, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if spec.width <= 0 || spec.height <= 0 || spec.rowsPerStrip <= 0 || len(strips) == 0 {
+		return nil, fmt.Errorf("%w: invalid TIFF strip assembly spec", ErrInvalid)
+	}
+	expectedStrips := (spec.height + spec.rowsPerStrip - 1) / spec.rowsPerStrip
+	if len(strips) != expectedStrips {
+		return nil, fmt.Errorf("%w: TIFF strip count mismatch: got %d want %d", ErrInvalid, len(strips), expectedStrips)
+	}
+	offsets := make([]uint32, len(strips))
+	counts := make([]uint32, len(strips))
+	cursor := int64(8)
+	for i, strip := range strips {
+		if int64(len(strip)) > math.MaxUint32 || cursor+int64(len(strip)) > maxBytes || cursor+int64(len(strip)) > math.MaxUint32 {
+			return nil, fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+		}
+		offsets[i] = uint32(cursor)
+		counts[i] = uint32(len(strip))
+		cursor += int64(len(strip))
+	}
+	pad := cursor & 1
+	ifdOffset := cursor + pad
+	if ifdOffset > math.MaxUint32 {
+		return nil, fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+	}
+	ifdBytes, err := encodeTIFFIFD(spec, offsets, counts, uint32(ifdOffset))
+	if err != nil {
+		return nil, err
+	}
+	total := ifdOffset + int64(len(ifdBytes))
+	if total > maxBytes || total > math.MaxUint32 {
+		return nil, fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+	}
+	out := make([]byte, int(total))
+	copy(out[0:2], "II")
+	binary.LittleEndian.PutUint16(out[2:4], 42)
+	binary.LittleEndian.PutUint32(out[4:8], uint32(ifdOffset))
+	pos := 8
+	for _, strip := range strips {
+		copy(out[pos:], strip)
+		pos += len(strip)
+	}
+	copy(out[int(ifdOffset):], ifdBytes)
+	return out, checkContext(ctx)
+}
+
+// encodeTIFFIFD 按TIFF 6.0规范将目录项按Tag升序编码为含附加数据区的IFD二进制块
+// 入参: spec 图像与压缩规格, stripOffsets 各条带文件偏移数组, stripCounts 各条带字节长度数组, ifdOffset 本IFD块在文件中的起始偏移
+// 返回: []byte 完整IFD与外部字段数据区字节, error 标签、DPI或范围错误
+func encodeTIFFIFD(spec tiffStripSpec, stripOffsets, stripCounts []uint32, ifdOffset uint32) ([]byte, error) {
+	if len(stripOffsets) == 0 || len(stripOffsets) != len(stripCounts) {
+		return nil, fmt.Errorf("%w: invalid TIFF strip offset/count arrays", ErrInvalid)
+	}
+	dpix, dpiy := spec.dpix, spec.dpiy
 	if dpix == 0 || dpiy == 0 {
 		dpix, dpiy = 96, 96
 	}
@@ -1254,162 +2213,20 @@ func encodeGoImageTIFF(ctx context.Context, img image.Image, compression TIFFCom
 	if yNum < 1 {
 		yNum = 1
 	}
-	bounds := img.Bounds()
-	w, h := bounds.Dx(), bounds.Dy()
-	var spp uint16
-	var bps uint16
-	var photometric uint16
-	var extraSample uint16
-	var hasExtra bool
-	var pixels []byte
-	pixelBudget := min(maxBytes, int64(math.MaxUint32))
-	if compression != TIFFCompressionNone {
-		maxRaw := uint64(math.MaxUint32)
-		if maxPixels > 0 && maxPixels < maxRaw/8 {
-			maxRaw = maxPixels * 8
-		}
-		pixelBudget = min(int64(maxRaw), int64(^uint(0)>>1))
-	}
-	checkPixelBudget := func(bytesPerPixel int64) error {
-		if int64(w) <= 0 || int64(h) <= 0 || int64(w) > math.MaxUint32 || int64(h) > math.MaxUint32 || int64(w) > pixelBudget/bytesPerPixel || int64(h) > pixelBudget/(int64(w)*bytesPerPixel) {
-			return fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
-		}
-		return nil
-	}
-	switch typed := img.(type) {
-	case *image.Gray:
-		spp, bps, photometric = 1, 8, 1
-		if err := checkPixelBudget(1); err != nil {
-			return nil, err
-		}
-		pixels = make([]byte, w*h)
-		for y := range h {
-			if err := checkContext(ctx); err != nil {
-				return nil, err
-			}
-			rowOff := typed.PixOffset(bounds.Min.X, bounds.Min.Y+y)
-			copy(pixels[y*w:(y+1)*w], typed.Pix[rowOff:rowOff+w])
-		}
-	case *image.Gray16:
-		spp, bps, photometric = 1, 16, 1
-		if err := checkPixelBudget(2); err != nil {
-			return nil, err
-		}
-		pixels = make([]byte, w*h*2)
-		for y := range h {
-			if err := checkContext(ctx); err != nil {
-				return nil, err
-			}
-			for x := range w {
-				v := typed.Gray16At(bounds.Min.X+x, bounds.Min.Y+y).Y
-				binary.LittleEndian.PutUint16(pixels[(y*w+x)*2:], v)
-			}
-		}
-	case *image.CMYK:
-		spp, bps, photometric = 4, 8, 5
-		if err := checkPixelBudget(4); err != nil {
-			return nil, err
-		}
-		pixels = make([]byte, w*h*4)
-		for y := range h {
-			if err := checkContext(ctx); err != nil {
-				return nil, err
-			}
-			rowOff := typed.PixOffset(bounds.Min.X, bounds.Min.Y+y)
-			copy(pixels[y*w*4:(y+1)*w*4], typed.Pix[rowOff:rowOff+w*4])
-		}
-	case *image.NRGBA64:
-		spp, bps, photometric, extraSample, hasExtra = 4, 16, 2, 2, true
-		if err := checkPixelBudget(8); err != nil {
-			return nil, err
-		}
-		pixels = make([]byte, w*h*8)
-		for y := range h {
-			if err := checkContext(ctx); err != nil {
-				return nil, err
-			}
-			for x := range w {
-				c := typed.NRGBA64At(bounds.Min.X+x, bounds.Min.Y+y)
-				off := (y*w + x) * 8
-				binary.LittleEndian.PutUint16(pixels[off:], c.R)
-				binary.LittleEndian.PutUint16(pixels[off+2:], c.G)
-				binary.LittleEndian.PutUint16(pixels[off+4:], c.B)
-				binary.LittleEndian.PutUint16(pixels[off+6:], c.A)
-			}
-		}
-	case *image.RGBA64:
-		spp, bps, photometric, extraSample, hasExtra = 4, 16, 2, 1, true
-		if err := checkPixelBudget(8); err != nil {
-			return nil, err
-		}
-		pixels = make([]byte, w*h*8)
-		for y := range h {
-			if err := checkContext(ctx); err != nil {
-				return nil, err
-			}
-			for x := range w {
-				c := typed.RGBA64At(bounds.Min.X+x, bounds.Min.Y+y)
-				off := (y*w + x) * 8
-				binary.LittleEndian.PutUint16(pixels[off:], c.R)
-				binary.LittleEndian.PutUint16(pixels[off+2:], c.G)
-				binary.LittleEndian.PutUint16(pixels[off+4:], c.B)
-				binary.LittleEndian.PutUint16(pixels[off+6:], c.A)
-			}
-		}
-	default:
-		if goImageIsOpaque(img) {
-			spp, bps, photometric = 3, 8, 2
-			if err := checkPixelBudget(3); err != nil {
-				return nil, err
-			}
-			pixels = make([]byte, w*h*3)
-			for y := range h {
-				if err := checkContext(ctx); err != nil {
-					return nil, err
-				}
-				for x := range w {
-					c := color.NRGBAModel.Convert(img.At(bounds.Min.X+x, bounds.Min.Y+y)).(color.NRGBA)
-					off := (y*w + x) * 3
-					pixels[off], pixels[off+1], pixels[off+2] = c.R, c.G, c.B
-				}
-			}
-		} else {
-			spp, bps, photometric, extraSample, hasExtra = 4, 8, 2, 2, true
-			if err := checkPixelBudget(4); err != nil {
-				return nil, err
-			}
-			pixels = make([]byte, w*h*4)
-			for y := range h {
-				if err := checkContext(ctx); err != nil {
-					return nil, err
-				}
-				for x := range w {
-					c := color.NRGBAModel.Convert(img.At(bounds.Min.X+x, bounds.Min.Y+y)).(color.NRGBA)
-					off := (y*w + x) * 4
-					pixels[off], pixels[off+1], pixels[off+2], pixels[off+3] = c.R, c.G, c.B, c.A
-				}
-			}
-		}
-	}
-	rowBytes := w * int(spp) * int(bps/8)
 	var compressionTag uint32
-	var stripData []byte
-	var err error
-	switch compression {
+	switch spec.compression {
 	case TIFFCompressionNone:
 		compressionTag = 1
-		stripData = pixels
 	case TIFFCompressionPackBits:
 		compressionTag = 32773
-		stripData, err = encodeTIFFPackBits(ctx, pixels, rowBytes, maxBytes)
 	case TIFFCompressionDeflate:
 		compressionTag = 8
-		stripData, err = encodeTIFFDeflate(ctx, pixels, maxBytes)
+	case TIFFCompressionLZW:
+		compressionTag = 5
+	case TIFFCompressionCCITTGroup4:
+		compressionTag = 4
 	default:
-		return nil, fmt.Errorf("%w: unsupported TIFF compression %d", ErrInvalid, compression)
-	}
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: unsupported TIFF compression %d", ErrInvalid, spec.compression)
 	}
 	type tiffEntry struct {
 		tag   uint16
@@ -1418,19 +2235,19 @@ func encodeGoImageTIFF(ctx context.Context, img image.Image, compression TIFFCom
 		value uint32
 		extra []byte
 	}
-	var entries []tiffEntry
+	entries := make([]tiffEntry, 0, 16)
 	entries = append(entries,
-		tiffEntry{tag: 256, kind: 4, count: 1, value: uint32(w)},
-		tiffEntry{tag: 257, kind: 4, count: 1, value: uint32(h)},
+		tiffEntry{tag: 256, kind: 4, count: 1, value: uint32(spec.width)},
+		tiffEntry{tag: 257, kind: 4, count: 1, value: uint32(spec.height)},
 	)
-	if spp == 1 {
-		entries = append(entries, tiffEntry{tag: 258, kind: 3, count: 1, value: uint32(bps)})
+	if spec.spp == 1 {
+		entries = append(entries, tiffEntry{tag: 258, kind: 3, count: 1, value: uint32(spec.bps)})
 	} else {
-		bpsBytes := make([]byte, int(spp)*2)
-		for i := range int(spp) {
-			binary.LittleEndian.PutUint16(bpsBytes[i*2:], bps)
+		bpsBytes := make([]byte, int(spec.spp)*2)
+		for i := range int(spec.spp) {
+			binary.LittleEndian.PutUint16(bpsBytes[i*2:], spec.bps)
 		}
-		entries = append(entries, tiffEntry{tag: 258, kind: 3, count: uint32(spp), extra: bpsBytes})
+		entries = append(entries, tiffEntry{tag: 258, kind: 3, count: uint32(spec.spp), extra: bpsBytes})
 	}
 	xRat := make([]byte, 8)
 	binary.LittleEndian.PutUint32(xRat[0:4], uint32(xNum))
@@ -1438,50 +2255,59 @@ func encodeGoImageTIFF(ctx context.Context, img image.Image, compression TIFFCom
 	yRat := make([]byte, 8)
 	binary.LittleEndian.PutUint32(yRat[0:4], uint32(yNum))
 	binary.LittleEndian.PutUint32(yRat[4:8], 1000)
+	var offsetEntry, countEntry tiffEntry
+	if len(stripOffsets) == 1 {
+		offsetEntry = tiffEntry{tag: 273, kind: 4, count: 1, value: stripOffsets[0]}
+		countEntry = tiffEntry{tag: 279, kind: 4, count: 1, value: stripCounts[0]}
+	} else {
+		offBytes := make([]byte, len(stripOffsets)*4)
+		cntBytes := make([]byte, len(stripCounts)*4)
+		for i := range stripOffsets {
+			binary.LittleEndian.PutUint32(offBytes[i*4:], stripOffsets[i])
+			binary.LittleEndian.PutUint32(cntBytes[i*4:], stripCounts[i])
+		}
+		offsetEntry = tiffEntry{tag: 273, kind: 4, count: uint32(len(stripOffsets)), extra: offBytes}
+		countEntry = tiffEntry{tag: 279, kind: 4, count: uint32(len(stripCounts)), extra: cntBytes}
+	}
 	entries = append(entries,
 		tiffEntry{tag: 259, kind: 3, count: 1, value: compressionTag},
-		tiffEntry{tag: 262, kind: 3, count: 1, value: uint32(photometric)},
-		tiffEntry{tag: 273, kind: 4, count: 1, value: 8},
-		tiffEntry{tag: 277, kind: 3, count: 1, value: uint32(spp)},
-		tiffEntry{tag: 278, kind: 4, count: 1, value: uint32(h)},
-		tiffEntry{tag: 279, kind: 4, count: 1, value: uint32(len(stripData))},
+		tiffEntry{tag: 262, kind: 3, count: 1, value: uint32(spec.photometric)},
+		offsetEntry,
+		tiffEntry{tag: 277, kind: 3, count: 1, value: uint32(spec.spp)},
+		tiffEntry{tag: 278, kind: 4, count: 1, value: uint32(spec.rowsPerStrip)},
+		countEntry,
 		tiffEntry{tag: 282, kind: 5, count: 1, extra: xRat},
 		tiffEntry{tag: 283, kind: 5, count: 1, extra: yRat},
 		tiffEntry{tag: 296, kind: 3, count: 1, value: 2},
 	)
-	if hasExtra {
-		entries = append(entries, tiffEntry{tag: 338, kind: 3, count: 1, value: uint32(extraSample)})
+	if spec.compression == TIFFCompressionCCITTGroup4 {
+		entries = append(entries, tiffEntry{tag: 293, kind: 4, count: 1, value: 0})
 	}
-	if len(icc) != 0 {
-		if int64(len(icc)) > math.MaxUint32 {
+	if spec.hasExtra {
+		entries = append(entries, tiffEntry{tag: 338, kind: 3, count: 1, value: uint32(spec.extraSample)})
+	}
+	if len(spec.icc) != 0 {
+		if int64(len(spec.icc)) > math.MaxUint32 {
 			return nil, fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
 		}
-		entries = append(entries, tiffEntry{tag: 34675, kind: 7, count: uint32(len(icc)), extra: icc})
+		entries = append(entries, tiffEntry{tag: 34675, kind: 7, count: uint32(len(spec.icc)), extra: spec.icc})
 	}
 	slices.SortFunc(entries, func(a, b tiffEntry) int { return int(a.tag) - int(b.tag) })
-	pixelEnd := int64(8) + int64(len(stripData))
-	pad := pixelEnd & 1
-	ifdOffset := pixelEnd + pad
 	ifdSize := int64(2 + len(entries)*12 + 4)
-	extraOffset := ifdOffset + ifdSize
-	total := extraOffset
+	total := ifdSize
 	for _, entry := range entries {
 		if len(entry.extra) > 4 {
 			total += int64(len(entry.extra) + (len(entry.extra) & 1))
 		}
 	}
-	if total > maxBytes || total > math.MaxUint32 {
-		return nil, fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+	if int64(ifdOffset)+total > math.MaxUint32 {
+		return nil, fmt.Errorf("%w: encoded TIFF IFD exceeds offset limit", ErrLimit)
 	}
 	out := make([]byte, int(total))
-	copy(out[0:2], "II")
-	binary.LittleEndian.PutUint16(out[2:4], 42)
-	binary.LittleEndian.PutUint32(out[4:8], uint32(ifdOffset))
-	copy(out[8:], stripData)
-	binary.LittleEndian.PutUint16(out[int(ifdOffset):], uint16(len(entries)))
-	cursor := int(extraOffset)
+	binary.LittleEndian.PutUint16(out[0:], uint16(len(entries)))
+	cursor := int(ifdSize)
 	for i, entry := range entries {
-		pos := int(ifdOffset) + 2 + i*12
+		pos := 2 + i*12
 		binary.LittleEndian.PutUint16(out[pos:], entry.tag)
 		binary.LittleEndian.PutUint16(out[pos+2:], entry.kind)
 		binary.LittleEndian.PutUint32(out[pos+4:], entry.count)
@@ -1490,12 +2316,299 @@ func encodeGoImageTIFF(ctx context.Context, img image.Image, compression TIFFCom
 		} else if len(entry.extra) <= 4 {
 			copy(out[pos+8:], entry.extra)
 		} else {
-			binary.LittleEndian.PutUint32(out[pos+8:], uint32(cursor))
+			binary.LittleEndian.PutUint32(out[pos+8:], ifdOffset+uint32(cursor))
 			copy(out[cursor:], entry.extra)
 			cursor += len(entry.extra) + (len(entry.extra) & 1)
 		}
 	}
 	return out, nil
+}
+
+// writeBits 将无符号整数的低length位按MSB优先写入有界字节流
+// 入参: code 待写入码字, length 位宽（1至24）
+// 返回: error 字节预算错误
+func (w *tiffBitWriter) writeBits(code uint32, length uint) error {
+	w.acc = w.acc<<length | uint64(code&((uint32(1)<<length)-1))
+	w.bits += length
+	for w.bits >= 8 {
+		w.bits -= 8
+		if int64(len(w.out))+1 > w.limit {
+			return fmt.Errorf("%w: encoded TIFF bitstream exceeds byte budget", ErrLimit)
+		}
+		w.out = append(w.out, byte(w.acc>>w.bits))
+	}
+	return nil
+}
+
+// flush 将未满一字节的尾部残余位低位补零并写入输出缓冲
+// 返回: error 字节预算错误
+func (w *tiffBitWriter) flush() error {
+	if w.bits == 0 {
+		return nil
+	}
+	if int64(len(w.out))+1 > w.limit {
+		return fmt.Errorf("%w: encoded TIFF bitstream exceeds byte budget", ErrLimit)
+	}
+	w.out = append(w.out, byte(w.acc<<(8-w.bits)))
+	w.bits = 0
+	w.acc = 0
+	return nil
+}
+
+// encodeTIFFLZW 按TIFF 6.0规范以MSB优先变长码执行LZW无损压缩，与decodeTIFFLZW严格互逆
+// 入参: ctx 取消Context, data 条带原始字节, maxBytes 输出字节上限
+// 返回: []byte LZW压缩条带字节, error 预算或取消错误
+func encodeTIFFLZW(ctx context.Context, data []byte, maxBytes int64) ([]byte, error) {
+	limit := min(maxBytes, int64(math.MaxUint32))
+	bw := tiffBitWriter{out: make([]byte, 0, min(int64(len(data)), limit)), limit: limit}
+	const clearCode = 256
+	const eoiCode = 257
+	const tableSize = 8192
+	const tableMask = tableSize - 1
+	var keys [tableSize]uint32
+	var vals [tableSize]uint16
+	var gens [tableSize]uint32
+	gen := uint32(1)
+	width := uint(9)
+	next := uint16(258)
+	if err := bw.writeBits(clearCode, width); err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		if err := bw.writeBits(eoiCode, width); err != nil {
+			return nil, err
+		}
+		if err := bw.flush(); err != nil {
+			return nil, err
+		}
+		return bw.out, nil
+	}
+	w := uint16(data[0])
+	for i := 1; i < len(data); i++ {
+		if i&4095 == 0 {
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+		}
+		k := data[i]
+		key := uint32(w)<<8 | uint32(k) | 0x80000000
+		slot := int((key * 2654435761) >> 19 & tableMask)
+		found := false
+		for gens[slot] == gen {
+			if keys[slot] == key {
+				w = vals[slot]
+				found = true
+				break
+			}
+			slot = (slot + 1) & tableMask
+		}
+		if found {
+			continue
+		}
+		if err := bw.writeBits(uint32(w), width); err != nil {
+			return nil, err
+		}
+		keys[slot] = key
+		vals[slot] = next
+		gens[slot] = gen
+		next++
+		if next == 4094 {
+			if err := bw.writeBits(clearCode, width); err != nil {
+				return nil, err
+			}
+			width = 9
+			next = 258
+			gen++
+			if gen == 0 {
+				clear(gens[:])
+				gen = 1
+			}
+		} else if width < 12 && next == uint16(1<<width) {
+			width++
+		}
+		w = uint16(k)
+	}
+	if err := bw.writeBits(uint32(w), width); err != nil {
+		return nil, err
+	}
+	if width < 12 && next == uint16(1<<width)-1 {
+		width++
+	}
+	if err := bw.writeBits(eoiCode, width); err != nil {
+		return nil, err
+	}
+	if err := bw.flush(); err != nil {
+		return nil, err
+	}
+	return bw.out, checkContext(ctx)
+}
+
+// buildTIFFFaxEncodeTable 将104项T.4/T.6二进制字符串码表预编译为高16位位宽、低16位码字的查找数组
+// 入参: codes 按0..63终止码与64..2560补充码顺序排列的码字切片
+// 返回: [104]uint32 预编译编码查找表
+func buildTIFFFaxEncodeTable(codes []string) [104]uint32 {
+	var table [104]uint32
+	for i, code := range codes {
+		var bits uint32
+		for _, ch := range code {
+			bits = bits<<1 | uint32(ch-'0')
+		}
+		table[i] = uint32(len(code))<<16 | bits
+	}
+	return table
+}
+
+// writeTIFFFaxRun 按ITU-T T.4/T.6标准写出单色游程长度所需的零至多个补充码与唯一终止码
+// 入参: bw MSB位流写入器, length 游程像素数, black 是否为黑色游程
+// 返回: error 字节预算错误
+func writeTIFFFaxRun(bw *tiffBitWriter, length int, black bool) error {
+	table := &tiffFaxWhiteEncode
+	if black {
+		table = &tiffFaxBlackEncode
+	}
+	for length >= 2560 {
+		entry := table[103]
+		if err := bw.writeBits(entry&0xffff, uint(entry>>16)); err != nil {
+			return err
+		}
+		length -= 2560
+	}
+	if length >= 64 {
+		entry := table[63+length/64]
+		if err := bw.writeBits(entry&0xffff, uint(entry>>16)); err != nil {
+			return err
+		}
+		length %= 64
+	}
+	entry := table[length]
+	return bw.writeBits(entry&0xffff, uint(entry>>16))
+}
+
+// extractTIFFFaxChanges 提取1位MSB打包二值扫描行中由白(0)到黑(1)及由黑到白的所有变色列位置
+// 入参: row 单行1位打包位图, width 有效像素列数, dst 复用的变色点切片缓冲
+// 返回: []int 严格递增且小于width的变色列号切片
+func extractTIFFFaxChanges(row []byte, width int, dst []int) []int {
+	changes := dst[:0]
+	black := false
+	x := 0
+	for x < width {
+		if x&7 == 0 && x+8 <= width {
+			b := row[x>>3]
+			if !black && b == 0 || black && b == 0xff {
+				x += 8
+				continue
+			}
+		}
+		bit := (row[x>>3]>>uint(7-x&7))&1 != 0
+		if bit != black {
+			changes = append(changes, x)
+			black = bit
+		}
+		x++
+	}
+	return changes
+}
+
+// encodeTIFFCCITTGroup4 按ITU-T T.6二维传真标准压缩1位MSB二值条带（0白1黑），输出含EOFB的Group 4位流
+// 入参: ctx 取消Context, data 1位打包条带像素, width 像素宽度, rows 条带行数, maxBytes 输出字节上限
+// 返回: []byte CCITT Group 4压缩条带字节, error 参数、预算或取消错误
+func encodeTIFFCCITTGroup4(ctx context.Context, data []byte, width, rows int, maxBytes int64) ([]byte, error) {
+	rowBytes := (width + 7) / 8
+	if width <= 0 || rows <= 0 || len(data) != rows*rowBytes {
+		return nil, fmt.Errorf("%w: invalid TIFF CCITT Group 4 strip layout", ErrInvalid)
+	}
+	limit := min(maxBytes, int64(math.MaxUint32))
+	bw := tiffBitWriter{out: make([]byte, 0, min(int64(len(data)), limit)), limit: limit}
+	reference := make([]int, 0, width+3)
+	reference = append(reference, width, width, width)
+	current := make([]int, 0, width+3)
+	for y := range rows {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		row := data[y*rowBytes : (y+1)*rowBytes]
+		current = extractTIFFFaxChanges(row, width, current)
+		curLen := len(current)
+		current = append(current, width, width, width)
+		position, refCursor, curIdx := 0, 0, 0
+		black, started := false, false
+		for position < width {
+			for curIdx < curLen && (current[curIdx] < position || started && current[curIdx] == position) {
+				curIdx++
+			}
+			a1 := current[curIdx]
+			a2 := current[curIdx+1]
+			for refCursor < len(reference) && (reference[refCursor] < position || started && reference[refCursor] == position) {
+				refCursor++
+			}
+			refIdx := refCursor
+			if (refIdx&1 == 1) != black {
+				refIdx++
+			}
+			b1, b2 := width, width
+			if refIdx < len(reference) {
+				b1 = reference[refIdx]
+			}
+			if refIdx+1 < len(reference) {
+				b2 = reference[refIdx+1]
+			}
+			if b2 < a1 {
+				if err := bw.writeBits(1, 4); err != nil {
+					return nil, err
+				}
+				position = b2
+				started = true
+				continue
+			}
+			delta := a1 - b1
+			if delta >= -3 && delta <= 3 {
+				var code uint32
+				var length uint
+				switch delta {
+				case 0:
+					code, length = 1, 1
+				case 1:
+					code, length = 3, 3
+				case -1:
+					code, length = 2, 3
+				case 2:
+					code, length = 3, 6
+				case -2:
+					code, length = 2, 6
+				case 3:
+					code, length = 3, 7
+				case -3:
+					code, length = 2, 7
+				}
+				if err := bw.writeBits(code, length); err != nil {
+					return nil, err
+				}
+				position = a1
+				black = !black
+				started = true
+				continue
+			}
+			if err := bw.writeBits(1, 3); err != nil {
+				return nil, err
+			}
+			if err := writeTIFFFaxRun(&bw, a1-position, black); err != nil {
+				return nil, err
+			}
+			if err := writeTIFFFaxRun(&bw, a2-a1, !black); err != nil {
+				return nil, err
+			}
+			position = a2
+			started = true
+		}
+		reference, current = current, reference[:0]
+	}
+	if err := bw.writeBits(0x001001, 24); err != nil {
+		return nil, err
+	}
+	if err := bw.flush(); err != nil {
+		return nil, err
+	}
+	return bw.out, checkContext(ctx)
 }
 
 // encodeTIFFPackBits 按TIFF 6.0规范逐行执行PackBits无损字节游程编码，严格保证游程不跨越行边界

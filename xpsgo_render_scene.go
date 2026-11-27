@@ -197,29 +197,42 @@ func newSceneParser(format Format, resources *resourceGraph) *sceneParser {
 	return &sceneParser{format: format, resources: resources, geometries: make(map[*xmlElement]*Geometry), matrices: make(map[*xmlElement]Matrix), brushes: make(map[*xmlElement]*Brush), elements: make(map[*xmlElement]Element)}
 }
 
+// parseDefinitions 按依赖顺序解析资源图中的全部几何、变换、画刷与视觉定义
+// 入参: ctx 可选取消Context，nil跳过取消检查
+// 返回: error 取消或资源解析错误
+func (p *sceneParser) parseDefinitions(ctx context.Context) error {
+	for _, definition := range p.resources.Definitions {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		switch resourceKind(definition.Kind) {
+		case "geometry":
+			if _, err := p.geometry(definition.Element, true); err != nil {
+				return err
+			}
+		case "matrix":
+			if _, err := p.matrix(definition.Element, true); err != nil {
+				return err
+			}
+		case "brush":
+			if _, err := p.brush(definition.Element, true); err != nil {
+				return err
+			}
+		case "visual":
+			if _, err := p.elementValue(definition.Element); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // parse 按依赖顺序解析资源定义，再读取页面绘制元素
 // 入参: root 页面根元素
 // 返回: []Element 绘制元素, error 错误信息
 func (p *sceneParser) parse(root *xmlElement) ([]Element, error) {
-	for _, definition := range p.resources.Definitions {
-		switch resourceKind(definition.Kind) {
-		case "geometry":
-			if _, err := p.geometry(definition.Element, true); err != nil {
-				return nil, err
-			}
-		case "matrix":
-			if _, err := p.matrix(definition.Element, true); err != nil {
-				return nil, err
-			}
-		case "brush":
-			if _, err := p.brush(definition.Element, true); err != nil {
-				return nil, err
-			}
-		case "visual":
-			if _, err := p.elementValue(definition.Element); err != nil {
-				return nil, err
-			}
-		}
+	if err := p.parseDefinitions(nil); err != nil {
+		return nil, err
 	}
 	var elements []Element
 	for _, child := range root.Children {

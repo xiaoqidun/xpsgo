@@ -114,6 +114,21 @@ type tiffPixelFormat struct {
 	sMax         [5]float64
 }
 
+// tiffDecodeSpec 保存完成全部IFD标签、样本布局、压缩参数与块边界校验的TIFF解码规格，供整图与流式解码共用
+type tiffDecodeSpec struct {
+	hdr         *tiffHeader
+	layout      tiffLayout
+	format      tiffPixelFormat
+	profile     []byte
+	fillOrder   uint32
+	predictor   uint32
+	fax         bool
+	faxOptions  uint32
+	jpegTables  tiffJPEGTable
+	legacy      tiffLegacyJPEG
+	legacyExtra tiffLegacyExtraJPEG
+}
+
 // readTIFFDirectory 读取经典TIFF头及首个目录，限制目录项数量
 // 入参: data 图像字节
 // 返回: *tiffDirectory 图像目录, error 数据或资源错误
@@ -476,13 +491,17 @@ func readTIFFImageInfo(data []byte, part, media string) (*ImageInfo, error) {
 	}, nil
 }
 
-// decodeTIFFImage 解码首个目录的条带或分块图像，保持16位颜色及独立透明度并按Tag 274规范化视觉方向
-// 入参: data 图像字节, maxPixels 剩余像素预算
-// 返回: *rasterImage 图像与分辨率, error 数据、能力或资源错误
-func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
+// parseTIFFDecodeSpec 统一校验TIFF目录样本布局、ICC配置、预测器、传真与JPEG参数及全部块偏移，供整图与流式解码共用
+// 当allowJPEG为false且遇到JPEG压缩、转置方向或分块存储时返回nil规格与nil错误，提示流式路径平滑回退整图解码
+// 入参: data 完整TIFF字节, maxPixels 像素容量上限, profileLimit ICC配置字节上限，零采用64MiB, allowJPEG 是否允许JPEG、分块及转置方向
+// 返回: *tiffDecodeSpec 已校验解码规格, error 结构、能力或资源错误
+func parseTIFFDecodeSpec(data []byte, maxPixels, profileLimit uint64, allowJPEG bool) (*tiffDecodeSpec, error) {
 	hdr, err := parseTIFFHeader(data)
 	if err != nil {
 		return nil, err
+	}
+	if !allowJPEG && (hdr.jpegCompression || hdr.orientation >= 5) {
+		return nil, nil
 	}
 	d := hdr.dir
 	width, height := hdr.width, hdr.height
@@ -491,7 +510,7 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 		return nil, fmt.Errorf("%w: decoded TIFF pixels", ErrLimit)
 	}
 	compression, jpegCompression := hdr.compression, hdr.jpegCompression
-	orientation, photo, channels, base := hdr.orientation, hdr.photo, hdr.channels, hdr.base
+	photo, channels, base := hdr.photo, hdr.channels, hdr.base
 	sampleFormat, bits, alpha := hdr.sampleFormat, hdr.bits, hdr.alpha
 	var sMin, sMax [5]float64
 	var hasSMin, hasSMax bool
@@ -542,7 +561,10 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 	if planar != 1 && planar != 2 {
 		return nil, fmt.Errorf("%w: TIFF planar configuration", ErrInvalid)
 	}
-	profile, err := d.byteField(34675, 64<<20)
+	if profileLimit == 0 {
+		profileLimit = 64 << 20
+	}
+	profile, err := d.byteField(34675, profileLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -558,7 +580,6 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 			return nil, e
 		}
 	}
-	dpi := hdr.dpi
 	predictor, err := d.number(317, 1, false)
 	if err != nil {
 		return nil, err
@@ -583,6 +604,9 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 			}
 		}
 	}
+	var jpegTables tiffJPEGTable
+	var legacy tiffLegacyJPEG
+	var legacyExtra tiffLegacyExtraJPEG
 	if jpegCompression {
 		if photo == 3 || predictor != 1 || sampleFormat != 1 || planar == 2 && channels > 1 || channels != base && photo != 2 && photo != 5 {
 			return nil, fmt.Errorf("%w: TIFF JPEG sample layout", ErrUnsupported)
@@ -595,29 +619,29 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 				return nil, err
 			}
 		}
-	}
-	var jpegTables tiffJPEGTable
-	if compression == 7 {
-		jpegTables, err = d.jpegTables()
-		if err != nil {
-			return nil, err
+		if compression == 7 {
+			jpegTables, err = d.jpegTables()
+			if err != nil {
+				return nil, err
+			}
 		}
-	}
-	var legacy tiffLegacyJPEG
-	var legacyExtra tiffLegacyExtraJPEG
-	if compression == 6 {
-		if channels > 4 {
-			legacyExtra, err = d.legacyExtraJPEG(width, height, channels, bits)
-		} else {
-			legacy, err = d.legacyJPEG(width, height, photo, channels, bits)
-		}
-		if err != nil {
-			return nil, err
+		if compression == 6 {
+			if channels > 4 {
+				legacyExtra, err = d.legacyExtraJPEG(width, height, channels, bits)
+			} else {
+				legacy, err = d.legacyJPEG(width, height, photo, channels, bits)
+			}
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	layout, err := d.imageLayout(width, height, channels, bits, compression, planar)
 	if err != nil {
 		return nil, err
+	}
+	if !allowJPEG && layout.tiled {
+		return nil, nil
 	}
 	var palette []byte
 	if photo == 3 {
@@ -641,10 +665,41 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 			return nil, fmt.Errorf("%w: TIFF block work", ErrLimit)
 		}
 	}
-	result := &rasterImage{
-		dpi:         dpi,
-		channels:    hdr.colorChannels,
+	return &tiffDecodeSpec{
+		hdr:         hdr,
+		layout:      layout,
+		format:      tiffPixelFormat{order: d.order, photo: photo, bits: bits, channels: channels, alpha: alpha, sampleFormat: sampleFormat, palette: palette, hasSMin: hasSMin, hasSMax: hasSMax, sMin: sMin, sMax: sMax},
 		profile:     profile,
+		fillOrder:   fillOrder,
+		predictor:   predictor,
+		fax:         fax,
+		faxOptions:  faxOptions,
+		jpegTables:  jpegTables,
+		legacy:      legacy,
+		legacyExtra: legacyExtra,
+	}, nil
+}
+
+// decodeTIFFImage 解码首个目录的条带或分块图像，保持16位颜色及独立透明度并按Tag 274规范化视觉方向
+// 入参: data 图像字节, maxPixels 剩余像素预算
+// 返回: *rasterImage 图像与分辨率, error 数据、能力或资源错误
+func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
+	spec, err := parseTIFFDecodeSpec(data, maxPixels, 64<<20, true)
+	if err != nil {
+		return nil, err
+	}
+	hdr := spec.hdr
+	d, layout, format := hdr.dir, spec.layout, spec.format
+	width, height := hdr.width, hdr.height
+	compression, jpegCompression := hdr.compression, hdr.jpegCompression
+	orientation, photo, channels, base := hdr.orientation, hdr.photo, hdr.channels, hdr.base
+	sampleFormat, bits, alpha := hdr.sampleFormat, hdr.bits, hdr.alpha
+	fillOrder, predictor, fax, faxOptions := spec.fillOrder, spec.predictor, spec.fax, spec.faxOptions
+	jpegTables, legacy, legacyExtra := spec.jpegTables, spec.legacy, spec.legacyExtra
+	result := &rasterImage{
+		dpi:         hdr.dpi,
+		channels:    hdr.colorChannels,
+		profile:     spec.profile,
 		colorSpace:  hdr.colorSpace,
 		hasAlpha:    alpha != 0,
 		bitDepth:    hdr.bitDepth,
@@ -678,7 +733,6 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 			floatScratch = make([]byte, layout.rowBytes)
 		}
 	}
-	format := tiffPixelFormat{order: d.order, photo: photo, bits: bits, channels: channels, alpha: alpha, sampleFormat: sampleFormat, palette: palette, hasSMin: hasSMin, hasSMax: hasSMax, sMin: sMin, sMax: sMax}
 	var jpegFrame tiffJPEGTable
 	for i := range layout.blocksPerPlane {
 		region := layout.region(i)
@@ -777,155 +831,33 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 
 // decodeTIFFImageRows 按Strip增量流式解码非分块、非JPEG、非转置TIFF并逐行色彩管理输出，峰值内存仅占单Strip与单行缓冲
 // 对分块TIFF、JPEG压缩TIFF或需转置方向返回handled=false由上层回退整帧解码路径
-// 入参: ctx 已规范化取消Context, data 完整TIFF字节, maxPixels 像素容量上限, maxBytes 色彩配置与工作内存上限, cfg 已校验色彩转换选项, fn 逐行消费回调
+// 入参: ctx 已规范化取消Context, data 完整TIFF字节, maxPixels 像素容量上限, profileBudget 色彩配置字节上限, stripBudget 显式收紧的Strip解压内存上限，零表示跟随像素解码预算, cfg 已校验色彩转换选项, fn 逐行消费回调
 // 返回: bool 是否已由Strip流式路径处理, error 解码、色彩、预算、回调或取消错误
-func decodeTIFFImageRows(ctx context.Context, data []byte, maxPixels, maxBytes uint64, cfg ImageConvertOptions, fn func(y int, nrgba []byte) error) (bool, error) {
+func decodeTIFFImageRows(ctx context.Context, data []byte, maxPixels, profileBudget, stripBudget uint64, cfg ImageConvertOptions, fn func(y int, nrgba []byte) error) (bool, error) {
 	if err := checkContext(ctx); err != nil {
 		return false, err
 	}
-	hdr, err := parseTIFFHeader(data)
+	spec, err := parseTIFFDecodeSpec(data, maxPixels, profileBudget, false)
 	if err != nil {
 		return false, err
 	}
-	if hdr.jpegCompression || hdr.orientation >= 5 {
+	if spec == nil {
 		return false, nil
 	}
+	hdr, layout, format := spec.hdr, spec.layout, spec.format
 	d := hdr.dir
-	width, height := hdr.width, hdr.height
-	pixels := uint64(width) * uint64(height)
-	if pixels > maxPixels || pixels > uint64(^uint(0)>>1)/8 {
-		return false, fmt.Errorf("%w: decoded TIFF pixels", ErrLimit)
-	}
-	compression, photo, channels := hdr.compression, hdr.photo, hdr.channels
-	sampleFormat, bits, alpha := hdr.sampleFormat, hdr.bits, hdr.alpha
-	var sMin, sMax [5]float64
-	var hasSMin, hasSMax bool
-	if sampleFormat == 2 {
-		defaultMin, defaultMax := -128.0, 127.0
-		if bits == 16 {
-			defaultMin, defaultMax = -32768.0, 32767.0
-		}
-		for i := range int(channels) {
-			sMin[i], sMax[i] = defaultMin, defaultMax
-		}
-		if d.entry[340] != nil {
-			values, err := d.sampleRange(340, int(channels))
-			if err != nil {
-				return false, err
-			}
-			copy(sMin[:], values)
-			hasSMin = true
-		}
-		if d.entry[341] != nil {
-			values, err := d.sampleRange(341, int(channels))
-			if err != nil {
-				return false, err
-			}
-			copy(sMax[:], values)
-			hasSMax = true
-		}
-		for i := range int(channels) {
-			if !geometryFinite(sMin[i], sMax[i]) || sMax[i] <= sMin[i] {
-				return false, fmt.Errorf("%w: TIFF signed sample range", ErrInvalid)
-			}
-		}
-	}
-	fillOrder, err := d.number(266, 1, false)
-	if err != nil {
-		return false, err
-	}
-	if fillOrder != 1 && fillOrder != 2 {
-		return false, fmt.Errorf("%w: TIFF fill order", ErrInvalid)
-	}
-	if fillOrder == 2 && (bits != 1 || compression > 4) {
-		return false, fmt.Errorf("%w: TIFF low-bit-order sample format", ErrUnsupported)
-	}
-	planar, err := d.number(284, 1, false)
-	if err != nil {
-		return false, err
-	}
-	if planar != 1 && planar != 2 {
-		return false, fmt.Errorf("%w: TIFF planar configuration", ErrInvalid)
-	}
-	profileLimit := maxBytes
-	if profileLimit == 0 {
-		profileLimit = 64 << 20
-	}
-	profile, err := d.byteField(34675, profileLimit)
-	if err != nil {
-		return false, err
-	}
-	if profile != nil && len(profile) == 0 {
-		return false, fmt.Errorf("%w: empty TIFF ICC profile", ErrInvalid)
-	}
-	if d.entry[34665] != nil {
-		offset, e := d.number(34665, 0, true)
-		if e != nil {
-			return false, e
-		}
-		if e = exifImageColor(data, d.order, uint64(offset)); e != nil {
-			return false, e
-		}
-	}
-	predictor, err := d.number(317, 1, false)
-	if err != nil {
-		return false, err
-	}
-	if predictor < 1 || predictor > 3 || predictor == 2 && (sampleFormat == 3 || bits < 8) || predictor == 3 && (sampleFormat != 3 || bits != 32) {
-		return false, fmt.Errorf("%w: TIFF predictor", ErrUnsupported)
-	}
-	fax := compression >= 2 && compression <= 4
-	faxOptions := uint32(0)
-	if fax {
-		if bits != 1 || channels != 1 || photo > 1 || predictor != 1 || sampleFormat != 1 {
-			return false, fmt.Errorf("%w: TIFF fax sample layout", ErrInvalid)
-		}
-		if compression == 3 || compression == 4 {
-			tag := uint16(292)
-			if compression == 4 {
-				tag = 293
-			}
-			faxOptions, err = d.number(tag, 0, true)
-			if err != nil {
-				return false, err
-			}
-		}
-	}
-	layout, err := d.imageLayout(width, height, channels, bits, compression, planar)
-	if err != nil {
-		return false, err
-	}
-	if layout.tiled {
-		return false, nil
-	}
-	var palette []byte
-	if photo == 3 {
-		palette, _, err = d.field(320, 3*(1<<bits), false)
-		if err != nil {
-			return false, err
-		}
-	}
-	overhead := uint64(layout.count)
-	var compressedBytes uint64
-	for i := range layout.count {
-		offset, size := layout.block(d, i)
-		if offset > uint64(len(data)) || size > uint64(len(data))-offset {
-			return false, fmt.Errorf("%w: TIFF block offset", ErrInvalid)
-		}
-		compressedBytes += size
-		if compressedBytes > uint64(len(data))+pixels*8+overhead || compressedBytes+overhead > rasterMaxWork {
-			return false, fmt.Errorf("%w: TIFF block work", ErrLimit)
-		}
-	}
+	width := hdr.width
+	compression, photo, sampleFormat, bits, alpha := hdr.compression, hdr.photo, hdr.sampleFormat, hdr.bits, hdr.alpha
+	fillOrder, predictor, fax, faxOptions := spec.fillOrder, spec.predictor, spec.fax, spec.faxOptions
 	stripMem := uint64(layout.rowBytes) * uint64(layout.blockHeight) * uint64(layout.planes)
-	if maxBytes > 0 && stripMem > maxBytes {
+	if stripBudget > 0 && stripMem > stripBudget {
 		return false, fmt.Errorf("%w: TIFF strip buffer memory budget", ErrLimit)
 	}
 	rowBounds := image.Rect(0, 0, int(width), 1)
 	rowRaster := &rasterImage{
 		dpi:         hdr.dpi,
 		channels:    hdr.colorChannels,
-		profile:     profile,
+		profile:     spec.profile,
 		colorSpace:  hdr.colorSpace,
 		hasAlpha:    alpha != 0,
 		bitDepth:    hdr.bitDepth,
@@ -948,7 +880,7 @@ func decodeTIFFImageRows(ctx context.Context, data []byte, maxPixels, maxBytes u
 		rowOut = image.NewNRGBA64(rowBounds)
 		rowRaster.pixels = rowOut
 	}
-	sampler, err := prepareImageConvertSampler(&ImageResource{source: rowRaster}, cfg, maxBytes)
+	sampler, err := prepareImageConvertSampler(&ImageResource{source: rowRaster}, cfg, profileBudget)
 	if err != nil {
 		return false, err
 	}
@@ -966,7 +898,6 @@ func decodeTIFFImageRows(ctx context.Context, data []byte, maxPixels, maxBytes u
 	if predictor == 3 {
 		floatScratch = make([]byte, layout.rowBytes)
 	}
-	format := tiffPixelFormat{order: d.order, photo: photo, bits: bits, channels: channels, alpha: alpha, sampleFormat: sampleFormat, palette: palette, hasSMin: hasSMin, hasSMax: hasSMax, sMin: sMin, sMax: sMax}
 	rowBuf := make([]byte, int(width)*4)
 	reverseStrips := hdr.orientation == 3 || hdr.orientation == 4
 	flipX := hdr.orientation == 2 || hdr.orientation == 3
@@ -1027,34 +958,8 @@ func decodeTIFFImageRows(ctx context.Context, data []byte, maxPixels, maxBytes u
 			} else {
 				format.writeRowRange(rowOut, 0, 0, int(width), row)
 			}
-			clear(rowBuf)
-			for x := range int(width) {
-				if x&1023 == 0 {
-					if err := checkContext(ctx); err != nil {
-						return true, err
-					}
-				}
-				srcX := x
-				if flipX {
-					srcX = int(width) - 1 - x
-				}
-				c, err := sampler.pixelColorWithCache(srcX, 0, &jxrCache)
-				if err != nil {
-					return true, err
-				}
-				lin, alphaVal, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode)
-				if err != nil {
-					return true, err
-				}
-				a8 := colorQuantize8(alphaVal)
-				if a8 == 0 {
-					continue
-				}
-				off := x * 4
-				rowBuf[off] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[0])))
-				rowBuf[off+1] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[1])))
-				rowBuf[off+2] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[2])))
-				rowBuf[off+3] = a8
+			if err := convertSamplerRowToNRGBA(ctx, sampler, &jxrCache, 0, 0, int(width), flipX, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode, rowBuf); err != nil {
+				return true, err
 			}
 			if err := fn(outY, rowBuf); err != nil {
 				return true, err

@@ -17,6 +17,7 @@ package xpsgo
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"encoding/xml"
 	"fmt"
 	"maps"
@@ -734,11 +735,18 @@ func (g *compositionStoryProjector) visual(page int, name string) error {
 		if err := g.plan.budget.scan(int64(len(part.data))); err != nil {
 			return err
 		}
-		root, err := decodeXMLVisit(part.data, g.plan.budget.limits, func(token xml.Token, node *xmlElement) error {
-			return g.plan.budget.step(1)
-		})
+		var root *xmlElement
+		var err error
+		if cached := source.cachedXML(part, g.plan.budget.limits); cached != nil {
+			root = cached
+			err = visitXMLElementTree(cached, func(_ xml.Token, _ *xmlElement) error { return g.plan.budget.step(1) })
+		} else {
+			root, err = decodeXMLVisit(part.data, g.plan.budget.limits, func(_ xml.Token, _ *xmlElement) error {
+				return g.plan.budget.step(1)
+			})
+		}
 		if err == nil {
-			root, err = preprocessXMLContext(root, []string{formatNamespace(source.format), formatNamespace(source.format) + "/resourcedictionary-key"}, g.plan.budget.context)
+			root, err = preprocessXMLContext(root, compositionLayoutUnderstoodNamespaces(source.format), g.plan.budget.context)
 		}
 		if err != nil {
 			return err
@@ -789,111 +797,65 @@ func compositionStoryString(value *string) *string {
 	return &copy
 }
 
+// equalOptionalPtr 比较可选指针，保留nil与零值的区别
+// 入参: a, b 可选指针, eq 值等价比较函数
+// 返回: bool 是否完全等价
+func equalOptionalPtr[T any](a, b *T, eq func(T, T) bool) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return eq(*a, *b)
+}
+
+// equalOptionalSlice 比较可选切片，区分nil与空切片
+// 入参: a, b 切片, eq 元素等价比较函数
+// 返回: bool 是否完全等价
+func equalOptionalSlice[T any](a, b []T, eq func(T, T) bool) bool {
+	return (a == nil) == (b == nil) && slices.EqualFunc(a, b, eq)
+}
+
 // equalOptionalString 比较可选字符串，保留nil与空值的区别
 // 入参: a, b 可选字符串指针
 // 返回: bool 是否完全等价
 func equalOptionalString(a, b *string) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return *a == *b
+	return equalOptionalPtr(a, b, func(x, y string) bool { return x == y })
 }
 
 // equalDocumentStructure 深度比较文档结构模型，区分nil与空切片
 // 入参: a, b 文档结构指针
 // 返回: bool 是否完全等价
 func equalDocumentStructure(a, b *DocumentStructure) bool {
-	if a == b {
-		return true
-	}
-	if a == nil || b == nil || a.Part != b.Part || !equalDocumentOutline(a.Outline, b.Outline) || (a.Stories == nil) != (b.Stories == nil) || len(a.Stories) != len(b.Stories) {
-		return false
-	}
-	for index := range a.Stories {
-		if !equalStory(a.Stories[index], b.Stories[index]) {
-			return false
-		}
-	}
-	return true
-}
-
-// equalDocumentOutline 深度比较文档目录模型，区分nil与空切片
-// 入参: a, b 目录指针
-// 返回: bool 是否完全等价
-func equalDocumentOutline(a, b *DocumentOutline) bool {
-	if a == b {
-		return true
-	}
-	if a == nil || b == nil || a.Language != b.Language || (a.Entries == nil) != (b.Entries == nil) || len(a.Entries) != len(b.Entries) {
-		return false
-	}
-	for index := range a.Entries {
-		left, right := a.Entries[index], b.Entries[index]
-		if left.Level != right.Level || left.Target != right.Target || left.Description != right.Description || !equalOptionalString(left.Language, right.Language) {
-			return false
-		}
-	}
-	return true
-}
-
-// equalStory 深度比较故事定义及其片段引用序列，区分nil与空切片
-// 入参: a, b 故事定义
-// 返回: bool 是否完全等价
-func equalStory(a, b Story) bool {
-	if a.Name != b.Name || (a.Fragments == nil) != (b.Fragments == nil) || len(a.Fragments) != len(b.Fragments) {
-		return false
-	}
-	for index := range a.Fragments {
-		left, right := a.Fragments[index], b.Fragments[index]
-		if left.PageNumber != right.PageNumber || !equalOptionalString(left.FragmentName, right.FragmentName) {
-			return false
-		}
-	}
-	return true
+	return equalOptionalPtr(a, b, func(x, y DocumentStructure) bool {
+		return x.Part == y.Part && equalOptionalPtr(x.Outline, y.Outline, func(o1, o2 DocumentOutline) bool {
+			return o1.Language == o2.Language && equalOptionalSlice(o1.Entries, o2.Entries, func(e1, e2 OutlineEntry) bool {
+				return e1.Level == e2.Level && e1.Target == e2.Target && e1.Description == e2.Description && equalOptionalString(e1.Language, e2.Language)
+			})
+		}) && equalOptionalSlice(x.Stories, y.Stories, func(s1, s2 Story) bool {
+			return s1.Name == s2.Name && equalOptionalSlice(s1.Fragments, s2.Fragments, func(f1, f2 StoryFragmentReference) bool {
+				return f1.PageNumber == f2.PageNumber && equalOptionalString(f1.FragmentName, f2.FragmentName)
+			})
+		})
+	})
 }
 
 // equalStoryFragments 深度比较页面故事片段集合，区分nil与空切片
 // 入参: a, b 片段集合指针
 // 返回: bool 是否完全等价
 func equalStoryFragments(a, b *StoryFragments) bool {
-	if a == b {
-		return true
-	}
-	if a == nil || b == nil || a.Part != b.Part || (a.Fragments == nil) != (b.Fragments == nil) || len(a.Fragments) != len(b.Fragments) {
-		return false
-	}
-	for index := range a.Fragments {
-		if !equalStoryFragment(a.Fragments[index], b.Fragments[index]) {
-			return false
-		}
-	}
-	return true
-}
-
-// equalStoryFragment 深度比较单个故事片段，保留指针省略与断点语义
-// 入参: a, b 故事片段
-// 返回: bool 是否完全等价
-func equalStoryFragment(a, b StoryFragment) bool {
-	if !equalOptionalString(a.StoryName, b.StoryName) || !equalOptionalString(a.FragmentName, b.FragmentName) || a.Type != b.Type || a.BreakBefore != b.BreakBefore || a.BreakAfter != b.BreakAfter {
-		return false
-	}
-	return equalContentStructures(a.Content, b.Content)
+	return equalOptionalPtr(a, b, func(x, y StoryFragments) bool {
+		return x.Part == y.Part && equalOptionalSlice(x.Fragments, y.Fragments, func(f1, f2 StoryFragment) bool {
+			return equalOptionalString(f1.StoryName, f2.StoryName) && equalOptionalString(f1.FragmentName, f2.FragmentName) && f1.Type == f2.Type && f1.BreakBefore == f2.BreakBefore && f1.BreakAfter == f2.BreakAfter && equalContentStructures(f1.Content, f2.Content)
+		})
+	})
 }
 
 // equalContentStructures 深度比较语义结构节点切片，区分nil与空切片
 // 入参: a, b 语义节点切片
 // 返回: bool 是否完全等价
 func equalContentStructures(a, b []ContentStructure) bool {
-	if (a == nil) != (b == nil) || len(a) != len(b) {
-		return false
-	}
-	for index := range a {
-		left, right := a[index], b[index]
-		if left.Kind != right.Kind || left.NameReference != right.NameReference || !equalOptionalString(left.Marker, right.Marker) || left.RowSpan != right.RowSpan || left.ColumnSpan != right.ColumnSpan || !equalContentStructures(left.Children, right.Children) {
-			return false
-		}
-	}
-	return true
+	return equalOptionalSlice(a, b, func(left, right ContentStructure) bool {
+		return left.Kind == right.Kind && left.NameReference == right.NameReference && equalOptionalString(left.Marker, right.Marker) && left.RowSpan == right.RowSpan && left.ColumnSpan == right.ColumnSpan && equalContentStructures(left.Children, right.Children)
+	})
 }
 
 // newCompositionSignatures 预留全部原始标识后协调冲突，优先保持受保护请求原文
@@ -1039,29 +1001,35 @@ func newCompositionSignatures(plan *compositionPlan, protected []map[string]bool
 	return result, nil
 }
 
-// compositionSignatureNames 收集签署请求各已知原始分支中的全部SpotID
+// compositionSignatureNames 收集签署请求各已知原始分支中的全部SpotID，自动跳过非ProcessContent的Ignorable扩展子树
 // 入参: part 原请求部件, source 源快照, budget 共享预算
 // 返回: []string 稳定排序的原始标识, error 模式、扩展、标识、预算或取消错误
 func compositionSignatureNames(part packagePart, source *compositionSource, budget *compositionBudget) ([]string, error) {
 	if err := budget.scan(int64(len(part.data))); err != nil {
 		return nil, err
 	}
+	namespace := formatNamespace(source.format) + "/signature-definitions"
+	tracker := newCompositionSignatureIgnoreTracker(namespace, budget.context)
 	validator := compositionProtectionGraph{source: source, budget: budget}
 	names := make(map[string]bool)
 	_, err := decodeXMLVisit(part.data, budget.limits, func(token xml.Token, node *xmlElement) error {
 		if err := budget.step(1); err != nil {
 			return err
 		}
-		if _, start := token.(xml.StartElement); !start {
+		skip, scope, err := tracker.visit(token, node)
+		if err != nil {
+			return err
+		}
+		if _, start := token.(xml.StartElement); !start || skip {
 			return nil
 		}
 		if err := validator.attributes(node); err != nil {
 			return err
 		}
-		if err := validator.definition(node); err != nil {
+		if err := compositionSignatureValidateNode(node, namespace, scope); err != nil {
 			return err
 		}
-		if node.Name == (xml.Name{Space: formatNamespace(source.format) + "/signature-definitions", Local: "SignatureDefinition"}) {
+		if node.Name == (xml.Name{Space: namespace, Local: "SignatureDefinition"}) {
 			value, exists := node.attribute("SpotID")
 			if err := budget.scan(int64(len(value))); err != nil {
 				return err
@@ -1095,6 +1063,50 @@ func compositionSignatureNames(part packagePart, source *compositionSource, budg
 		return nil, sortError
 	}
 	return result, nil
+}
+
+// newCompositionSignatureIgnoreTracker 创建签署定义专用词元级MCE忽略跟踪器，跳过非ProcessContent的Ignorable子树
+// 入参: namespace 签署定义目标命名空间, ctx 取消Context
+// 返回: *resourceMarkupScopeTracker 仅处理Ignorable与ProcessContent的词元跟踪器
+func newCompositionSignatureIgnoreTracker(namespace string, ctx context.Context) *resourceMarkupScopeTracker {
+	understood := map[string]bool{namespace: true, mcNamespace: true, xmlNamespace: true}
+	return &resourceMarkupScopeTracker{ignoreOnly: true, processor: compatibilityProcessor{understood: understood, context: ctx}}
+}
+
+// compositionSignatureValidateNode 在MCE忽略作用域下校验签署请求节点及属性，放行声明可忽略的扩展属性
+// 入参: node 原始请求节点, namespace 签署定义命名空间, scope 当前生效MCE作用域
+// 返回: error 未支持元素、属性或兼容分支错误
+func compositionSignatureValidateNode(node *xmlElement, namespace string, scope compatibilityScope) error {
+	if node.Name.Space == mcNamespace {
+		if !slices.Contains([]string{"AlternateContent", "Choice", "Fallback"}, node.Name.Local) {
+			return fmt.Errorf("%w: protected signature compatibility element", ErrUnsupported)
+		}
+		if node.Name.Local == "Choice" {
+			value, _ := node.attribute("Requires")
+			for _, prefix := range compatibilityWords(value) {
+				if node.Namespaces[prefix] != namespace {
+					return fmt.Errorf("%w: protected signature compatibility requirement", ErrUnsupported)
+				}
+			}
+		}
+	} else if node.Name.Space != namespace || !slices.Contains([]string{"SignatureDefinitions", "SignatureDefinition", "SpotLocation", "Intent", "SignBy", "SigningLocation"}, node.Name.Local) {
+		return fmt.Errorf("%w: protected signature definition element", ErrUnsupported)
+	}
+	for _, attr := range node.Attr {
+		if attr.Name.Space == xmlnsNamespace || attr.Name == (xml.Name{Local: "xmlns"}) || attr.Name.Space == mcNamespace || attr.Name == (xml.Name{Space: xmlNamespace, Local: "lang"}) {
+			continue
+		}
+		if attr.Name.Space != "" && scope.ignorable[attr.Name.Space] {
+			continue
+		}
+		allowed := node.Name.Space == mcNamespace && node.Name.Local == "Choice" && attr.Name == (xml.Name{Local: "Requires"})
+		allowed = allowed || node.Name.Local == "SignatureDefinition" && attr.Name.Space == "" && slices.Contains([]string{"SpotID", "SignerName"}, attr.Name.Local)
+		allowed = allowed || node.Name.Local == "SpotLocation" && attr.Name.Space == "" && slices.Contains([]string{"PageURI", "StartX", "StartY"}, attr.Name.Local)
+		if !allowed {
+			return fmt.Errorf("%w: protected signature definition attribute", ErrUnsupported)
+		}
+	}
+	return nil
 }
 
 // target 查询原请求标识的输出映射，不在写出过程中临时生成未协调的全局ID
@@ -1159,12 +1171,12 @@ func rewriteCompositionSignatureMarkup(value packagePart, options compositionSig
 	if err != nil {
 		return nil, err
 	}
+	tracker := newCompositionSignatureIgnoreTracker(namespace, b.context)
 	g := compositionProtectionGraph{source: &compositionSource{format: options.format}, budget: b}
 	var changes []xmlValueReplacement
 	var identities map[*xmlElement]string
 	omitted := make(map[*xmlElement]int)
 	nodes := 0
-	outputSize := int64(len(input))
 	intermediateLimit := maximum
 	if encoding, _ := xmlInputEncoding(value.data); encoding != "utf-8" {
 		intermediateLimit += min(maximum/2, int64(math.MaxInt)-maximum)
@@ -1174,22 +1186,25 @@ func rewriteCompositionSignatureMarkup(value packagePart, options compositionSig
 		if err := b.step(1); err != nil {
 			return err
 		}
+		skip, scope, err := tracker.visit(token, node)
+		if err != nil {
+			return err
+		}
 		if _, endElement := token.(xml.EndElement); endElement {
 			if position, present := omitted[node]; present {
 				changes = append(changes, xmlValueReplacement{start: position, end: int(end)})
-				outputSize -= end - int64(position)
 				delete(omitted, node)
 			}
 			return nil
 		}
-		if _, startElement := token.(xml.StartElement); !startElement {
+		if _, startElement := token.(xml.StartElement); !startElement || skip {
 			return nil
 		}
 		nodes++
 		if err := g.attributes(node); err != nil {
 			return err
 		}
-		if err := g.definition(node); err != nil {
+		if err := compositionSignatureValidateNode(node, namespace, scope); err != nil {
 			return err
 		}
 		if node.Name.Space != namespace || node.Name.Local != "SignatureDefinition" && node.Name.Local != "SpotLocation" {
@@ -1228,9 +1243,6 @@ func rewriteCompositionSignatureMarkup(value packagePart, options compositionSig
 				return err
 			}
 			if !keep {
-				if err := b.step(0); err != nil {
-					return err
-				}
 				omitted[node] = int(start)
 				return nil
 			}
@@ -1272,7 +1284,6 @@ func rewriteCompositionSignatureMarkup(value packagePart, options compositionSig
 			}
 			span := ranges[index]
 			changes = append(changes, xmlValueReplacement{start: int(start) + span.start, end: int(start) + span.end, data: escaped.Bytes()})
-			outputSize += int64(escaped.Len() - (span.end - span.start))
 			replacementBytes += int64(escaped.Len())
 		}
 		return nil
@@ -1289,39 +1300,15 @@ func rewriteCompositionSignatureMarkup(value packagePart, options compositionSig
 		mappings = append(mappings, identities)
 	}
 	for _, mapped := range mappings {
-		if err := compositionSignatureMarkupIDs(root, processor, compatibilityScope{}, false, make(map[string]bool), mapped, b); err != nil {
+		if err := compositionSignatureMarkupIDs(root, processor, compatibilityScope{}, make(map[string]bool), mapped, b); err != nil {
 			return nil, err
 		}
 	}
 	if len(changes) == 0 {
-		output := bytes.Clone(value.data)
-		if err := b.step(0); err != nil {
-			return nil, err
-		}
-		return output, nil
+		return bytes.Clone(value.data), b.step(0)
 	}
-	if outputSize < 0 || outputSize > intermediateLimit {
-		return nil, fmt.Errorf("%w: composition signature output bytes", ErrLimit)
-	}
-	output := make([]byte, 0, int(outputSize))
-	position := 0
-	for _, change := range changes {
-		if err := b.step(1); err != nil {
-			return nil, err
-		}
-		if change.start < position || change.end < change.start || change.end > len(input) {
-			return nil, fmt.Errorf("%w: overlapping composition signature edits", ErrInvalid)
-		}
-		output = append(output, input[position:change.start]...)
-		output = append(output, change.data...)
-		position = change.end
-	}
-	output = append(output, input[position:]...)
-	output, err = restoreXMLEncoding(value.data, output, maximum, b.context)
+	output, err := applyCompositionXMLSpans(value.data, input, changes, maximum, intermediateLimit, false, b)
 	if err != nil {
-		return nil, err
-	}
-	if err := b.scan(int64(len(output))); err != nil {
 		return nil, err
 	}
 	if err := b.step(nodes); err != nil {
@@ -1330,81 +1317,31 @@ func rewriteCompositionSignatureMarkup(value packagePart, options compositionSig
 	if _, err := readSignatureDefinitions(output, namespace, b.limits, b.context); err != nil {
 		return nil, err
 	}
-	if err := b.step(0); err != nil {
-		return nil, err
-	}
 	return output, nil
 }
 
-// compositionSignatureMarkupIDs 检查可同时出现的签署标识，互斥兼容分支允许复用标识
-// 入参: node 原始节点, processor 兼容处理器, inherited 祖先规则, branch 是否为直接候选分支, seen 当前标识集合, mapped 可选新标识, budget 共享预算
+// compositionSignatureMarkupIDs 通过分支感知MCE收集器校验可同时出现的签署标识，未选分支与Ignorable子树不误报冲突或MustUnderstand
+// 入参: node 原始节点, processor 兼容处理器, inherited 祖先规则, seen 当前标识集合, mapped 可选新标识, budget 共享预算
 // 返回: error 重复标识、兼容结构、预算或取消错误
-func compositionSignatureMarkupIDs(node *xmlElement, processor compatibilityProcessor, inherited compatibilityScope, branch bool, seen map[string]bool, mapped map[*xmlElement]string, budget *compositionBudget) error {
-	if err := budget.step(1); err != nil {
-		return err
-	}
-	scope, err := processor.rules(node, inherited)
-	if err != nil {
-		return err
-	}
-	if err := processor.validateAttributes(node, scope, branch); err != nil {
-		return err
-	}
-	if node.Name.Space == mcNamespace {
-		if node.Name.Local == "AlternateContent" {
-			if !xmlWhitespace(node.Text) {
-				return fmt.Errorf("%w: composition signature compatibility text", ErrInvalid)
+func compositionSignatureMarkupIDs(node *xmlElement, processor compatibilityProcessor, inherited compatibilityScope, seen map[string]bool, mapped map[*xmlElement]string, budget *compositionBudget) error {
+	return collectCompositionMCEIdentifiers(node, compositionMCEIdentifierConfig{
+		processor:  processor,
+		budget:     budget,
+		duplicate:  "duplicate composition signature ID",
+		misplaced:  "misplaced composition signature compatibility branch",
+		altText:    "composition signature compatibility text",
+		needChoice: "composition signature compatibility requires Choice",
+		unknownNS:  "composition signature element namespace",
+		extract: func(elem *xmlElement, _ bool) (string, bool, error) {
+			if elem.Name.Local != "SignatureDefinition" || elem.Name.Space == mcNamespace || !processor.understood[elem.Name.Space] {
+				return "", false, nil
 			}
-			var selection compatibilitySelection
-			union := make(map[string]bool)
-			for _, child := range node.Children {
-				if err := processor.alternative(child, scope, &selection); err != nil {
-					return err
-				}
-				local := make(map[string]bool)
-				if err := compositionSignatureMarkupIDs(child, processor, scope, true, local, mapped, budget); err != nil {
-					return err
-				}
-				for id := range local {
-					if err := budget.step(1); err != nil {
-						return err
-					}
-					union[id] = true
-				}
+			raw, _ := elem.attribute("SpotID")
+			id := structureURI(raw)
+			if value, present := mapped[elem]; present {
+				id = value
 			}
-			if selection.choices == 0 {
-				return fmt.Errorf("%w: composition signature compatibility requires Choice", ErrInvalid)
-			}
-			for id := range union {
-				if err := budget.step(1); err != nil {
-					return err
-				}
-				if seen[id] {
-					return fmt.Errorf("%w: duplicate composition signature ID", ErrInvalid)
-				}
-				seen[id] = true
-			}
-			return nil
-		}
-		if !branch || !slices.Contains([]string{"Choice", "Fallback"}, node.Name.Local) {
-			return fmt.Errorf("%w: misplaced composition signature compatibility branch", ErrInvalid)
-		}
-	}
-	if node.Name.Local == "SignatureDefinition" && node.Name.Space != mcNamespace {
-		raw, _ := node.attribute("SpotID")
-		id := structureURI(raw)
-		if value, present := mapped[node]; present {
-			id = value
-		}
-		if seen[id] {
-			return fmt.Errorf("%w: duplicate composition signature ID", ErrInvalid)
-		}
-		seen[id] = true
-	}
-	for _, child := range node.Children {
-		if err := compositionSignatureMarkupIDs(child, processor, scope, false, seen, mapped, budget); err != nil {
-			return err
-		}
-	}
-	return nil
+			return id, true, nil
+		},
+	}, false, false, seen, inherited)
 }

@@ -42,10 +42,70 @@ type FontSubsetOptions struct {
 	SynthesizeCmap   map[rune]uint16
 }
 
-// subsetCFFPrivate 保存重定位后的私有字典与未重编号的局部子程序索引
+// subsetCFFPrivate 保存重定位后的私有字典与局部子程序索引
 type subsetCFFPrivate struct {
 	size int
 	data []byte
+}
+
+// cffProgRef 标识CFF字形程序或子程序用于静态调用点去重与重写
+type cffProgRef struct {
+	kind    uint8
+	privKey [2]uint32
+	index   int
+}
+
+// cffType2Origin 记录Type2操作数栈槽是否来自当前字节流内的独立整数字面量
+type cffType2Origin struct {
+	prog  cffProgRef
+	start int
+	end   int
+	valid bool
+}
+
+// cffType2CallSite 记录Type2字节流中单个静态子程序调用字面量区间及目标信息
+type cffType2CallSite struct {
+	start    int
+	end      int
+	isGlobal bool
+	privKey  [2]uint32
+	target   int
+}
+
+// cffCompactPlan 保存CFF紧凑裁剪后的字形程序、字符集、字典选择、子程序与字符串表规划
+type cffCompactPlan struct {
+	programs        [][]byte
+	charsetValues   []uint16
+	fdSelect        []uint8
+	usedFDs         []int
+	strings         [][]byte
+	globalSubr      [][]byte
+	localSubrs      map[[2]uint32][][]byte
+	topSIDPatches   map[uint16][]int64
+	fdSIDPatches    map[int]map[uint16][]int64
+	pruneEmptySubrs bool
+}
+
+// cffType2Tracer 追踪Type2字形与子程序的实际调用集合并记录静态字面量调用点
+type cffType2Tracer struct {
+	globalSubr   [][]byte
+	localSubr    [][]byte
+	privKey      [2]uint32
+	randomState  uint32
+	ctx          context.Context
+	work         *int
+	usedGlobal   map[int]bool
+	usedLocal    map[[2]uint32]map[int]bool
+	globalPinned *bool
+	localPinned  map[[2]uint32]bool
+	sites        map[cffProgRef]map[int][]cffType2CallSite
+	stack        [48]float64
+	origins      [48]cffType2Origin
+	n            int
+	transient    [32]float64
+	initialized  uint32
+	widthSeen    bool
+	stems        int
 }
 
 // fontSubsetFaceKey 区分原始字体目录、保留编号与必需隐式码点映射，重复字体面复用已重定位的候选目录
@@ -339,6 +399,12 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, requir
 			binary.BigEndian.PutUint32(loca[index*stride:], offset)
 		}
 	}
+	if len(glyf) == 0 {
+		if configuration.MaxBytes < 2 {
+			return nil, nil, fmt.Errorf("%w: subset glyph byte budget", ErrLimit)
+		}
+		glyf = []byte{0, 0}
+	}
 	tables := map[string][]byte{"glyf": glyf, "loca": loca}
 	if err := profile.apply(face, fontMetrics, tables, configuration.CompactGIDs, ctx); err != nil {
 		return nil, nil, err
@@ -348,10 +414,8 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, requir
 			return nil, nil, err
 		}
 	}
-	if cmapTable, err := buildSubsetCmapTable(face, uint32(font.numGlyphs), oldToNew, newToOld, requiredRunes, configuration); err != nil {
+	if err := applySubsetCmapAndOS2(face, uint32(font.numGlyphs), oldToNew, newToOld, requiredRunes, configuration, tables); err != nil {
 		return nil, nil, err
-	} else if cmapTable != nil {
-		tables["cmap"] = cmapTable
 	}
 	if short {
 		binary.BigEndian.PutUint16(tables["head"][50:], 0)
@@ -386,7 +450,9 @@ func encodeSubsetFont(ctx context.Context, face *fontFace, replacements map[stri
 		}
 		if compact {
 			switch tag {
-			case "kern", "GPOS", "GSUB", "GDEF", "JSTF", "BASE", "VORG", "hdmx", "LTSH", "VDMX", "EBLC", "EBDT", "EBSC", "CBDT", "CBLC", "sbix":
+			case "kern", "GPOS", "GSUB", "GDEF", "JSTF", "BASE", "VORG", "MATH",
+				"morx", "mort", "kerx", "ankr", "lcar", "opbd", "prop", "feat", "trak", "Zapf",
+				"hdmx", "LTSH", "VDMX", "EBLC", "EBDT", "EBSC", "CBDT", "CBLC", "sbix", "bloc", "bdat", "bhed":
 				return true
 			}
 		}
@@ -394,70 +460,12 @@ func encodeSubsetFont(ctx context.Context, face *fontFace, replacements map[stri
 			return false
 		}
 		switch tag {
-		case "hdmx", "LTSH", "VDMX", "EBLC", "EBDT", "EBSC", "CBDT", "CBLC", "sbix":
+		case "hdmx", "LTSH", "VDMX", "EBLC", "EBDT", "EBSC", "CBDT", "CBLC", "sbix", "bloc", "bdat":
 			return true
 		}
 		return false
 	})
-	count := len(tags)
-	if count == 0 || count > 4095 {
-		return nil, fmt.Errorf("%w: subset table directory range", ErrLimit)
-	}
-	total := uint64(12 + count*16)
-	for _, tag := range tags {
-		length := uint64(face.tables[tag].length)
-		if replacement, present := replacements[tag]; present {
-			length = uint64(len(replacement))
-		}
-		total += (length + 3) &^ uint64(3)
-		if total > uint64(options.MaxBytes) || total > uint64(int(^uint(0)>>1)) || total > uint64(^uint32(0)) {
-			return nil, fmt.Errorf("%w: subset font output budget", ErrLimit)
-		}
-	}
-	output := make([]byte, int(total))
-	binary.BigEndian.PutUint32(output, binary.BigEndian.Uint32(face.data[face.offset:]))
-	binary.BigEndian.PutUint16(output[4:], uint16(count))
-	selector := bits.Len(uint(count)) - 1
-	search := 16 << selector
-	binary.BigEndian.PutUint16(output[6:], uint16(search))
-	binary.BigEndian.PutUint16(output[8:], uint16(selector))
-	binary.BigEndian.PutUint16(output[10:], uint16(count*16-search))
-	position, headOffset := 12+count*16, -1
-	for index, tag := range tags {
-		if err := checkContext(ctx); err != nil {
-			return nil, err
-		}
-		data, present := replacements[tag]
-		if !present {
-			var err error
-			data, err = face.table(tag)
-			if err != nil {
-				return nil, err
-			}
-		}
-		copy(output[position:], data)
-		if tag == "head" {
-			if len(data) < 54 {
-				return nil, fmt.Errorf("%w: subset head table", ErrInvalid)
-			}
-			headOffset = position
-			clear(output[position+8 : position+12])
-		}
-		record := output[12+index*16 : 12+(index+1)*16]
-		copy(record, tag)
-		binary.BigEndian.PutUint32(record[4:], fontChecksum(output[position:position+len(data)]))
-		binary.BigEndian.PutUint32(record[8:], uint32(position))
-		binary.BigEndian.PutUint32(record[12:], uint32(len(data)))
-		position += (len(data) + 3) &^ 3
-	}
-	if headOffset < 0 {
-		return nil, fmt.Errorf("%w: missing subset head", ErrInvalid)
-	}
-	binary.BigEndian.PutUint32(output[headOffset+8:], 0xb1b0afba-fontChecksum(output))
-	if err := checkContext(ctx); err != nil {
-		return nil, err
-	}
-	return output, nil
+	return assembleSFNT(ctx, face, tags, replacements, options.MaxBytes, 54)
 }
 
 // subsetCFFFont 裁剪CFF1字体子集表，支持原GID保号或紧凑重编号与合成cmap
@@ -652,9 +660,21 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 			return nil, nil, err
 		}
 	}
-	encoded, err := encodeSubsetCFFTable(ctx, font, programs, charsetValues, fdSelect, cffBounds[:], options.CompactGIDs, options)
-	if err != nil {
-		return nil, nil, err
+	var encoded []byte
+	if options.CompactGIDs {
+		plan, err := buildSubsetCFFCompactPlan(ctx, font, programs, charsetValues, fdSelect, &remaining)
+		if err != nil {
+			return nil, nil, err
+		}
+		encoded, err = encodeSubsetCFFTableWithPlan(ctx, font, plan, cffBounds[:], true, options)
+		if err != nil {
+			return nil, nil, err
+		}
+	} else {
+		encoded, err = encodeSubsetCFFTable(ctx, font, programs, charsetValues, fdSelect, cffBounds[:], false, options)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	tables := map[string][]byte{"CFF ": encoded}
 	if err := profile.apply(face, metrics, tables, options.CompactGIDs, ctx); err != nil {
@@ -665,10 +685,8 @@ func subsetCFFFont(ctx context.Context, face *fontFace, metrics *fontMetrics, gl
 			return nil, nil, err
 		}
 	}
-	if cmapTable, err := buildSubsetCmapTable(face, uint32(len(font.charstrings)), oldToNew, newToOld, requiredRunes, options); err != nil {
+	if err := applySubsetCmapAndOS2(face, uint32(len(font.charstrings)), oldToNew, newToOld, requiredRunes, options, tables); err != nil {
 		return nil, nil, err
-	} else if cmapTable != nil {
-		tables["cmap"] = cmapTable
 	}
 	out, err := encodeSubsetFont(ctx, face, tables, slices.Contains(needed, false), options.CompactGIDs, options)
 	if err != nil {
@@ -838,12 +856,16 @@ func patchSubsetCFFDictReal(original []byte, values map[uint16][]int64, reals ma
 		}
 		entry := original[start:position]
 		if operands, replace := values[operator]; replace {
+			seen[operator] = true
+			if operands == nil {
+				start = position
+				continue
+			}
 			var err error
 			entry, err = subsetCFFEntry(operator, operands)
 			if err != nil {
 				return nil, err
 			}
-			seen[operator] = true
 		} else if operands, replace := reals[operator]; replace {
 			var err error
 			entry, err = subsetCFFFloatEntry(operator, operands)
@@ -859,8 +881,8 @@ func patchSubsetCFFDictReal(original []byte, values map[uint16][]int64, reals ma
 		start = position
 	}
 	var missing []uint16
-	for operator := range values {
-		if !seen[operator] {
+	for operator, operands := range values {
+		if !seen[operator] && operands != nil {
 			missing = append(missing, operator)
 		}
 	}
@@ -995,6 +1017,26 @@ func subsetCFFNumberOperand(value float64) ([]byte, error) {
 // 入参: ctx 取消Context, font 原CFF字体, programs 新字形程序, charsetValues GID到SID或CID映射, fdSelect CID字体字典选择数组, fontBBox 可选四元组FontBBox, resetEncoding 紧凑模式下是否重置自定义编码, options 字节上限
 // 返回: []byte 独立CFF表, error 字典、布局、范围或取消错误
 func encodeSubsetCFFTable(ctx context.Context, font *cffFont, programs [][]byte, charsetValues []uint16, fdSelect []uint8, fontBBox []float64, resetEncoding bool, options FontSubsetOptions) ([]byte, error) {
+	plan := cffCompactPlan{
+		programs:      programs,
+		charsetValues: charsetValues,
+		fdSelect:      fdSelect,
+		strings:       font.set.strings,
+		globalSubr:    font.set.globalSubr,
+	}
+	if font.cid {
+		plan.usedFDs = make([]int, len(font.fontDict))
+		for i := range font.fontDict {
+			plan.usedFDs[i] = i
+		}
+	}
+	return encodeSubsetCFFTableWithPlan(ctx, font, plan, fontBBox, resetEncoding, options)
+}
+
+// encodeSubsetCFFTableWithPlan 按裁剪规划重建CFF1表，支持子程序、FDArray与Strings表同步重定位
+// 入参: ctx 取消Context, font 原CFF字体, plan 裁剪与重映射规划, fontBBox 可选四元组FontBBox, resetEncoding 紧凑模式下是否重置自定义编码, options 字节上限
+// 返回: []byte 独立CFF表, error 字典、布局、范围或取消错误
+func encodeSubsetCFFTableWithPlan(ctx context.Context, font *cffFont, plan cffCompactPlan, fontBBox []float64, resetEncoding bool, options FontSubsetOptions) ([]byte, error) {
 	maximum := min(options.MaxBytes, int64(math.MaxInt32))
 	set := font.set
 	_, afterName, err := parseCFFIndex(set.data, uint32(set.data[2]))
@@ -1008,14 +1050,22 @@ func encodeSubsetCFFTable(ctx context.Context, font *cffFont, programs [][]byte,
 	privateFonts := []cffFontDict{font.top}
 	var dictionaries [][]byte
 	if font.cid {
-		privateFonts = font.fontDict
 		offset, err := cffRequiredOffset(font.top.dict, 0x0c24)
 		if err != nil {
 			return nil, err
 		}
-		dictionaries, _, err = parseCFFIndex(set.data, offset)
+		allDicts, _, err := parseCFFIndex(set.data, offset)
 		if err != nil {
 			return nil, err
+		}
+		privateFonts = make([]cffFontDict, len(plan.usedFDs))
+		dictionaries = make([][]byte, len(plan.usedFDs))
+		for newIdx, oldIdx := range plan.usedFDs {
+			if oldIdx < 0 || oldIdx >= len(font.fontDict) || oldIdx >= len(allDicts) {
+				return nil, fmt.Errorf("%w: subset CFF FDArray index out of range", ErrInvalid)
+			}
+			privateFonts[newIdx] = font.fontDict[oldIdx]
+			dictionaries[newIdx] = allDicts[oldIdx]
 		}
 	}
 	privates := make([]subsetCFFPrivate, len(privateFonts))
@@ -1026,30 +1076,36 @@ func encodeSubsetCFFTable(ctx context.Context, font *cffFont, programs [][]byte,
 		if err := checkContext(ctx); err != nil {
 			return nil, err
 		}
-		values, _ := fd.dict.value(18)
-		for field := range privateKeys[index] {
-			value, err := cffInteger(values[field:field+1], 0, math.MaxInt32)
-			if err != nil {
-				return nil, err
-			}
-			privateKeys[index][field] = uint32(value)
+		key, err := cffPrivateKey(fd)
+		if err != nil {
+			return nil, err
 		}
-		if cached, present := privateCache[privateKeys[index]]; present {
+		privateKeys[index] = key
+		if cached, present := privateCache[key]; present {
 			privates[index] = cached
 			continue
 		}
-		privates[index], err = buildSubsetCFFPrivate(set.data, fd, maximum-privateBytes)
+		localSubr := fd.private.localSubr
+		if plan.localSubrs != nil {
+			if pruned, ok := plan.localSubrs[key]; ok {
+				localSubr = pruned
+			}
+		}
+		privates[index], err = buildSubsetCFFPrivate(set.data, fd, localSubr, plan.pruneEmptySubrs, maximum-privateBytes)
 		if err != nil {
 			return nil, err
 		}
 		privateBytes += int64(len(privates[index].data))
-		privateCache[privateKeys[index]] = privates[index]
+		privateCache[key] = privates[index]
 	}
 	encoding, customEncoding, err := subsetCFFEncoding(font)
 	if err != nil {
 		return nil, err
 	}
 	values := map[uint16][]int64{15: {0}, 17: {0}}
+	for op, operands := range plan.topSIDPatches {
+		values[op] = operands
+	}
 	var reals map[uint16][]float64
 	if len(fontBBox) == 4 {
 		reals = map[uint16][]float64{5: fontBBox}
@@ -1071,7 +1127,7 @@ func encodeSubsetCFFTable(ctx context.Context, font *cffFont, programs [][]byte,
 	if err != nil {
 		return nil, err
 	}
-	coreObjects := [][][]byte{set.names, {top}, set.strings, set.globalSubr}
+	coreObjects := [][][]byte{set.names, {top}, plan.strings, plan.globalSubr}
 	output := bytes.Clone(set.data[:set.data[2]])
 	output[3] = 4
 	put := func(data []byte) (int64, error) {
@@ -1101,10 +1157,10 @@ func encodeSubsetCFFTable(ctx context.Context, font *cffFont, programs [][]byte,
 	}
 	var charset []byte
 	if font.cid {
-		charset = encodeSubsetCFFCharsetFormat2(charsetValues)
+		charset = encodeSubsetCFFCharsetFormat2(plan.charsetValues)
 	} else {
-		charset = make([]byte, 1, 1+2*max(0, len(charsetValues)-1))
-		for _, value := range charsetValues[1:] {
+		charset = make([]byte, 1, 1+2*max(0, len(plan.charsetValues)-1))
+		for _, value := range plan.charsetValues[1:] {
 			charset = binary.BigEndian.AppendUint16(charset, value)
 		}
 	}
@@ -1120,7 +1176,7 @@ func encodeSubsetCFFTable(ctx context.Context, font *cffFont, programs [][]byte,
 		}
 		values[16][0] = position
 	}
-	chars, err := encodeSubsetCFFIndex(programs, maximum)
+	chars, err := encodeSubsetCFFIndex(plan.programs, maximum)
 	if err != nil {
 		return nil, err
 	}
@@ -1131,13 +1187,19 @@ func encodeSubsetCFFTable(ctx context.Context, font *cffFont, programs [][]byte,
 	values[17][0] = position
 	var fdPosition, fdLength int
 	if font.cid {
-		position, err := put(encodeSubsetCFFFDSelectFormat3(fdSelect))
+		position, err := put(encodeSubsetCFFFDSelectFormat3(plan.fdSelect))
 		if err != nil {
 			return nil, err
 		}
 		values[0x0c25][0] = position
 		for index, dictionary := range dictionaries {
-			dictionaries[index], err = patchSubsetCFFDictReal(dictionary, map[uint16][]int64{18: {int64(privates[index].size), 0}}, nil, maximum)
+			fdValues := map[uint16][]int64{18: {int64(privates[index].size), 0}}
+			if plan.fdSIDPatches != nil {
+				for op, operands := range plan.fdSIDPatches[plan.usedFDs[index]] {
+					fdValues[op] = operands
+				}
+			}
+			dictionaries[index], err = patchSubsetCFFDictReal(dictionary, fdValues, nil, maximum)
 			if err != nil {
 				return nil, err
 			}
@@ -1198,6 +1260,709 @@ func encodeSubsetCFFTable(ctx context.Context, font *cffFont, programs [][]byte,
 	return output, checkContext(ctx)
 }
 
+// buildSubsetCFFCompactPlan 针对紧凑子集执行Type2子程序可达性追踪与重编号、CID FDArray裁剪及自定义Strings裁剪
+// 入参: ctx 取消Context, font 原CFF字体, programs 保留字形程序列表, charsetValues 保留字形字符集映射, fdSelect 保留字形原FDSelect索引, remaining 可选工作预算参考
+// 返回: cffCompactPlan 紧凑裁剪规划, error 解析、范围、预算或取消错误
+func buildSubsetCFFCompactPlan(ctx context.Context, font *cffFont, programs [][]byte, charsetValues []uint16, fdSelect []uint8, remaining *int) (cffCompactPlan, error) {
+	plan := cffCompactPlan{
+		programs:        slices.Clone(programs),
+		charsetValues:   slices.Clone(charsetValues),
+		fdSelect:        slices.Clone(fdSelect),
+		pruneEmptySubrs: true,
+	}
+	activePrivates := make(map[[2]uint32]cffPrivate)
+	if font.cid {
+		usedFDSet := make(map[int]bool, len(fdSelect))
+		for _, fd := range fdSelect {
+			usedFDSet[int(fd)] = true
+		}
+		plan.usedFDs = slices.Sorted(maps.Keys(usedFDSet))
+		oldToNewFD := make(map[int]uint8, len(plan.usedFDs))
+		for newIdx, oldIdx := range plan.usedFDs {
+			oldToNewFD[oldIdx] = uint8(newIdx)
+			key, err := cffPrivateKey(font.fontDict[oldIdx])
+			if err != nil {
+				return plan, err
+			}
+			activePrivates[key] = font.fontDict[oldIdx].private
+		}
+		for i, oldFD := range fdSelect {
+			plan.fdSelect[i] = oldToNewFD[int(oldFD)]
+		}
+	} else {
+		key, err := cffPrivateKey(font.top)
+		if err != nil {
+			return plan, err
+		}
+		activePrivates[key] = font.top.private
+	}
+	usedGlobal := make(map[int]bool)
+	usedLocal := make(map[[2]uint32]map[int]bool)
+	globalPinned := false
+	localPinned := make(map[[2]uint32]bool)
+	sites := make(map[cffProgRef]map[int][]cffType2CallSite)
+	traceBudget := 1 << 20
+	if remaining != nil && *remaining > traceBudget {
+		traceBudget = *remaining
+	}
+	for gid, prog := range programs {
+		if err := checkContext(ctx); err != nil {
+			return plan, err
+		}
+		fd := font.top
+		if font.cid {
+			fd = font.fontDict[fdSelect[gid]]
+		}
+		key, err := cffPrivateKey(fd)
+		if err != nil {
+			return plan, err
+		}
+		tracer := cffType2Tracer{
+			globalSubr:   font.set.globalSubr,
+			localSubr:    fd.private.localSubr,
+			privKey:      key,
+			randomState:  0x6d2b79f5,
+			ctx:          ctx,
+			work:         &traceBudget,
+			usedGlobal:   usedGlobal,
+			usedLocal:    usedLocal,
+			globalPinned: &globalPinned,
+			localPinned:  localPinned,
+			sites:        sites,
+		}
+		if fd.private.randomSeed != 0 {
+			tracer.randomState = uint32(fd.private.randomSeed)
+		}
+		if _, err := tracer.execute(prog, cffProgRef{kind: 0, index: gid}, 0); err != nil {
+			return plan, err
+		}
+	}
+	for _, posMap := range sites {
+		for _, list := range posMap {
+			if len(list) <= 1 {
+				continue
+			}
+			first := list[0]
+			for _, other := range list[1:] {
+				if first.isGlobal != other.isGlobal || first.target != other.target {
+					if first.isGlobal || other.isGlobal {
+						globalPinned = true
+					}
+					if !first.isGlobal {
+						localPinned[first.privKey] = true
+					}
+					if !other.isGlobal {
+						localPinned[other.privKey] = true
+					}
+				} else if !first.isGlobal && first.privKey != other.privKey {
+					localPinned[first.privKey] = true
+					localPinned[other.privKey] = true
+				}
+			}
+		}
+	}
+	buildSubrMap := func(orig [][]byte, used map[int]bool, pinned bool) (map[int]int, []int, int) {
+		if len(orig) == 0 {
+			return nil, nil, 107
+		}
+		if pinned {
+			mapping := make(map[int]int, len(orig))
+			order := make([]int, len(orig))
+			for i := range orig {
+				mapping[i] = i
+				order[i] = i
+			}
+			return mapping, order, cffSubrBias(len(orig))
+		}
+		order := slices.Sorted(maps.Keys(used))
+		mapping := make(map[int]int, len(order))
+		for newIdx, oldIdx := range order {
+			mapping[oldIdx] = newIdx
+		}
+		return mapping, order, cffSubrBias(len(order))
+	}
+	globalMap, globalOrder, newGlobalBias := buildSubrMap(font.set.globalSubr, usedGlobal, globalPinned)
+	localMaps := make(map[[2]uint32]map[int]int, len(activePrivates))
+	localOrders := make(map[[2]uint32][]int, len(activePrivates))
+	localBiases := make(map[[2]uint32]int, len(activePrivates))
+	for key, priv := range activePrivates {
+		lm, lo, lb := buildSubrMap(priv.localSubr, usedLocal[key], localPinned[key])
+		localMaps[key], localOrders[key], localBiases[key] = lm, lo, lb
+	}
+	rewriteProg := func(raw []byte, ref cffProgRef) ([]byte, bool) {
+		posMap := sites[ref]
+		if len(posMap) == 0 {
+			return raw, true
+		}
+		starts := slices.Sorted(maps.Keys(posMap))
+		var out []byte
+		cursor := 0
+		changed := false
+		for _, start := range starts {
+			site := posMap[start][0]
+			if site.start < cursor || site.end > len(raw) {
+				return raw, false
+			}
+			var encoded []byte
+			if site.isGlobal {
+				if globalPinned {
+					continue
+				}
+				newIdx, ok := globalMap[site.target]
+				if !ok {
+					return raw, false
+				}
+				encoded = subsetType2Integer(newIdx - newGlobalBias)
+			} else {
+				if localPinned[site.privKey] {
+					continue
+				}
+				newIdx, ok := localMaps[site.privKey][site.target]
+				if !ok {
+					return raw, false
+				}
+				encoded = subsetType2Integer(newIdx - localBiases[site.privKey])
+			}
+			out = append(out, raw[cursor:site.start]...)
+			out = append(out, encoded...)
+			cursor = site.end
+			changed = true
+		}
+		if !changed {
+			return raw, true
+		}
+		out = append(out, raw[cursor:]...)
+		if len(out) > 65535 {
+			return raw, false
+		}
+		return out, true
+	}
+	assembleSubrs := func() bool {
+		rewrittenProgs := make([][]byte, len(programs))
+		for gid, prog := range programs {
+			rewritten, ok := rewriteProg(prog, cffProgRef{kind: 0, index: gid})
+			if !ok {
+				return false
+			}
+			rewrittenProgs[gid] = rewritten
+		}
+		var newGlobals [][]byte
+		if len(globalOrder) > 0 {
+			newGlobals = make([][]byte, len(globalOrder))
+			for newIdx, oldIdx := range globalOrder {
+				if globalPinned && !usedGlobal[oldIdx] {
+					newGlobals[newIdx] = []byte{11}
+					continue
+				}
+				rewritten, ok := rewriteProg(font.set.globalSubr[oldIdx], cffProgRef{kind: 1, index: oldIdx})
+				if !ok {
+					return false
+				}
+				newGlobals[newIdx] = rewritten
+			}
+		}
+		newLocals := make(map[[2]uint32][][]byte, len(activePrivates))
+		for key, priv := range activePrivates {
+			order := localOrders[key]
+			if len(order) == 0 {
+				newLocals[key] = nil
+				continue
+			}
+			subrs := make([][]byte, len(order))
+			for newIdx, oldIdx := range order {
+				if localPinned[key] && !usedLocal[key][oldIdx] {
+					subrs[newIdx] = []byte{11}
+					continue
+				}
+				rewritten, ok := rewriteProg(priv.localSubr[oldIdx], cffProgRef{kind: 2, privKey: key, index: oldIdx})
+				if !ok {
+					return false
+				}
+				subrs[newIdx] = rewritten
+			}
+			newLocals[key] = subrs
+		}
+		plan.programs = rewrittenProgs
+		plan.globalSubr = newGlobals
+		plan.localSubrs = newLocals
+		return true
+	}
+	if !assembleSubrs() {
+		globalPinned = true
+		for key := range activePrivates {
+			localPinned[key] = true
+		}
+		globalMap, globalOrder, newGlobalBias = buildSubrMap(font.set.globalSubr, usedGlobal, true)
+		for key, priv := range activePrivates {
+			lm, lo, lb := buildSubrMap(priv.localSubr, usedLocal[key], true)
+			localMaps[key], localOrders[key], localBiases[key] = lm, lo, lb
+		}
+		assembleSubrs()
+	}
+	pruneSubsetCFFStrings(font, &plan)
+	return plan, nil
+}
+
+// pruneSubsetCFFStrings 裁剪CFF自定义String INDEX中未被Top DICT、保留FDArray与字符集引用的字符串并生成SID重映射补丁
+// 入参: font 原CFF字体, plan 裁剪规划指针
+func pruneSubsetCFFStrings(font *cffFont, plan *cffCompactPlan) {
+	if len(font.set.strings) == 0 {
+		return
+	}
+	maxSID := uint16(min(64999, 390+len(font.set.strings)))
+	usedSIDs := make(map[uint16]bool)
+	cffCollectDictSIDs(font.top.dict, usedSIDs, maxSID)
+	if font.cid {
+		for _, oldFD := range plan.usedFDs {
+			cffCollectDictSIDs(font.fontDict[oldFD].dict, usedSIDs, maxSID)
+		}
+	} else {
+		for _, sid := range plan.charsetValues[1:] {
+			if sid >= 391 && sid <= maxSID {
+				usedSIDs[sid] = true
+			}
+		}
+	}
+	if len(usedSIDs) == len(font.set.strings) {
+		plan.strings = font.set.strings
+		return
+	}
+	sortedSIDs := slices.Sorted(maps.Keys(usedSIDs))
+	sidMap := make(map[uint16]uint16, len(sortedSIDs))
+	newStrings := make([][]byte, len(sortedSIDs))
+	for i, oldSID := range sortedSIDs {
+		sidMap[oldSID] = uint16(391 + i)
+		newStrings[i] = font.set.strings[int(oldSID-391)]
+	}
+	plan.strings = newStrings
+	plan.topSIDPatches = cffBuildDictSIDPatches(font.top.dict, sidMap)
+	if font.cid {
+		plan.fdSIDPatches = make(map[int]map[uint16][]int64, len(plan.usedFDs))
+		for _, oldFD := range plan.usedFDs {
+			if patches := cffBuildDictSIDPatches(font.fontDict[oldFD].dict, sidMap); len(patches) > 0 {
+				plan.fdSIDPatches[oldFD] = patches
+			}
+		}
+	} else {
+		for i := 1; i < len(plan.charsetValues); i++ {
+			if mapped, ok := sidMap[plan.charsetValues[i]]; ok {
+				plan.charsetValues[i] = mapped
+			}
+		}
+	}
+}
+
+// cffCollectDictSIDs 收集CFF字典中所有引用自定义String INDEX的字符串标识
+// 入参: dict 已解析CFF字典, used 收集结果集合, maxSID 允许的最大合法SID
+func cffCollectDictSIDs(dict cffDict, used map[uint16]bool, maxSID uint16) {
+	record := func(op cffOperand) {
+		if op.real || !geometryFinite(op.value) || math.Trunc(op.value) != op.value || op.value < 391 || op.value > float64(maxSID) {
+			return
+		}
+		used[uint16(op.value)] = true
+	}
+	for _, entry := range dict {
+		switch entry.operator {
+		case 0, 1, 2, 3, 4, 0x0c00, 0x0c15, 0x0c16, 0x0c26:
+			if len(entry.operands) == 1 {
+				record(entry.operands[0])
+			}
+		case 0x0c1e:
+			if len(entry.operands) == 3 {
+				record(entry.operands[0])
+				record(entry.operands[1])
+			}
+		}
+	}
+}
+
+// cffBuildDictSIDPatches 按旧新自定义SID映射构造需要更新的CFF字典操作符补丁
+// 入参: dict 已解析CFF字典, sidMap 旧SID到新SID映射表
+// 返回: map[uint16][]int64 需替换的字典操作符与整数字面量列表
+func cffBuildDictSIDPatches(dict cffDict, sidMap map[uint16]uint16) map[uint16][]int64 {
+	var patches map[uint16][]int64
+	remap := func(op cffOperand) (int64, bool) {
+		if op.real || !geometryFinite(op.value) || math.Trunc(op.value) != op.value || op.value < 0 || op.value > 65535 {
+			return 0, false
+		}
+		v := uint16(op.value)
+		if mapped, ok := sidMap[v]; ok {
+			return int64(mapped), mapped != v
+		}
+		return int64(v), false
+	}
+	for _, entry := range dict {
+		switch entry.operator {
+		case 0, 1, 2, 3, 4, 0x0c00, 0x0c15, 0x0c16, 0x0c26:
+			if len(entry.operands) == 1 {
+				if v, changed := remap(entry.operands[0]); changed {
+					if patches == nil {
+						patches = make(map[uint16][]int64)
+					}
+					patches[entry.operator] = []int64{v}
+				}
+			}
+		case 0x0c1e:
+			if len(entry.operands) == 3 {
+				r, rChanged := remap(entry.operands[0])
+				o, oChanged := remap(entry.operands[1])
+				if rChanged || oChanged {
+					sup, err := cffInteger(entry.operands[2:3], math.MinInt32, math.MaxInt32)
+					if err == nil {
+						if patches == nil {
+							patches = make(map[uint16][]int64)
+						}
+						patches[entry.operator] = []int64{r, o, sup}
+					}
+				}
+			}
+		}
+	}
+	return patches
+}
+
+// cffPrivateKey 提取字体字典Private条目的尺寸与偏移组合键用于共享私有字典去重
+// 入参: fd CFF字体字典
+// 返回: [2]uint32 私有字典尺寸与偏移键, error 缺失或范围错误
+func cffPrivateKey(fd cffFontDict) ([2]uint32, error) {
+	var key [2]uint32
+	values, present := fd.dict.value(18)
+	if !present || len(values) != 2 {
+		return key, fmt.Errorf("%w: subset CFF Private range", ErrInvalid)
+	}
+	for field := range key {
+		value, err := cffInteger(values[field:field+1], 0, math.MaxInt32)
+		if err != nil {
+			return key, err
+		}
+		key[field] = uint32(value)
+	}
+	return key, nil
+}
+
+// cffSubrBias 按Adobe TN #5177计算Type2子程序表对应的索引偏置
+// 入参: count 子程序表条目数量
+// 返回: int 偏置值107、1131或32768
+func cffSubrBias(count int) int {
+	if count >= 33900 {
+		return 32768
+	}
+	if count >= 1240 {
+		return 1131
+	}
+	return 107
+}
+
+// execute 追踪单个Type2程序或子程序的栈状态、stem掩码与子程序调用点
+// 入参: data 当前Type2字节流, ref 当前程序标识, depth 当前子程序嵌套深度
+// 返回: bool 是否执行到endchar, error 程序语法、预算或取消错误
+func (t *cffType2Tracer) execute(data []byte, ref cffProgRef, depth int) (bool, error) {
+	if len(data) > 65535 || depth > 10 {
+		return false, fmt.Errorf("%w: Type2 charstring length or subroutine depth", ErrLimit)
+	}
+	for pc := 0; pc < len(data); {
+		if err := checkContext(t.ctx); err != nil {
+			return false, err
+		}
+		if t.work != nil {
+			if *t.work <= 0 {
+				return false, fmt.Errorf("%w: Type2 trace operation budget", ErrLimit)
+			}
+			*t.work--
+		}
+		start := pc
+		op := data[pc]
+		pc++
+		if op >= 32 || op == 28 {
+			value, consumed, err := type2Number(op, data[pc:])
+			if err != nil {
+				return false, err
+			}
+			pc += consumed
+			if t.n == len(t.stack) {
+				return false, fmt.Errorf("%w: Type2 operand stack", ErrLimit)
+			}
+			t.stack[t.n] = value
+			t.origins[t.n] = cffType2Origin{prog: ref, start: start, end: pc, valid: op != 255}
+			t.n++
+			continue
+		}
+		switch op {
+		case 10, 29:
+			if t.n == 0 {
+				return false, type2Arguments(op)
+			}
+			t.n--
+			operand := t.stack[t.n]
+			origin := t.origins[t.n]
+			isGlobal := op == 29
+			subr := t.localSubr
+			if isGlobal {
+				subr = t.globalSubr
+			}
+			bias := cffSubrBias(len(subr))
+			indexFloat := operand + float64(bias)
+			if math.Trunc(operand) != operand || !type2Integer(indexFloat, 0, len(subr)-1) {
+				return false, fmt.Errorf("%w: Type2 subroutine index", ErrInvalid)
+			}
+			idx := int(indexFloat)
+			if isGlobal {
+				t.usedGlobal[idx] = true
+			} else {
+				if t.usedLocal[t.privKey] == nil {
+					t.usedLocal[t.privKey] = make(map[int]bool)
+				}
+				t.usedLocal[t.privKey][idx] = true
+			}
+			if origin.valid && origin.prog == ref {
+				if t.sites[ref] == nil {
+					t.sites[ref] = make(map[int][]cffType2CallSite)
+				}
+				t.sites[ref][origin.start] = append(t.sites[ref][origin.start], cffType2CallSite{
+					start:    origin.start,
+					end:      origin.end,
+					isGlobal: isGlobal,
+					privKey:  t.privKey,
+					target:   idx,
+				})
+			} else if isGlobal {
+				*t.globalPinned = true
+			} else {
+				t.localPinned[t.privKey] = true
+			}
+			childRef := cffProgRef{kind: 2, privKey: t.privKey, index: idx}
+			if isGlobal {
+				childRef = cffProgRef{kind: 1, index: idx}
+			}
+			ended, err := t.execute(subr[idx], childRef, depth+1)
+			if err != nil {
+				return false, err
+			}
+			if ended {
+				return true, nil
+			}
+		case 11:
+			if depth == 0 {
+				return false, fmt.Errorf("%w: Type2 misplaced return", ErrInvalid)
+			}
+			return false, nil
+		case 12:
+			if pc == len(data) {
+				return false, fmt.Errorf("%w: truncated Type2 escape", ErrInvalid)
+			}
+			escape := data[pc]
+			pc++
+			if err := t.escape(escape); err != nil {
+				return false, err
+			}
+		case 14:
+			t.consumeWidth(op)
+			t.n = 0
+			return true, nil
+		case 1, 3, 18, 23, 19, 20:
+			t.consumeWidth(op)
+			t.stems += t.n / 2
+			t.n = 0
+			if op == 19 || op == 20 {
+				maskBytes := (t.stems + 7) / 8
+				if maskBytes == 0 || pc+maskBytes > len(data) {
+					return false, fmt.Errorf("%w: Type2 mask without stems or truncated mask", ErrInvalid)
+				}
+				pc += maskBytes
+			}
+		case 4, 5, 6, 7, 8, 21, 22, 24, 25, 26, 27, 30, 31:
+			if op == 4 || op == 21 || op == 22 {
+				t.consumeWidth(op)
+			}
+			t.n = 0
+		default:
+			return false, fmt.Errorf("%w: undefined Type2 operator %d", ErrUnsupported, op)
+		}
+	}
+	return false, fmt.Errorf("%w: unterminated Type2 program", ErrInvalid)
+}
+
+// consumeWidth 按Type2规范在首个清栈指令处剥离可选宽度操作数以维持精确stem计数
+// 入参: op 触发清栈的操作符编号
+func (t *cffType2Tracer) consumeWidth(op byte) {
+	if t.widthSeen {
+		return
+	}
+	t.widthSeen = true
+	present := false
+	switch op {
+	case 1, 3, 18, 23, 19, 20:
+		present = t.n%2 == 1
+	case 4, 22:
+		present = t.n == 2
+	case 21:
+		present = t.n == 3
+	case 14:
+		present = t.n == 1 || t.n == 5
+	}
+	if present && t.n > 0 {
+		copy(t.stack[:], t.stack[1:t.n])
+		copy(t.origins[:], t.origins[1:t.n])
+		t.n--
+	}
+}
+
+// escape 追踪Type2转义算术、栈、存储与flex指令，确保动态子程序索引与静态来源判定精确同步
+// 入参: op 转义操作符编号
+// 返回: error 操作数、能力或栈上限错误
+func (t *cffType2Tracer) escape(op byte) error {
+	if op >= 34 && op <= 37 {
+		t.n = 0
+		return nil
+	}
+	if op == 0 {
+		return nil
+	}
+	if op == 23 {
+		x := t.randomState
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		t.randomState = x
+		if t.n == len(t.stack) {
+			return fmt.Errorf("%w: Type2 operand stack", ErrLimit)
+		}
+		t.stack[t.n] = (float64(x) + 1) / 4294967296
+		t.origins[t.n] = cffType2Origin{}
+		t.n++
+		return nil
+	}
+	need := 0
+	switch op {
+	case 5, 9, 14, 18, 21, 26, 27, 29:
+		need = 1
+	case 3, 4, 10, 11, 12, 15, 20, 24, 28, 30:
+		need = 2
+	case 22:
+		need = 4
+	default:
+		return fmt.Errorf("%w: undefined Type2 escaped operator %d", ErrUnsupported, op)
+	}
+	if t.n < need {
+		return type2Arguments(op)
+	}
+	a := t.stack[t.n-need : t.n]
+	switch op {
+	case 27:
+		if t.n == len(t.stack) {
+			return fmt.Errorf("%w: Type2 operand stack", ErrLimit)
+		}
+		t.origins[t.n-1].valid = false
+		t.stack[t.n] = a[0]
+		t.origins[t.n] = cffType2Origin{}
+		t.n++
+		return nil
+	case 28:
+		a[0], a[1] = a[1], a[0]
+		t.origins[t.n-2], t.origins[t.n-1] = t.origins[t.n-1], t.origins[t.n-2]
+		return nil
+	case 29:
+		index := a[0]
+		t.n--
+		if !geometryFinite(index) || math.Trunc(index) != index {
+			return type2Arguments(op)
+		}
+		index = max(index, 0)
+		if !type2Integer(index, 0, t.n-1) {
+			return type2Arguments(op)
+		}
+		src := t.n - 1 - int(index)
+		t.origins[src].valid = false
+		t.stack[t.n] = t.stack[src]
+		t.origins[t.n] = cffType2Origin{}
+		t.n++
+		return nil
+	case 30:
+		count, shift := a[0], a[1]
+		t.n -= 2
+		if !type2Integer(count, 0, t.n) || math.Trunc(shift) != shift {
+			return type2Arguments(op)
+		}
+		if count != 0 {
+			n := int(count)
+			j := int(math.Mod(shift, count))
+			if j < 0 {
+				j += n
+			}
+			var copyStack [48]float64
+			var copyOrigins [48]cffType2Origin
+			copy(copyStack[:], t.stack[t.n-n:t.n])
+			copy(copyOrigins[:], t.origins[t.n-n:t.n])
+			for i := 0; i < n; i++ {
+				t.stack[t.n-n+(i+j)%n] = copyStack[i]
+				t.origins[t.n-n+(i+j)%n] = copyOrigins[i]
+			}
+		}
+		return nil
+	}
+	t.n -= need
+	value := 0.0
+	switch op {
+	case 3:
+		if a[0] != 0 && a[1] != 0 {
+			value = 1
+		}
+	case 4:
+		if a[0] != 0 || a[1] != 0 {
+			value = 1
+		}
+	case 5:
+		if a[0] == 0 {
+			value = 1
+		}
+	case 9:
+		value = math.Abs(a[0])
+	case 10:
+		value = a[0] + a[1]
+	case 11:
+		value = a[0] - a[1]
+	case 12:
+		value = a[0] / a[1]
+	case 14:
+		value = -a[0]
+	case 15:
+		if a[0] == a[1] {
+			value = 1
+		}
+	case 18:
+		return nil
+	case 20:
+		if !type2Integer(a[1], 0, 31) {
+			return type2Arguments(op)
+		}
+		index := uint32(a[1])
+		t.transient[index] = a[0]
+		t.initialized |= 1 << index
+		return nil
+	case 21:
+		if !type2Integer(a[0], 0, 31) || t.initialized&(1<<uint32(a[0])) == 0 {
+			return fmt.Errorf("%w: Type2 uninitialized or invalid transient index", ErrInvalid)
+		}
+		value = t.transient[uint32(a[0])]
+	case 22:
+		value = a[1]
+		if a[2] <= a[3] {
+			value = a[0]
+		}
+	case 24:
+		value = a[0] * a[1]
+	case 26:
+		value = math.Sqrt(a[0])
+	}
+	if !geometryFinite(value) {
+		return fmt.Errorf("%w: non-finite Type2 arithmetic", ErrInvalid)
+	}
+	t.stack[t.n] = value
+	t.origins[t.n] = cffType2Origin{}
+	t.n++
+	return nil
+}
+
 // encodeSubsetCFFCharsetFormat2 按连续区间编码紧凑的CFF Format 2字符集表
 // 入参: values 包含隐式.notdef在内的GID到CID或SID映射
 // 返回: []byte Format 2字符集字节
@@ -1236,10 +2001,10 @@ func encodeSubsetCFFFDSelectFormat3(fdSelect []uint8) []byte {
 	return binary.BigEndian.AppendUint16(out, uint16(len(fdSelect)))
 }
 
-// buildSubsetCFFPrivate 重建局部Subrs相对偏移，子程序内容与编号不变，不复制原布局中的无关间隔
-// 入参: source 原CFF表, fd 原字体字典, maximum 字节上限
+// buildSubsetCFFPrivate 重建局部Subrs相对偏移，支持裁剪后的子程序列表及空子程序操作符移除
+// 入参: source 原CFF表, fd 原字体字典, localSubr 目标局部子程序列表, pruneEmptySubrs 无局部子程序时是否移除Subrs操作符, maximum 字节上限
 // 返回: subsetCFFPrivate 私有字典及子程序, error 范围或字节预算错误
-func buildSubsetCFFPrivate(source []byte, fd cffFontDict, maximum int64) (subsetCFFPrivate, error) {
+func buildSubsetCFFPrivate(source []byte, fd cffFontDict, localSubr [][]byte, pruneEmptySubrs bool, maximum int64) (subsetCFFPrivate, error) {
 	values, present := fd.dict.value(18)
 	if !present || len(values) != 2 {
 		return subsetCFFPrivate{}, fmt.Errorf("%w: subset CFF Private range", ErrInvalid)
@@ -1256,7 +2021,18 @@ func buildSubsetCFFPrivate(source []byte, fd cffFontDict, maximum int64) (subset
 	if int64(len(original)) > maximum {
 		return subsetCFFPrivate{}, fmt.Errorf("%w: subset CFF Private byte budget", ErrLimit)
 	}
-	if _, present := fd.private.dict.value(19); !present {
+	_, hasSubrsOp := fd.private.dict.value(19)
+	if pruneEmptySubrs && len(localSubr) == 0 {
+		if !hasSubrsOp {
+			return subsetCFFPrivate{size: len(original), data: original}, nil
+		}
+		dict, err := patchSubsetCFFDictReal(original, map[uint16][]int64{19: nil}, nil, maximum)
+		if err != nil {
+			return subsetCFFPrivate{}, err
+		}
+		return subsetCFFPrivate{size: len(dict), data: dict}, nil
+	}
+	if !hasSubrsOp && len(localSubr) == 0 {
 		return subsetCFFPrivate{size: len(original), data: original}, nil
 	}
 	dict, err := patchSubsetCFFDictReal(original, map[uint16][]int64{19: {0}}, nil, maximum)
@@ -1267,7 +2043,7 @@ func buildSubsetCFFPrivate(source []byte, fd cffFontDict, maximum int64) (subset
 	if err != nil {
 		return subsetCFFPrivate{}, err
 	}
-	subrs, err := encodeSubsetCFFIndex(fd.private.localSubr, maximum-int64(len(dict)))
+	subrs, err := encodeSubsetCFFIndex(localSubr, maximum-int64(len(dict)))
 	if err != nil {
 		return subsetCFFPrivate{}, err
 	}
@@ -1803,27 +2579,19 @@ func (p *Package) subsetFontsWithReader(ctx context.Context, reader *Reader, opt
 		closeOwned()
 		return result, nil, nil
 	}
-	var groups map[string]map[uint32][]uint16
-	var implicitRunes map[string]map[uint32]map[rune]uint16
-	if options.CompactGIDs {
-		groups, implicitRunes, err = collectSubsetFontUsageWithImplicit(ctx, reader)
-	} else {
-		var usage []FontUsage
-		usage, err = reader.FontUsage(ctx, nil)
-		if err == nil {
-			groups = make(map[string]map[uint32][]uint16)
-			for _, font := range usage {
-				key := strings.ToLower(font.Part)
-				if groups[key] == nil {
-					groups[key] = make(map[uint32][]uint16)
-				}
-				groups[key][font.CollectionIndex] = font.Glyphs
-			}
-		}
-	}
+	usageOpts := OptimizationOptions{MaxBytes: min(options.MaxBytes, reader.limits.MaxPackageBytes), MaxWork: min(options.MaxWork, reader.limits.MaxXMLNodes)}
+	usage, implicitRunes, err := collectFontUsage(ctx, reader, &usageOpts, options.CompactGIDs)
 	if err != nil {
 		closeOwned()
 		return nil, nil, err
+	}
+	groups := make(map[string]map[uint32][]uint16)
+	for _, font := range usage {
+		key := strings.ToLower(font.Part)
+		if groups[key] == nil {
+			groups[key] = make(map[uint32][]uint16)
+		}
+		groups[key][font.CollectionIndex] = font.Glyphs
 	}
 	pending := make(map[string]packagePart)
 	remaps := make(map[string]map[uint32]map[uint16]uint16)
@@ -1910,7 +2678,7 @@ func (p *Package) subsetFontsWithReader(ctx context.Context, reader *Reader, opt
 			return nil, nil, err
 		}
 		part := q.parts[key]
-		if !strings.EqualFold(part.media, fixedContentType("fixedpage")) && !strings.EqualFold(part.media, resourceDictionaryContentType) {
+		if !matchStandardContentType(q.format, part.media, fixedContentType("fixedpage")) && !matchStandardContentType(q.format, part.media, resourceDictionaryContentType) {
 			continue
 		}
 		rewritten, changed, err := rewriteSubsetFontGlyphIndices(part.name, part.data, q.format, q.limits, remaps, ctx)
@@ -1946,163 +2714,6 @@ func (p *Package) subsetFontsWithReader(ctx context.Context, reader *Reader, opt
 	return result, nil, nil
 }
 
-// collectSubsetFontUsageWithImplicit 单遍扫描固定页面与资源字典，同时收集各字体面使用的字形编号与隐式cmap查表的码点映射
-// 入参: ctx 已规范化取消Context, r 已校验只读阅读器
-// 返回: map[string]map[uint32][]uint16 各字体面按升序排列的使用字形编号, map[string]map[uint32]map[rune]uint16 各字体面隐式查表的码点到旧GID映射, error 标记、字体、预算或取消错误
-func collectSubsetFontUsageWithImplicit(ctx context.Context, r *Reader) (map[string]map[uint32][]uint16, map[string]map[uint32]map[rune]uint16, error) {
-	if err := r.readLock(); err != nil {
-		return nil, nil, err
-	}
-	defer r.mu.RUnlock()
-	c := fontUsageCollector{reader: r, fonts: fontCache{pkg: r.pkg, data: make(map[string][]byte), faces: make(map[fontCacheKey]*fontSource), remaining: r.limits.MaxPackageBytes, maxFaces: r.limits.MaxPartCount}, usage: make(map[fontCacheKey]map[uint16]bool), work: r.limits.MaxXMLNodes, context: ctx}
-	implicit := make(map[fontCacheKey]map[rune]uint16)
-	namespace := formatNamespace(r.format)
-	keyNS := namespace + "/resourcedictionary-key"
-	for _, key := range slices.Sorted(maps.Keys(r.pkg.parts)) {
-		if err := c.charge(1); err != nil {
-			return nil, nil, err
-		}
-		part := r.pkg.names[key]
-		if key == strings.ToLower(opcTypesName) || opcRelationshipName(part) {
-			continue
-		}
-		media, err := r.pkg.contentType(part)
-		if err != nil {
-			return nil, nil, err
-		}
-		model, err := resourceModelMedia(media)
-		if err != nil {
-			return nil, nil, &PartError{Part: part, Err: err}
-		}
-		if model {
-			return nil, nil, &PartError{Part: part, Err: fmt.Errorf("%w: font usage in opaque X3D content", ErrUnsupported)}
-		}
-		markup, err := fontUsageMarkup(media)
-		if err != nil {
-			return nil, nil, &PartError{Part: part, Err: err}
-		}
-		if !markup {
-			continue
-		}
-		limit := min(r.limits.MaxMetadataBytes, r.limits.MaxPartBytes, c.fonts.remaining)
-		data, err := r.pkg.readItems(key, limit)
-		if err != nil {
-			return nil, nil, err
-		}
-		c.fonts.remaining -= int64(len(data))
-		tracker := newResourceMarkupScopeTracker(r.format, r.format == FormatOpenXPS, ctx)
-		root, err := decodeXMLVisit(data, r.limits, func(token xml.Token, node *xmlElement) error {
-			if _, start := token.(xml.StartElement); start {
-				if err := c.charge(1); err != nil {
-					return err
-				}
-			}
-			skip, _, err := tracker.visit(token, node)
-			if err != nil {
-				return err
-			}
-			if skip {
-				return nil
-			}
-			if _, start := token.(xml.StartElement); !start {
-				return nil
-			}
-			if node.Name != (xml.Name{Space: namespace, Local: "Glyphs"}) {
-				return nil
-			}
-			for _, attr := range node.Attr {
-				if attr.Name.Space != "" && attr.Name.Space != xmlnsNamespace && attr.Name.Space != namespace && attr.Name.Space != keyNS && attr.Name.Space != mcNamespace && attr.Name.Space != xmlNamespace {
-					return fmt.Errorf("%w: ignorable extension attribute %s", ErrUnsupported, attr.Name.Local)
-				}
-			}
-			value := *node
-			value.Children = nil
-			value.Attr = slices.DeleteFunc(slices.Clone(node.Attr), func(attr xml.Attr) bool { return attr.Name.Space == mcNamespace })
-			attrs, err := visualAttributes(&value, r.format)
-			if err != nil {
-				return err
-			}
-			if err := validateGlyphAttributes(attrs, r.format); err != nil {
-				return err
-			}
-			uri, face, present, err := ParseFontURI(strings.Trim(attrs["FontUri"], " \t\r\n"))
-			if err != nil {
-				return err
-			}
-			fontPart, err := resolvePart(part, uri)
-			if err != nil {
-				return err
-			}
-			unescaped, err := UnescapeUnicodeString(attrs["UnicodeString"])
-			if err != nil {
-				return err
-			}
-			glyphs := NewGlyphs("", 0, unescaped)
-			glyphs.FontPart, glyphs.CollectionIndex, glyphs.HasCollectionIndex = fontPart, face, present
-			glyphs.FontRenderingEmSize, _ = xmlNumber(attrs["FontRenderingEmSize"])
-			glyphs.Indices, _ = ParseGlyphIndices(attrs["Indices"])
-			count, err := glyphRunCount(glyphs, c.work)
-			if err != nil {
-				return err
-			}
-			font, err := c.fonts.load(glyphs)
-			if err != nil {
-				return err
-			}
-			fontKey := fontCacheKey{part: strings.ToLower(fontPart), index: face}
-			indices := c.usage[fontKey]
-			if indices == nil {
-				indices = map[uint16]bool{0: true}
-				c.usage[fontKey] = indices
-			}
-			if err := c.charge(count); err != nil {
-				return err
-			}
-			return walkGlyphRun(glyphs, func(entry GlyphIndex, character rune, start, end, cluster int) error {
-				if err := checkContext(c.context); err != nil {
-					return err
-				}
-				gid, err := glyphRunIndex(entry, character, font.metrics.numGlyphs, font.glyphIndex)
-				if err != nil {
-					return err
-				}
-				indices[gid] = true
-				if !entry.HasIndex && gid != 0 {
-					if implicit[fontKey] == nil {
-						implicit[fontKey] = make(map[rune]uint16)
-					}
-					implicit[fontKey][character] = gid
-				}
-				return nil
-			})
-		})
-		if err != nil {
-			return nil, nil, &PartError{Part: part, Err: err}
-		}
-		if _, err := preprocessXMLContext(root, []string{namespace, keyNS, structureNamespace(r.format)}, ctx); err != nil {
-			return nil, nil, &PartError{Part: part, Err: err}
-		}
-	}
-	if err := checkContext(ctx); err != nil {
-		return nil, nil, err
-	}
-	groups := make(map[string]map[uint32][]uint16)
-	for fontKey, indices := range c.usage {
-		if groups[fontKey.part] == nil {
-			groups[fontKey.part] = make(map[uint32][]uint16)
-		}
-		groups[fontKey.part][fontKey.index] = slices.Sorted(maps.Keys(indices))
-	}
-	implicitByPart := make(map[string]map[uint32]map[rune]uint16, len(implicit))
-	for fontKey, runeMap := range implicit {
-		if implicitByPart[fontKey.part] == nil {
-			implicitByPart[fontKey.part] = make(map[uint32]map[rune]uint16)
-		}
-		implicitByPart[fontKey.part][fontKey.index] = runeMap
-	}
-	return groups, implicitByPart, nil
-}
-
 // fontSubsetHasNonIdentityRemap 判断字体各面的GID映射是否存在实际变化
 // 入参: gidMaps 字体面索引到旧新GID映射表的集合
 // 返回: bool 是否至少有一个字形编号发生改变
@@ -2122,7 +2733,7 @@ func fontSubsetHasNonIdentityRemap(gidMaps map[uint32]map[uint16]uint16) bool {
 // 返回: []byte 重写后XML字节, bool 是否发生修改, error XML、解析或映射缺失错误
 func rewriteSubsetFontGlyphIndices(partName string, original []byte, format Format, limits Limits, remaps map[string]map[uint32]map[uint16]uint16, ctx context.Context) ([]byte, bool, error) {
 	namespace := formatNamespace(format)
-	tracker := newResourceMarkupIgnoreTracker(format, false, ctx)
+	tracker := newResourceMarkupIgnoreTracker(format, format == FormatOpenXPS, ctx)
 	filter := func(token xml.Token, node *xmlElement) (bool, error) {
 		skip, _, err := tracker.visit(token, node)
 		return skip, err
@@ -2330,16 +2941,59 @@ func applyCompactSubsetTables(face *fontFace, metrics *fontMetrics, newToOld []u
 	return nil
 }
 
+// applySubsetCmapAndOS2 按配置构建子集cmap表，并在cmap重写且存在OS/2表时同步usFirstCharIndex与usLastCharIndex
+// 入参: face 原字体面, numGlyphs 原字形总数, oldToNew 旧GID到新GID映射表, newToOld 按新GID升序排列的原GID列表, requiredRunes 可选页面隐式查表使用的码点到旧GID映射, options 子集配置, tables 待写入的替换表集合
+// 返回: error 映射越界、表解析或编码错误
+func applySubsetCmapAndOS2(face *fontFace, numGlyphs uint32, oldToNew map[uint16]uint16, newToOld []uint16, requiredRunes map[rune]uint16, options FontSubsetOptions, tables map[string][]byte) error {
+	cmapTable, mapping, err := buildSubsetCmapTable(face, numGlyphs, oldToNew, newToOld, requiredRunes, options)
+	if err != nil || cmapTable == nil {
+		return err
+	}
+	tables["cmap"] = cmapTable
+	if _, hasOS2 := face.tables["OS/2"]; !hasOS2 {
+		return nil
+	}
+	os2Data, err := face.table("OS/2")
+	if err != nil {
+		return err
+	}
+	if len(os2Data) < 68 {
+		return nil
+	}
+	var firstCode, lastCode uint16
+	hasCode := false
+	for r, gid := range mapping {
+		if gid == 0 || !utf8.ValidRune(r) {
+			continue
+		}
+		code := uint16(0xffff)
+		if r <= 0xffff {
+			code = uint16(r)
+		}
+		if !hasCode {
+			firstCode, lastCode, hasCode = code, code, true
+		} else {
+			firstCode = min(firstCode, code)
+			lastCode = max(lastCode, code)
+		}
+	}
+	updated := bytes.Clone(os2Data)
+	binary.BigEndian.PutUint16(updated[64:], firstCode)
+	binary.BigEndian.PutUint16(updated[66:], lastCode)
+	tables["OS/2"] = updated
+	return nil
+}
+
 // buildSubsetCmapTable 按SynthesizeCmap或CompactGIDs生成标准OpenType Format 4与Format 12 cmap表，优先并入页面隐式码点并按newToOld确定性有序构建
 // 入参: face 原字体面, numGlyphs 原字形总数, oldToNew 旧GID到新GID映射表, newToOld 按新GID升序排列的原GID列表, requiredRunes 可选页面隐式查表使用的码点到旧GID映射, options 子集配置
-// 返回: []byte 新cmap表字节，无需重写时为nil, error 映射越界或解析错误
-func buildSubsetCmapTable(face *fontFace, numGlyphs uint32, oldToNew map[uint16]uint16, newToOld []uint16, requiredRunes map[rune]uint16, options FontSubsetOptions) ([]byte, error) {
+// 返回: []byte 新cmap表字节，无需重写时为nil, map[rune]uint16 写入新cmap的有效码点到新GID映射, error 映射越界或解析错误
+func buildSubsetCmapTable(face *fontFace, numGlyphs uint32, oldToNew map[uint16]uint16, newToOld []uint16, requiredRunes map[rune]uint16, options FontSubsetOptions) ([]byte, map[rune]uint16, error) {
 	if len(options.SynthesizeCmap) > 0 {
 		mapping := make(map[rune]uint16, len(options.SynthesizeCmap))
 		for _, r := range slices.Sorted(maps.Keys(options.SynthesizeCmap)) {
 			oldGID := options.SynthesizeCmap[r]
 			if !utf8.ValidRune(r) || uint32(oldGID) >= numGlyphs {
-				return nil, fmt.Errorf("%w: invalid SynthesizeCmap rune %U or glyph %d", ErrInvalid, r, oldGID)
+				return nil, nil, fmt.Errorf("%w: invalid SynthesizeCmap rune %U or glyph %d", ErrInvalid, r, oldGID)
 			}
 			if oldGID == 0 {
 				continue
@@ -2352,14 +3006,15 @@ func buildSubsetCmapTable(face *fontFace, numGlyphs uint32, oldToNew map[uint16]
 				mapping[r] = newGID
 			}
 		}
-		return encodeOpenTypeCmap(mapping)
+		encoded, err := encodeOpenTypeCmap(mapping)
+		return encoded, mapping, err
 	}
 	if !options.CompactGIDs {
-		return nil, nil
+		return nil, nil, nil
 	}
 	_, hasCmap := face.tables["cmap"]
 	if !hasCmap && len(requiredRunes) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	mapping := make(map[rune]uint16, len(newToOld)+len(requiredRunes))
 	for _, r := range slices.Sorted(maps.Keys(requiredRunes)) {
@@ -2374,11 +3029,11 @@ func buildSubsetCmapTable(face *fontFace, numGlyphs uint32, oldToNew map[uint16]
 	if hasCmap {
 		cmapData, err := face.table("cmap")
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		parsed, err := parseFontCmap(cmapData, numGlyphs)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for newGID, oldGID := range newToOld {
 			if oldGID == 0 || newGID == 0 {
@@ -2391,7 +3046,8 @@ func buildSubsetCmapTable(face *fontFace, numGlyphs uint32, oldToNew map[uint16]
 			}
 		}
 	}
-	return encodeOpenTypeCmap(mapping)
+	encoded, err := encodeOpenTypeCmap(mapping)
+	return encoded, mapping, err
 }
 
 // encodeOpenTypeCmap 合成标准OpenType cmap表，BMP优先使用Format 4，含U+FFFF、增补平面码点或超限时写出Format 12

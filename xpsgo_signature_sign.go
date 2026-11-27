@@ -92,7 +92,7 @@ type SignatureSpot struct {
 }
 
 // Sign 按当前方言创建完整文档数字签名并保留已有签名，失败时不修改包状态；certificates须包含与signer匹配的证书
-// 支持RSA、RSA-PSS、ECDSA及DSA签名器，DSA签名器须返回四十字节r||s值，ECDSA签名器遵循crypto.Signer返回ASN.1签名
+// 支持RSA、RSA-PSS、ECDSA及DSA签名器，DSA-SHA1与DSA-SHA256签名器分别须返回40或64字节r||s值，ECDSA签名器遵循crypto.Signer返回ASN.1签名
 // 入参: ctx 取消Context，nil采用Background, signer 可用且调用期间不变的签名器, certificates 与签名器匹配的X509证书列表, options 可选签署参数，nil采用默认值
 // 返回: PartInfo 新签名部件，失败为零值, error 结构、策略、算法、证书、签名器、预算或取消错误
 func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates []*x509.Certificate, options *SignatureSignOptions) (PartInfo, error) {
@@ -258,30 +258,50 @@ func (p *Package) Sign(ctx context.Context, signer crypto.Signer, certificates [
 	if err := q.store(part, opcSignatureType, data); err != nil {
 		return PartInfo{}, err
 	}
-	final, err := q.reader(ctx)
+	createdPut(reader.pkg, part, opcSignatureType, data)
+	if err := q.validateSigningResult(reader.pkg, ctx); err != nil {
+		return PartInfo{}, err
+	}
+	p.commitSigning(q)
+	return PartInfo{Name: part, ContentType: opcSignatureType, Size: int64(len(data))}, nil
+}
+
+// validateSigningResult 在已有已校验快照上校验新增签名后的内容类型表、部件数量及包字节预算，避免全包重复解析与重哈希
+// 入参: pkg 已同步写入新签名及关系的私有包读取器, ctx 取消Context
+// 返回: error 部件数量、内容类型、资源上限或取消错误
+func (p *Package) validateSigningResult(pkg *packageReader, ctx context.Context) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	types := createdNode(opcTypesNS, "Types")
+	for _, key := range slices.Sorted(maps.Keys(pkg.parts)) {
+		if key == strings.ToLower(opcTypesName) {
+			continue
+		}
+		child := createdNode(opcTypesNS, "Override")
+		child.Attr = []xml.Attr{{Name: xml.Name{Local: "PartName"}, Value: pkg.names[key]}, {Name: xml.Name{Local: "ContentType"}, Value: pkg.overrides[key]}}
+		types.Children = append(types.Children, child)
+	}
+	typesData, err := createdMarkup(types, p.limits, ctx)
 	if err != nil {
-		return PartInfo{}, err
+		return err
 	}
-	defer final.Close()
-	verification, err := final.VerifySignature(ctx, part, &SignatureVerifyOptions{PublicKey: public})
-	if err != nil {
-		return PartInfo{}, err
+	createdPut(pkg, opcTypesName, "", typesData)
+	if len(pkg.parts) > p.limits.MaxPartCount {
+		return fmt.Errorf("%w: generated package part count", ErrLimit)
 	}
-	if verification.Coverage == nil || !verification.Coverage.Complete {
-		return PartInfo{}, fmt.Errorf("%w: generated signature coverage", ErrInvalid)
+	var total int64
+	for _, key := range slices.Sorted(maps.Keys(pkg.data)) {
+		raw := pkg.data[key]
+		if int64(len(raw)) > p.limits.MaxPartBytes {
+			return fmt.Errorf("%w: generated package byte budget", ErrLimit)
+		}
+		if int64(len(raw)) > p.limits.MaxPackageBytes-total {
+			return fmt.Errorf("%w: generated package byte budget", ErrLimit)
+		}
+		total += int64(len(raw))
 	}
-	if verification.SignatureError != nil {
-		return PartInfo{}, verification.SignatureError
-	}
-	if !verification.SignatureVerified {
-		return PartInfo{}, fmt.Errorf("%w: generated signature verification", ErrSignature)
-	}
-	if err := ctx.Err(); err != nil {
-		return PartInfo{}, err
-	}
-	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
-	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
-	return verification.Part, nil
+	return checkContext(ctx)
 }
 
 // signingParts 向私有快照补入待签署部件、独立证书部件与签名源关系供覆盖清单及摘要计算使用
@@ -414,10 +434,17 @@ func signatureSigningMethod(public crypto.PublicKey, hash crypto.Hash, pss *rsa.
 			return "", "", nil, nil, fmt.Errorf("%w: RSA-PSS options require RSA key", ErrInvalid)
 		}
 		if hash == 0 {
-			hash = crypto.SHA1
+			if key != nil && key.P != nil && key.Q != nil && key.Q.BitLen() == 256 && key.P.BitLen() >= 2048 {
+				hash = crypto.SHA256
+			} else if key == nil || key.Q == nil || key.Q.BitLen() == 160 {
+				hash = crypto.SHA1
+			}
 		}
-		if hash == crypto.SHA1 {
+		switch hash {
+		case crypto.SHA1:
 			method = xmlSignatureNamespace + "dsa-sha1"
+		case crypto.SHA256:
+			method = signatureMethodDSA256
 		}
 	}
 	if method == "" {
@@ -578,7 +605,7 @@ func signatureSigningOrigin(reader *Reader, ctx context.Context) (string, error)
 func encodeDocumentSignature(options SignatureSignOptions, certificates [][]byte, references []SignatureReference, graph *signaturePartGraph, method, digest string, pss *SignaturePSSParams, signerOpts crypto.SignerOpts, signer crypto.Signer) ([]byte, error) {
 	ctx, limits := graph.context, graph.pkg.limits
 	root := createdNode(xmlSignatureNamespace, "Signature")
-	root.Attr = []xml.Attr{{Name: xml.Name{Local: "Id"}, Value: options.ID}}
+	root.Attr = []xml.Attr{{Name: xml.Name{Local: "xmlns"}, Value: xmlSignatureNamespace}, {Name: xml.Name{Local: "Id"}, Value: options.ID}}
 	info := createdNode(xmlSignatureNamespace, "SignedInfo")
 	canonicalization := signatureSigningCanonicalNode("CanonicalizationMethod", options.Canonicalization, options.InclusiveNamespaces)
 	signatureMethod := signatureSigningMethodNode(method, pss)
@@ -634,18 +661,17 @@ func encodeDocumentSignature(options SignatureSignOptions, certificates [][]byte
 		keyInfo.Children = []*xmlElement{x509Data}
 		root.Children = []*xmlElement{info, value, keyInfo, object}
 	}
-	data, err := signatureSigningMarkup(root, limits, ctx)
-	if err != nil {
-		return nil, err
+	ancestors := []*xmlElement{root}
+	canonicalOpts := canonicalXMLOptions{
+		limits:    limits,
+		maxBytes:  limits.MaxMetadataBytes,
+		comments:  false,
+		exclusive: signatureCanonicalExclusive(options.Canonicalization),
+		version11: options.Canonicalization == signatureCanonical11 || options.Canonicalization == signatureComments11,
+		inclusive: signatureInclusiveSet(options.InclusiveNamespaces),
+		context:   ctx,
 	}
-	canonical, err := v.canonicalExclusive(data, options.Canonicalization, options.InclusiveNamespaces, false, limits.MaxMetadataBytes, func(node *xmlElement, _ []xml.Name) bool {
-		for _, attribute := range node.Attr {
-			if signatureIDAttribute(node, attribute) && attribute.Value == "idPackageObject" {
-				return true
-			}
-		}
-		return false
-	})
+	canonical, err := canonicalXMLElement(ancestors, object, canonicalOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -660,13 +686,8 @@ func encodeDocumentSignature(options SignatureSignOptions, certificates [][]byte
 		return nil, err
 	}
 	objectReference.Children[len(objectReference.Children)-1].Text = base64.StdEncoding.EncodeToString(hasher.Sum(nil))
-	data, err = signatureSigningMarkup(root, limits, ctx)
-	if err != nil {
-		return nil, err
-	}
-	canonical, err = v.canonicalExclusive(data, options.Canonicalization, options.InclusiveNamespaces, signatureCanonicalComments(options.Canonicalization), limits.MaxMetadataBytes, func(node *xmlElement, path []xml.Name) bool {
-		return len(path) == 2 && node.Name == (xml.Name{Space: xmlSignatureNamespace, Local: "SignedInfo"})
-	})
+	canonicalOpts.comments = signatureCanonicalComments(options.Canonicalization)
+	canonical, err = canonicalXMLElement(ancestors, info, canonicalOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -704,15 +725,11 @@ func encodeDocumentSignature(options SignatureSignOptions, certificates [][]byte
 	if len(signed) > signatureMaxKeyBits/8 || int64(len(signed)) > limits.MaxMetadataBytes {
 		return nil, fmt.Errorf("%w: signing provider value size", ErrLimit)
 	}
+	if err := verifySignatureValueParams(ctx, method, pss, signer.Public(), canonical, signed); err != nil {
+		return nil, err
+	}
 	value.Text = base64.StdEncoding.EncodeToString(signed)
-	data, err = signatureSigningMarkup(root, limits, ctx)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := readSignatureXML(data, limits, ctx); err != nil {
-		return nil, err
-	}
-	return data, nil
+	return signatureSigningMarkup(root, limits, ctx)
 }
 
 // signatureSigningCanonicalNode 创建规范化元素并在Exclusive C14N存在前缀列表时附加InclusiveNamespaces子元素
@@ -754,47 +771,70 @@ func signatureSigningMethodNode(method string, pss *SignaturePSSParams) *xmlElem
 	return node
 }
 
-// signatureSigningMarkup 紧凑编码自生成签名的空元素，按XML词元处理而非替换标记字符串
+// signatureSigningMarkup 单遍紧凑编码自生成签名XML并直接闭合空元素，消除中间编码与词元回扫
 // 入参: root 生成节点, limits XML及输出上限, ctx 取消Context
 // 返回: []byte UTF-8签名XML, error 编码、资源或取消错误
 func signatureSigningMarkup(root *xmlElement, limits Limits, ctx context.Context) ([]byte, error) {
-	data, err := createdMarkup(root, limits, ctx)
-	if err != nil {
+	limit := min(limits.MaxPartBytes, limits.MaxMetadataBytes, limits.MaxPackageBytes)
+	var output bytes.Buffer
+	counted := packageOutput{writer: &output, context: ctx, limit: limit}
+	nodes := 0
+	var writeNode func(*xmlElement, int) error
+	writeNode = func(node *xmlElement, depth int) error {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		nodes++
+		if nodes > limits.MaxXMLNodes || depth > limits.MaxXMLDepth {
+			return fmt.Errorf("%w: generated XML complexity", ErrLimit)
+		}
+		if !xmlTextValid(node.Text) || len(node.Children) != 0 && !xmlWhitespace(node.Text) {
+			return fmt.Errorf("%w: invalid or ambiguous generated XML text", ErrInvalid)
+		}
+		if _, err := io.WriteString(&counted, "<"+node.Name.Local); err != nil {
+			return err
+		}
+		for _, attr := range node.Attr {
+			if !xmlTextValid(attr.Value) {
+				return fmt.Errorf("%w: invalid generated XML attribute", ErrInvalid)
+			}
+			if _, err := io.WriteString(&counted, " "+attr.Name.Local+`="`); err != nil {
+				return err
+			}
+			if err := xml.EscapeText(&counted, []byte(attr.Value)); err != nil {
+				return err
+			}
+			if _, err := io.WriteString(&counted, `"`); err != nil {
+				return err
+			}
+		}
+		if len(node.Children) == 0 && node.Text == "" {
+			_, err := io.WriteString(&counted, "/>")
+			return err
+		}
+		if _, err := io.WriteString(&counted, ">"); err != nil {
+			return err
+		}
+		if node.Text != "" {
+			if err := xml.EscapeText(&counted, []byte(node.Text)); err != nil {
+				return err
+			}
+		}
+		for _, child := range node.Children {
+			if err := writeNode(child, depth+1); err != nil {
+				return err
+			}
+		}
+		_, err := io.WriteString(&counted, "</"+node.Name.Local+">")
+		return err
+	}
+	if err := writeNode(root, 1); err != nil {
 		return nil, err
 	}
-	reader := xml.NewDecoder(bytes.NewReader(data))
-	output := make([]byte, 0, len(data))
-	covered, startEnd := 0, 0
-	var name xml.Name
-	pending := false
-	for {
-		if err := checkContext(ctx); err != nil {
-			return nil, err
-		}
-		start := int(reader.InputOffset())
-		token, err := reader.RawToken()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		switch token := token.(type) {
-		case xml.StartElement:
-			startEnd, name, pending = int(reader.InputOffset()), token.Name, true
-		case xml.EndElement:
-			end := int(reader.InputOffset())
-			if pending && name == token.Name && startEnd == start && end > start {
-				output = append(output, data[covered:startEnd-1]...)
-				output = append(output, '/', '>')
-				covered = end
-			}
-			pending = false
-		default:
-			pending = false
-		}
+	if err := checkContext(ctx); err != nil {
+		return nil, err
 	}
-	return append(output, data[covered:]...), nil
+	return output.Bytes(), nil
 }
 
 // signatureSigningNode 创建XML签名元素及一个无命名空间属性，不手工拼接未转义输入

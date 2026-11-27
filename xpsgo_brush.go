@@ -1585,9 +1585,9 @@ func (g *ResolvedGradient) SampleOffset(offset float64) (ResolvedColor, error) {
 				t = 2 - t
 			}
 		}
-		if t <= 0 {
+		if t < 0 {
 			col = cloneResolvedColor(g.Stops[0].Color)
-		} else if t >= 1 {
+		} else if t > 1 {
 			col = cloneResolvedColor(g.Stops[len(g.Stops)-1].Color)
 		} else {
 			i := sort.Search(len(g.Stops), func(i int) bool { return g.Stops[i].Offset > t })
@@ -1611,8 +1611,26 @@ func (g *ResolvedGradient) SampleOffset(offset float64) (ResolvedColor, error) {
 	if g.PostProcessColor {
 		col.HasCMYK = false
 		col.CMYK = [4]float64{}
+		col.SpotName = ""
+		col.SpotColors = nil
+		col.DeviceComponents = nil
+		col.ProfilePart = ""
+		col.ProfileSpace = ""
 		if err := finalizeResolvedColor(&col, col.Linear, ColorResolveOptions{Negative: g.Negative, PrintColor: g.PrintColor}); err != nil {
 			return ResolvedColor{}, err
+		}
+		if g.ColorInterpolationMode == ColorInterpolationScRGB {
+			col.Space = ColorScRGB
+			col.ColorSpace = "scRGB"
+			col.Components = []float64{col.Linear[0], col.Linear[1], col.Linear[2]}
+		} else {
+			col.Space = ColorSRGB
+			col.ColorSpace = "sRGB"
+			col.Components = []float64{
+				renderLinearToSRGB(colorClamp(col.Linear[0])),
+				renderLinearToSRGB(colorClamp(col.Linear[1])),
+				renderLinearToSRGB(colorClamp(col.Linear[2])),
+			}
 		}
 	}
 	return col, nil

@@ -1191,19 +1191,20 @@ func (b *xmlRewriteBuffer) Write(data []byte) (int, error) {
 	return b.Buffer.Write(data)
 }
 
-// xmlStartAttributeRanges 从已校验的起始标签提取属性值范围，识别两种引号及自闭合标记
+// xmlStartAttributeFullRanges 从已校验的起始标签同步提取每个属性的完整声明范围与引号内值范围，识别两种引号及自闭合标记
 // 入参: tag 一个完整起始标签
-// 返回: []xmlAttributeRange 按属性顺序排列的范围, error 标签范围错误
-func xmlStartAttributeRanges(tag []byte) ([]xmlAttributeRange, error) {
+// 返回: []xmlAttributeRange 含前导空白的完整属性范围, []xmlAttributeRange 引号内值范围, error 标签范围或词法错误
+func xmlStartAttributeFullRanges(tag []byte) ([]xmlAttributeRange, []xmlAttributeRange, error) {
 	if len(tag) < 3 || tag[0] != '<' {
-		return nil, fmt.Errorf("%w: XML start tag range", ErrInvalid)
+		return nil, nil, fmt.Errorf("%w: XML start tag range", ErrInvalid)
 	}
 	position := 1
 	for position < len(tag) && !xmlSpace(tag[position]) && tag[position] != '/' && tag[position] != '>' {
 		position++
 	}
-	var ranges []xmlAttributeRange
+	var fulls, values []xmlAttributeRange
 	for position < len(tag) {
+		wsStart := position
 		for position < len(tag) && xmlSpace(tag[position]) {
 			position++
 		}
@@ -1211,7 +1212,10 @@ func xmlStartAttributeRanges(tag []byte) ([]xmlAttributeRange, error) {
 			break
 		}
 		if tag[position] == '/' || tag[position] == '>' {
-			return ranges, nil
+			return fulls, values, nil
+		}
+		if wsStart == position {
+			return nil, nil, fmt.Errorf("%w: XML attribute delimiter", ErrInvalid)
 		}
 		for position < len(tag) && !xmlSpace(tag[position]) && tag[position] != '=' {
 			position++
@@ -1238,10 +1242,20 @@ func xmlStartAttributeRanges(tag []byte) ([]xmlAttributeRange, error) {
 		if position == len(tag) {
 			break
 		}
-		ranges = append(ranges, xmlAttributeRange{start: start, end: position})
+		end := position
 		position++
+		fulls = append(fulls, xmlAttributeRange{start: wsStart, end: position})
+		values = append(values, xmlAttributeRange{start: start, end: end})
 	}
-	return nil, fmt.Errorf("%w: XML attribute range", ErrInvalid)
+	return nil, nil, fmt.Errorf("%w: XML attribute range", ErrInvalid)
+}
+
+// xmlStartAttributeRanges 从已校验的起始标签提取属性值范围，识别两种引号及自闭合标记
+// 入参: tag 一个完整起始标签
+// 返回: []xmlAttributeRange 按属性顺序排列的范围, error 标签范围错误
+func xmlStartAttributeRanges(tag []byte) ([]xmlAttributeRange, error) {
+	_, values, err := xmlStartAttributeFullRanges(tag)
+	return values, err
 }
 
 // decodeXMLReader 从前向流解码并校验XML树，按需向回调流式交付已校验词元范围
@@ -1612,8 +1626,27 @@ func (p *compatibilityProcessor) preserveElement(node *xmlElement, scope compati
 // 入参: node 当前保留子树节点, scope 当前作用域
 // 返回: *xmlElement 独立副本, error 兼容性或取消错误
 func (p *compatibilityProcessor) clonePreservedSubtree(node *xmlElement, scope compatibilityScope) (*xmlElement, error) {
+	return p.clonePreservedChildren(node, func(child *xmlElement) (*xmlElement, error) {
+		return p.preserveDescendant(child, scope)
+	})
+}
+
+// clonePreservedRaw 深拷贝保留子树内无需评估后代规则的节点，并在启用有序内容索引时同步映射
+// 入参: node 原始节点
+// 返回: *xmlElement 独立副本, error 取消错误
+func (p *compatibilityProcessor) clonePreservedRaw(node *xmlElement) (*xmlElement, error) {
+	return p.clonePreservedChildren(node, p.clonePreservedRaw)
+}
+
+// clonePreservedChildren 按指定子节点克隆函数构造保留节点副本，并在启用有序内容索引时同步映射
+// 入参: node 原始节点, cloneChild 子节点克隆函数
+// 返回: *xmlElement 独立副本, error 兼容性或取消错误
+func (p *compatibilityProcessor) clonePreservedChildren(node *xmlElement, cloneChild func(*xmlElement) (*xmlElement, error)) (*xmlElement, error) {
 	if err := checkContext(p.context); err != nil {
 		return nil, err
+	}
+	if node == nil {
+		return nil, nil
 	}
 	cloned := &xmlElement{
 		Name:                node.Name,
@@ -1622,11 +1655,11 @@ func (p *compatibilityProcessor) clonePreservedSubtree(node *xmlElement, scope c
 		Namespaces:          maps.Clone(node.Namespaces),
 		PreservedAttributes: slices.Clone(node.PreservedAttributes),
 	}
-	childMap := make(map[*xmlElement]*xmlElement, len(node.Children))
+	childMap := make(map[*xmlElement]*xmlElement, len(node.Children)+len(node.PreservedElements))
 	if len(node.Children) != 0 {
 		cloned.Children = make([]*xmlElement, len(node.Children))
 		for i, child := range node.Children {
-			copyChild, err := p.preserveDescendant(child, scope)
+			copyChild, err := cloneChild(child)
 			if err != nil {
 				return nil, err
 			}
@@ -1637,7 +1670,7 @@ func (p *compatibilityProcessor) clonePreservedSubtree(node *xmlElement, scope c
 	if len(node.PreservedElements) != 0 {
 		cloned.PreservedElements = make([]*xmlElement, len(node.PreservedElements))
 		for i, item := range node.PreservedElements {
-			copyItem, err := p.preserveDescendant(item, scope)
+			copyItem, err := cloneChild(item)
 			if err != nil {
 				return nil, err
 			}
@@ -1682,10 +1715,14 @@ func (p *compatibilityProcessor) preserveDescendant(node *xmlElement, inherited 
 	if isControl && node.Name.Local != "AlternateContent" && !isBranch {
 		return nil, fmt.Errorf("%w: unexpected MCE element %s", ErrInvalid, node.Name.Local)
 	}
-	if err := p.validateAttributes(node, scope, isControl); err != nil {
+	allowSelfSpace := !isControl && !p.understood[node.Name.Space] && node.Name.Space != ""
+	if err := p.validateAttributesMode(node, scope, isControl, allowSelfSpace); err != nil {
 		return nil, err
 	}
 	if isControl && node.Name.Local == "AlternateContent" {
+		if len(compatibilityWords(node.Text)) != 0 {
+			return nil, fmt.Errorf("%w: text directly inside AlternateContent", ErrInvalid)
+		}
 		var selection compatibilitySelection
 		for _, child := range node.Children {
 			if err := p.alternative(child, scope, &selection); err != nil {
@@ -1695,8 +1732,30 @@ func (p *compatibilityProcessor) preserveDescendant(node *xmlElement, inherited 
 		if selection.choices == 0 {
 			return nil, fmt.Errorf("%w: AlternateContent requires a Choice", ErrInvalid)
 		}
+		return p.clonePreservedAlternate(node, scope, selection.selected, selection.scope)
 	}
 	return p.clonePreservedSubtree(node, scope)
+}
+
+// clonePreservedAlternate 克隆保留子树中的AlternateContent结构，仅对选中分支评估后代规则并对未选分支纯深拷贝
+// 入参: node AlternateContent或其ProcessContent包装元素, scope 当前作用域, selected 选中分支元素, selectedScope 选中分支作用域
+// 返回: *xmlElement 独立副本, error 兼容性或取消错误
+func (p *compatibilityProcessor) clonePreservedAlternate(node *xmlElement, scope compatibilityScope, selected *xmlElement, selectedScope compatibilityScope) (*xmlElement, error) {
+	return p.clonePreservedChildren(node, func(child *xmlElement) (*xmlElement, error) {
+		if child == selected {
+			return p.clonePreservedSubtree(child, selectedScope)
+		}
+		if child != nil && !p.understood[child.Name.Space] {
+			childScope, err := p.rulesChecked(child, scope, false)
+			if err != nil {
+				return nil, err
+			}
+			if childScope.ignorable[child.Name.Space] && childScope.processes(child.Name) {
+				return p.clonePreservedAlternate(child, childScope, selected, selectedScope)
+			}
+		}
+		return p.clonePreservedRaw(child)
+	})
 }
 
 // cloneXMLElement 深拷贝被MCE保留的未知扩展元素子树，避免输出与原始树共享可变状态
@@ -1931,6 +1990,13 @@ func (s compatibilityScope) preservesAttribute(name xml.Name) bool {
 // 入参: node 当前元素, scope 当前兼容性作用域, control 是否为MCE控制元素
 // 返回: error 错误信息
 func (p *compatibilityProcessor) validateAttributes(node *xmlElement, scope compatibilityScope, control bool) error {
+	return p.validateAttributesMode(node, scope, control, false)
+}
+
+// validateAttributesMode 按可选扩展自身命名空间放行模式校验元素属性规则
+// 入参: node 当前元素, scope 当前兼容性作用域, control 是否为MCE控制元素, allowSelfSpace 是否放行元素自身命名空间属性
+// 返回: error 错误信息
+func (p *compatibilityProcessor) validateAttributesMode(node *xmlElement, scope compatibilityScope, control, allowSelfSpace bool) error {
 	if control {
 		if err := compatibilityNoXMLContext(node); err != nil {
 			return err
@@ -1951,7 +2017,7 @@ func (p *compatibilityProcessor) validateAttributes(node *xmlElement, scope comp
 				}
 				return fmt.Errorf("%w: attribute namespace %q", ErrUnsupported, attr.Name.Space)
 			}
-		} else if !p.understood[attr.Name.Space] && !scope.ignorable[attr.Name.Space] {
+		} else if !p.understood[attr.Name.Space] && !scope.ignorable[attr.Name.Space] && (!allowSelfSpace || attr.Name.Space != node.Name.Space) {
 			return fmt.Errorf("%w: attribute namespace %q", ErrUnsupported, attr.Name.Space)
 		}
 	}
@@ -2072,36 +2138,9 @@ func (p *compatibilityProcessor) alternative(node *xmlElement, inherited compati
 	if !branch {
 		return fmt.Errorf("%w: unexpected AlternateContent child %s", ErrInvalid, node.Name.Local)
 	}
-	if err := p.validateAttributes(node, scope, true); err != nil {
+	selectable, err := p.checkAlternateBranch(node, scope, &selection.choices, &selection.fallback)
+	if err != nil {
 		return err
-	}
-	selectable := true
-	if node.Name.Local == "Choice" {
-		if selection.fallback {
-			return fmt.Errorf("%w: Choice follows Fallback", ErrInvalid)
-		}
-		selection.choices++
-		requires, ok := node.attributeNS("", "Requires")
-		if !ok {
-			return fmt.Errorf("%w: Choice requires an unqualified Requires attribute", ErrInvalid)
-		}
-		uris, err := compatibilityPrefixes(node, requires)
-		if err != nil {
-			return err
-		}
-		if len(uris) == 0 {
-			return fmt.Errorf("%w: empty Choice Requires", ErrInvalid)
-		}
-		for _, uri := range uris {
-			if !p.understood[uri] {
-				selectable = false
-			}
-		}
-	} else {
-		if selection.fallback || selection.choices == 0 {
-			return fmt.Errorf("%w: Fallback must occur once after all Choices", ErrInvalid)
-		}
-		selection.fallback = true
 	}
 	if selection.selected == nil && selectable {
 		if value, ok := node.attributeNS(mcNamespace, "MustUnderstand"); ok {
@@ -2113,6 +2152,44 @@ func (p *compatibilityProcessor) alternative(node *xmlElement, inherited compati
 		selection.scope = scope
 	}
 	return nil
+}
+
+// checkAlternateBranch 校验AlternateContent的Choice或Fallback分支属性顺序及Requires命名空间集合
+// 入参: node Choice或Fallback元素, scope 当前作用域, choices Choice计数指针, sawFallback Fallback状态指针
+// 返回: bool 当前分支是否可选, error 分支顺序、属性或前缀错误
+func (p *compatibilityProcessor) checkAlternateBranch(node *xmlElement, scope compatibilityScope, choices *int, sawFallback *bool) (bool, error) {
+	if err := p.validateAttributes(node, scope, true); err != nil {
+		return false, err
+	}
+	selectable := true
+	if node.Name.Local == "Choice" {
+		if *sawFallback {
+			return false, fmt.Errorf("%w: Choice follows Fallback", ErrInvalid)
+		}
+		*choices++
+		requires, ok := node.attributeNS("", "Requires")
+		if !ok {
+			return false, fmt.Errorf("%w: Choice requires an unqualified Requires attribute", ErrInvalid)
+		}
+		uris, err := compatibilityPrefixes(node, requires)
+		if err != nil {
+			return false, err
+		}
+		if len(uris) == 0 {
+			return false, fmt.Errorf("%w: empty Choice Requires", ErrInvalid)
+		}
+		for _, uri := range uris {
+			if !p.understood[uri] {
+				selectable = false
+			}
+		}
+	} else {
+		if *sawFallback || *choices == 0 {
+			return false, fmt.Errorf("%w: Fallback must occur once after all Choices", ErrInvalid)
+		}
+		*sawFallback = true
+	}
+	return selectable, nil
 }
 
 // compatibilityPrefixes 将当前元素上的前缀列表解析为命名空间URI
@@ -2231,6 +2308,178 @@ func canonicalXML(data []byte, options canonicalXMLOptions) ([]byte, error) {
 		return nil, err
 	}
 	return output.Bytes(), nil
+}
+
+// canonicalXMLElement 基于已构建的元素树与祖先链直接执行C14N1.0、Exclusive C14N1.0或C14N1.1规范化，避免中间序列化与重解
+// 入参: ancestors 目标元素之前的祖先链, target 待规范化的子树根元素, options 算法、预算及取消选项
+// 返回: []byte 独立规范化数据, error 结构、命名空间、预算或取消错误，失败无部分结果
+func canonicalXMLElement(ancestors []*xmlElement, target *xmlElement, options canonicalXMLOptions) ([]byte, error) {
+	options.limits = mergeLimits(DefaultLimits(), options.limits)
+	if err := validateLimits(options.limits); err != nil {
+		return nil, err
+	}
+	limit := min(options.limits.MaxPartBytes, options.limits.MaxPackageBytes)
+	if options.maxBytes == 0 {
+		options.maxBytes = limit
+	}
+	if options.maxBytes < 0 {
+		return nil, fmt.Errorf("%w: canonical XML output limit", ErrInvalid)
+	}
+	if target == nil {
+		return nil, fmt.Errorf("%w: canonical element not found", ErrInvalid)
+	}
+	if err := checkContext(options.context); err != nil {
+		return nil, err
+	}
+	var output bytes.Buffer
+	w := canonicalWriter{options: options, output: packageOutput{writer: &output, context: options.context, limit: min(limit, options.maxBytes)}}
+	inherited := map[string]string{"xml": xmlNamespace}
+	depth := 0
+	for _, ancestor := range ancestors {
+		if err := checkContext(options.context); err != nil {
+			return nil, err
+		}
+		if ancestor == nil {
+			return nil, fmt.Errorf("%w: nil canonical ancestor", ErrInvalid)
+		}
+		depth++
+		if depth > options.limits.MaxXMLDepth {
+			return nil, fmt.Errorf("%w: canonical XML depth", ErrLimit)
+		}
+		ns, _, err := canonicalElementScope(inherited, ancestor.Attr)
+		if err != nil {
+			return nil, err
+		}
+		w.ancestors = append(w.ancestors, &xmlElement{Name: ancestor.Name, Attr: ancestor.Attr, Namespaces: ns})
+		inherited = ns
+	}
+	var walk func(*xmlElement, map[string]string, int, bool) error
+	walk = func(node *xmlElement, parentNS map[string]string, level int, selected bool) error {
+		if err := checkContext(options.context); err != nil {
+			return err
+		}
+		if node == nil {
+			return fmt.Errorf("%w: nil canonical element", ErrInvalid)
+		}
+		if level > options.limits.MaxXMLDepth {
+			return fmt.Errorf("%w: canonical XML depth", ErrLimit)
+		}
+		w.nodes++
+		if w.nodes > options.limits.MaxXMLNodes {
+			return fmt.Errorf("%w: canonical XML token count", ErrLimit)
+		}
+		ns, rawAttrs, err := canonicalElementScope(parentNS, node.Attr)
+		if err != nil {
+			return err
+		}
+		rawName := xml.Name{Local: node.Name.Local}
+		if node.Name.Space != "" && ns[""] != node.Name.Space {
+			for key, uri := range ns {
+				if key != "" && uri == node.Name.Space && (rawName.Space == "" || key < rawName.Space) {
+					rawName.Space = key
+				}
+			}
+			if rawName.Space == "" {
+				return fmt.Errorf("%w: undeclared canonical element namespace %q", ErrInvalid, node.Name.Space)
+			}
+		}
+		elem := &xmlElement{Name: node.Name, Attr: node.Attr, Namespaces: ns}
+		if err := w.start(xml.StartElement{Name: rawName, Attr: rawAttrs}, elem, selected); err != nil {
+			return err
+		}
+		w.ancestors = append(w.ancestors, elem)
+		if node.Text != "" {
+			w.nodes++
+			if w.nodes > options.limits.MaxXMLNodes {
+				return fmt.Errorf("%w: canonical XML token count", ErrLimit)
+			}
+			if err := w.escaped(node.Text, false); err != nil {
+				return err
+			}
+		}
+		for _, child := range node.Children {
+			if err := walk(child, ns, level+1, false); err != nil {
+				return err
+			}
+		}
+		if err := w.write("</" + canonicalQName(rawName) + ">"); err != nil {
+			return err
+		}
+		w.rendered = w.rendered[:len(w.rendered)-1]
+		w.ancestors = w.ancestors[:len(w.ancestors)-1]
+		return nil
+	}
+	if err := walk(target, inherited, depth+1, true); err != nil {
+		return nil, err
+	}
+	if err := checkContext(options.context); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}
+
+// canonicalElementScope 基于祖先命名空间与当前元素声明计算有效作用域并生成原始前缀形式属性
+// 入参: inherited 祖先命名空间映射, attrs 当前元素属性列表
+// 返回: map[string]string 有效命名空间映射, []xml.Attr 原始前缀属性列表, error 非法、相对或未声明命名空间错误
+func canonicalElementScope(inherited map[string]string, attrs []xml.Attr) (map[string]string, []xml.Attr, error) {
+	ns := inherited
+	cloned := false
+	for _, attr := range attrs {
+		isDefault := attr.Name == (xml.Name{Local: "xmlns"})
+		isPrefixed := attr.Name.Space == "xmlns" || attr.Name.Space == xmlnsNamespace
+		if !isDefault && !isPrefixed {
+			continue
+		}
+		if attr.Value != "" {
+			uri, err := opcURI(attr.Value)
+			if err != nil || uri.Scheme == "" {
+				return nil, nil, fmt.Errorf("%w: relative or invalid canonical namespace", ErrInvalid)
+			}
+		}
+		if !cloned {
+			ns = maps.Clone(inherited)
+			cloned = true
+		}
+		prefix := ""
+		if isPrefixed {
+			prefix = attr.Name.Local
+		}
+		if attr.Value == "" {
+			delete(ns, prefix)
+		} else {
+			ns[prefix] = attr.Value
+		}
+	}
+	rawAttrs := make([]xml.Attr, 0, len(attrs))
+	for _, attr := range attrs {
+		if attr.Name == (xml.Name{Local: "xmlns"}) {
+			rawAttrs = append(rawAttrs, attr)
+			continue
+		}
+		if attr.Name.Space == "xmlns" || attr.Name.Space == xmlnsNamespace {
+			rawAttrs = append(rawAttrs, xml.Attr{Name: xml.Name{Space: "xmlns", Local: attr.Name.Local}, Value: attr.Value})
+			continue
+		}
+		if attr.Name.Space == "" {
+			rawAttrs = append(rawAttrs, attr)
+			continue
+		}
+		if attr.Name.Space == xmlNamespace {
+			rawAttrs = append(rawAttrs, xml.Attr{Name: xml.Name{Space: "xml", Local: attr.Name.Local}, Value: attr.Value})
+			continue
+		}
+		prefix := ""
+		for key, uri := range ns {
+			if key != "" && uri == attr.Name.Space && (prefix == "" || key < prefix) {
+				prefix = key
+			}
+		}
+		if prefix == "" {
+			return nil, nil, fmt.Errorf("%w: undeclared canonical attribute namespace %q", ErrInvalid, attr.Name.Space)
+		}
+		rawAttrs = append(rawAttrs, xml.Attr{Name: xml.Name{Space: prefix, Local: attr.Name.Local}, Value: attr.Value})
+	}
+	return ns, rawAttrs, nil
 }
 
 // token 按已校验词元输出C14N1.0、Exclusive C14N1.0或C14N1.1，不将显示层的属性默认值或MCE改写用于摘要

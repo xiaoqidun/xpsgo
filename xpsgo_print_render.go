@@ -144,13 +144,14 @@ type printPageStateOptions struct {
 	computeBackLayout    bool
 }
 
-// preparedPrintPageState 保存单页打印票据拆解后的水印、反相、输出色彩、色彩计划、剩余设置与可选物理布局
+// preparedPrintPageState 保存单页打印票据拆解后的水印、反相、输出色彩、色彩计划、分辨率、剩余设置与可选物理布局
 type preparedPrintPageState struct {
 	settings    *PrintSettings
 	watermark   *PrintWatermark
 	negative    bool
 	outputColor PrintColor
 	colorPlan   *PrintColorPlan
+	resolution  *PrintResolution
 	layout      *PrintLayout
 	rotation    Matrix
 	backLayout  *PrintLayout
@@ -1245,11 +1246,15 @@ func (r *printWatermarkRenderer) reserveGeometry(edges int) error {
 	return nil
 }
 
-// preparePrintPageState 拆解单页有效票据的水印、反相、输出色彩与色彩计划，按需剥离拼版Feature并计算正背面布局
+// preparePrintPageState 单遍校验有效票据并拆解水印、反相、输出色彩、色彩计划与页级分辨率，按需剥离拼版Feature并计算正背面布局
 // 入参: ctx 取消Context, ticket 有效打印票据, config 票据解析配置, page 可选页面头, media 物理介质, opts 拆解与校验策略
 // 返回: preparedPrintPageState 单页打印准备状态, error 票据、特征、布局或取消错误
 func preparePrintPageState(ctx context.Context, ticket *PrintSettings, config printSettingsConfig, page *Page, media PrintMedia, opts printPageStateOptions) (preparedPrintPageState, error) {
 	var state preparedPrintPageState
+	configuration, err := printSettingsOptions(ctx, &config.PrintSettingsOptions)
+	if err != nil {
+		return state, err
+	}
 	if ticket == nil {
 		ticket = &PrintSettings{Version: 1}
 	}
@@ -1257,55 +1262,135 @@ func preparePrintPageState(ctx context.Context, ticket *PrintSettings, config pr
 	if opts.stripPrivate {
 		model = printStripPrivateExtensions(model)
 	}
-	if opts.stripSignatures && !opts.stripPlanFeatures {
-		model = printSignatureLayoutSettings(model)
+	validated, err := validatePrintSettingsModel(model, configuration, printDocumentTicket)
+	if err != nil {
+		return state, err
 	}
-	var err error
-	if opts.stripSinglePoster {
-		model, err = printSinglePosterSettings(model, config)
+	control := newPrintLayoutSettings(validated, configuration)
+	hasPoster, hasWatermark, hasOutputColor, hasResolution := false, false, false, false
+	for _, element := range validated.Elements {
+		if element.Kind != PrintSettingFeature || !printPublicKeywordSpace(element.Name.Space) {
+			continue
+		}
+		switch element.Name.Local {
+		case "PagePoster":
+			hasPoster = true
+		case "PageWatermark":
+			hasWatermark = true
+		case "PageOutputColor", "PageNegativeImage":
+			hasOutputColor = true
+		case "PageResolution":
+			hasResolution = true
+		}
+	}
+	if opts.stripSinglePoster && hasPoster {
+		count, err := control.poster(int(^uint(0) >> 1))
+		if err != nil {
+			return state, err
+		}
+		if count != 1 {
+			return state, fmt.Errorf("%w: multiple poster sheets require PrintPlan", ErrUnsupported)
+		}
+	}
+	if hasWatermark {
+		state.watermark, err = control.watermark()
 		if err != nil {
 			return state, err
 		}
 	}
-	model, state.watermark, err = printWatermarkSettings(model, config)
-	if err != nil {
-		return state, err
+	if hasOutputColor {
+		state.negative, state.outputColor, err = control.printColors()
+		if err != nil {
+			return state, err
+		}
 	}
-	model, state.negative, state.outputColor, err = printColorSettings(model, config)
-	if err != nil {
-		return state, err
-	}
-	cleaned, colorPlan, err := printColorPlanSettings(ctx, model, &config.PrintSettingsOptions)
+	colorPlan, _, err := control.extractColorPlan()
 	if err != nil {
 		if !opts.ignoreColorPlanError || !errors.Is(err, ErrUnsupported) {
 			return state, err
 		}
-		model = printStripColorPlanFeatures(model)
 		state.colorPlan = nil
 	} else {
-		model = cleaned
 		state.colorPlan = colorPlan
 	}
-	if opts.stripPlanFeatures {
-		model, err = printPlanLayoutSettings(model, opts.stripSignatures, opts.ignoreUnsupported)
+	if opts.stripPlanFeatures && hasResolution {
+		res, err := control.resolution()
 		if err != nil {
+			if !opts.ignoreUnsupported || !errors.Is(err, ErrUnsupported) {
+				return state, err
+			}
+		} else {
+			state.resolution = res
+		}
+	}
+	filtered := &PrintSettings{Version: validated.Version, Elements: make([]PrintSetting, 0, len(validated.Elements))}
+	for _, setting := range validated.Elements {
+		if printColorPlanName(setting.Name) && (setting.Kind == PrintSettingFeature || setting.Kind == PrintSettingParameterInit) {
+			continue
+		}
+		if setting.Kind == PrintSettingFeature && printPublicKeywordSpace(setting.Name.Space) {
+			switch setting.Name.Local {
+			case "PageWatermark", "PageOutputColor", "PageNegativeImage":
+				continue
+			case "PagePoster":
+				if opts.stripSinglePoster || opts.stripPlanFeatures {
+					continue
+				}
+			case "JobDigitalSignatureProcessing":
+				if opts.stripSignatures {
+					continue
+				}
+			case "PageResolution":
+				if opts.stripPlanFeatures {
+					for _, child := range setting.Children {
+						if child.Kind == PrintSettingFeature {
+							return state, fmt.Errorf("%w: unhandled print plan subfeature", ErrUnsupported)
+						}
+					}
+					continue
+				}
+			case "JobCollateAllDocuments", "DocumentCollate", "JobPageOrder", "PageForceFrontSide", "JobBindAllDocuments", "DocumentBinding", "JobDuplexAllDocumentsContiguously", "DocumentDuplex", "JobNUpAllDocumentsContiguously", "DocumentNUp":
+				if opts.stripPlanFeatures {
+					for _, child := range setting.Children {
+						if child.Kind != PrintSettingFeature {
+							continue
+						}
+						if setting.Name.Local != "JobNUpAllDocumentsContiguously" && setting.Name.Local != "DocumentNUp" || !printPublicKeywordSpace(child.Name.Space) || child.Name.Local != "PresentationDirection" {
+							return state, fmt.Errorf("%w: unhandled print plan subfeature", ErrUnsupported)
+						}
+					}
+					continue
+				}
+			}
+		}
+		filtered.Elements = append(filtered.Elements, setting)
+	}
+	if opts.stripPlanFeatures {
+		if err := validatePrintLayoutFeatures(filtered, opts.ignoreUnsupported); err != nil {
 			return state, err
 		}
 	}
-	state.settings = model
+	state.settings = filtered
 	if page != nil {
-		if err := state.computeLayout(ctx, config, page, media, opts.computeBackLayout); err != nil {
+		if err := state.computeLayout(configuration, page, media, opts.computeBackLayout); err != nil {
 			return state, err
 		}
 	}
 	return state, nil
 }
 
-// computeLayout 按已拆解的布局票据计算单页物理正面布局及可选的旋转背面布局
-// 入参: ctx 取消Context, config 票据解析配置, page 页面头, media 物理介质, computeBack 是否计算非对称背面布局
+// computeLayout 按已校验且拆解完成的布局票据计算单页物理正面布局及可选的旋转背面布局，不再重复整树校验
+// 入参: config 票据解析配置, page 页面头, media 物理介质, computeBack 是否计算非对称背面布局
 // 返回: error 页面、介质或布局错误
-func (s *preparedPrintPageState) computeLayout(ctx context.Context, config printSettingsConfig, page *Page, media PrintMedia, computeBack bool) error {
-	layout, rotation, err := s.settings.layoutWithRotation(ctx, page, media, &config.PrintSettingsOptions)
+func (s *preparedPrintPageState) computeLayout(config printSettingsConfig, page *Page, media PrintMedia, computeBack bool) error {
+	if err := checkContext(config.context); err != nil {
+		return err
+	}
+	if err := validatePrintLayoutPageMedia(config, page, media); err != nil {
+		return err
+	}
+	control := newPrintLayoutSettings(s.settings, config)
+	layout, rotation, err := control.layoutWithRotation(page, media)
 	if err != nil {
 		return err
 	}
@@ -1316,7 +1401,7 @@ func (s *preparedPrintPageState) computeLayout(ctx context.Context, config print
 			backMedia := media
 			backMedia.Width, backMedia.Height = layout.Width, layout.Height
 			backMedia.ImageableArea = &backClip
-			backLayout, _, err := s.settings.layoutWithRotation(ctx, page, backMedia, &config.PrintSettingsOptions)
+			backLayout, _, err := control.layoutWithRotation(page, backMedia)
 			if err != nil {
 				return err
 			}
@@ -1324,23 +1409,6 @@ func (s *preparedPrintPageState) computeLayout(ctx context.Context, config print
 		}
 	}
 	return nil
-}
-
-// printStripColorPlanFeatures 从预览渲染票据视图中移除色彩计划相关的Feature与参数
-// 入参: settings 有效票据视图
-// 返回: *PrintSettings 过滤后的票据视图
-func printStripColorPlanFeatures(settings *PrintSettings) *PrintSettings {
-	if settings == nil {
-		return nil
-	}
-	result := &PrintSettings{Version: settings.Version, Elements: make([]PrintSetting, 0, len(settings.Elements))}
-	for _, value := range settings.Elements {
-		if printColorPlanName(value.Name) && (value.Kind == PrintSettingFeature || value.Kind == PrintSettingParameterInit) {
-			continue
-		}
-		result.Elements = append(result.Elements, value)
-	}
-	return result
 }
 
 // printResourceMedia 识别Microsoft两代票据及能力媒体类型，不接受参数或猜测自定义票据
@@ -1400,11 +1468,15 @@ func (c *printResourceCollector) collect() ([]printResourceReference, error) {
 	if err := c.scan(c.document.model.Elements, 2); err != nil {
 		return nil, err
 	}
-	root, err := printDocumentRoot(c.document.model.Version, c.document.model.Elements, c.options, c.document.capabilities)
+	mode := printDocumentTicket
+	if c.document.capabilities {
+		mode = printDocumentCapabilities
+	}
+	validated, err := validatePrintSettingsModel(c.document.model, c.options, mode)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := parsePrintDocument(root, c.options, c.document.capabilities); err != nil {
+	if err := validatePrintSettingsOutputBudget(validated, c.options, mode); err != nil {
 		return nil, err
 	}
 	parameterKind := PrintSettingParameterInit

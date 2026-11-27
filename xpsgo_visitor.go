@@ -197,9 +197,10 @@ type WalkGlyphsEvent struct {
 	element             *Glyphs
 }
 
-// WalkImageEvent 保存ImageBrush驱动的图像绘制事件，State.Opacity已计入Brush.Opacity，LocalOpacity为宿主路径与Brush.Opacity局部乘积
+// WalkImageEvent 保存ImageBrush驱动的图像绘制事件；默认及拆分派发场景下State.Opacity已计入Brush.Opacity，LocalOpacity为宿主路径与Brush.Opacity局部乘积，Element()已清除Stroke并将有效ImageBrush.Opacity归一为1
+// 若未注册Path回调且宿主路径同时含Stroke而触发整路径回退，则State.Opacity与LocalOpacity保持宿主路径不透明度，Element()保留完整Fill、Stroke与原始ImageBrush.Opacity
 // ImageTransform已包含State.Matrix并将96DPI源图像映射至页面或纸面坐标，ImageExtent为源图像96DPI物理尺寸，Bounds与ClipPath保持元素局部坐标
-// Brush、ClipPath及State内指针字段均为只读零拷贝视图，回调期间及返回后不得修改
+// Brush、ClipPath、Element返回值及State内指针字段均为只读视图，回调期间及返回后不得修改
 type WalkImageEvent struct {
 	State               WalkState
 	LocalOpacity        float64
@@ -214,6 +215,7 @@ type WalkImageEvent struct {
 	NeedsRasterFallback bool
 	FallbackReasons     FallbackReason
 	FallbackDPI         float64
+	element             *Path
 }
 
 // WalkGroupEvent 保存进入或离开Canvas与VisualBrush隔离组时的图形状态信息
@@ -349,8 +351,8 @@ func (e WalkGroupEvent) Element() Element {
 	return e.element
 }
 
-// Element 返回当前路径事件对应的只读*Path元素
-// 返回: Element 只读*Path元素或nil
+// Element 返回当前路径事件对应的规范化只读*Path元素，拆分派发场景已清除未归属的Fill或Stroke
+// 返回: Element 规范化只读*Path元素或nil
 func (e WalkPathEvent) Element() Element {
 	if e.element == nil {
 		return nil
@@ -358,7 +360,7 @@ func (e WalkPathEvent) Element() Element {
 	return e.element
 }
 
-// Bounds 计算路径几何及其可选描边半宽外延在页面或纸面坐标系下的轴对齐外包矩形
+// Bounds 计算路径几何及完整描边样式在页面或纸面坐标系下的精确轴对齐外包矩形
 // 返回: Rect 页面或纸面坐标系中的路径外包矩形, bool 是否存在非空有效外包矩形
 func (e WalkPathEvent) Bounds() (Rect, bool) {
 	if e.Data == nil || len(e.Data.Figures) == 0 {
@@ -371,11 +373,34 @@ func (e WalkPathEvent) Bounds() (Rect, bool) {
 	if !geometryFillMatrixFinite(local) {
 		return Rect{}, false
 	}
-	box, ok, err := pathGeometryBounds(e.Data, local, e.Stroke != nil, e.StrokeThickness)
+	path := &Path{
+		Data:               e.Data,
+		Fill:               e.Fill,
+		Stroke:             e.Stroke,
+		StrokeThickness:    e.StrokeThickness,
+		StrokeDashArray:    e.StrokeDashArray,
+		StrokeDashOffset:   e.StrokeDashOffset,
+		StrokeDashCap:      e.StrokeDashCap,
+		StrokeStartLineCap: e.StrokeStartLineCap,
+		StrokeEndLineCap:   e.StrokeEndLineCap,
+		StrokeLineJoin:     e.StrokeLineJoin,
+		StrokeMiterLimit:   e.StrokeMiterLimit,
+	}
+	box, ok, err := pathElementBounds(path, local)
 	if err != nil || !ok {
 		return Rect{}, false
 	}
 	return box, true
+}
+
+// Element 返回当前图像事件对应的规范化只读*Path元素，可直接传给RenderElementMapped进行光栅回退
+// 拆分派发场景已清除重复Stroke并将有效ImageBrush.Opacity归一为1，避免与State.Opacity二次相乘
+// 返回: Element 规范化只读*Path元素或nil
+func (e WalkImageEvent) Element() Element {
+	if e.element == nil {
+		return nil
+	}
+	return e.element
 }
 
 // Element 返回当前字形事件对应的只读*Glyphs元素
@@ -1296,6 +1321,7 @@ func (w *sceneWalker) walkPath(ctx context.Context, path *Path, state WalkState,
 // 入参: ctx 取消Context, path 宿主路径, state 当前有效状态, forceFallback 是否强制标记光栅回退, extraReasons 额外回退原因位掩码
 // 返回: error 回调或边界错误
 func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state WalkState, forceFallback bool, extraReasons FallbackReason) error {
+	keepStroke := forceFallback && path.Stroke != nil && w.visitor.Path == nil
 	brush := path.Fill
 	basePart := brush.Part
 	if basePart == "" {
@@ -1334,11 +1360,15 @@ func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state Walk
 		brushFallback = true
 	}
 	brushOpacity := 1.0
-	if !geometryFinite(brush.Opacity) || brush.Opacity < 0 || brush.Opacity > 1 {
+	validOpacity := geometryFinite(brush.Opacity) && brush.Opacity >= 0 && brush.Opacity <= 1
+	if !validOpacity {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "ImageBrush", Attribute: "Opacity", Message: "image brush opacity out of range"})
 		brushFallback = true
 	} else {
 		brushOpacity = brush.Opacity
+	}
+	if !keepStroke && colorClamp(state.Opacity*brushOpacity) == 0 && !w.config.includeInvisible {
+		return nil
 	}
 	var extent walkImageExtent
 	if resolvedImage && imagePart != "" {
@@ -1410,13 +1440,26 @@ func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state Walk
 		}
 	}
 	imgState := state.clone()
-	if viewportClip {
+	if viewportClip && !keepStroke {
 		imgState.Clip = append(imgState.Clip, WalkClip{Geometry: renderBoxGeometry(brush.Viewport), Matrix: brushMatrix, Aliased: state.EdgeMode == EdgeModeAliased})
 	}
-	imgState.Opacity = colorClamp(state.Opacity * brushOpacity)
+	localOpacity := path.Opacity
+	if !keepStroke {
+		imgState.Opacity = colorClamp(state.Opacity * brushOpacity)
+		localOpacity = colorClamp(path.Opacity * brushOpacity)
+	}
+	normPath := *path
+	if !keepStroke {
+		normPath.Stroke = nil
+		if validOpacity && brush.Opacity != 1 {
+			normFill := *brush
+			normFill.Opacity = 1
+			normPath.Fill = &normFill
+		}
+	}
 	event := WalkImageEvent{
 		State:               imgState,
-		LocalOpacity:        colorClamp(path.Opacity * brushOpacity),
+		LocalOpacity:        localOpacity,
 		ImagePart:           imagePart,
 		ImageProfilePart:    profilePart,
 		ImageExtent:         imageExtent,
@@ -1428,6 +1471,7 @@ func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state Walk
 		NeedsRasterFallback: w.forceRasterFallback || forceFallback || brushFallback || state.OpacityMask != nil,
 		FallbackReasons:     reasons,
 		FallbackDPI:         w.config.fallbackDPI,
+		element:             &normPath,
 	}
 	return w.visitor.Image(ctx, event)
 }
@@ -1470,6 +1514,13 @@ func (w *sceneWalker) emitPathEvent(ctx context.Context, path *Path, state WalkS
 	if w.visitor.Path == nil {
 		return nil
 	}
+	elem := path
+	if fill != path.Fill || stroke != path.Stroke {
+		norm := *path
+		norm.Fill = fill
+		norm.Stroke = stroke
+		elem = &norm
+	}
 	event := WalkPathEvent{
 		State:               state.clone(),
 		LocalOpacity:        path.Opacity,
@@ -1490,7 +1541,7 @@ func (w *sceneWalker) emitPathEvent(ctx context.Context, path *Path, state WalkS
 		NeedsRasterFallback: w.forceRasterFallback || needsFallback,
 		FallbackReasons:     reasons,
 		FallbackDPI:         w.config.fallbackDPI,
-		element:             path,
+		element:             elem,
 	}
 	return w.visitor.Path(ctx, event)
 }
@@ -1920,7 +1971,7 @@ func (w *sceneWalker) bitmapGlyphYMax(ctx context.Context, source *fontSource, g
 	if strike == nil || ppemY == 0 {
 		return nil, fmt.Errorf("%w: no matching bitmap strike", ErrUnsupported)
 	}
-	fallback := float64(source.metrics.hhea.ascender)
+	selection := fontBitmapSelection{scaleY: scaleY, ppemY: ppemY}
 	return func(gid uint16) (float64, error) {
 		if err := checkContext(ctx); err != nil {
 			return 0, err
@@ -1940,13 +1991,7 @@ func (w *sceneWalker) bitmapGlyphYMax(ctx context.Context, source *fontSource, g
 		if metrics.width == 0 || metrics.height == 0 {
 			return 0, nil
 		}
-		if metrics.hasHorizontal {
-			return math.Round(float64(metrics.horizontal.bearingY)*scaleY) * float64(source.metrics.unitsPerEm) / float64(ppemY), nil
-		}
-		if metrics.hasVertical {
-			return fallback - math.Round(float64(metrics.vertical.bearingY)*scaleY)*float64(source.metrics.unitsPerEm)/float64(ppemY), nil
-		}
-		return 0, fmt.Errorf("%w: bitmap glyph has no positioning metrics", ErrUnsupported)
+		return source.bitmapGlyphTop(metrics, selection)
 	}, nil
 }
 

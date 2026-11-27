@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -1161,6 +1162,12 @@ func (p *pageEncoder) properties(node *xmlElement, owner Element, value ElementP
 		}
 	}
 	if value.NavigateURI != nil {
+		normalized := structureURI(*value.NavigateURI)
+		if normalized != "" {
+			if _, err := url.Parse(normalized); err != nil {
+				return fmt.Errorf("%w: invalid FixedPage.NavigateUri: %w", ErrInvalid, err)
+			}
+		}
 		if err := p.attr(node, "FixedPage.NavigateUri", *value.NavigateURI); err != nil {
 			return err
 		}
@@ -1647,6 +1654,9 @@ func (p *pageEncoder) geometryFigures(values []GeometryFigure, depth int) (strin
 	for _, figure := range values {
 		if err := p.step(depth); err != nil {
 			return "", err
+		}
+		if len(figure.Segments) == 0 {
+			return "", fmt.Errorf("%w: geometry figure requires a segment", ErrInvalid)
 		}
 		if !geometryFinite(figure.StartPoint.X, figure.StartPoint.Y) {
 			return "", fmt.Errorf("%w: non-finite geometry StartPoint", ErrInvalid)

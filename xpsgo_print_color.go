@@ -25,6 +25,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -292,40 +293,6 @@ func (s *printLayoutSettings) printColors() (bool, PrintColor, error) {
 		return false, PrintColor{}, err
 	}
 	return negative == "Negative", result, checkContext(s.options.context)
-}
-
-// printColorSettings 解析并移除已由打印消费者执行的两种色彩Feature，保留其他设置供后续校验
-// 入参: settings 有效票据, options 描述值及取消参数
-// 返回: *PrintSettings 只读布局视图, bool 源页反色, PrintColor 目标颜色, error 设置或资源错误
-func printColorSettings(settings *PrintSettings, options printSettingsConfig) (*PrintSettings, bool, PrintColor, error) {
-	if settings == nil {
-		return nil, false, PrintColor{}, fmt.Errorf("%w: nil print color settings", ErrInvalid)
-	}
-	present := false
-	for _, setting := range settings.Elements {
-		if setting.Kind == PrintSettingFeature && printPublicKeywordSpace(setting.Name.Space) && (setting.Name.Local == "PageOutputColor" || setting.Name.Local == "PageNegativeImage") {
-			present = true
-			break
-		}
-	}
-	if !present {
-		return settings, false, PrintColor{}, checkContext(options.context)
-	}
-	configuration, err := printSettingsOptions(options.context, &options.PrintSettingsOptions)
-	if err != nil {
-		return nil, false, PrintColor{}, err
-	}
-	negative, output, err := newPrintLayoutSettings(settings, configuration).printColors()
-	if err != nil {
-		return nil, false, PrintColor{}, err
-	}
-	result := &PrintSettings{Version: settings.Version}
-	for _, setting := range settings.Elements {
-		if setting.Kind != PrintSettingFeature || !printPublicKeywordSpace(setting.Name.Space) || setting.Name.Local != "PageOutputColor" && setting.Name.Local != "PageNegativeImage" {
-			result.Elements = append(result.Elements, setting)
-		}
-	}
-	return result, negative, output, nil
 }
 
 // vector 保留原始矢量颜色的ICC身份及源页意图
@@ -1059,7 +1026,26 @@ func printColorPlanSettings(ctx context.Context, model *PrintSettings, options *
 	if err != nil {
 		return nil, nil, err
 	}
-	s := newPrintLayoutSettings(validated, configuration)
+	plan, present, err := newPrintLayoutSettings(validated, configuration).extractColorPlan()
+	if err != nil {
+		return nil, nil, err
+	}
+	if !present {
+		return model, nil, nil
+	}
+	result := &PrintSettings{Version: validated.Version, Elements: make([]PrintSetting, 0, len(validated.Elements))}
+	for _, value := range validated.Elements {
+		if printColorPlanName(value.Name) && (value.Kind == PrintSettingFeature || value.Kind == PrintSettingParameterInit) {
+			continue
+		}
+		result.Elements = append(result.Elements, value)
+	}
+	return result, plan, nil
+}
+
+// extractColorPlan 在已校验票据模型上直接提取标准颜色计划与是否存在颜色计划声明，不重复整树校验
+// 返回: *PrintColorPlan 独立颜色计划，未声明为nil, bool 是否存在颜色计划相关元素, error 格式、预算或能力错误
+func (s *printLayoutSettings) extractColorPlan() (*PrintColorPlan, bool, error) {
 	p := &PrintColorPlan{}
 	features := []struct {
 		name    string
@@ -1073,24 +1059,18 @@ func printColorPlanSettings(ctx context.Context, model *PrintSettings, options *
 		{"PageDestinationColorProfile", &p.DestinationMode, []string{PrintColorDestinationModeApplication, PrintColorDestinationModeDriverConfiguration}},
 	}
 	for _, f := range features {
-		option, err := s.leafOption(validated.Elements, f.name)
+		option, err := s.leafOption(s.model.Elements, f.name)
 		if err != nil {
-			return nil, nil, err
+			return nil, false, err
 		}
 		if option == nil {
 			continue
 		}
 		if !printPublicKeywordSpace(option.Name.Space) {
-			return nil, nil, fmt.Errorf("%w: private print color option", ErrUnsupported)
+			return nil, false, fmt.Errorf("%w: private print color option", ErrUnsupported)
 		}
-		found := false
-		for _, name := range f.allowed {
-			if option.Name.Local == name {
-				found = true
-			}
-		}
-		if !found {
-			return nil, nil, fmt.Errorf("%w: print color option %s", ErrUnsupported, option.Name.Local)
+		if !slices.Contains(f.allowed, option.Name.Local) {
+			return nil, false, fmt.Errorf("%w: print color option %s", ErrUnsupported, option.Name.Local)
 		}
 		*f.output = option.Name.Local
 		var names []string
@@ -1109,19 +1089,19 @@ func printColorPlanSettings(ctx context.Context, model *PrintSettings, options *
 			}
 		}
 		if err := printOptionProperties(option, names...); err != nil {
-			return nil, nil, err
+			return nil, false, err
 		}
 	}
-	intent, err := s.leafOption(validated.Elements, "PageICMRenderingIntent")
+	intent, err := s.leafOption(s.model.Elements, "PageICMRenderingIntent")
 	if err != nil {
-		return nil, nil, err
+		return nil, false, err
 	}
 	if intent != nil {
 		if err := printOptionProperties(intent); err != nil {
-			return nil, nil, err
+			return nil, false, err
 		}
 		if !printPublicKeywordSpace(intent.Name.Space) {
-			return nil, nil, fmt.Errorf("%w: private print rendering intent", ErrUnsupported)
+			return nil, false, fmt.Errorf("%w: private print rendering intent", ErrUnsupported)
 		}
 		switch intent.Name.Local {
 		case "Photographs":
@@ -1133,14 +1113,14 @@ func printColorPlanSettings(ctx context.Context, model *PrintSettings, options *
 		case "AbsoluteColorimetric":
 			p.Intent = IntentAbsoluteColorimetric
 		default:
-			return nil, nil, fmt.Errorf("%w: print rendering intent", ErrUnsupported)
+			return nil, false, fmt.Errorf("%w: print rendering intent", ErrUnsupported)
 		}
 	}
-	remaining := min(configuration.Limits.MaxPartBytes, configuration.Limits.MaxMetadataBytes, configuration.Limits.MaxPackageBytes)
+	remaining := min(s.options.Limits.MaxPartBytes, s.options.Limits.MaxMetadataBytes, s.options.Limits.MaxPackageBytes)
 	if value := printParamValue(s.values, "PageDeviceColorSpaceProfileURI"); value != nil {
 		p.Device, err = printColorProfileValue(value, false, &remaining)
 		if err != nil {
-			return nil, nil, err
+			return nil, false, err
 		}
 	}
 	for _, f := range []struct {
@@ -1155,32 +1135,32 @@ func printColorPlanSettings(ctx context.Context, model *PrintSettings, options *
 		if !f.selected {
 			continue
 		}
-		if err := checkContext(configuration.context); err != nil {
-			return nil, nil, err
+		if err := checkContext(s.options.context); err != nil {
+			return nil, false, err
 		}
-		option, _, e := s.option(validated.Elements, f.feature)
+		option, _, e := s.option(s.model.Elements, f.feature)
 		if e != nil {
-			return nil, nil, e
+			return nil, false, e
 		}
 		if option == nil {
-			return nil, nil, fmt.Errorf("%w: missing print color option %s", ErrInvalid, f.feature)
+			return nil, false, fmt.Errorf("%w: missing print color option %s", ErrInvalid, f.feature)
 		}
 		uri, e := s.scored(option, f.uri)
 		if e != nil {
-			return nil, nil, e
+			return nil, false, e
 		}
 		var embedded *PrintValue
 		if f.embedded != "" {
 			embedded, e = s.scored(option, f.embedded)
 			if e != nil {
-				return nil, nil, e
+				return nil, false, e
 			}
 		}
 		if uri == nil && embedded == nil {
-			return nil, nil, fmt.Errorf("%w: missing print color profile", ErrUnsupported)
+			return nil, false, fmt.Errorf("%w: missing print color profile", ErrUnsupported)
 		}
 		if uri != nil && embedded != nil {
-			return nil, nil, fmt.Errorf("%w: ambiguous print color profile", ErrUnsupported)
+			return nil, false, fmt.Errorf("%w: ambiguous print color profile", ErrUnsupported)
 		}
 		if uri != nil {
 			*f.output, err = printColorProfileValue(uri, false, &remaining)
@@ -1188,32 +1168,29 @@ func printColorPlanSettings(ctx context.Context, model *PrintSettings, options *
 			*f.output, err = printColorProfileValue(embedded, true, &remaining)
 		}
 		if err != nil {
-			return nil, nil, err
+			return nil, false, err
 		}
 	}
-	result := &PrintSettings{Version: validated.Version}
 	present := false
-	for _, value := range validated.Elements {
+	for _, value := range s.model.Elements {
 		if printColorPlanName(value.Name) && (value.Kind == PrintSettingFeature || value.Kind == PrintSettingParameterInit) {
 			parameter := strings.HasSuffix(value.Name.Local, "URI") || strings.HasSuffix(value.Name.Local, "Embedded")
 			if parameter != (value.Kind == PrintSettingParameterInit) {
-				return nil, nil, fmt.Errorf("%w: print color keyword kind", ErrInvalid)
+				return nil, false, fmt.Errorf("%w: print color keyword kind", ErrInvalid)
 			}
 			if parameter && (len(value.Children) == 0 || value.Children[0].Value == nil || value.Children[0].Value.Type != (xml.Name{Space: printValueNS, Local: "string"})) {
-				return nil, nil, fmt.Errorf("%w: print color parameter type", ErrInvalid)
+				return nil, false, fmt.Errorf("%w: print color parameter type", ErrInvalid)
 			}
 			present = true
-			continue
 		}
-		result.Elements = append(result.Elements, value)
 	}
-	if err := checkContext(configuration.context); err != nil {
-		return nil, nil, err
+	if err := checkContext(s.options.context); err != nil {
+		return nil, false, err
 	}
 	if !present {
-		return model, nil, nil
+		return nil, false, nil
 	}
-	return result, p, nil
+	return p, true, nil
 }
 
 // printColorPlanName 识别本执行组解释的公共颜色Feature及标准参数名称
@@ -1358,7 +1335,6 @@ func (r *sceneRenderer) renderPrintColorScene(elements []Element, transform Matr
 	if err := r.options.device.allocate(bounds); err != nil {
 		return nil, err
 	}
-	samples := r.options.samples
 	var background printNativeColor
 	if r.options.background.a != 0 {
 		space := ColorScRGB
@@ -1374,85 +1350,9 @@ func (r *sceneRenderer) renderPrintColorScene(elements []Element, transform Matr
 	if bounds.Empty() {
 		return nil, nil
 	}
-	cols := (bounds.Dx() + sceneTileSize - 1) / sceneTileSize
-	rows := (bounds.Dy() + sceneTileSize - 1) / sceneTileSize
-	tileCount := cols * rows
-	tileW := min(sceneTileSize, bounds.Dx()) * samples
-	tileH := min(sceneTileSize, bounds.Dy()) * samples
-	first := image.Rect(bounds.Min.X*samples, bounds.Min.Y*samples, bounds.Min.X*samples+tileW, bounds.Min.Y*samples+tileH)
-	workers := resolveXPSWorkers(r.options.workers, tileCount)
-	if r.options.workers == 0 && (tileCount < 4 || bounds.Dx()*bounds.Dy() < 4096) {
-		workers = 1
-	}
-	if workers > 1 {
-		available := uint64(max(0, r.options.pixels-r.live))
-		perWorker := uint64(tileW) * uint64(tileH) * 4 * uint64(1+sceneMaxIsolatedDepth(nodes))
-		if r.hasFiltered {
-			if available <= perWorker*2 {
-				workers = 1
-			} else {
-				workers = budgetXPSWorkers(workers, available/2, perWorker)
-			}
-		} else {
-			workers = budgetXPSWorkers(workers, available, perWorker)
-		}
-	}
-	if workers <= 1 {
-		storage, err := r.acquirePrintSurface(first)
-		if err != nil {
-			return nil, err
-		}
-		defer r.releasePrintSurface(storage)
-		worker := acquireSceneWorker()
-		defer releaseSceneWorker(worker)
-		for y := bounds.Min.Y; y < bounds.Max.Y; y += sceneTileSize {
-			for x := bounds.Min.X; x < bounds.Max.X; x += sceneTileSize {
-				tileOut := image.Rect(x, y, min(x+sceneTileSize, bounds.Max.X), min(y+sceneTileSize, bounds.Max.Y))
-				if err := r.printColorTile(nodes, storage, background, tileOut, worker); err != nil {
-					return nil, err
-				}
-			}
-		}
-		return nil, nil
-	}
-	surfaces := make([]*printSurfaceBuffer, workers)
-	states := make([]*sceneWorkerState, workers)
-	defer func() {
-		for i := range workers {
-			if states[i] != nil {
-				releaseSceneWorker(states[i])
-			}
-			if surfaces[i] != nil {
-				r.releasePrintSurface(surfaces[i])
-			}
-		}
-	}()
-	for i := range workers {
-		surface, err := r.acquirePrintSurface(first)
-		if err != nil {
-			return nil, err
-		}
-		surfaces[i] = surface
-		states[i] = acquireSceneWorker()
-	}
-	r.concurrent = true
-	err = runXPSWorkerSlots(r.options.context, workers, tileCount, func(runCtx context.Context, slot, task int) error {
-		if err := runCtx.Err(); err != nil {
-			r.cancelled.Store(true)
-			return err
-		}
-		tx := task % cols
-		ty := task / cols
-		x := bounds.Min.X + tx*sceneTileSize
-		y := bounds.Min.Y + ty*sceneTileSize
-		tileOut := image.Rect(x, y, min(x+sceneTileSize, bounds.Max.X), min(y+sceneTileSize, bounds.Max.Y))
-		if err := r.printColorTile(nodes, surfaces[slot], background, tileOut, states[slot]); err != nil {
-			r.cancelled.Store(true)
-			return err
-		}
-		return nil
-	})
-	if err != nil {
+	if err := runPreparedTiles(r, nodes, bounds, 4, r.acquirePrintSurface, r.releasePrintSurface, func(surface *printSurfaceBuffer, tile image.Rectangle, worker *sceneWorkerState) error {
+		return r.printColorTile(nodes, surface, background, tile, worker)
+	}); err != nil {
 		return nil, err
 	}
 	return nil, nil

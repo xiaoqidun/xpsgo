@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"io"
 	"io/fs"
 	"math"
 	"math/big"
@@ -81,7 +80,7 @@ type PrintDuplex uint8
 
 // PrintPlacement 保存单个源页面在纸面中的位置与变换，PageClip位于页面空间，MediaClip位于纸面空间
 // DocumentIndex为零基文档序号；Part非空时引用辅助FixedPage且Page须为-1，错误报告页的DocumentIndex也为-1
-// Watermark位于源页坐标空间，Negative在源页与水印合成后逐通道反相，Color保存源页独立有效颜色计划
+// Watermark位于源页坐标空间，Negative在源页与水印合成后逐通道反相，Color保存源页独立有效颜色计划，Resolution保存源页有效输出分辨率
 type PrintPlacement struct {
 	Page          int
 	DocumentIndex int
@@ -92,17 +91,19 @@ type PrintPlacement struct {
 	Watermark     *PrintWatermark
 	Negative      bool
 	Color         *PrintColorPlan
+	Resolution    *PrintResolution
 }
 
 // PrintSide 保存一面物理纸张的尺寸、可打印区域与按绘制顺序排列的页面，单位为九十六分之一英寸
 // Gutter为MediaClip内可选的物理留白区域，排除放置内容并保留背景；nil表示无留白
-// Color作用于整个纸面（含背景），SignaturePolicy为本纸面要求的最低签名策略
+// Color作用于整个纸面（含背景），Resolution保存本纸面汇聚后的有效输出分辨率，SignaturePolicy为本纸面要求的最低签名策略
 type PrintSide struct {
 	Width, Height   float64
 	MediaClip       Rect
 	Gutter          *Rect
 	Pages           []PrintPlacement
 	Color           PrintColor
+	Resolution      *PrintResolution
 	SignaturePolicy PrintSignaturePolicy
 }
 
@@ -151,6 +152,7 @@ type printPlanPage struct {
 	negative   bool
 	color      PrintColor
 	colorPlan  *PrintColorPlan
+	resolution *PrintResolution
 }
 
 // printPlanDocument 保存文档选页及编排设置，分别记录文档和副本的整纸边界
@@ -289,9 +291,10 @@ type printSignatureBudget struct {
 	evidence int
 }
 
-// PrintResolution 保存打印票据声明的水平与垂直输出分辨率，单位为每英寸点数
+// PrintResolution 保存打印票据声明的水平与垂直输出分辨率（每英寸点数）及可选质量后缀关键字
 type PrintResolution struct {
-	X, Y float64
+	X, Y        float64
+	Qualitative string
 }
 
 // PrintScalingSummary 保存打印票据中PageScaling的摘要类型、比例、微米偏移与对齐方式
@@ -309,6 +312,9 @@ type PrintTicketSummary struct {
 	Resolution            *PrintResolution
 	OutputQuality         string
 	PhotoPrintingIntent   string
+	InputBin              string
+	OutputBin             string
+	MediaType             string
 	MediaSize             *Point
 	MediaWidthMicrons     int64
 	MediaHeightMicrons    int64
@@ -322,7 +328,12 @@ type PrintTicketSummary struct {
 	Negative              bool
 	Watermark             *PrintWatermark
 	Copies                int
+	JobCopies             int
+	DocumentCopies        int
+	PageCopies            int
 	Collate               string
+	JobCollate            string
+	DocumentCollate       string
 	Duplex                PrintDuplex
 	ManualDuplex          bool
 	NUp                   int
@@ -814,6 +825,7 @@ func (b *printPlanBuilder) appendSheet(plan *PrintPlan, sheet PrintSheet, tempor
 	*placements += count
 	*sheets++
 	sheet.Front.Pages = clonePrintPlacements(sheet.Front.Pages)
+	sheet.Front.Resolution = clonePrintResolution(sheet.Front.Resolution)
 	if b.signatures != nil {
 		sheet.Front.SignaturePolicy = b.signatures.Policy
 	}
@@ -827,6 +839,7 @@ func (b *printPlanBuilder) appendSheet(plan *PrintPlan, sheet PrintSheet, tempor
 			back.SignaturePolicy = b.signatures.Policy
 		}
 		back.Pages = clonePrintPlacements(back.Pages)
+		back.Resolution = clonePrintResolution(back.Resolution)
 		if back.Gutter != nil {
 			gutter := *back.Gutter
 			back.Gutter = &gutter
@@ -837,13 +850,14 @@ func (b *printPlanBuilder) appendSheet(plan *PrintPlan, sheet PrintSheet, tempor
 	return nil
 }
 
-// clonePrintPlacements 复制纸面放置及水印描述，避免不同副本共享可变元数据
+// clonePrintPlacements 复制纸面放置及水印、色彩与分辨率描述，避免不同副本共享可变元数据
 // 入参: source 源页面放置
 // 返回: []PrintPlacement 独立放置
 func clonePrintPlacements(source []PrintPlacement) []PrintPlacement {
 	result := append([]PrintPlacement(nil), source...)
 	for index := range result {
 		result[index].Color = clonePrintColorPlan(result[index].Color)
+		result[index].Resolution = clonePrintResolution(result[index].Resolution)
 		if result[index].Watermark != nil {
 			mark := *result[index].Watermark
 			result[index].Watermark = &mark
@@ -1112,48 +1126,21 @@ func (b *printPlanBuilder) page(index int, source string, document *PrintSetting
 	if err != nil {
 		return result, err
 	}
-	if err := state.computeLayout(b.settings.context, b.settings, page, b.options.Print.Media, true); err != nil {
+	if err := state.computeLayout(b.settings, page, b.options.Print.Media, true); err != nil {
 		return result, err
 	}
 	result.watermark = state.watermark
 	result.negative = state.negative
 	result.color = state.outputColor
 	result.colorPlan = state.colorPlan
+	result.resolution = state.resolution
 	result.layout = *state.layout
 	result.rotation = state.rotation
 	result.backLayout = state.backLayout
 	return result, nil
 }
 
-// printPlanLayoutSettings 分离已由作业编排执行的Feature，未实现的设置按忽略策略校验
-// 入参: settings 已校验有效设置, signatures 是否已执行整包签名策略, ignoreUnsupported 是否跳过不影响几何与拼版的设备控制Feature
-// 返回: *PrintSettings 仅供内部布局使用的视图, error 未支持Feature错误
-func printPlanLayoutSettings(settings *PrintSettings, signatures, ignoreUnsupported bool) (*PrintSettings, error) {
-	if signatures {
-		settings = printSignatureLayoutSettings(settings)
-	}
-	result := &PrintSettings{Version: settings.Version}
-	for _, setting := range settings.Elements {
-		if setting.Kind == PrintSettingFeature && printPublicKeywordSpace(setting.Name.Space) {
-			switch setting.Name.Local {
-			case "JobCollateAllDocuments", "DocumentCollate", "JobPageOrder", "PageForceFrontSide", "PagePoster", "JobBindAllDocuments", "DocumentBinding", "JobDuplexAllDocumentsContiguously", "DocumentDuplex", "JobNUpAllDocumentsContiguously", "DocumentNUp":
-				for _, child := range setting.Children {
-					if child.Kind != PrintSettingFeature {
-						continue
-					}
-					if setting.Name.Local != "JobNUpAllDocumentsContiguously" && setting.Name.Local != "DocumentNUp" || !printPublicKeywordSpace(child.Name.Space) || child.Name.Local != "PresentationDirection" {
-						return nil, fmt.Errorf("%w: unhandled print plan subfeature", ErrUnsupported)
-					}
-				}
-				continue
-			}
-		}
-		result.Elements = append(result.Elements, setting)
-	}
-	return result, validatePrintLayoutFeatures(result, ignoreUnsupported)
-}
-
-// merge 复用票据链校验与根设置合并，同一票据载荷仅从封装读取一次，无独立票据时直接复用已校验基线
+// merge 复用票据链校验与根设置合并，同一票据载荷仅从封装读取一次，无独立票据时通过纯内存预算校验直接复用基线
 // 入参: source 固定布局源部件, base 已继承设置
 // 返回: *PrintSettings 独立有效设置, error 读取、合并、预算或取消错误
 func (b *printPlanBuilder) merge(source string, base *PrintSettings) (*PrintSettings, error) {
@@ -1168,26 +1155,33 @@ func (b *printPlanBuilder) merge(source string, base *PrintSettings) (*PrintSett
 		if _, ok := b.validated[base]; ok {
 			return base, nil
 		}
-		size, err := EncodePrintSettings(b.settings.context, io.Discard, base, &b.settings.PrintSettingsOptions)
+		validated, err := validatePrintSettingsModel(base, b.settings, printDocumentTicket)
+		if err != nil {
+			return nil, err
+		}
+		size, err := printSettingsEncodedSize(validated, b.settings, printDocumentTicket)
 		if err != nil {
 			return nil, err
 		}
 		if err := b.step(uint64(size) * 3); err != nil {
 			return nil, err
 		}
-		merged, err := MergePrintSettings(b.settings.context, base, &PrintSettings{Version: base.Version}, &b.settings.PrintSettingsOptions)
-		if err != nil {
-			return nil, err
-		}
 		if b.settings.ignoreUnsupported {
-			merged = printStripPrivateExtensions(merged)
+			validated = printStripPrivateExtensions(validated)
 		}
-		b.validated[merged] = size
-		return merged, nil
+		b.validated[validated] = size
+		return validated, nil
 	}
 	size, ok := b.validated[base]
 	if !ok || size < 0 {
-		size, err = EncodePrintSettings(b.settings.context, io.Discard, base, &b.settings.PrintSettingsOptions)
+		checked := base
+		if !ok {
+			checked, err = validatePrintSettingsModel(base, b.settings, printDocumentTicket)
+			if err != nil {
+				return nil, err
+			}
+		}
+		size, err = printSettingsEncodedSize(checked, b.settings, printDocumentTicket)
 		if err != nil {
 			return nil, err
 		}
@@ -1546,6 +1540,23 @@ func (p *printSheetPacker) bookletSide(pages []printPlanPage, slots [2]int, ref 
 	}
 	side.Gutter = printBindingGutter(finishing, side, PrintDuplexShortEdge, back)
 	phys, base, usable := printBookletCells(side)
+	rot := ref.rotation
+	if rot == (Matrix{}) {
+		rot = IdentityMatrix()
+	}
+	orthDir := side.Height > side.Width && rot.A != 0 || side.Width > side.Height && rot.A == 0
+	refSrc := ref.layout.MediaClip
+	if refSrc.Width <= 0 || refSrc.Height <= 0 {
+		refSrc = Rect{Width: ref.layout.Width, Height: ref.layout.Height}
+	}
+	refTarget := usable[0]
+	if refTarget.Width <= 0 || refTarget.Height <= 0 {
+		refTarget = base[0]
+	}
+	if refTarget.Width <= 0 || refTarget.Height <= 0 {
+		refTarget = phys[0]
+	}
+	rotateBooklet := orthDir && refTarget.Width > 0 && refTarget.Height > 0 && refSrc.Width > 0 && refSrc.Height > 0 && min(refTarget.Width/refSrc.Height, refTarget.Height/refSrc.Width) > min(refTarget.Width/refSrc.Width, refTarget.Height/refSrc.Height)
 	for slot, index := range slots {
 		if index >= len(pages) {
 			continue
@@ -1568,12 +1579,24 @@ func (p *printSheetPacker) bookletSide(pages []printPlanPage, slots [2]int, ref 
 		if src.Width <= 0 || src.Height <= 0 {
 			src = Rect{Width: page.layout.Width, Height: page.layout.Height}
 		}
-		factor := min(target.Width/src.Width, target.Height/src.Height)
-		mapping := Matrix{
-			A: factor,
-			D: factor,
-			E: target.X + (target.Width-factor*src.Width)/2 - factor*src.X,
-			F: target.Y + (target.Height-factor*src.Height)/2 - factor*src.Y,
+		var factor float64
+		var mapping Matrix
+		if rotateBooklet {
+			factor = min(target.Width/src.Height, target.Height/src.Width)
+			mapping = Matrix{
+				B: factor,
+				C: -factor,
+				E: target.X + (target.Width+factor*src.Height)/2 + factor*src.Y,
+				F: target.Y + (target.Height-factor*src.Width)/2 - factor*src.X,
+			}
+		} else {
+			factor = min(target.Width/src.Width, target.Height/src.Height)
+			mapping = Matrix{
+				A: factor,
+				D: factor,
+				E: target.X + (target.Width-factor*src.Width)/2 - factor*src.X,
+				F: target.Y + (target.Height-factor*src.Height)/2 - factor*src.Y,
+			}
 		}
 		placement := PrintPlacement{
 			Page:          page.index,
@@ -1584,10 +1607,12 @@ func (p *printSheetPacker) bookletSide(pages []printPlanPage, slots [2]int, ref 
 			Watermark:     page.watermark,
 			Negative:      page.negative,
 			Color:         clonePrintColorPlan(page.colorPlan),
+			Resolution:    clonePrintResolution(page.resolution),
 		}
 		if factor <= 0 || !geometryFillMatrixFinite(placement.Transform) || !geometryFinite(placement.MediaClip.X, placement.MediaClip.Y, placement.MediaClip.Width, placement.MediaClip.Height) {
 			return PrintSide{}, fmt.Errorf("%w: print booklet mapping", ErrLimit)
 		}
+		side.Resolution = printMergeSideResolution(side.Resolution, page.resolution)
 		side.Pages = append(side.Pages, placement)
 	}
 	return side, nil
@@ -1712,7 +1737,7 @@ func (p *printSheetPacker) add(page printPlanPage, document printPlanDocument) e
 	if p.nup == 1 && isBack && printBackRotates(document.duplex, layout.Width, layout.Height) && page.backLayout != nil {
 		placementLayout = *page.backLayout
 	}
-	placement := PrintPlacement{Page: page.index, DocumentIndex: page.document, Transform: placementLayout.Transform, PageClip: placementLayout.PageClip, MediaClip: placementLayout.MediaClip, Watermark: page.watermark, Negative: page.negative, Color: clonePrintColorPlan(page.colorPlan)}
+	placement := PrintPlacement{Page: page.index, DocumentIndex: page.document, Transform: placementLayout.Transform, PageClip: placementLayout.PageClip, MediaClip: placementLayout.MediaClip, Watermark: page.watermark, Negative: page.negative, Color: clonePrintColorPlan(page.colorPlan), Resolution: clonePrintResolution(page.resolution)}
 	if p.nup > 1 {
 		cell := printNUpCell(len(side.Pages), p.nup, side.MediaClip, p.direction)
 		src := layout.MediaClip
@@ -1744,6 +1769,7 @@ func (p *printSheetPacker) add(page printPlanPage, document printPlanDocument) e
 			return fmt.Errorf("%w: print NUp mapping", ErrLimit)
 		}
 	}
+	side.Resolution = printMergeSideResolution(side.Resolution, page.resolution)
 	side.Pages = append(side.Pages, placement)
 	return nil
 }
@@ -2327,40 +2353,6 @@ func (s *printLayoutSettings) watermarkString(option *PrintSetting, name string)
 	return value.Text, nil
 }
 
-// printWatermarkSettings 解析源页水印后移除已执行的Feature，其余设置仍须由各自消费者校验
-// 入参: settings 有效票据, options 资源和取消参数
-// 返回: *PrintSettings 无水印的只读布局视图, *PrintWatermark 水印描述, error 结构或语义错误
-func printWatermarkSettings(settings *PrintSettings, options printSettingsConfig) (*PrintSettings, *PrintWatermark, error) {
-	if settings == nil {
-		return nil, nil, fmt.Errorf("%w: nil watermark settings", ErrInvalid)
-	}
-	present := false
-	for _, setting := range settings.Elements {
-		if setting.Kind == PrintSettingFeature && printPublicKeywordSpace(setting.Name.Space) && setting.Name.Local == "PageWatermark" {
-			present = true
-			break
-		}
-	}
-	if !present {
-		return settings, nil, checkContext(options.context)
-	}
-	configuration, err := printSettingsOptions(options.context, &options.PrintSettingsOptions)
-	if err != nil {
-		return nil, nil, err
-	}
-	mark, err := newPrintLayoutSettings(settings, configuration).watermark()
-	if err != nil {
-		return settings, nil, err
-	}
-	result := &PrintSettings{Version: settings.Version}
-	for _, setting := range settings.Elements {
-		if setting.Kind != PrintSettingFeature || !printPublicKeywordSpace(setting.Name.Space) || setting.Name.Local != "PageWatermark" {
-			result.Elements = append(result.Elements, setting)
-		}
-	}
-	return result, mark, nil
-}
-
 // Error 返回包含策略与签名证据摘要的打印拒绝信息
 // 返回: string 错误说明
 func (e *PrintSignatureError) Error() string {
@@ -2476,19 +2468,6 @@ func printSignaturePolicy(settings *PrintSettings, ctx context.Context) (PrintSi
 	default:
 		return PrintSignatureFromTicket, fmt.Errorf("%w: digital signature processing option", ErrUnsupported)
 	}
-}
-
-// printSignatureLayoutSettings 移除已经执行的作业签名Feature，保留其他设置供原布局校验
-// 入参: settings 已校验的有效设置
-// 返回: *PrintSettings 只读布局视图
-func printSignatureLayoutSettings(settings *PrintSettings) *PrintSettings {
-	result := &PrintSettings{Version: settings.Version}
-	for _, setting := range settings.Elements {
-		if setting.Kind != PrintSettingFeature || !printPublicKeywordSpace(setting.Name.Space) || setting.Name.Local != "JobDigitalSignatureProcessing" {
-			result.Elements = append(result.Elements, setting)
-		}
-	}
-	return result
 }
 
 // readPrintSignatures 在已持读锁时检查整个作业，所有签名共用关联索引及累计读取预算
@@ -2788,7 +2767,7 @@ func (s *PrintSettings) Summary(ctx context.Context, opts *PrintLayoutOptions) (
 		model = printStripPrivateExtensions(model)
 	}
 	control := newPrintLayoutSettings(model, configuration)
-	summary := &PrintTicketSummary{Orientation: "Portrait", MirrorImage: "None", Copies: 1, Collate: "Collated", NUp: 1, PresentationDirection: "RightBottom", PageOrder: "Standard", Poster: 1}
+	summary := &PrintTicketSummary{Orientation: "Portrait", MirrorImage: "None", Copies: 1, JobCopies: 1, DocumentCopies: 1, PageCopies: 1, Collate: "Collated", NUp: 1, PresentationDirection: "RightBottom", PageOrder: "Standard", Poster: 1}
 	summary.Resolution, err = control.resolution()
 	if err != nil {
 		return nil, err
@@ -2806,6 +2785,33 @@ func (s *PrintSettings) Summary(ctx context.Context, opts *PrintLayoutOptions) (
 		}
 	} else {
 		summary.PhotoPrintingIntent = intent
+	}
+	for _, binName := range []string{"PageInputBin", "DocumentInputBin", "JobInputBin"} {
+		if val, err := control.summaryPublicKeyword(binName); err != nil {
+			if !layoutOpts.IgnoreUnsupportedFeatures || !errors.Is(err, ErrUnsupported) {
+				return nil, err
+			}
+		} else if val != "" {
+			summary.InputBin = val
+			break
+		}
+	}
+	for _, binName := range []string{"PageOutputBin", "DocumentOutputBin", "JobOutputBin"} {
+		if val, err := control.summaryPublicKeyword(binName); err != nil {
+			if !layoutOpts.IgnoreUnsupportedFeatures || !errors.Is(err, ErrUnsupported) {
+				return nil, err
+			}
+		} else if val != "" {
+			summary.OutputBin = val
+			break
+		}
+	}
+	if mediaType, err := control.summaryPublicKeyword("PageMediaType"); err != nil {
+		if !layoutOpts.IgnoreUnsupportedFeatures || !errors.Is(err, ErrUnsupported) {
+			return nil, err
+		}
+	} else {
+		summary.MediaType = mediaType
 	}
 	if placement, err := control.mediaSize(&media); err != nil {
 		if placement.rollNoLength {
@@ -2882,7 +2888,7 @@ func (s *PrintSettings) Summary(ctx context.Context, opts *PrintLayoutOptions) (
 		colorCopy := outputColor
 		summary.OutputColor = &colorCopy
 	}
-	if _, colorPlan, err := printColorPlanSettings(configuration.context, model, &configuration.PrintSettingsOptions); err != nil {
+	if colorPlan, _, err := control.extractColorPlan(); err != nil {
 		if !layoutOpts.IgnoreUnsupportedFeatures || !errors.Is(err, ErrUnsupported) {
 			return nil, err
 		}
@@ -2909,20 +2915,29 @@ func (s *PrintSettings) Summary(ctx context.Context, opts *PrintLayoutOptions) (
 	if jobCopies > maxInt/docCopies || jobCopies*docCopies > maxInt/pageCopies {
 		return nil, fmt.Errorf("%w: print summary copy count", ErrLimit)
 	}
+	summary.JobCopies, summary.DocumentCopies, summary.PageCopies = jobCopies, docCopies, pageCopies
 	summary.Copies = jobCopies * docCopies * pageCopies
+	jobCollateOpt, _, err := control.option(model.Elements, "JobCollateAllDocuments")
+	if err != nil {
+		return nil, err
+	}
 	jobCollate, err := control.choice("JobCollateAllDocuments", "Collated", "Collated", "Uncollated")
 	if err != nil {
 		return nil, err
+	}
+	if jobCollateOpt != nil {
+		summary.JobCollate = jobCollate
 	}
 	docCollateOpt, _, err := control.option(model.Elements, "DocumentCollate")
 	if err != nil {
 		return nil, err
 	}
 	if docCollateOpt != nil {
-		summary.Collate, err = control.choice("DocumentCollate", "Collated", "Collated", "Uncollated")
+		summary.DocumentCollate, err = control.choice("DocumentCollate", "Collated", "Collated", "Uncollated")
 		if err != nil {
 			return nil, err
 		}
+		summary.Collate = summary.DocumentCollate
 	} else {
 		summary.Collate = jobCollate
 	}
@@ -2964,6 +2979,20 @@ func (s *PrintSettings) Summary(ctx context.Context, opts *PrintLayoutOptions) (
 		summary.Finishing = finishing
 	}
 	return summary, checkContext(configuration.context)
+}
+
+// summaryPublicKeyword 读取公共叶子Feature的公共关键字Option名称，拒绝匿名或私有选项
+// 入参: name 公共Feature本地名称
+// 返回: string 公共Option名称，未声明为空字符串, error 结构、匿名或私有选项错误
+func (s *printLayoutSettings) summaryPublicKeyword(name string) (string, error) {
+	option, err := s.leafOption(s.model.Elements, name)
+	if err != nil || option == nil {
+		return "", err
+	}
+	if option.Name == (xml.Name{}) {
+		return "", fmt.Errorf("%w: anonymous print option for %s", ErrInvalid, name)
+	}
+	return s.keyword(option, "")
 }
 
 // strictSummaryChoice 严格校验公共叶子枚举Feature的命名空间、非匿名Option、禁止子Feature与合法枚举值
@@ -3065,8 +3094,8 @@ func (s *printLayoutSettings) scalingSummary() (*PrintScalingSummary, error) {
 	return result, nil
 }
 
-// resolution 从PageResolution提取水平与垂直输出分辨率DPI，支持跨公共关键字命名空间与参数引用
-// 返回: *PrintResolution 输出分辨率，未提供数值分辨率时为nil, error 数值、未初始化或范围错误
+// resolution 从PageResolution提取水平、垂直输出分辨率DPI及可选QualitativeResolution质量关键字，支持跨公共关键字命名空间与参数引用
+// 返回: *PrintResolution 输出分辨率，未提供数值与质量分辨率时为nil, error 数值、未初始化或范围错误
 func (s *printLayoutSettings) resolution() (*PrintResolution, error) {
 	option, _, err := s.option(s.model.Elements, "PageResolution")
 	if err != nil || option == nil {
@@ -3080,16 +3109,33 @@ func (s *printLayoutSettings) resolution() (*PrintResolution, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !hasX && !hasY {
+	qualitative := ""
+	if qVal, err := s.scored(option, "QualitativeResolution"); err != nil {
+		return nil, err
+	} else if qVal != nil {
+		if qVal.QName != (xml.Name{}) {
+			if !printPublicKeywordSpace(qVal.QName.Space) {
+				return nil, fmt.Errorf("%w: private print QualitativeResolution", ErrUnsupported)
+			}
+			qualitative = qVal.QName.Local
+		} else if qVal.Type == (xml.Name{}) || qVal.Type == (xml.Name{Space: printValueNS, Local: "string"}) {
+			qualitative = strings.TrimSpace(qVal.Text)
+		} else {
+			return nil, fmt.Errorf("%w: print QualitativeResolution type", ErrInvalid)
+		}
+	}
+	if !hasX && !hasY && qualitative == "" {
 		return nil, nil
 	}
-	if !hasX {
-		rx = ry
+	if hasX || hasY {
+		if !hasX {
+			rx = ry
+		}
+		if !hasY {
+			ry = rx
+		}
 	}
-	if !hasY {
-		ry = rx
-	}
-	return &PrintResolution{X: rx, Y: ry}, nil
+	return &PrintResolution{X: rx, Y: ry, Qualitative: qualitative}, nil
 }
 
 // resolutionNumber 读取PageResolution中的正数分辨率分量，支持xs:integer、xs:decimal及ParameterRef
@@ -3191,11 +3237,50 @@ func (s *printLayoutSettings) effectiveNUp(maximum int) (int, string, error) {
 	return 1, "RightBottom", nil
 }
 
-// clonePrintPlacement 复制单个纸面放置及其可变颜色与水印指针
+// clonePrintResolution 独立复制可选输出分辨率指针，避免计划返回结果共享可变状态
+// 入参: src 源输出分辨率指针
+// 返回: *PrintResolution 独立副本，输入为nil时返回nil
+func clonePrintResolution(src *PrintResolution) *PrintResolution {
+	if src == nil {
+		return nil
+	}
+	copied := *src
+	return &copied
+}
+
+// printMergeSideResolution 汇聚同一纸面多个放置页的有效输出分辨率，保留更高水平与垂直DPI
+// 入参: current 纸面当前分辨率, next 新放置页分辨率
+// 返回: *PrintResolution 汇聚后的独立分辨率指针
+func printMergeSideResolution(current, next *PrintResolution) *PrintResolution {
+	if next == nil {
+		return current
+	}
+	if current == nil {
+		return clonePrintResolution(next)
+	}
+	merged := *current
+	if next.X*next.Y > merged.X*merged.Y {
+		if next.Qualitative != "" {
+			merged.Qualitative = next.Qualitative
+		}
+	} else if merged.Qualitative == "" && next.Qualitative != "" {
+		merged.Qualitative = next.Qualitative
+	}
+	if next.X > merged.X {
+		merged.X = next.X
+	}
+	if next.Y > merged.Y {
+		merged.Y = next.Y
+	}
+	return &merged
+}
+
+// clonePrintPlacement 复制单个纸面放置及其可变颜色、水印与分辨率指针
 // 入参: source 源放置项
 // 返回: PrintPlacement 独立放置副本
 func clonePrintPlacement(source PrintPlacement) PrintPlacement {
 	source.Color = clonePrintColorPlan(source.Color)
+	source.Resolution = clonePrintResolution(source.Resolution)
 	if source.Watermark != nil {
 		mark := *source.Watermark
 		source.Watermark = &mark

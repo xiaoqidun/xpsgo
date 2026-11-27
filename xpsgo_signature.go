@@ -320,7 +320,7 @@ func (r *Reader) loadSignaturePart(info PartInfo, graph *signaturePartGraph) (*S
 		if err != nil {
 			return nil, nil, err
 		}
-		if !strings.EqualFold(media, reference.ContentType) {
+		if !signaturePartMedia(r.format, media, reference.ContentType) {
 			return nil, nil, fmt.Errorf("%w: signature content type differs for %s", ErrInvalid, reference.Part)
 		}
 	}
@@ -329,6 +329,30 @@ func (r *Reader) loadSignaturePart(info PartInfo, graph *signaturePartGraph) (*S
 		return nil, nil, err
 	}
 	return result, data, nil
+}
+
+// signaturePartMedia 按方言禁参规则比对包部件与签名引用声明的媒体类型，仅对非禁参自定义扩展类型规范化MIME参数比对
+// 入参: format 文档方言, actual 包内部件实际内容类型, declared 签名引用声明内容类型
+// 返回: bool 两者是否按规范等价
+func signaturePartMedia(format Format, actual, declared string) bool {
+	if actual == "" || declared == "" {
+		return false
+	}
+	if !strings.Contains(actual, ";") && !strings.Contains(declared, ";") {
+		return strings.EqualFold(actual, declared)
+	}
+	actualMedia, actualParams, err := mime.ParseMediaType(actual)
+	if err != nil {
+		return false
+	}
+	declaredMedia, declaredParams, err := mime.ParseMediaType(declared)
+	if err != nil {
+		return false
+	}
+	if opcSpecificContentType(actualMedia) || opcSpecificContentType(declaredMedia) || standardXPSContentType(format, actualMedia) || standardXPSContentType(format, declaredMedia) {
+		return false
+	}
+	return actualMedia == declaredMedia && maps.Equal(actualParams, declaredParams)
 }
 
 // readSignatureXML 解析OPC签名声明，按展开名称和模式ID绑定引用，不从任意Id属性猜测标识
@@ -455,22 +479,27 @@ func signatureIDAttribute(node *xmlElement, attr xml.Attr) bool {
 	if attr.Name == (xml.Name{Space: xmlNamespace, Local: "id"}) {
 		return true
 	}
-	if attr.Name == (xml.Name{Local: "Id"}) && node.Name.Space == xmlSignatureNamespace {
-		switch node.Name.Local {
-		case "Signature", "SignedInfo", "SignatureValue", "KeyInfo", "Object", "Reference", "Manifest", "SignatureProperties", "SignatureProperty":
+	if attr.Name == (xml.Name{Local: "Id"}) {
+		if node.Name.Space == xmlSignatureNamespace {
+			switch node.Name.Local {
+			case "Signature", "SignedInfo", "SignatureValue", "KeyInfo", "Object", "Reference", "Manifest", "SignatureProperties", "SignatureProperty":
+				return true
+			}
+		}
+		if node.Name == (xml.Name{Space: xmlSignature11Namespace, Local: "ECKeyValue"}) {
 			return true
 		}
 	}
 	return false
 }
 
-// signatureAttributes 检查XML签名元素的无命名空间属性并忽略命名空间声明
+// signatureAttributes 检查XML签名元素的无命名空间属性并忽略命名空间声明与xml:id
 // 入参: node 元素, allowed 允许的属性名称
 // 返回: map[string]string 属性值, error 属性错误
 func signatureAttributes(node *xmlElement, allowed ...string) (map[string]string, error) {
 	attrs := make(map[string]string)
 	for _, attr := range node.Attr {
-		if attr.Name.Space == xmlnsNamespace || attr.Name == (xml.Name{Local: "xmlns"}) {
+		if attr.Name.Space == xmlnsNamespace || attr.Name == (xml.Name{Local: "xmlns"}) || attr.Name == (xml.Name{Space: xmlNamespace, Local: "id"}) {
 			continue
 		}
 		if attr.Name.Space != "" {
@@ -1520,53 +1549,25 @@ func (p *signatureXML) certificates(node *xmlElement) ([][]byte, []crypto.Public
 				if err := checkContext(p.context); err != nil {
 					return nil, nil, err
 				}
-				switch value.Name {
-				case xml.Name{Space: xmlSignature11Namespace, Local: "ECKeyValue"}:
-					if len(publicKeys) >= min(signatureMaxCertificates, p.limits.MaxPartCount) {
-						return nil, nil, fmt.Errorf("%w: signer key value count", ErrLimit)
-					}
-					key, err := parseSignatureECKeyValue(value)
-					if err != nil {
-						return nil, nil, err
-					}
-					if err := p.retrievalCharge(int64((key.Curve.Params().BitSize+7)/8)*2 + 1); err != nil {
-						return nil, nil, err
-					}
-					publicKeys = append(publicKeys, key)
-				case xml.Name{Space: xmlSignatureNamespace, Local: "RSAKeyValue"}:
-					if len(publicKeys) >= min(signatureMaxCertificates, p.limits.MaxPartCount) {
-						return nil, nil, fmt.Errorf("%w: signer key value count", ErrLimit)
-					}
-					key, charge, err := parseSignatureRSAKeyValue(value)
-					if err != nil {
-						return nil, nil, err
-					}
-					if err := p.retrievalCharge(charge); err != nil {
-						return nil, nil, err
-					}
-					publicKeys = append(publicKeys, key)
-				case xml.Name{Space: xmlSignatureNamespace, Local: "DSAKeyValue"}:
-					if len(publicKeys) >= min(signatureMaxCertificates, p.limits.MaxPartCount) {
-						return nil, nil, fmt.Errorf("%w: signer key value count", ErrLimit)
-					}
-					key, charge, err := parseSignatureDSAKeyValue(value)
-					if err != nil {
-						return nil, nil, err
-					}
-					if err := p.retrievalCharge(charge); err != nil {
-						return nil, nil, err
-					}
-					publicKeys = append(publicKeys, key)
-				default:
-					if value.Name.Space == "" || value.Name.Space == xmlSignatureNamespace {
-						return nil, nil, fmt.Errorf("%w: unexpected KeyValue element", ErrInvalid)
-					}
+				matched, err := p.appendKeyValue(value, &publicKeys)
+				if err != nil {
+					return nil, nil, err
+				}
+				if !matched && (value.Name.Space == "" || value.Name.Space == xmlSignatureNamespace) {
+					return nil, nil, fmt.Errorf("%w: unexpected KeyValue element", ErrInvalid)
 				}
 			}
 			continue
 		case "RetrievalMethod":
-			if err := p.retrievalMethod(child); err != nil {
+			keyNode, err := p.retrievalMethod(child)
+			if err != nil {
 				return nil, nil, err
+			}
+			if keyNode != nil {
+				if _, err := p.appendKeyValue(keyNode, &publicKeys); err != nil {
+					return nil, nil, err
+				}
+				continue
 			}
 			data, embedded, err := p.retrievalCertificates(child)
 			if err != nil {
@@ -1645,50 +1646,47 @@ func (p *signatureXML) certificates(node *xmlElement) ([][]byte, []crypto.Public
 	return result, publicKeys, nil
 }
 
-// retrievalMethod 校验KeyInfo的RetrievalMethod引用并拒绝包外远程证书位置
+// retrievalMethod 校验KeyInfo的RetrievalMethod引用并拒绝包外远程证书位置，命中同文档KeyValue目标时返回该节点
 // 入参: node KeyInfo的RetrievalMethod元素
-// 返回: error 结构、远程证书、悬空片段、类型不符、能力或取消错误
-func (p *signatureXML) retrievalMethod(node *xmlElement) error {
+// 返回: *xmlElement 已校验的同文档KeyValue目标元素，不适用时为nil, error 结构、远程证书、悬空片段、类型不符、能力或取消错误
+func (p *signatureXML) retrievalMethod(node *xmlElement) (*xmlElement, error) {
 	attrs, err := signatureAttributes(node, "URI", "Type")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	uri, present := attrs["URI"]
 	uri = strings.Trim(uri, " \t\r\n")
 	typ := strings.Trim(attrs["Type"], " \t\r\n")
 	if !present || !uriReference(uri) || !uriReference(typ) || !xmlWhitespace(node.Text) {
-		return fmt.Errorf("%w: RetrievalMethod URI, Type or content", ErrInvalid)
+		return nil, fmt.Errorf("%w: RetrievalMethod URI, Type or content", ErrInvalid)
 	}
 	if err := p.retrievalTransforms(node); err != nil {
-		return err
+		return nil, err
 	}
 	reference, err := url.Parse(uri)
 	if err != nil {
-		return fmt.Errorf("%w: RetrievalMethod URI", ErrInvalid)
+		return nil, fmt.Errorf("%w: RetrievalMethod URI", ErrInvalid)
 	}
 	certificate := typ == xmlSignatureNamespace+"X509Data" || typ == xmlSignatureNamespace+"rawX509Certificate"
-	nonCertificate := false
-	switch typ {
-	case xmlSignatureNamespace + "DSAKeyValue", xmlSignatureNamespace + "RSAKeyValue", xmlSignature11Namespace + "ECKeyValue", xmlSignatureNamespace + "PGPData", xmlSignatureNamespace + "SPKIData", xmlSignatureNamespace + "MgmtData":
-		nonCertificate = true
-	}
+	keyValue := typ == xmlSignatureNamespace+"DSAKeyValue" || typ == xmlSignatureNamespace+"RSAKeyValue" || typ == xmlSignature11Namespace+"ECKeyValue"
+	nonCertificate := keyValue || typ == xmlSignatureNamespace+"PGPData" || typ == xmlSignatureNamespace+"SPKIData" || typ == xmlSignatureNamespace+"MgmtData"
 	if reference.Scheme != "" || strings.HasPrefix(uri, "//") {
 		if certificate {
-			return fmt.Errorf("%w: XPS M10.18 forbids remote certificate RetrievalMethod", ErrInvalid)
+			return nil, fmt.Errorf("%w: XPS M10.18 forbids remote certificate RetrievalMethod", ErrInvalid)
 		}
 		if nonCertificate && len(node.Children) == 0 {
-			return nil
+			return nil, nil
 		}
-		return fmt.Errorf("%w: RetrievalMethod external information or transforms", ErrUnsupported)
+		return nil, fmt.Errorf("%w: RetrievalMethod external information or transforms", ErrUnsupported)
 	}
 	if nonCertificate && strings.HasPrefix(uri, "#") && uri != "#" {
 		id, err := signatureReferenceID(uri)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		target := p.ids[id]
 		if target == nil {
-			return fmt.Errorf("%w: unresolved RetrievalMethod fragment", ErrInvalid)
+			return nil, fmt.Errorf("%w: unresolved RetrievalMethod fragment", ErrInvalid)
 		}
 		if len(node.Children) == 0 {
 			want := xml.Name{Space: xmlSignatureNamespace, Local: strings.TrimPrefix(typ, xmlSignatureNamespace)}
@@ -1696,15 +1694,66 @@ func (p *signatureXML) retrievalMethod(node *xmlElement) error {
 				want = xml.Name{Space: xmlSignature11Namespace, Local: strings.TrimPrefix(typ, xmlSignature11Namespace)}
 			}
 			if target.Name != want {
-				return fmt.Errorf("%w: RetrievalMethod target differs from Type", ErrInvalid)
+				return nil, fmt.Errorf("%w: RetrievalMethod target differs from Type", ErrInvalid)
 			}
-			return nil
+			if keyValue {
+				return target, nil
+			}
+			return nil, nil
 		}
 	}
 	if certificate || typ == "" {
-		return nil
+		return nil, nil
 	}
-	return fmt.Errorf("%w: RetrievalMethod unclassified information", ErrUnsupported)
+	return nil, fmt.Errorf("%w: RetrievalMethod unclassified information", ErrUnsupported)
+}
+
+// appendKeyValue 按XML-DSig规范解析单个公钥元素并计入工作字节与数量上限
+// 入参: value 公钥元素节点, publicKeys 目标公钥切片指针
+// 返回: bool 元素是否属于支持的公钥类型, error 结构、参数、预算或上限错误
+func (p *signatureXML) appendKeyValue(value *xmlElement, publicKeys *[]crypto.PublicKey) (bool, error) {
+	switch value.Name {
+	case xml.Name{Space: xmlSignature11Namespace, Local: "ECKeyValue"}:
+		if len(*publicKeys) >= min(signatureMaxCertificates, p.limits.MaxPartCount) {
+			return true, fmt.Errorf("%w: signer key value count", ErrLimit)
+		}
+		key, err := parseSignatureECKeyValue(value)
+		if err != nil {
+			return true, err
+		}
+		if err := p.retrievalCharge(int64((key.Curve.Params().BitSize+7)/8)*2 + 1); err != nil {
+			return true, err
+		}
+		*publicKeys = append(*publicKeys, key)
+		return true, nil
+	case xml.Name{Space: xmlSignatureNamespace, Local: "RSAKeyValue"}:
+		if len(*publicKeys) >= min(signatureMaxCertificates, p.limits.MaxPartCount) {
+			return true, fmt.Errorf("%w: signer key value count", ErrLimit)
+		}
+		key, charge, err := parseSignatureRSAKeyValue(value)
+		if err != nil {
+			return true, err
+		}
+		if err := p.retrievalCharge(charge); err != nil {
+			return true, err
+		}
+		*publicKeys = append(*publicKeys, key)
+		return true, nil
+	case xml.Name{Space: xmlSignatureNamespace, Local: "DSAKeyValue"}:
+		if len(*publicKeys) >= min(signatureMaxCertificates, p.limits.MaxPartCount) {
+			return true, fmt.Errorf("%w: signer key value count", ErrLimit)
+		}
+		key, charge, err := parseSignatureDSAKeyValue(value)
+		if err != nil {
+			return true, err
+		}
+		if err := p.retrievalCharge(charge); err != nil {
+			return true, err
+		}
+		*publicKeys = append(*publicKeys, key)
+		return true, nil
+	}
+	return false, nil
 }
 
 // retrievalTransforms 检查检索变换算法列表并禁止在KeyInfo中使用关系变换
@@ -2849,6 +2898,7 @@ func c14n11JoinURI(base, ref string) (string, error) {
 				if strings.HasPrefix(refURI.path, "/") {
 					out.path = c14n11RemoveDotSegments(refURI.path, out.scheme != "" || out.hasAuth)
 				} else {
+					baseOpaque := baseURI.scheme != "" && !baseURI.hasAuth && baseURI.path != "" && !strings.HasPrefix(baseURI.path, "/")
 					var merged string
 					if out.hasAuth && baseURI.path == "" {
 						merged = "/" + refURI.path
@@ -2857,7 +2907,11 @@ func c14n11JoinURI(base, ref string) (string, error) {
 					} else {
 						merged = refURI.path
 					}
-					out.path = c14n11RemoveDotSegments(merged, out.scheme != "" || out.hasAuth)
+					if baseOpaque {
+						out.path = merged
+					} else {
+						out.path = c14n11RemoveDotSegments(merged, out.scheme != "" || out.hasAuth)
+					}
 				}
 				out.hasQuery, out.query = refURI.hasQuery, refURI.query
 			}

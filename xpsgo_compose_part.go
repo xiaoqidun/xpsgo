@@ -18,6 +18,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"cmp"
+	"context"
 	"encoding/binary"
 	"encoding/xml"
 	"errors"
@@ -87,14 +88,37 @@ type compositionLinkIndex struct {
 
 // compositionMarkupOptions 提供原始布局标记的输出位置、名称映射及资源与导航改写回调
 type compositionMarkupOptions struct {
-	format      Format
-	destination string
-	owner       string
-	names       map[string]string
-	index       *compositionIndex
-	resource    func(string) (string, error)
-	navigation  func(string, string) (string, bool, error)
-	budget      *compositionBudget
+	format             Format
+	destination        string
+	owner              string
+	names              map[string]string
+	index              *compositionIndex
+	source             *compositionSource
+	resource           func(string) (string, error)
+	navigation         func(string, string) (string, bool, error)
+	navigationOptional func(string, string) (string, bool, bool, error)
+	budget             *compositionBudget
+}
+
+// compositionMCEIdentifierConfig 配置分支感知MCE互斥标识收集器的宿主提取及校验规则
+type compositionMCEIdentifierConfig struct {
+	processor  compatibilityProcessor
+	budget     *compositionBudget
+	duplicate  string
+	misplaced  string
+	altText    string
+	needChoice string
+	unknownNS  string
+	isResource func(*xmlElement) bool
+	extract    func(*xmlElement, bool) (string, bool, error)
+}
+
+// compositionPageGeometry 保存单页裁剪、旋转与缩放后的目标尺寸、裁剪框和总仿射矩阵
+type compositionPageGeometry struct {
+	newWidth  float64
+	newHeight float64
+	crop      Rect
+	matrix    Matrix
 }
 
 // compositionNames 保存各输出页面的元素名称映射及跨方言同源去重移除的LinkTarget集合
@@ -462,6 +486,9 @@ func (c *compositionFontCheck) parse(part packagePart, whole bool) (*composition
 	if index != nil {
 		err = index.visit(indexRoot, visit)
 		root = index.active
+	} else if cached := c.source.cachedXML(part, c.budget.limits); cached != nil {
+		root = cached
+		err = visitXMLElementTree(cached, visit)
 	} else {
 		root, err = decodeXMLVisit(part.data, c.budget.limits, visit)
 	}
@@ -963,7 +990,7 @@ func rewriteCompositionMarkup(value packagePart, options compositionMarkupOption
 			return nil, err
 		}
 		tracker := newResourceMarkupScopeTracker(options.format, options.format == FormatOpenXPS, budget.context)
-		root, err := decodeXMLVisit(value.data, budget.limits, func(token xml.Token, node *xmlElement) error {
+		visit := func(token xml.Token, node *xmlElement) error {
 			if err := budget.step(1); err != nil {
 				return err
 			}
@@ -995,11 +1022,18 @@ func rewriteCompositionMarkup(value packagePart, options compositionMarkupOption
 				}
 			}
 			return nil
-		})
+		}
+		var root *xmlElement
+		if cached := options.source.cachedXML(value, budget.limits); cached != nil {
+			root = cached
+			err = visitXMLElementTree(cached, visit)
+		} else {
+			root, err = decodeXMLVisit(value.data, budget.limits, visit)
+		}
 		if err != nil {
 			return nil, err
 		}
-		processed, err = preprocessXMLContext(root, []string{namespace, namespace + "/resourcedictionary-key"}, budget.context)
+		processed, err = preprocessXMLContext(root, compositionLayoutUnderstoodNamespaces(options.format), budget.context)
 		if err != nil {
 			return nil, err
 		}
@@ -1040,9 +1074,6 @@ func rewriteCompositionMarkup(value packagePart, options compositionMarkupOption
 		if err != nil {
 			return "", err
 		}
-		if err := budget.step(0); err != nil {
-			return "", err
-		}
 		aliases[key] = target
 		return target, nil
 	}
@@ -1056,37 +1087,38 @@ func rewriteCompositionMarkup(value packagePart, options compositionMarkupOption
 	} else {
 		rewriteTracker = newResourceMarkupScopeTracker(options.format, options.format == FormatOpenXPS, budget.context)
 	}
-	return rewriteExtractMarkup(value.data, budget.limits, budget.context, func(token xml.Token, node *xmlElement) (bool, error) {
+	filter := func(token xml.Token, node *xmlElement) (bool, error) {
 		skip, _, err := rewriteTracker.visit(token, node)
 		return skip, err
-	}, func(node *xmlElement, attr xml.Attr) (string, bool, error) {
+	}
+	rewriteAttr := func(node *xmlElement, attr xml.Attr) (string, bool, bool, error) {
 		if err := budget.step(1); err != nil {
-			return "", false, err
+			return "", false, false, err
 		}
 		if err := budget.scan(int64(len(attr.Value))); err != nil {
-			return "", false, err
+			return "", false, false, err
 		}
 		isModel := options.format == FormatOpenXPS && node.Name.Space == openXPS3DNamespace
 		if (node.Name.Space != namespace && !isModel) || attr.Name.Space != "" {
-			return attr.Value, false, nil
+			return attr.Value, false, false, nil
 		}
 		if attr.Name.Local == "Name" && slices.Contains([]string{"FixedPage", "Canvas", "Path", "Glyphs"}, node.Name.Local) {
 			name, err := collector.name(attr.Value, false)
 			if err != nil || options.names == nil {
-				return attr.Value, false, err
+				return attr.Value, false, false, err
 			}
 			target, present := options.names[name]
 			if !present {
-				return "", false, fmt.Errorf("%w: composition Name mapping for %q", ErrInvalid, name)
+				return "", false, false, fmt.Errorf("%w: composition Name mapping for %q", ErrInvalid, name)
 			}
 			normalized, err := collector.name(target, false)
 			if err != nil || normalized != target {
 				if err == nil {
 					err = fmt.Errorf("%w: noncanonical composition Name mapping", ErrInvalid)
 				}
-				return "", false, err
+				return "", false, false, err
 			}
-			return target, name != target, nil
+			return target, name != target, false, nil
 		}
 		if resourceIdentityAttribute(node, attr, options.format) {
 			base := source
@@ -1094,64 +1126,82 @@ func rewriteCompositionMarkup(value packagePart, options compositionMarkupOption
 				base = owner
 				if base == "" {
 					if !linkExternal(structureURI(attr.Value)) {
-						return "", false, fmt.Errorf("%w: composition dictionary navigation owner", ErrUnsupported)
+						return "", false, false, fmt.Errorf("%w: composition dictionary navigation owner", ErrUnsupported)
 					}
 					base = source
 				}
 			}
+			if options.navigationOptional != nil {
+				target, changed, strip, err := options.navigationOptional(base, attr.Value)
+				if err != nil {
+					return "", false, false, err
+				}
+				if strip {
+					return "", true, true, nil
+				}
+				if err := budget.scan(int64(len(target))); err != nil {
+					return "", false, false, err
+				}
+				return target, changed, false, nil
+			}
 			if options.navigation == nil {
-				return "", false, fmt.Errorf("%w: missing composition navigation callback", ErrInvalid)
+				return "", false, false, fmt.Errorf("%w: missing composition navigation callback", ErrInvalid)
 			}
 			target, changed, err := options.navigation(base, attr.Value)
 			if err != nil {
-				return "", false, err
+				return "", false, false, err
 			}
 			if err := budget.scan(int64(len(target))); err != nil {
-				return "", false, err
+				return "", false, false, err
 			}
-			if err := budget.step(0); err != nil {
-				return "", false, err
-			}
-			return target, changed, nil
+			return target, changed, false, nil
 		}
 		if attr.Name.Local == "Source" && (node.Name.Local == "PageContent" || node.Name.Local == "DocumentReference") {
 			if node.Name.Local == "PageContent" && local != "FixedDocument" || node.Name.Local == "DocumentReference" && local != "FixedDocumentSequence" {
-				return "", false, fmt.Errorf("%w: composition layout reference outside its index", ErrUnsupported)
+				return "", false, false, fmt.Errorf("%w: composition layout reference outside its index", ErrUnsupported)
 			}
 			target, err := resolve(attr.Value)
 			if err != nil {
-				return "", false, err
+				return "", false, false, err
 			}
 			original, err := resolvePart(destination, attr.Value)
 			if err == nil && strings.EqualFold(original, target) {
-				return attr.Value, false, nil
+				return attr.Value, false, false, nil
 			}
 			target, err = relativePart(destination, target)
 			if err != nil {
-				return "", false, err
+				return "", false, false, err
 			}
 			if int64(len(target)) > maximum {
-				return "", false, fmt.Errorf("%w: composition layout reference size", ErrLimit)
+				return "", false, false, fmt.Errorf("%w: composition layout reference size", ErrLimit)
 			}
 			if err := budget.scan(int64(len(target))); err != nil {
-				return "", false, err
+				return "", false, false, err
 			}
-			return target, target != attr.Value, nil
+			return target, target != attr.Value, false, nil
 		}
 		references, err := resourceAttributeReferences(node, attr)
 		if err != nil {
-			return "", false, err
+			return "", false, false, err
 		}
 		for _, reference := range references {
 			if _, err := resolve(reference.uri); err != nil {
-				return "", false, err
+				return "", false, false, err
 			}
 		}
 		if len(references) == 0 {
-			return attr.Value, false, nil
+			return attr.Value, false, false, nil
 		}
-		return compositionResourceAttribute(source, destination, node, attr, aliases, budget, false)
-	})
+		target, changed, err := compositionResourceAttribute(source, destination, node, attr, aliases, budget, false)
+		return target, changed, false, err
+	}
+	if options.navigationOptional == nil {
+		return rewriteExtractMarkup(value.data, budget.limits, budget.context, filter, func(node *xmlElement, attr xml.Attr) (string, bool, error) {
+			target, changed, _, err := rewriteAttr(node, attr)
+			return target, changed, err
+		})
+	}
+	return rewriteCompositionMarkupWithStrip(value.data, maximum, budget, filter, rewriteAttr)
 }
 
 // compositionMarkupAttribute 识别布局结构和资源属性，不把未知属性中的潜在引用当作普通文字
@@ -1512,7 +1562,7 @@ func (c *compositionNameCollector) root(part packagePart, local string) (*xmlEle
 	}
 	nodes := 0
 	tracker := newResourceMarkupScopeTracker(c.format, c.format == FormatOpenXPS, c.budget.context)
-	root, err := decodeXMLVisit(part.data, c.budget.limits, func(token xml.Token, node *xmlElement) error {
+	visit := func(token xml.Token, node *xmlElement) error {
 		if err := c.budget.step(1); err != nil {
 			return err
 		}
@@ -1527,15 +1577,22 @@ func (c *compositionNameCollector) root(part packagePart, local string) (*xmlEle
 			}
 		}
 		return nil
-	})
+	}
+	var root *xmlElement
+	var err error
+	if cached := c.source.cachedXML(part, c.budget.limits); cached != nil {
+		root = cached
+		err = visitXMLElementTree(cached, visit)
+	} else {
+		root, err = decodeXMLVisit(part.data, c.budget.limits, visit)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if err := c.budget.step(nodes); err != nil {
 		return nil, err
 	}
-	namespace := formatNamespace(c.format)
-	processed, err := preprocessXMLContext(root, []string{namespace, namespace + "/resourcedictionary-key"}, c.budget.context)
+	processed, err := preprocessXMLContext(root, compositionLayoutUnderstoodNamespaces(c.format), c.budget.context)
 	if err != nil {
 		return nil, err
 	}
@@ -1574,107 +1631,46 @@ func (c *compositionNameCollector) page(part packagePart) (map[string]bool, erro
 		return nil, err
 	}
 	result := make(map[string]bool)
-	if err := c.visual(root, false, false, result, compatibilityScope{}); err != nil {
+	if err := c.visual(root, false, result, compatibilityScope{}); err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
-// visual 遍历全部已知分支，只有AlternateContent的不同候选分支允许复用同一名称
-// 入参: node 原始节点, resource 是否位于资源字典内, branch 是否为直接候选分支, seen 可同时存在的名称, inherited 祖先MCE规则
+// visual 通过分支感知MCE收集器遍历页面标识，未选分支不评估MustUnderstand或未知扩展，仅合并互斥名称
+// 入参: node 原始节点, resource 是否位于资源字典内, seen 可同时存在的名称, inherited 祖先MCE规则
 // 返回: error 重复声明、资源名称、MCE、预算或取消错误
-func (c *compositionNameCollector) visual(node *xmlElement, resource, branch bool, seen map[string]bool, inherited compatibilityScope) error {
-	if err := c.budget.step(1); err != nil {
-		return err
-	}
-	scope, err := c.mce.rules(node, inherited)
-	if err != nil {
-		return err
-	}
-	control := branch || node.Name.Space == mcNamespace && node.Name.Local == "AlternateContent"
-	if err := c.mce.validateAttributes(node, scope, control); err != nil {
-		return err
-	}
-	if !c.mce.understood[node.Name.Space] {
-		if !scope.ignorable[node.Name.Space] {
-			return fmt.Errorf("%w: composition page element namespace %q", ErrUnsupported, node.Name.Space)
-		}
-		if !scope.processes(node.Name) {
-			return nil
-		}
-		if err := compatibilityNoXMLContext(node); err != nil {
-			return err
-		}
-		for _, child := range node.Children {
-			if err := c.visual(child, resource, false, seen, scope); err != nil {
-				return err
+func (c *compositionNameCollector) visual(node *xmlElement, resource bool, seen map[string]bool, inherited compatibilityScope) error {
+	namespace := formatNamespace(c.format)
+	return collectCompositionMCEIdentifiers(node, compositionMCEIdentifierConfig{
+		processor:  c.mce,
+		budget:     c.budget,
+		duplicate:  "duplicate composition page Name",
+		misplaced:  "misplaced composition MCE branch",
+		altText:    "text inside composition AlternateContent",
+		needChoice: "composition AlternateContent requires Choice",
+		unknownNS:  "composition page element namespace",
+		isResource: func(elem *xmlElement) bool {
+			return elem.Name.Space == namespace && elem.Name.Local == "ResourceDictionary"
+		},
+		extract: func(elem *xmlElement, inResource bool) (string, bool, error) {
+			if elem.Name.Space != namespace || !slices.Contains([]string{"FixedPage", "Canvas", "Path", "Glyphs"}, elem.Name.Local) {
+				return "", false, nil
 			}
-		}
-		return nil
-	}
-	if node.Name.Space == mcNamespace {
-		if node.Name.Local == "AlternateContent" {
-			if len(compatibilityWords(node.Text)) != 0 {
-				return fmt.Errorf("%w: text inside composition AlternateContent", ErrInvalid)
+			raw, present := elem.attribute("Name")
+			if !present {
+				return "", false, nil
 			}
-			var selection compatibilitySelection
-			union := make(map[string]bool)
-			for _, child := range node.Children {
-				if err := c.mce.alternative(child, scope, &selection); err != nil {
-					return err
-				}
-				local := make(map[string]bool)
-				if err := c.visual(child, resource, true, local, scope); err != nil {
-					return err
-				}
-				for name := range local {
-					if err := c.budget.step(1); err != nil {
-						return err
-					}
-					union[name] = true
-				}
+			value, err := c.name(raw, false)
+			if err != nil {
+				return "", false, err
 			}
-			if selection.choices == 0 {
-				return fmt.Errorf("%w: composition AlternateContent requires Choice", ErrInvalid)
+			if inResource {
+				return "", false, fmt.Errorf("%w: duplicate or resource composition Name %q", ErrInvalid, value)
 			}
-			for name := range union {
-				if err := c.budget.step(1); err != nil {
-					return err
-				}
-				if seen[name] {
-					return fmt.Errorf("%w: duplicate composition page Name %q", ErrInvalid, name)
-				}
-				seen[name] = true
-			}
-			return nil
-		}
-		if !branch || node.Name.Local != "Choice" && node.Name.Local != "Fallback" {
-			return fmt.Errorf("%w: misplaced composition MCE branch", ErrInvalid)
-		}
-	}
-	if node.Name.Space == formatNamespace(c.format) {
-		switch node.Name.Local {
-		case "FixedPage", "Canvas", "Path", "Glyphs":
-			if raw, present := node.attribute("Name"); present {
-				value, err := c.name(raw, false)
-				if err != nil {
-					return err
-				}
-				if resource || seen[value] {
-					return fmt.Errorf("%w: duplicate or resource composition Name %q", ErrInvalid, value)
-				}
-				seen[value] = true
-			}
-		case "ResourceDictionary":
-			resource = true
-		}
-	}
-	for _, child := range node.Children {
-		if err := c.visual(child, resource, false, seen, scope); err != nil {
-			return err
-		}
-	}
-	return nil
+			return value, true, nil
+		},
+	}, resource, false, seen, inherited)
 }
 
 // document 收集原文档所有保留分支中声明的页面地址，不把未声明的页面元素自动变为链接目标
@@ -2378,47 +2374,11 @@ func compositionPrintReplace(original []byte, changes []xmlValueReplacement, max
 	if err != nil {
 		return nil, false, err
 	}
-	slices.SortFunc(changes, func(a, b xmlValueReplacement) int { return cmp.Compare(a.start, b.start) })
-	outputSize := int64(len(input))
-	position := 0
-	for _, change := range changes {
-		if err := budget.step(1); err != nil {
-			return nil, false, err
-		}
-		if change.start < position || change.end < change.start || change.end > len(input) {
-			return nil, false, fmt.Errorf("%w: overlapping print resource text", ErrInvalid)
-		}
-		outputSize += int64(len(change.data)) - int64(change.end-change.start)
-		position = change.end
-	}
-	if outputSize < 0 || outputSize > intermediate {
-		return nil, false, fmt.Errorf("%w: print resource rewrite output", ErrLimit)
-	}
-	if err := budget.scan(outputSize); err != nil {
-		return nil, false, err
-	}
-	output := make([]byte, 0, int(outputSize))
-	position = 0
-	for _, change := range changes {
-		if err := budget.step(1); err != nil {
-			return nil, false, err
-		}
-		output = append(output, input[position:change.start]...)
-		output = append(output, change.data...)
-		position = change.end
-	}
-	output = append(output, input[position:]...)
-	output, err = restoreXMLEncoding(original, output, maximum, budget.context)
+	output, err := applyCompositionXMLSpans(original, input, changes, maximum, intermediate, true, budget)
 	if err != nil {
 		return nil, false, err
 	}
-	if err := budget.scan(int64(len(output))); err != nil {
-		return nil, false, err
-	}
 	if _, err := decodeXMLVisit(output, budget.limits, func(_ xml.Token, _ *xmlElement) error { return budget.step(1) }); err != nil {
-		return nil, false, err
-	}
-	if err := budget.step(0); err != nil {
 		return nil, false, err
 	}
 	return output, true, nil
@@ -2628,6 +2588,9 @@ func (g *compositionProtectionGraph) markup(part packagePart) error {
 	if index != nil {
 		root = index.raw
 		err = index.visit(root, visit)
+	} else if cached := g.source.cachedXML(part, g.budget.limits); cached != nil {
+		root = cached
+		err = visitXMLElementTree(cached, visit)
 	} else {
 		root, err = decodeXMLVisit(part.data, g.budget.limits, visit)
 	}
@@ -2897,8 +2860,671 @@ func compositionResourceAttribute(source, destination string, node *xmlElement, 
 		position = references[i].end
 	}
 	output.WriteString(attribute.Value[position:])
-	if err := budget.step(0); err != nil {
-		return "", false, err
-	}
 	return output.String(), true, nil
+}
+
+// compositionLayoutUnderstoodNamespaces 返回固定布局及资源字典在指定方言下的标准理解命名空间列表
+// 入参: format 文档方言
+// 返回: []string 理解的命名空间列表
+func compositionLayoutUnderstoodNamespaces(format Format) []string {
+	namespace := formatNamespace(format)
+	if format == FormatOpenXPS {
+		return []string{namespace, namespace + "/resourcedictionary-key", openXPS3DNamespace}
+	}
+	return []string{namespace, namespace + "/resourcedictionary-key"}
+}
+
+// cachedXML 按不可变切片底层地址与上限兼容性查询部件的已解码只读XML树，绝不修改源快照
+// 入参: part 目标原始部件, limits 当前调用方资源上限
+// 返回: *xmlElement 只读XML根，未命中或上限更严格时返回nil
+func (s *compositionSource) cachedXML(part packagePart, limits Limits) *xmlElement {
+	if s == nil || len(s.parsedXML) == 0 || len(part.data) == 0 {
+		return nil
+	}
+	entry := s.parsedXML[strings.ToLower(part.name)]
+	if entry == nil || entry.raw == nil || len(entry.data) != len(part.data) || &entry.data[0] != &part.data[0] {
+		return nil
+	}
+	if limits.MaxXMLNodes < entry.limits.MaxXMLNodes || limits.MaxXMLDepth < entry.limits.MaxXMLDepth || limits.MaxXMLBindings < entry.limits.MaxXMLBindings {
+		return nil
+	}
+	return entry.raw
+}
+
+// visitXMLElementTree 按StartElement、CharData、EndElement顺序遍历已解析只读XML树，复现decodeXMLVisit回调事件
+// 入参: root 只读元素树根, visit 词元级回调
+// 返回: error 回调返回的首个错误
+func visitXMLElementTree(root *xmlElement, visit func(xml.Token, *xmlElement) error) error {
+	if root == nil {
+		return nil
+	}
+	if err := visit(xml.StartElement{Name: root.Name, Attr: root.Attr}, root); err != nil {
+		return err
+	}
+	if root.Text != "" {
+		if err := visit(xml.CharData(root.Text), root); err != nil {
+			return err
+		}
+	}
+	for _, child := range root.Children {
+		if err := visitXMLElementTree(child, visit); err != nil {
+			return err
+		}
+	}
+	return visit(xml.EndElement{Name: root.Name}, root)
+}
+
+// collectCompositionMCEIdentifiers 在分支感知MCE作用域下收集宿主标识，未选分支不评估MustUnderstand或未知扩展，仅检查互斥与同分支重复
+// 入参: node 原始XML节点, cfg 收集器规则与提取回调, resource 是否位于资源字典内, unselected 是否位于未选分支内, seen 当前并存标识集合, inherited 祖先MCE作用域
+// 返回: error 重复声明、结构、兼容、预算或取消错误
+func collectCompositionMCEIdentifiers(node *xmlElement, cfg compositionMCEIdentifierConfig, resource, unselected bool, seen map[string]bool, inherited compatibilityScope) error {
+	if err := cfg.budget.step(1); err != nil {
+		return err
+	}
+	if unselected {
+		scope, err := cfg.processor.rulesChecked(node, inherited, false)
+		if err != nil {
+			scope = inherited
+		}
+		if !cfg.processor.understood[node.Name.Space] {
+			if scope.ignorable[node.Name.Space] && !scope.processes(node.Name) {
+				return nil
+			}
+			for _, child := range node.Children {
+				if err := collectCompositionMCEIdentifiers(child, cfg, resource, true, seen, scope); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		if node.Name.Space == mcNamespace && node.Name.Local == "AlternateContent" {
+			union := make(map[string]bool)
+			var visitBranches func(*xmlElement, compatibilityScope) error
+			visitBranches = func(parent *xmlElement, parentScope compatibilityScope) error {
+				for _, child := range parent.Children {
+					childScope, scopeErr := cfg.processor.rulesChecked(child, parentScope, false)
+					if scopeErr != nil {
+						childScope = parentScope
+					}
+					if child.Name.Space == mcNamespace && (child.Name.Local == "Choice" || child.Name.Local == "Fallback") {
+						local := make(map[string]bool)
+						for _, grand := range child.Children {
+							if err := collectCompositionMCEIdentifiers(grand, cfg, resource, true, local, childScope); err != nil {
+								return err
+							}
+						}
+						for id := range local {
+							if err := cfg.budget.step(1); err != nil {
+								return err
+							}
+							union[id] = true
+						}
+						continue
+					}
+					if !cfg.processor.understood[child.Name.Space] && childScope.ignorable[child.Name.Space] && !childScope.processes(child.Name) {
+						continue
+					}
+					if err := visitBranches(child, childScope); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			if err := visitBranches(node, scope); err != nil {
+				return err
+			}
+			for id := range union {
+				if err := cfg.budget.step(1); err != nil {
+					return err
+				}
+				if seen[id] {
+					return fmt.Errorf("%w: %s %q", ErrInvalid, cfg.duplicate, id)
+				}
+				seen[id] = true
+			}
+			return nil
+		}
+		if id, present, err := cfg.extract(node, resource); err != nil {
+			return err
+		} else if present {
+			if seen[id] {
+				return fmt.Errorf("%w: %s %q", ErrInvalid, cfg.duplicate, id)
+			}
+			seen[id] = true
+		}
+		if cfg.isResource != nil && cfg.isResource(node) {
+			resource = true
+		}
+		for _, child := range node.Children {
+			if err := collectCompositionMCEIdentifiers(child, cfg, resource, true, seen, scope); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	scope, err := cfg.processor.rulesChecked(node, inherited, true)
+	if err != nil {
+		return err
+	}
+	control := node.Name.Space == mcNamespace && node.Name.Local == "AlternateContent"
+	if err := cfg.processor.validateAttributes(node, scope, control); err != nil {
+		return err
+	}
+	if !cfg.processor.understood[node.Name.Space] {
+		if !scope.ignorable[node.Name.Space] {
+			return fmt.Errorf("%w: %s %q", ErrUnsupported, cfg.unknownNS, node.Name.Space)
+		}
+		if !scope.processes(node.Name) {
+			return nil
+		}
+		if err := compatibilityNoXMLContext(node); err != nil {
+			return err
+		}
+		for _, child := range node.Children {
+			if err := collectCompositionMCEIdentifiers(child, cfg, resource, false, seen, scope); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if node.Name.Space == mcNamespace {
+		if node.Name.Local == "AlternateContent" {
+			if len(compatibilityWords(node.Text)) != 0 {
+				return fmt.Errorf("%w: %s", ErrInvalid, cfg.altText)
+			}
+			var selection compatibilitySelection
+			for _, child := range node.Children {
+				if err := cfg.processor.alternative(child, scope, &selection); err != nil {
+					return err
+				}
+			}
+			if selection.choices == 0 {
+				return fmt.Errorf("%w: %s", ErrInvalid, cfg.needChoice)
+			}
+			union := make(map[string]bool)
+			var visitBranches func(*xmlElement, compatibilityScope) error
+			visitBranches = func(parent *xmlElement, parentScope compatibilityScope) error {
+				for _, child := range parent.Children {
+					if child.Name.Space == mcNamespace && (child.Name.Local == "Choice" || child.Name.Local == "Fallback") {
+						local := make(map[string]bool)
+						if child == selection.selected {
+							for _, grand := range child.Children {
+								if err := collectCompositionMCEIdentifiers(grand, cfg, resource, false, local, selection.scope); err != nil {
+									return err
+								}
+							}
+						} else {
+							branchScope, scopeErr := cfg.processor.rulesChecked(child, parentScope, false)
+							if scopeErr != nil {
+								branchScope = parentScope
+							}
+							for _, grand := range child.Children {
+								if err := collectCompositionMCEIdentifiers(grand, cfg, resource, true, local, branchScope); err != nil {
+									return err
+								}
+							}
+						}
+						for id := range local {
+							if err := cfg.budget.step(1); err != nil {
+								return err
+							}
+							union[id] = true
+						}
+						continue
+					}
+					if !cfg.processor.understood[child.Name.Space] {
+						childScope, scopeErr := cfg.processor.rulesChecked(child, parentScope, false)
+						if scopeErr != nil {
+							return scopeErr
+						}
+						if childScope.ignorable[child.Name.Space] && childScope.processes(child.Name) {
+							if err := visitBranches(child, childScope); err != nil {
+								return err
+							}
+						}
+					}
+				}
+				return nil
+			}
+			if err := visitBranches(node, scope); err != nil {
+				return err
+			}
+			for id := range union {
+				if err := cfg.budget.step(1); err != nil {
+					return err
+				}
+				if seen[id] {
+					return fmt.Errorf("%w: %s %q", ErrInvalid, cfg.duplicate, id)
+				}
+				seen[id] = true
+			}
+			return nil
+		}
+		return fmt.Errorf("%w: %s", ErrInvalid, cfg.misplaced)
+	}
+	if id, present, err := cfg.extract(node, resource); err != nil {
+		return err
+	} else if present {
+		if seen[id] {
+			return fmt.Errorf("%w: %s %q", ErrInvalid, cfg.duplicate, id)
+		}
+		seen[id] = true
+	}
+	if cfg.isResource != nil && cfg.isResource(node) {
+		resource = true
+	}
+	for _, child := range node.Children {
+		if err := collectCompositionMCEIdentifiers(child, cfg, resource, false, seen, scope); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyCompositionXMLSpans 将互不重叠的UTF-8区间替换应用到原始XML并恢复原编码，同时执行容量与扫描预算校验
+// 入参: original 原始编码XML, input 已解码UTF-8字节, changes 替换区间列表, maximum 原编码上限, intermediate UTF-8中间上限, sortChanges 是否按起点排序, budget 共享预算
+// 返回: []byte 恢复原编码后的独立结果, error 范围重叠、容量、编码、预算或取消错误
+func applyCompositionXMLSpans(original, input []byte, changes []xmlValueReplacement, maximum, intermediate int64, sortChanges bool, budget *compositionBudget) ([]byte, error) {
+	if sortChanges {
+		slices.SortFunc(changes, func(a, b xmlValueReplacement) int {
+			if order := cmp.Compare(a.start, b.start); order != 0 {
+				return order
+			}
+			return cmp.Compare(a.end, b.end)
+		})
+	}
+	outputSize := int64(len(input))
+	position := 0
+	for _, change := range changes {
+		if err := budget.step(1); err != nil {
+			return nil, err
+		}
+		if change.start < position || change.end < change.start || change.end > len(input) {
+			return nil, fmt.Errorf("%w: overlapping composition XML edits", ErrInvalid)
+		}
+		outputSize += int64(len(change.data)) - int64(change.end-change.start)
+		position = change.end
+	}
+	if outputSize < 0 || outputSize > intermediate {
+		return nil, fmt.Errorf("%w: composition XML rewrite output bytes", ErrLimit)
+	}
+	if err := budget.scan(outputSize); err != nil {
+		return nil, err
+	}
+	output := make([]byte, 0, int(outputSize))
+	position = 0
+	for _, change := range changes {
+		if err := budget.step(1); err != nil {
+			return nil, err
+		}
+		output = append(output, input[position:change.start]...)
+		output = append(output, change.data...)
+		position = change.end
+	}
+	output = append(output, input[position:]...)
+	output, err := restoreXMLEncoding(original, output, maximum, budget.context)
+	if err != nil {
+		return nil, err
+	}
+	if err := budget.scan(int64(len(output))); err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+// rewriteCompositionMarkupWithStrip 按词元作用域定点改写或完整剥离属性，保持原编码与未修改词法
+// 入参: original 原XML字节, maximum 原编码上限, budget 共享预算, filter 词元跳过回调, rewrite 返回新值、是否修改与是否剥离的回调
+// 返回: []byte 原编码结果, error XML、容量、预算或取消错误
+func rewriteCompositionMarkupWithStrip(original []byte, maximum int64, budget *compositionBudget, filter func(xml.Token, *xmlElement) (bool, error), rewrite func(*xmlElement, xml.Attr) (string, bool, bool, error)) ([]byte, error) {
+	input, encoding, err := xmlDecodedUTF8(original)
+	if err != nil {
+		return nil, err
+	}
+	intermediate := maximum
+	if encoding != "utf-8" {
+		intermediate += min(maximum/2, int64(math.MaxInt)-maximum)
+	}
+	var changes []xmlValueReplacement
+	var replacementBytes int64
+	_, err = parseXMLTokens(&xmlTokenInput{reader: bytes.NewReader(input), data: input}, encoding, budget.limits, func(token xml.Token, node *xmlElement, start, end int64) error {
+		if err := checkContext(budget.context); err != nil {
+			return err
+		}
+		if filter != nil {
+			skip, err := filter(token, node)
+			if err != nil {
+				return err
+			}
+			if skip {
+				return nil
+			}
+		}
+		if _, present := token.(xml.StartElement); !present {
+			return nil
+		}
+		fulls, values, err := xmlStartAttributeFullRanges(input[start:end])
+		if err != nil {
+			return err
+		}
+		if len(values) != len(node.Attr) {
+			return fmt.Errorf("%w: XML attribute range count", ErrInvalid)
+		}
+		for index, attribute := range node.Attr {
+			value, changed, strip, err := rewrite(node, attribute)
+			if err != nil {
+				return err
+			}
+			if !changed && !strip {
+				continue
+			}
+			if strip {
+				span := fulls[index]
+				changes = append(changes, xmlValueReplacement{start: int(start) + span.start, end: int(start) + span.end})
+				continue
+			}
+			if value == attribute.Value {
+				continue
+			}
+			if int64(len(value)) > intermediate-replacementBytes {
+				return fmt.Errorf("%w: XML attribute replacement byte budget", ErrLimit)
+			}
+			if !xmlTextValid(value) {
+				return fmt.Errorf("%w: XML attribute replacement text", ErrInvalid)
+			}
+			escaped := xmlRewriteBuffer{maximum: intermediate - replacementBytes, context: budget.context}
+			if err := xml.EscapeText(&escaped, []byte(value)); err != nil {
+				return err
+			}
+			span := values[index]
+			replacementBytes += int64(escaped.Len())
+			changes = append(changes, xmlValueReplacement{start: int(start) + span.start, end: int(start) + span.end, data: escaped.Bytes()})
+		}
+		return nil
+	}, true)
+	if err != nil {
+		return nil, err
+	}
+	if len(changes) == 0 {
+		return bytes.Clone(original), checkContext(budget.context)
+	}
+	output, err := applyCompositionXMLSpans(original, input, changes, maximum, intermediate, true, budget)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := decodeXMLVisit(output, budget.limits, func(_ xml.Token, _ *xmlElement) error { return checkContext(budget.context) }); err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+// computeCompositionPageGeometry 计算单页裁剪、顺时针旋转与目标尺寸等比缩放居中的目标宽高与总仿射矩阵
+// 入参: origW 原页面宽度, origH 原页面高度, transform 已校验单页几何配置
+// 返回: compositionPageGeometry 完整几何变换方案, error 尺寸非正或数值溢出错误
+func computeCompositionPageGeometry(origW, origH float64, transform compositionPageTransform) (compositionPageGeometry, error) {
+	if !geometryFinite(origW) || !geometryFinite(origH) || origW <= 0 || origH <= 0 {
+		return compositionPageGeometry{}, fmt.Errorf("%w: composition page dimensions", ErrInvalid)
+	}
+	crop := Rect{X: 0, Y: 0, Width: origW, Height: origH}
+	if transform.cropBox != nil {
+		crop = *transform.cropBox
+	}
+	mCrop := Matrix{A: 1, D: 1, E: -crop.X, F: -crop.Y}
+	rw, rh := crop.Width, crop.Height
+	mRot := Matrix{A: 1, D: 1}
+	switch transform.rotate {
+	case 90:
+		rw, rh = crop.Height, crop.Width
+		mRot = Matrix{B: 1, C: -1, E: crop.Height}
+	case 180:
+		mRot = Matrix{A: -1, D: -1, E: crop.Width, F: crop.Height}
+	case 270:
+		rw, rh = crop.Height, crop.Width
+		mRot = Matrix{B: -1, C: 1, F: crop.Width}
+	}
+	newW, newH := rw, rh
+	scale, tx, ty := 1.0, 0.0, 0.0
+	switch {
+	case transform.targetWidth > 0 && transform.targetHeight > 0:
+		scale = min(transform.targetWidth/rw, transform.targetHeight/rh)
+		newW, newH = transform.targetWidth, transform.targetHeight
+		tx = (newW - rw*scale) / 2
+		ty = (newH - rh*scale) / 2
+	case transform.targetWidth > 0:
+		scale = transform.targetWidth / rw
+		newW, newH = transform.targetWidth, rh*scale
+	case transform.targetHeight > 0:
+		scale = transform.targetHeight / rh
+		newW, newH = rw*scale, transform.targetHeight
+	}
+	mScale := Matrix{A: scale, D: scale, E: tx, F: ty}
+	total := mScale.Mul(mRot.Mul(mCrop))
+	if !geometryFinite(newW) || !geometryFinite(newH) || newW <= 0 || newH <= 0 || !geometryFinite(scale) || scale <= 0 || !geometryFillMatrixFinite(total) {
+		return compositionPageGeometry{}, fmt.Errorf("%w: composition page transform range", ErrInvalid)
+	}
+	return compositionPageGeometry{newWidth: newW, newHeight: newH, crop: crop, matrix: total}, nil
+}
+
+// transformCompositionBox 将原ContentBox或BleedBox经页面几何方案映射为符合XPS边界约束的新矩形
+// 入参: box 原区域矩形, geom 页面几何方案, bleed 是否为BleedBox
+// 返回: Rect 变换并规范化后的目标矩形
+func transformCompositionBox(box Rect, geom compositionPageGeometry, bleed bool) Rect {
+	x0, y0, x1, y1 := box.X, box.Y, box.X+box.Width, box.Y+box.Height
+	if !bleed {
+		x0 = max(x0, geom.crop.X)
+		y0 = max(y0, geom.crop.Y)
+		x1 = min(x1, geom.crop.X+geom.crop.Width)
+		y1 = min(y1, geom.crop.Y+geom.crop.Height)
+		if x1 <= x0 || y1 <= y0 {
+			return Rect{Width: geom.newWidth, Height: geom.newHeight}
+		}
+	}
+	corners := [4]Point{{x0, y0}, {x1, y0}, {x0, y1}, {x1, y1}}
+	minX, maxX := math.Inf(1), math.Inf(-1)
+	minY, maxY := math.Inf(1), math.Inf(-1)
+	for _, pt := range corners {
+		nx := geom.matrix.A*pt.X + geom.matrix.C*pt.Y + geom.matrix.E
+		ny := geom.matrix.B*pt.X + geom.matrix.D*pt.Y + geom.matrix.F
+		minX, maxX = min(minX, nx), max(maxX, nx)
+		minY, maxY = min(minY, ny), max(maxY, ny)
+	}
+	if bleed {
+		minX = min(minX, 0)
+		minY = min(minY, 0)
+		maxX = max(maxX, geom.newWidth)
+		maxY = max(maxY, geom.newHeight)
+		return Rect{X: minX, Y: minY, Width: maxX - minX, Height: maxY - minY}
+	}
+	minX = max(minX, 0)
+	minY = max(minY, 0)
+	maxX = min(maxX, geom.newWidth)
+	maxY = min(maxY, geom.newHeight)
+	if maxX <= minX || maxY <= minY {
+		return Rect{Width: geom.newWidth, Height: geom.newHeight}
+	}
+	return Rect{X: minX, Y: minY, Width: maxX - minX, Height: maxY - minY}
+}
+
+// readCompositionPageDimensions 从只读缓存或原始XML读取FixedPage的Width与Height属性
+// 入参: part 原FixedPage部件, source 所属源快照, format 文档方言, limits 资源上限, ctx 取消Context
+// 返回: float64 原宽度, float64 原高度, error 解析或属性错误
+func readCompositionPageDimensions(part packagePart, source *compositionSource, format Format, limits Limits, ctx context.Context) (float64, float64, error) {
+	root := source.cachedXML(part, limits)
+	if root == nil {
+		var err error
+		root, err = decodeXMLVisit(part.data, limits, func(_ xml.Token, _ *xmlElement) error { return checkContext(ctx) })
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	processed, err := preprocessXMLContext(root, compositionLayoutUnderstoodNamespaces(format), ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	if processed.Name != (xml.Name{Space: formatNamespace(format), Local: "FixedPage"}) {
+		return 0, 0, fmt.Errorf("%w: composition transform page root", ErrInvalid)
+	}
+	rawW, okW := processed.attribute("Width")
+	rawH, okH := processed.attribute("Height")
+	if !okW || !okH {
+		return 0, 0, fmt.Errorf("%w: missing FixedPage dimensions", ErrInvalid)
+	}
+	w, err := xmlNumber(rawW)
+	if err != nil || w <= 0 {
+		return 0, 0, fmt.Errorf("%w: invalid FixedPage Width", ErrInvalid)
+	}
+	h, err := xmlNumber(rawH)
+	if err != nil || h <= 0 {
+		return 0, 0, fmt.Errorf("%w: invalid FixedPage Height", ErrInvalid)
+	}
+	return w, h, nil
+}
+
+// transformCompositionPageMarkup 对FixedPage执行单页裁剪、旋转与缩放变换，更新页面属性并外包带Clip和RenderTransform的Canvas，保留FixedPage.Resources与原编码
+// 入参: original 原FixedPage字节, format 文档方言, transform 单页几何配置, maximum 原编码上限, budget 共享预算
+// 返回: []byte 变换后的原编码FixedPage, error 几何、XML、容量或取消错误
+func transformCompositionPageMarkup(original []byte, format Format, transform compositionPageTransform, maximum int64, budget *compositionBudget) ([]byte, error) {
+	input, encoding, err := xmlDecodedUTF8(original)
+	if err != nil {
+		return nil, err
+	}
+	intermediate := maximum
+	if encoding != "utf-8" {
+		intermediate += min(maximum/2, int64(math.MaxInt)-maximum)
+	}
+	namespace := formatNamespace(format)
+	type pageSpan struct {
+		node         *xmlElement
+		start        int
+		startEnd     int
+		endStart     int
+		resourcesEnd int
+		selfClosing  bool
+		prefix       string
+		hasBody      bool
+	}
+	var pages []*pageSpan
+	var current *pageSpan
+	depth := 0
+	pageDepth := 0
+	_, err = parseXMLTokens(&xmlTokenInput{reader: bytes.NewReader(input), data: input}, encoding, budget.limits, func(token xml.Token, node *xmlElement, start, end int64) error {
+		if err := budget.step(1); err != nil {
+			return err
+		}
+		switch token.(type) {
+		case xml.StartElement:
+			depth++
+			if node.Name == (xml.Name{Space: namespace, Local: "FixedPage"}) {
+				tag := input[start:end]
+				prefix := ""
+				nameEnd := 1
+				for nameEnd < len(tag) && tag[nameEnd] != ' ' && tag[nameEnd] != '\t' && tag[nameEnd] != '\r' && tag[nameEnd] != '\n' && tag[nameEnd] != '>' && tag[nameEnd] != '/' {
+					nameEnd++
+				}
+				if colon := bytes.IndexByte(tag[1:nameEnd], ':'); colon >= 0 {
+					prefix = string(tag[1 : 1+colon+1])
+				}
+				selfClosing := len(tag) >= 2 && tag[len(tag)-2] == '/' && tag[len(tag)-1] == '>'
+				current = &pageSpan{node: node, start: int(start), startEnd: int(end), selfClosing: selfClosing, prefix: prefix}
+				pageDepth = depth
+				pages = append(pages, current)
+			} else if current != nil && depth == pageDepth+1 {
+				if node.Name != (xml.Name{Space: namespace, Local: "FixedPage.Resources"}) {
+					current.hasBody = true
+				}
+			}
+		case xml.EndElement:
+			if current != nil {
+				if depth == pageDepth+1 && node.Name == (xml.Name{Space: namespace, Local: "FixedPage.Resources"}) {
+					current.resourcesEnd = int(end)
+				} else if depth == pageDepth {
+					current.endStart = int(start)
+					current = nil
+					pageDepth = 0
+				}
+			}
+			depth--
+		}
+		return nil
+	}, true)
+	if err != nil {
+		return nil, err
+	}
+	if len(pages) == 0 {
+		return nil, fmt.Errorf("%w: missing FixedPage for geometry transform", ErrInvalid)
+	}
+	var changes []xmlValueReplacement
+	for _, page := range pages {
+		rawW, okW := page.node.attribute("Width")
+		rawH, okH := page.node.attribute("Height")
+		if !okW || !okH {
+			return nil, fmt.Errorf("%w: missing FixedPage dimensions", ErrInvalid)
+		}
+		origW, errW := xmlNumber(rawW)
+		origH, errH := xmlNumber(rawH)
+		if errW != nil || errH != nil {
+			return nil, fmt.Errorf("%w: invalid FixedPage dimensions", ErrInvalid)
+		}
+		geom, err := computeCompositionPageGeometry(origW, origH, transform)
+		if err != nil {
+			return nil, err
+		}
+		valRanges, err := xmlStartAttributeRanges(input[page.start:page.startEnd])
+		if err != nil || len(valRanges) != len(page.node.Attr) {
+			return nil, fmt.Errorf("%w: FixedPage attribute ranges", ErrInvalid)
+		}
+		for idx, attr := range page.node.Attr {
+			if attr.Name.Space != "" {
+				continue
+			}
+			var updated string
+			replace := false
+			switch attr.Name.Local {
+			case "Width":
+				updated, replace = encodeNumber(geom.newWidth), true
+			case "Height":
+				updated, replace = encodeNumber(geom.newHeight), true
+			case "ContentBox":
+				box, boxErr := parsePageBox(attr.Value, false)
+				if boxErr != nil {
+					return nil, boxErr
+				}
+				updated, replace = encodeRect(transformCompositionBox(box, geom, false)), true
+			case "BleedBox":
+				box, boxErr := parsePageBox(attr.Value, true)
+				if boxErr != nil {
+					return nil, boxErr
+				}
+				updated, replace = encodeRect(transformCompositionBox(box, geom, true)), true
+			}
+			if replace && updated != attr.Value {
+				span := valRanges[idx]
+				changes = append(changes, xmlValueReplacement{start: page.start + span.start, end: page.start + span.end, data: []byte(updated)})
+			}
+		}
+		if !page.selfClosing && page.hasBody {
+			bodyStart := page.startEnd
+			if page.resourcesEnd > bodyStart {
+				bodyStart = page.resourcesEnd
+			}
+			bodyEnd := page.endStart
+			if bodyEnd > bodyStart {
+				clip := "M " + encodeNumber(geom.crop.X) + "," + encodeNumber(geom.crop.Y) + " H " + encodeNumber(geom.crop.X+geom.crop.Width) + " V " + encodeNumber(geom.crop.Y+geom.crop.Height) + " H " + encodeNumber(geom.crop.X) + " Z"
+				openTag := "<" + page.prefix + "Canvas Clip=\"" + clip + "\" RenderTransform=\"" + encodeMatrix(geom.matrix) + "\">"
+				closeTag := "</" + page.prefix + "Canvas>"
+				changes = append(changes, xmlValueReplacement{start: bodyStart, end: bodyStart, data: []byte(openTag)})
+				changes = append(changes, xmlValueReplacement{start: bodyEnd, end: bodyEnd, data: []byte(closeTag)})
+			}
+		}
+	}
+	if len(changes) == 0 {
+		return bytes.Clone(original), nil
+	}
+	output, err := applyCompositionXMLSpans(original, input, changes, maximum, intermediate, true, budget)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := decodeXMLVisit(output, budget.limits, func(_ xml.Token, _ *xmlElement) error { return checkContext(budget.context) }); err != nil {
+		return nil, err
+	}
+	return output, nil
 }

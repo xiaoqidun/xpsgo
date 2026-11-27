@@ -36,9 +36,21 @@ type PageSelection struct {
 	Page   int
 }
 
-// ComposeOptions 设置组合输出格式、累计资源上限、元数据来源及舍弃策略
+// ComposePage 指定源阅读器中的零基全局页号及可选单页几何变换，零值变换字段表示保持原页不变
+// Rotate仅允许0、90、180、270顺时针旋转；CropBox在原页面坐标系裁剪；TargetWidth与TargetHeight按正有限尺寸等比缩放，同时指定时等比缩放居中至目标尺寸，仅指定单边时按比例推导另一边
+type ComposePage struct {
+	Reader       *Reader
+	Page         int
+	Rotate       int
+	CropBox      *Rect
+	TargetWidth  float64
+	TargetHeight float64
+}
+
+// ComposeOptions 设置组合输出格式、累计资源上限、元数据来源、舍弃策略、剪枝及资源去重
 // Format和Metadata未指定时取首张页面所在来源，Limits和MaxImagePixels零值采用默认上限
 // DiscardSignatures允许舍弃源签名起点，DiscardSignatureLocations允许移除未选页面的普通签署位置
+// PruneUnselectedOutlines允许剪除指向未选页面的目录条目，StripDanglingNavigateUri允许剥离悬空内部超链接，DeduplicateResources启用跨源静态二进制资源摘要去重
 type ComposeOptions struct {
 	Format                    Format
 	Limits                    Limits
@@ -46,6 +58,24 @@ type ComposeOptions struct {
 	Metadata                  *Reader
 	DiscardSignatures         bool
 	DiscardSignatureLocations bool
+	PruneUnselectedOutlines   bool
+	StripDanglingNavigateUri  bool
+	DeduplicateResources      bool
+}
+
+// compositionPageTransform 保存单页可选裁剪、顺时针旋转与目标尺寸缩放配置
+type compositionPageTransform struct {
+	rotate       int
+	cropBox      *Rect
+	targetWidth  float64
+	targetHeight float64
+}
+
+// compositionXMLCache 保存单个只读XML部件已解析的原始树，在构造期写入并在后续只读阶段并发复用
+type compositionXMLCache struct {
+	data   []byte
+	limits Limits
+	raw    *xmlElement
 }
 
 // compositionReaderSelection 汇总单个阅读器的选页，不同时持有多个源阅读器的锁
@@ -123,6 +153,7 @@ type compositionPlan struct {
 	indices                   []*compositionSourceIndex
 	documents                 []compositionDocumentInstance
 	pages                     []compositionPageInstance
+	transforms                []compositionPageTransform
 	instances                 map[compositionPageKey][]int
 	resources                 map[compositionPartKey]string
 	fixed                     map[compositionPartKey]string
@@ -135,6 +166,9 @@ type compositionPlan struct {
 	protected                 []map[string]bool
 	fonts                     []*compositionFontReport
 	discardSignatureLocations bool
+	pruneUnselectedOutlines   bool
+	stripDanglingNavigateUri  bool
+	deduplicateResources      bool
 }
 
 // compositionIndex 缓存原索引及当前能力下的消费视图，原文保留与派生投影分别检查
@@ -160,6 +194,8 @@ type compositionSource struct {
 	selected          map[int]bool
 	parts             map[string]packagePart
 	relationships     map[string][]Relationship
+	parsedRels        map[string][]Relationship
+	parsedXML         map[string]*compositionXMLCache
 	rootRelationships packagePart
 	auxiliary         map[string]bool
 	retained          map[string]bool
@@ -201,6 +237,25 @@ func DefaultComposeOptions() ComposeOptions {
 // 入参: ctx 取消Context，nil采用Background, documents 输出文档及所选原页面, options 组合选项，nil采用默认值
 // 返回: *Package 独立可编辑包，失败为nil, error 参数、结构、能力、许可、预算、关闭或取消错误
 func Compose(ctx context.Context, documents [][]PageSelection, options *ComposeOptions) (*Package, error) {
+	converted := make([][]ComposePage, len(documents))
+	for i, pages := range documents {
+		if len(pages) == 0 {
+			continue
+		}
+		list := make([]ComposePage, len(pages))
+		for j, page := range pages {
+			list[j] = ComposePage{Reader: page.Reader, Page: page.Page}
+		}
+		converted[i] = list
+	}
+	return ComposePages(ctx, converted, options)
+}
+
+// ComposePages 按外层文档顺序和内层页序组合页面并支持单页裁剪、旋转与缩放，不修改源阅读器，关闭源后仍可读写
+// 每个输出文档须含页面；未支持的格式转换、兼容分支投影或元数据合并返回ErrUnsupported
+// 入参: ctx 取消Context，nil采用Background, documents 输出文档及所选原页面与单页几何配置, options 组合选项，nil采用默认值
+// 返回: *Package 独立可编辑包，失败为nil, error 参数、结构、能力、许可、预算、关闭或取消错误
+func ComposePages(ctx context.Context, documents [][]ComposePage, options *ComposeOptions) (*Package, error) {
 	ctx = normalizeContext(ctx)
 	configuration := ComposeOptions{}
 	if options != nil {
@@ -222,6 +277,8 @@ func Compose(ctx context.Context, documents [][]PageSelection, options *ComposeO
 	readers := make(map[*Reader]int)
 	var sources []compositionReaderSelection
 	selected := make([][]compositionPageSelection, len(documents))
+	var transforms []compositionPageTransform
+	hasTransforms := false
 	count := 0
 	for document, pages := range documents {
 		if err := budget.step(1); err != nil {
@@ -242,6 +299,12 @@ func Compose(ctx context.Context, documents [][]PageSelection, options *ComposeO
 			if page.Reader == nil || page.Page < 0 {
 				return nil, fmt.Errorf("%w: composition page selection", ErrInvalid)
 			}
+			transform, active, err := normalizeCompositionPageTransform(page)
+			if err != nil {
+				return nil, err
+			}
+			hasTransforms = hasTransforms || active
+			transforms = append(transforms, transform)
 			source, exists := readers[page.Reader]
 			if !exists {
 				source = len(sources)
@@ -305,18 +368,39 @@ func Compose(ctx context.Context, documents [][]PageSelection, options *ComposeO
 	plan.protected = protectedList
 	plan.fonts = fontReports
 	plan.discardSignatureLocations = configuration.DiscardSignatureLocations
+	plan.pruneUnselectedOutlines = configuration.PruneUnselectedOutlines
+	plan.stripDanglingNavigateUri = configuration.StripDanglingNavigateUri
+	plan.deduplicateResources = configuration.DeduplicateResources
+	if hasTransforms {
+		plan.transforms = transforms
+	}
 	names, err := newCompositionNames(plan)
 	if err != nil {
 		return nil, err
 	}
-	result, err := executeCompositionPlan(plan, names, root)
-	if err != nil {
-		return nil, err
+	return executeCompositionPlan(plan, names, root)
+}
+
+// normalizeCompositionPageTransform 校验单页旋转角度、裁剪区域与目标尺寸，并返回独立只读变换配置
+// 入参: page 单页选择与几何编辑选项
+// 返回: compositionPageTransform 规范化变换配置, bool 是否存在非零几何变换, error 参数非法错误
+func normalizeCompositionPageTransform(page ComposePage) (compositionPageTransform, bool, error) {
+	if page.Rotate != 0 && page.Rotate != 90 && page.Rotate != 180 && page.Rotate != 270 {
+		return compositionPageTransform{}, false, fmt.Errorf("%w: composition page rotate %d", ErrInvalid, page.Rotate)
 	}
-	if err := budget.step(0); err != nil {
-		return nil, err
+	var crop *Rect
+	if page.CropBox != nil {
+		r := *page.CropBox
+		if !geometryFinite(r.X) || !geometryFinite(r.Y) || !geometryFinite(r.Width) || !geometryFinite(r.Height) || r.Width <= 0 || r.Height <= 0 {
+			return compositionPageTransform{}, false, fmt.Errorf("%w: composition page crop box", ErrInvalid)
+		}
+		crop = &r
 	}
-	return result, nil
+	if !geometryFinite(page.TargetWidth) || !geometryFinite(page.TargetHeight) || page.TargetWidth < 0 || page.TargetHeight < 0 {
+		return compositionPageTransform{}, false, fmt.Errorf("%w: composition page target size", ErrInvalid)
+	}
+	active := page.Rotate != 0 || crop != nil || page.TargetWidth > 0 || page.TargetHeight > 0
+	return compositionPageTransform{rotate: page.Rotate, cropBox: crop, targetWidth: page.TargetWidth, targetHeight: page.TargetHeight}, active, nil
 }
 
 // ConvertFormat 将源阅读器的全部文档与页面按原结构一步转换为指定目标方言的独立可编辑包
@@ -952,6 +1036,8 @@ func convertCompositionSourceWithReport(source *compositionSource, format Format
 	}
 	result := *source
 	result.indices = nil
+	result.parsedXML = nil
+	result.parsedRels = nil
 	result.retained = maps.Clone(source.retained)
 	result.sourceFormat = source.format
 	result.targetFormat = FormatUnknown
@@ -1114,7 +1200,8 @@ func convertCompositionPartMarkup(part packagePart, source, target Format, parts
 			return packagePart{}, err
 		}
 	}
-	data, changed, err := rewriteXMLAttributes(part.data, budget.limits, budget.context, namespaces, nil, func(node *xmlElement, attribute xml.Attr) (string, bool, error) {
+	filter := newCompositionConvertMCEFilter(part, source, layout, budget.context)
+	data, changed, err := rewriteXMLAttributes(part.data, budget.limits, budget.context, namespaces, filter, func(node *xmlElement, attribute xml.Attr) (string, bool, error) {
 		if err := budget.step(1); err != nil {
 			return "", false, err
 		}
@@ -1188,10 +1275,33 @@ func convertCompositionPartMarkup(part packagePart, source, target Format, parts
 		}
 		return packagePart{}, err
 	}
-	if err := budget.step(0); err != nil {
-		return packagePart{}, err
-	}
 	return result, nil
+}
+
+// newCompositionConvertMCEFilter 构建跨方言转换时的词元级MCE过滤器，跳过Ignorable子树与保留子树内未选分支后代，保留存活容器与已知兼容分支以完成命名空间及URI重写
+// 入参: part 原部件, source 源方言, layout 是否为固定布局或字典, ctx 取消Context
+// 返回: func(xml.Token, *xmlElement) (bool, error) 词元跳过回调
+func newCompositionConvertMCEFilter(part packagePart, source Format, layout bool, ctx context.Context) func(xml.Token, *xmlElement) (bool, error) {
+	var tracker *resourceMarkupScopeTracker
+	if layout {
+		tracker = newResourceMarkupIgnoreTracker(source, source == FormatOpenXPS, ctx)
+	} else {
+		understood := map[string]bool{mcNamespace: true, xmlNamespace: true}
+		for _, uri := range compositionPartUnderstoodNamespaces(part, source) {
+			understood[uri] = true
+		}
+		tracker = &resourceMarkupScopeTracker{format: source, ignoreOnly: true, processor: compatibilityProcessor{understood: understood, context: ctx}}
+	}
+	return func(token xml.Token, node *xmlElement) (bool, error) {
+		_, _, err := tracker.visit(token, node)
+		if err != nil {
+			return false, err
+		}
+		if _, start := token.(xml.StartElement); !start {
+			return true, nil
+		}
+		return tracker.ignoredDepth > 0 || tracker.preservedSkipDepth > 0, nil
+	}
 }
 
 // compositionDialectNamespaces 返回指定方言的全部标准及标准扩展命名空间集合
@@ -1243,17 +1353,24 @@ func compositionPartMCETargetRisk(data []byte, source, target Format, budget *co
 		return false, err
 	}
 	targetNS := compositionDialectNamespaces(target)
+	understood := map[string]bool{mcNamespace: true, xmlNamespace: true}
+	for uri := range compositionDialectNamespaces(source) {
+		understood[uri] = true
+	}
+	tracker := &resourceMarkupScopeTracker{format: source, ignoreOnly: true, processor: compatibilityProcessor{understood: understood, context: budget.context}}
 	risky := false
 	_, err := decodeXMLVisit(data, budget.limits, func(token xml.Token, node *xmlElement) error {
 		if err := budget.step(1); err != nil {
 			return err
 		}
+		_, _, _ = tracker.visit(token, node)
 		if _, start := token.(xml.StartElement); !start {
 			return nil
 		}
 		if targetNS[node.Name.Space] || source == FormatOpenXPS && target == FormatXPS && node.Name.Space == openXPS3DNamespace {
 			risky = true
 		}
+		ignoredSubtree := tracker.ignoredDepth > 0 || tracker.preservedSkipDepth > 0
 		for _, attr := range node.Attr {
 			if err := budget.step(1); err != nil {
 				return err
@@ -1263,6 +1380,9 @@ func compositionPartMCETargetRisk(data []byte, source, target Format, budget *co
 			}
 			if targetNS[attr.Name.Space] || source == FormatOpenXPS && target == FormatXPS && attr.Name.Space == openXPS3DNamespace {
 				risky = true
+			}
+			if ignoredSubtree {
+				continue
 			}
 			checkTarget := node.Name == (xml.Name{Space: mcNamespace, Local: "Choice"}) && attr.Name == (xml.Name{Local: "Requires"}) || attr.Name == (xml.Name{Space: mcNamespace, Local: "MustUnderstand"}) || attr.Name == (xml.Name{Space: mcNamespace, Local: "Ignorable"})
 			if !checkTarget {
@@ -1648,6 +1768,11 @@ func normalizeCompositionDocumentLinkTargets(part packagePart, document composit
 	if err != nil {
 		return nil, err
 	}
+	maximum := min(budget.limits.MaxPartBytes, budget.limits.MaxPackageBytes, int64(math.MaxInt))
+	data, err = restoreXMLEncoding(part.data, data, maximum, budget.context)
+	if err != nil {
+		return nil, err
+	}
 	if err := budget.scan(int64(len(data))); err != nil {
 		return nil, err
 	}
@@ -1825,7 +1950,7 @@ func validateCompositionFormatMarkupMode(part packagePart, format, nameFormat Fo
 		_, err = processDiscardControl(root, part.name, format, budget.context)
 		return err
 	}
-	known := []string{namespace, namespace + "/resourcedictionary-key"}
+	known := compositionLayoutUnderstoodNamespaces(format)
 	if strings.EqualFold(part.media, fixedContentType("documentstructure")) || strings.EqualFold(part.media, fixedContentType("storyfragments")) {
 		known = []string{structureNamespace(format)}
 	}
@@ -2257,7 +2382,7 @@ func captureCompositionSourceForTarget(r *Reader, selected []int, targetFormat F
 	if len(r.pages) > budget.limits.MaxPageCount || len(r.documents) > budget.limits.MaxPageCount {
 		return nil, fmt.Errorf("%w: composition source index", ErrLimit)
 	}
-	s := &compositionCapture{reader: r, budget: budget, source: &compositionSource{format: r.format, targetFormat: targetFormat, sequence: r.sequence, selected: make(map[int]bool), parts: make(map[string]packagePart), relationships: make(map[string][]Relationship), auxiliary: make(map[string]bool), retained: make(map[string]bool), restricted: make(map[string]bool), printResources: make(map[string][]printResourceReference)}, layout: make(map[string]bool), queued: make(map[compositionSourcePart]bool), roles: &createdNavigation{parts: make(map[string]createdNavigationKind)}, owners: make(map[string]bool), unbound: make(map[string]bool), opaque: make(map[string]bool), profiles: make(map[string]bool)}
+	s := &compositionCapture{reader: r, budget: budget, source: &compositionSource{format: r.format, targetFormat: targetFormat, sequence: r.sequence, selected: make(map[int]bool), parts: make(map[string]packagePart), relationships: make(map[string][]Relationship), parsedRels: make(map[string][]Relationship), parsedXML: make(map[string]*compositionXMLCache), auxiliary: make(map[string]bool), retained: make(map[string]bool), restricted: make(map[string]bool), printResources: make(map[string][]printResourceReference)}, layout: make(map[string]bool), queued: make(map[compositionSourcePart]bool), roles: &createdNavigation{parts: make(map[string]createdNavigationKind)}, owners: make(map[string]bool), unbound: make(map[string]bool), opaque: make(map[string]bool), profiles: make(map[string]bool)}
 	for _, index := range selected {
 		if err := budget.step(1); err != nil {
 			return nil, err
@@ -2644,7 +2769,11 @@ func (s *compositionCapture) markup(part packagePart, owner string) error {
 	if index != nil {
 		err = index.visit(indexRoot, visit)
 	} else {
-		_, err = decodeXMLVisit(part.data, s.budget.limits, visit)
+		var root *xmlElement
+		root, err = decodeXMLVisit(part.data, s.budget.limits, visit)
+		if err == nil && root != nil && layout {
+			s.source.parsedXML[strings.ToLower(part.name)] = &compositionXMLCache{data: part.data, limits: s.budget.limits, raw: root}
+		}
 	}
 	if err != nil {
 		return err
@@ -2674,7 +2803,7 @@ func (s *compositionCapture) relations(source, owner string) error {
 	if err := s.budget.scan(int64(len(part.data))); err != nil {
 		return err
 	}
-	_, err = decodeXMLVisit(part.data, s.budget.limits, func(token xml.Token, node *xmlElement) error {
+	root, err := decodeXMLVisit(part.data, s.budget.limits, func(token xml.Token, node *xmlElement) error {
 		if err := s.budget.step(1); err != nil {
 			return err
 		}
@@ -2752,17 +2881,48 @@ func (s *compositionCapture) relations(source, owner string) error {
 			return err
 		}
 	}
-	relations, err := parseRelationshipMarkup(source, part.data, s.budget.limits, s.budget.context)
+	relations, err := parseCompositionRelationshipRoot(source, root, s.budget.context)
 	if err != nil {
 		return err
 	}
+	s.source.parsedRels[key] = relations
 	if source == "/" {
-		relations = slices.DeleteFunc(relations, s.omitRootRelation)
+		relations = slices.DeleteFunc(slices.Clone(relations), s.omitRootRelation)
 		s.source.rootRelationships = part
 		delete(s.source.parts, key)
 	}
 	s.source.relationships[strings.ToLower(source)] = relations
 	return nil
+}
+
+// parseCompositionRelationshipRoot 在已解码的关系XML树上执行MCE预处理与OPC关系语义解析，避免重复解码
+// 入参: source 已规范化关系源部件或包根, root 已解码原始XML根, ctx 取消Context
+// 返回: []Relationship 当前消费分支的关系, error MCE、结构、关系或取消错误
+func parseCompositionRelationshipRoot(source string, root *xmlElement, ctx context.Context) ([]Relationship, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	processed, err := preprocessXMLContext(root, []string{opcRelsNS}, ctx)
+	if err != nil {
+		return nil, err
+	}
+	var result []Relationship
+	ids := make(map[string]bool)
+	err = opcMetadataElements(processed, opcRelsNS, "Relationships", func(element xml.StartElement, attrs map[string]string) error {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		rel, err := parseRelationship(source, element, attrs, ids)
+		if err != nil {
+			return err
+		}
+		result = append(result, rel)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, checkContext(ctx)
 }
 
 // ticket 按关系角色识别OpenXPS自定义票据，保持不透明载荷，不豁免布局资源的类型约束

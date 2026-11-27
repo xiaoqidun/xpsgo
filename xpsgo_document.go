@@ -233,6 +233,19 @@ type LinkTarget struct {
 	External  bool
 }
 
+// geometryArcParam 保存椭圆弧中心参数化后的主轴基向量、起止角度、扫描角与归一化半径
+type geometryArcParam struct {
+	u      Point
+	v      Point
+	rx     float64
+	ry     float64
+	sinPhi float64
+	cosPhi float64
+	theta1 float64
+	theta2 float64
+	dtheta float64
+}
+
 // String 返回故事片段类型的可读名称
 // 返回: string 片段类型名称
 func (t FragmentType) String() string {
@@ -1907,21 +1920,33 @@ func (r *Reader) readPageHeaderStream(ctx context.Context, part string) (*PageHe
 		return nil, &PartError{Part: canonical, Err: err}
 	}
 	defer stream.Close()
+	namespace := formatNamespace(r.format)
 	var root *xmlElement
+	fallbackFull := false
 	scanErr := scanXMLReader(stream, r.limits, ctx, func(token xml.Token, node *xmlElement, _, _ int64) error {
 		if _, ok := token.(xml.StartElement); ok {
-			root = node
+			if node.Name.Space == namespace && node.Name.Local == "FixedPage" {
+				root = node
+			} else {
+				fallbackFull = true
+			}
 			return errPageHeaderStop
 		}
 		return nil
 	})
+	_ = stream.Close()
 	if scanErr != nil && !errors.Is(scanErr, errPageHeaderStop) {
 		return nil, &PartError{Part: canonical, Err: scanErr}
+	}
+	if fallbackFull {
+		root, err = r.pkg.readXMLPart(canonical, ctx)
+		if err != nil {
+			return nil, &PartError{Part: canonical, Err: err}
+		}
 	}
 	if root == nil {
 		return nil, &PartError{Part: canonical, Err: fmt.Errorf("%w: empty XML", ErrInvalid)}
 	}
-	namespace := formatNamespace(r.format)
 	root, err = preprocessXMLContext(root, []string{namespace, namespace + "/resourcedictionary-key"}, ctx)
 	if err != nil {
 		return nil, &PartError{Part: canonical, Err: err}
@@ -1929,7 +1954,7 @@ func (r *Reader) readPageHeaderStream(ctx context.Context, part string) (*PageHe
 	if root.Name.Space != namespace || root.Name.Local != "FixedPage" {
 		return nil, &PartError{Part: canonical, Element: root.Name.Local, Err: fmt.Errorf("%w: unexpected root {%s}%s", ErrInvalid, root.Name.Space, root.Name.Local)}
 	}
-	if err := validateFixedStructureElement(root, r.format, false); err != nil {
+	if err := validateFixedStructureElement(root, r.format, fallbackFull); err != nil {
 		return nil, &PartError{Part: canonical, Element: root.Name.Local, Err: err}
 	}
 	if err := validateFixedNames(root, r.format); err != nil {
@@ -2341,72 +2366,99 @@ func transformedGeometryBounds(g *Geometry, m Matrix) (Rect, bool, error) {
 	return r, true, nil
 }
 
+// geometryArcCenter 采用归一化分量完成椭圆弧中心参数化，消除大半径四次方溢出并供极值与切线共用
+// 入参: start 局部圆弧起点, seg 局部圆弧段
+// 返回: geometryArcParam 椭圆弧主轴基向量与角度参数, bool 是否为非退化圆弧, error 参数或数值溢出错误
+func geometryArcCenter(start Point, seg GeometrySegment) (geometryArcParam, bool, error) {
+	rx, ry := seg.RadiusX, seg.RadiusY
+	if !geometryFinite(rx, ry, seg.RotationAngle) || rx < 0 || ry < 0 {
+		return geometryArcParam{}, false, fmt.Errorf("%w: invalid arc radii or rotation", ErrInvalid)
+	}
+	if start == seg.Point || rx == 0 || ry == 0 {
+		return geometryArcParam{}, false, nil
+	}
+	sinPhi, cosPhi := geometryArcRotation(seg.RotationAngle)
+	dx, dy := geometryHalfDifference(start.X, seg.Point.X), geometryHalfDifference(start.Y, seg.Point.Y)
+	mx, my := geometryHalfDifference(start.X, -seg.Point.X), geometryHalfDifference(start.Y, -seg.Point.Y)
+	x1p := cosPhi*dx + sinPhi*dy
+	y1p := -sinPhi*dx + cosPhi*dy
+	if !geometryFinite(x1p, y1p, mx, my) {
+		return geometryArcParam{}, false, fmt.Errorf("%w: rotated arc chord exceeds finite float64 range", ErrLimit)
+	}
+	ux, uy := x1p/rx, y1p/ry
+	r := math.Hypot(ux, uy)
+	if !geometryFinite(r) {
+		return geometryArcParam{}, false, fmt.Errorf("%w: arc normalization exceeds float64 range", ErrLimit)
+	}
+	if r == 0 {
+		return geometryArcParam{}, false, nil
+	}
+	if r > 1 {
+		rx *= r
+		ry *= r
+		if !geometryFinite(rx, ry) || rx == 0 || ry == 0 {
+			return geometryArcParam{}, false, fmt.Errorf("%w: arc normalization exceeds float64 range", ErrLimit)
+		}
+		ux, uy = x1p/rx, y1p/ry
+		r = math.Hypot(ux, uy)
+		if r == 0 {
+			return geometryArcParam{}, false, nil
+		}
+		if r > 1 {
+			r = 1
+		}
+	}
+	nx, ny := ux/r, uy/r
+	k := math.Sqrt(max(0, (1-r)*(1+r)))
+	if seg.IsLargeArc == seg.SweepClockwise {
+		k = -k
+	}
+	cxpUnit := k * ny
+	cypUnit := -k * nx
+	cxp := rx * cxpUnit
+	cyp := ry * cypUnit
+	center := Point{X: cosPhi*cxp - sinPhi*cyp + mx, Y: sinPhi*cxp + cosPhi*cyp + my}
+	u := Point{X: rx * cosPhi, Y: rx * sinPhi}
+	v := Point{X: -ry * sinPhi, Y: ry * cosPhi}
+	theta1 := math.Atan2(uy-cypUnit, ux-cxpUnit)
+	theta2 := math.Atan2(-uy-cypUnit, -ux-cxpUnit)
+	absSweep := 2 * math.Asin(min(1, r))
+	if seg.IsLargeArc {
+		absSweep = 2*math.Pi - absSweep
+	}
+	dtheta := absSweep
+	if !seg.SweepClockwise {
+		dtheta = -dtheta
+	}
+	if !geometryFinite(center.X, center.Y, u.X, u.Y, v.X, v.Y, theta1, theta2, dtheta) {
+		return geometryArcParam{}, false, fmt.Errorf("%w: arc center parameterization overflow", ErrLimit)
+	}
+	return geometryArcParam{
+		u:      u,
+		v:      v,
+		rx:     rx,
+		ry:     ry,
+		sinPhi: sinPhi,
+		cosPhi: cosPhi,
+		theta1: theta1,
+		theta2: theta2,
+		dtheta: dtheta,
+	}, true, nil
+}
+
 // transformedArcExtrema 计算椭圆弧经仿射矩阵变换后的精确轴向极值点，避免旋转外包矩形角点夸大
 // 入参: start 局部圆弧起点, s 局部圆弧段, m 仿射变换矩阵
 // 返回: []Point 变换空间内落于弧段角度区间上的轴向极值点, error 参数或数值溢出错误
 func transformedArcExtrema(start Point, s GeometrySegment, m Matrix) ([]Point, error) {
-	rx, ry := s.RadiusX, s.RadiusY
-	if !geometryFinite(rx, ry, s.RotationAngle) || rx < 0 || ry < 0 {
-		return nil, fmt.Errorf("%w: invalid arc radii or rotation", ErrInvalid)
+	arc, ok, err := geometryArcCenter(start, s)
+	if err != nil || !ok {
+		return nil, err
 	}
-	if start == s.Point || rx == 0 || ry == 0 {
-		return nil, nil
-	}
-	sinPhi, cosPhi := geometryArcRotation(s.RotationAngle)
-	dx, dy := geometryHalfDifference(start.X, s.Point.X), geometryHalfDifference(start.Y, s.Point.Y)
-	mx, my := geometryHalfDifference(start.X, -s.Point.X), geometryHalfDifference(start.Y, -s.Point.Y)
-	x1p := cosPhi*dx + sinPhi*dy
-	y1p := -sinPhi*dx + cosPhi*dy
-	if !geometryFinite(x1p, y1p, mx, my) {
-		return nil, fmt.Errorf("%w: rotated arc chord exceeds finite float64 range", ErrLimit)
-	}
-	lambda := (x1p*x1p)/(rx*rx) + (y1p*y1p)/(ry*ry)
-	if !geometryFinite(lambda) {
-		return nil, fmt.Errorf("%w: arc normalization exceeds float64 range", ErrLimit)
-	}
-	if lambda > 1 {
-		scale := math.Sqrt(lambda)
-		rx *= scale
-		ry *= scale
-	}
-	if !geometryFinite(rx, ry) || rx == 0 || ry == 0 {
-		return nil, fmt.Errorf("%w: arc normalization exceeds float64 range", ErrLimit)
-	}
-	rxSq, rySq := rx*rx, ry*ry
-	x1pSq, y1pSq := x1p*x1p, y1p*y1p
-	denom := rxSq*y1pSq + rySq*x1pSq
-	if denom == 0 || !geometryFinite(denom) {
-		return nil, nil
-	}
-	rad := (rxSq*rySq - denom) / denom
-	if rad < 0 {
-		rad = 0
-	}
-	coef := math.Sqrt(rad)
-	if s.IsLargeArc == s.SweepClockwise {
-		coef = -coef
-	}
-	cxp := coef * (rx * y1p / ry)
-	cyp := coef * (-ry * x1p / rx)
-	center := Point{X: cosPhi*cxp - sinPhi*cyp + mx, Y: sinPhi*cxp + cosPhi*cyp + my}
-	u := Point{X: rx * cosPhi, Y: rx * sinPhi}
-	v := Point{X: -ry * sinPhi, Y: ry * cosPhi}
-	theta1 := math.Atan2((y1p-cyp)/ry, (x1p-cxp)/rx)
-	theta2 := math.Atan2((-y1p-cyp)/ry, (-x1p-cxp)/rx)
-	dtheta := theta2 - theta1
-	if s.SweepClockwise {
-		for dtheta <= 0 {
-			dtheta += 2 * math.Pi
-		}
-	} else {
-		for dtheta >= 0 {
-			dtheta -= 2 * math.Pi
-		}
-	}
-	tc := m.Transform(center)
-	tu := Point{X: m.A*u.X + m.C*u.Y, Y: m.B*u.X + m.D*u.Y}
-	tv := Point{X: m.A*v.X + m.C*v.Y, Y: m.B*v.X + m.D*v.Y}
-	if !geometryFinite(tc.X, tc.Y, tu.X, tu.Y, tv.X, tv.Y) {
+	tStart := m.Transform(start)
+	tEnd := m.Transform(s.Point)
+	tu := Point{X: m.A*arc.u.X + m.C*arc.u.Y, Y: m.B*arc.u.X + m.D*arc.u.Y}
+	tv := Point{X: m.A*arc.v.X + m.C*arc.v.Y, Y: m.B*arc.v.X + m.D*arc.v.Y}
+	if !geometryFinite(tStart.X, tStart.Y, tEnd.X, tEnd.Y, tu.X, tu.Y, tv.X, tv.Y) {
 		return nil, fmt.Errorf("%w: transformed arc bounds overflow", ErrLimit)
 	}
 	var candidates [4]float64
@@ -2423,23 +2475,39 @@ func transformedArcExtrema(start Point, s GeometrySegment, m Matrix) ([]Point, e
 		candidates[nCand+1] = ty + math.Pi
 		nCand += 2
 	}
-	absSweep := math.Abs(dtheta)
-	const eps = 1e-12
+	absSweep := math.Abs(arc.dtheta)
 	var out []Point
 	for i := range nCand {
 		angle := candidates[i]
 		var offset float64
 		if s.SweepClockwise {
-			offset = math.Mod(angle-theta1, 2*math.Pi)
+			offset = math.Mod(angle-arc.theta1, 2*math.Pi)
 		} else {
-			offset = math.Mod(theta1-angle, 2*math.Pi)
+			offset = math.Mod(arc.theta1-angle, 2*math.Pi)
 		}
 		if offset < 0 {
 			offset += 2 * math.Pi
 		}
-		if offset <= absSweep+eps || offset >= 2*math.Pi-eps {
-			sinA, cosA := math.Sincos(angle)
-			pt := Point{X: tc.X + tu.X*cosA + tv.X*sinA, Y: tc.Y + tu.Y*cosA + tv.Y*sinA}
+		if offset > 0 && offset < absSweep {
+			base := tStart
+			baseTheta := arc.theta1
+			delta := offset
+			if !s.SweepClockwise {
+				delta = -offset
+			}
+			if offset > 0.5*absSweep {
+				base = tEnd
+				baseTheta = arc.theta2
+				delta = absSweep - offset
+				if s.SweepClockwise {
+					delta = -delta
+				}
+			}
+			sinM, cosM := math.Sincos(baseTheta + 0.5*delta)
+			k := 2 * math.Sin(0.5*delta)
+			dCos := -k * sinM
+			dSin := k * cosM
+			pt := Point{X: base.X + tu.X*dCos + tv.X*dSin, Y: base.Y + tu.Y*dCos + tv.Y*dSin}
 			if !geometryFinite(pt.X, pt.Y) {
 				return nil, fmt.Errorf("%w: transformed arc bounds overflow", ErrLimit)
 			}
@@ -2447,6 +2515,42 @@ func transformedArcExtrema(start Point, s GeometrySegment, m Matrix) ([]Point, e
 		}
 	}
 	return out, nil
+}
+
+// geometryStrokedOnly 提取几何中全部显式描边段与隐式闭合段，避免纯描边路径受非描边段包围盒污染
+// 入参: data 原始路径几何
+// 返回: *Geometry 仅含描边段的新几何
+func geometryStrokedOnly(data *Geometry) *Geometry {
+	out := &Geometry{FillRule: data.FillRule}
+	for _, fig := range data.Figures {
+		cur := fig.StartPoint
+		var active *GeometryFigure
+		flush := func() {
+			if active != nil {
+				out.Figures = append(out.Figures, *active)
+				active = nil
+			}
+		}
+		for _, seg := range fig.Segments {
+			if seg.IsStroked {
+				if active == nil {
+					active = &GeometryFigure{StartPoint: cur}
+				}
+				active.Segments = append(active.Segments, seg)
+			} else {
+				flush()
+			}
+			cur = seg.Point
+		}
+		if fig.IsClosed && cur != fig.StartPoint {
+			if active == nil {
+				active = &GeometryFigure{StartPoint: cur}
+			}
+			active.Segments = append(active.Segments, GeometrySegment{Kind: GeometryLine, Point: fig.StartPoint, IsStroked: true})
+		}
+		flush()
+	}
+	return out
 }
 
 // pathElementBounds 计算Path元素几何及描边（含MiterLimit斜接尖角与方帽/三角帽扩展）在指定变换矩阵下的精确轴对齐包围盒
@@ -2469,12 +2573,27 @@ func pathElementBounds(path *Path, local Matrix) (Rect, bool, error) {
 			return Rect{}, false, fmt.Errorf("%w: path data transform overflow", ErrLimit)
 		}
 	}
-	box, hasBox, err := transformedGeometryBounds(data, geomMatrix)
-	if err != nil || !hasBox {
+	if path.Stroke == nil || path.StrokeThickness <= 0 {
+		if path.Fill == nil && path.Stroke != nil {
+			return Rect{}, false, nil
+		}
+		return transformedGeometryBounds(data, geomMatrix)
+	}
+	var fillBox Rect
+	hasFill := false
+	if path.Fill != nil {
+		var err error
+		fillBox, hasFill, err = transformedGeometryBounds(data, geomMatrix)
+		if err != nil {
+			return Rect{}, false, err
+		}
+	}
+	box, hasBox, err := transformedGeometryBounds(geometryStrokedOnly(data), geomMatrix)
+	if err != nil {
 		return Rect{}, false, err
 	}
-	if path.Stroke == nil || path.StrokeThickness <= 0 {
-		return box, true, nil
+	if !hasBox {
+		return fillBox, hasFill, nil
 	}
 	half := 0.5 * path.StrokeThickness
 	baseScale := 1.0
@@ -2531,7 +2650,16 @@ func pathElementBounds(path *Path, local Matrix) (Rect, bool, error) {
 		}
 		sinHalf := 0.5 * math.Hypot(u1.X-u2.X, u1.Y-u2.Y)
 		if sinHalf <= 1e-12 {
-			return nil
+			if bLen <= 1 {
+				return nil
+			}
+			dir := Point{X: -u1.X, Y: -u1.Y}
+			bevelDist := half * miterLimit
+			tangent := Point{X: -dir.Y, Y: dir.X}
+			if err := includeLocal(Point{X: vertex.X + bevelDist*dir.X + half*tangent.X, Y: vertex.Y + bevelDist*dir.Y + half*tangent.Y}); err != nil {
+				return err
+			}
+			return includeLocal(Point{X: vertex.X + bevelDist*dir.X - half*tangent.X, Y: vertex.Y + bevelDist*dir.Y - half*tangent.Y})
 		}
 		ratio := 1 / sinHalf
 		if ratio <= 1 {
@@ -2573,6 +2701,8 @@ func pathElementBounds(path *Path, local Matrix) (Rect, bool, error) {
 					endT:    et,
 					stroked: seg.IsStroked,
 				})
+			} else if !seg.IsStroked {
+				segs = append(segs, strokeSegDir{stroked: false})
 			}
 			cur = seg.Point
 		}
@@ -2620,6 +2750,9 @@ func pathElementBounds(path *Path, local Matrix) (Rect, bool, error) {
 		}
 	}
 	out := Rect{X: minX, Y: minY, Width: maxX - minX, Height: maxY - minY}
+	if hasFill {
+		out = rectUnion(fillBox, out)
+	}
 	if !geometryFinite(out.X, out.Y, out.Width, out.Height, out.X+out.Width, out.Y+out.Height) {
 		return Rect{}, false, fmt.Errorf("%w: path stroke bounds overflow", ErrLimit)
 	}
@@ -2676,65 +2809,31 @@ func strokeSegmentUnitTangents(start Point, seg GeometrySegment, dataMat Matrix)
 		}
 		return st, et, okS && okE
 	case GeometryArc:
-		if start == seg.Point || seg.RadiusX <= 0 || seg.RadiusY <= 0 {
+		arc, ok, err := geometryArcCenter(start, seg)
+		if err != nil || !ok {
 			d, ok := strokeUnitVector(p1.X-p0.X, p1.Y-p0.Y)
 			return d, d, ok
 		}
-		rx, ry := seg.RadiusX, seg.RadiusY
-		sinPhi, cosPhi := geometryArcRotation(seg.RotationAngle)
-		dx, dy := geometryHalfDifference(start.X, seg.Point.X), geometryHalfDifference(start.Y, seg.Point.Y)
-		x1p := cosPhi*dx + sinPhi*dy
-		y1p := -sinPhi*dx + cosPhi*dy
-		lambda := (x1p*x1p)/(rx*rx) + (y1p*y1p)/(ry*ry)
-		if lambda > 1 {
-			scale := math.Sqrt(lambda)
-			rx *= scale
-			ry *= scale
-		}
-		rxSq, rySq := rx*rx, ry*ry
-		denom := rxSq*y1p*y1p + rySq*x1p*x1p
-		if denom <= 0 || !geometryFinite(denom) {
-			d, ok := strokeUnitVector(p1.X-p0.X, p1.Y-p0.Y)
-			return d, d, ok
-		}
-		rad := max(0, (rxSq*rySq-denom)/denom)
-		coef := math.Sqrt(rad)
-		if seg.IsLargeArc == seg.SweepClockwise {
-			coef = -coef
-		}
-		cxp := coef * (rx * y1p / ry)
-		cyp := coef * (-ry * x1p / rx)
-		theta1 := math.Atan2((y1p-cyp)/ry, (x1p-cxp)/rx)
-		theta2 := math.Atan2((-y1p-cyp)/ry, (-x1p-cxp)/rx)
 		sign := 1.0
 		if !seg.SweepClockwise {
 			sign = -1
 		}
-		u := Point{X: rx * cosPhi, Y: rx * sinPhi}
-		v := Point{X: -ry * sinPhi, Y: ry * cosPhi}
+		scale := max(arc.rx, arc.ry)
+		rxN, ryN := arc.rx/scale, arc.ry/scale
+		u := Point{X: rxN * arc.cosPhi, Y: rxN * arc.sinPhi}
+		v := Point{X: -ryN * arc.sinPhi, Y: ryN * arc.cosPhi}
 		tanAt := func(theta float64) (Point, bool) {
 			s, c := math.Sincos(theta)
 			lx := sign * (-u.X*s + v.X*c)
 			ly := sign * (-u.Y*s + v.Y*c)
 			return strokeUnitVector(dataMat.A*lx+dataMat.C*ly, dataMat.B*lx+dataMat.D*ly)
 		}
-		st, okS := tanAt(theta1)
-		et, okE := tanAt(theta2)
+		st, okS := tanAt(arc.theta1)
+		et, okE := tanAt(arc.theta2)
 		return st, et, okS && okE
 	default:
 		return Point{}, Point{}, false
 	}
-}
-
-// pathGeometryBounds 计算路径几何及其可选描边在指定变换矩阵下的轴对齐包围盒，委托pathElementBounds执行完整校验
-// 入参: data 路径几何, local 有效变换矩阵, hasStroke 是否存在有效描边画刷, strokeThickness 描边线宽
-// 返回: Rect 变换后含描边外延的轴对齐包围盒, bool 是否非空, error 变换或数值溢出错误
-func pathGeometryBounds(data *Geometry, local Matrix, hasStroke bool, strokeThickness float64) (Rect, bool, error) {
-	path := &Path{Data: data, StrokeThickness: strokeThickness, StrokeLineJoin: LineJoinBevel}
-	if hasStroke {
-		path.Stroke = &Brush{}
-	}
-	return pathElementBounds(path, local)
 }
 
 // rectUnion 返回两个轴对齐矩形的最小并集矩形

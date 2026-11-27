@@ -1086,6 +1086,7 @@ func (p *Package) storePart(part, media string, data []byte, checkName bool) err
 	}
 	p.total = size + int64(len(data))
 	p.dirty[key] = true
+	delete(p.deleted, key)
 	return nil
 }
 
@@ -1337,10 +1338,10 @@ func newCreatedNavigation(r *Reader, ctx context.Context) (*createdNavigation, e
 	return n, nil
 }
 
-// validate 检查页面及资源定义中的内部链接，使用所属FixedPage而非远程字典作为相对地址基准
-// 入参: page 页面部件URI, graph 完整资源图, ctx 取消Context
+// validateCollect 检查页面及资源定义中的内部链接，onErr非nil时按节点非短路收集诊断
+// 入参: page 页面部件URI, graph 完整资源图, ctx 取消Context, onErr 非短路错误收集回调，nil时遇错即返回
 // 返回: error 导航地址、URI或取消错误
-func (n *createdNavigation) validate(page string, graph *resourceGraph, ctx context.Context) error {
+func (n *createdNavigation) validateCollect(page string, graph *resourceGraph, ctx context.Context, onErr func(part, element, attr string, err error) error) error {
 	for _, node := range graph.Nodes {
 		if err := checkContext(ctx); err != nil {
 			return err
@@ -1350,7 +1351,13 @@ func (n *createdNavigation) validate(page string, graph *resourceGraph, ctx cont
 		}
 		if target, present := node.attribute("FixedPage.NavigateUri"); present {
 			if err := n.target(page, target); err != nil {
-				return &PartError{Part: graph.Parts[node], Element: node.Name.Local, Err: fmt.Errorf("FixedPage.NavigateUri: %w", err)}
+				wrapped := &PartError{Part: graph.Parts[node], Element: node.Name.Local, Err: fmt.Errorf("FixedPage.NavigateUri: %w", err)}
+				if onErr == nil {
+					return wrapped
+				}
+				if cancelErr := onErr(graph.Parts[node], node.Name.Local, "FixedPage.NavigateUri", wrapped); cancelErr != nil {
+					return cancelErr
+				}
 			}
 		}
 	}
@@ -1730,10 +1737,19 @@ func validateCreatedFontsCollect(cache *fontCache, graph *resourceGraph, format 
 	return restricted, nil
 }
 
-// validateCreatedResourcesWithDeps 复用已提取依赖列表校验页面引用的图像与ICC资源，单次快照内每个部件仅校验一次
-// 入参: pkg 部件快照, graph 完整页面资源图, resources 已收集页面依赖列表, checked 已检查部件, channels 配置文件的输入分量数, ctx 取消Context
+// validateCreatedResourcesCollect 复用已提取依赖列表校验页面引用的图像与ICC资源，onErr非nil时按部件非短路收集诊断
+// 入参: pkg 部件快照, graph 完整页面资源图, resources 已收集页面依赖列表, checked 已检查部件, channels 配置文件的输入分量数, failedProfiles 已损坏无法解析的ICC部件小写键集合, ctx 取消Context, onErr 非短路错误收集回调，nil时遇错即返回
 // 返回: error 资源、解码、预算或取消错误
-func (p *Package) validateCreatedResourcesWithDeps(pkg *packageReader, graph *resourceGraph, resources []requiredResource, checked map[string]bool, channels map[string]uint32, ctx context.Context) error {
+func (p *Package) validateCreatedResourcesCollect(pkg *packageReader, graph *resourceGraph, resources []requiredResource, checked map[string]bool, channels map[string]uint32, failedProfiles map[string]bool, ctx context.Context, onErr func(part, element, attr string, err error) error) error {
+	report := func(part, element, attr string, err error) (bool, error) {
+		if onErr == nil {
+			return true, err
+		}
+		if cancelErr := onErr(part, element, attr, err); cancelErr != nil {
+			return true, cancelErr
+		}
+		return false, nil
+	}
 	for _, resource := range resources {
 		if resource.Kind != requiredImage && resource.Kind != requiredProfile {
 			continue
@@ -1745,30 +1761,54 @@ func (p *Package) validateCreatedResourcesWithDeps(pkg *packageReader, graph *re
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
+		checked[key] = true
+		partKey := strings.ToLower(resource.Part)
+		media, mediaErr := pkg.contentType(resource.Part)
+		if mediaErr != nil {
+			if resource.Kind == requiredProfile && failedProfiles != nil {
+				failedProfiles[partKey] = true
+			}
+			if onErr == nil {
+				return &PartError{Part: resource.Part, Err: mediaErr}
+			}
+			continue
+		}
+		if !requiredResourceMedia(resource.Kind, media) {
+			if resource.Kind == requiredProfile && failedProfiles != nil {
+				failedProfiles[partKey] = true
+			}
+			if onErr == nil {
+				return &PartError{Part: resource.Part, Err: fmt.Errorf("%w: unexpected resource content type %q for %s", ErrInvalid, media, resource.Part)}
+			}
+			continue
+		}
 		data, err := pkg.readPart(resource.Part)
 		if err != nil {
-			return err
+			if resource.Kind == requiredProfile && failedProfiles != nil {
+				failedProfiles[partKey] = true
+			}
+			if stop, retErr := report(resource.Part, resource.Element, resource.Attribute, &PartError{Part: resource.Part, Err: err}); stop {
+				return retErr
+			}
+			continue
 		}
 		if resource.Kind == requiredProfile {
-			var profile *iccProfile
-			profile, err = validateCreatedICCProfile(data, ctx)
-			if err == nil {
-				count := uint32(profile.channels)
-				if profile.class == "nmcl" {
-					count = binary.BigEndian.Uint32(profile.tag("ncl2")[12:])
+			profile, err := validateCreatedICCProfile(data, ctx)
+			if err != nil {
+				if failedProfiles != nil {
+					failedProfiles[partKey] = true
 				}
-				channels[strings.ToLower(resource.Part)] = count
+				if stop, retErr := report(resource.Part, resource.Element, resource.Attribute, &PartError{Part: resource.Part, Err: err}); stop {
+					return retErr
+				}
+				continue
 			}
+			channels[partKey] = uint32(profile.inputChannels())
 		} else {
-			media, mediaErr := pkg.contentType(resource.Part)
-			if mediaErr != nil {
-				return mediaErr
-			}
-			var image *rasterImage
-			image, err = decodeRasterImageContext(ctx, data, media, p.maxImagePixels)
-			if err == nil && len(image.profile) != 0 {
-				profile := image.profile
-				if image.profileCompressed {
+			img, err := decodeRasterImageContext(ctx, data, media, p.maxImagePixels)
+			if err == nil && len(img.profile) != 0 {
+				profile := img.profile
+				if img.profileCompressed {
 					profile, err = inflatePNGProfile(profile, p.limits.MaxMetadataBytes)
 				}
 				if err == nil {
@@ -1779,13 +1819,14 @@ func (p *Package) validateCreatedResourcesWithDeps(pkg *packageReader, graph *re
 					}
 				}
 			}
+			if err != nil {
+				if stop, retErr := report(resource.Part, resource.Element, resource.Attribute, &PartError{Part: resource.Part, Err: err}); stop {
+					return retErr
+				}
+			}
 		}
-		if err != nil {
-			return &PartError{Part: resource.Part, Err: err}
-		}
-		checked[key] = true
 	}
-	return validateCreatedContextColorsCollect(graph, channels, nil, ctx, nil)
+	return validateCreatedContextColorsCollect(graph, channels, failedProfiles, ctx, onErr)
 }
 
 // validateCreatedContextColorsCollect 检查颜色分量与ICC输入是否匹配，跳过已损坏ICC并支持非短路收集诊断
@@ -2244,40 +2285,73 @@ func (p *Package) relationSourceName(pkg *packageReader, source string) string {
 	return source
 }
 
-// validateRequiredResourcesWithDeps 复用已收集依赖列表校验页面RequiredResource关系及媒体类型匹配
-// 入参: pagePart 规范页面部件URI, dependencies 已收集页面依赖列表
-// 返回: error 关系、目标或媒体类型错误
-func (r *Reader) validateRequiredResourcesWithDeps(pagePart string, dependencies []requiredResource) error {
+// validateRequiredResourcesCollect 复用已收集依赖列表校验页面RequiredResource关系及媒体类型匹配，onErr非nil时按条目非短路收集诊断
+// 入参: pagePart 规范页面部件URI, dependencies 已收集页面依赖列表, onErr 非短路错误收集回调，nil时遇错即返回
+// 返回: error 关系、目标、媒体类型或取消错误
+func (r *Reader) validateRequiredResourcesCollect(pagePart string, dependencies []requiredResource, onErr func(part, element, attr string, err error) error) error {
+	report := func(part, element, attr string, err error) (bool, error) {
+		if onErr == nil {
+			return true, err
+		}
+		if cancelErr := onErr(part, element, attr, err); cancelErr != nil {
+			return true, cancelErr
+		}
+		return false, nil
+	}
 	relations, err := r.pkg.relationships(pagePart)
 	if err != nil {
-		return &PartError{Part: pagePart, Err: err}
+		if stop, retErr := report(pagePart, "Relationships", "", &PartError{Part: pagePart, Err: err}); stop {
+			return retErr
+		}
+		return nil
 	}
 	typeURI := formatNamespace(r.format) + "/required-resource"
 	targets := make(map[string]string, len(relations))
+	missingTargets := make(map[string]bool)
 	for _, relation := range relations {
 		if relation.Type != typeURI {
 			continue
 		}
 		if relation.TargetMode != TargetModeInternal {
-			return &PartError{Part: pagePart, Err: fmt.Errorf("%w: external Required Resource relationship %q", ErrInvalid, relation.ID)}
+			if stop, retErr := report(pagePart, "Relationship", "TargetMode", &PartError{Part: pagePart, Err: fmt.Errorf("%w: external Required Resource relationship %q", ErrInvalid, relation.ID)}); stop {
+				return retErr
+			}
+			continue
 		}
 		target, err := resolvePart(pagePart, relation.Target)
 		if err != nil {
-			return &PartError{Part: pagePart, Err: err}
+			if stop, retErr := report(pagePart, "Relationship", "Target", &PartError{Part: pagePart, Err: err}); stop {
+				return retErr
+			}
+			continue
 		}
+		targetKey := strings.ToLower(target)
 		media, err := r.pkg.contentType(target)
 		if err != nil {
-			return &PartError{Part: pagePart, Err: fmt.Errorf("Required Resource relationship %q target %s: %w", relation.ID, target, err)}
+			missingTargets[targetKey] = true
+			if stop, retErr := report(target, "Relationship", "Target", &PartError{Part: pagePart, Err: fmt.Errorf("Required Resource relationship %q target %s: %w", relation.ID, target, err)}); stop {
+				return retErr
+			}
+			continue
 		}
-		targets[strings.ToLower(target)] = media
+		targets[targetKey] = media
 	}
 	for _, dependency := range dependencies {
-		media, ok := targets[strings.ToLower(dependency.Part)]
+		depKey := strings.ToLower(dependency.Part)
+		media, ok := targets[depKey]
 		if !ok {
-			return requiredResourceError(dependency, fmt.Errorf("%w: missing Required Resource relationship from page %s to %s", ErrInvalid, pagePart, dependency.Part))
+			if missingTargets[depKey] {
+				continue
+			}
+			if stop, retErr := report(dependency.Part, dependency.Element, dependency.Attribute, requiredResourceError(dependency, fmt.Errorf("%w: missing Required Resource relationship from page %s to %s", ErrInvalid, pagePart, dependency.Part))); stop {
+				return retErr
+			}
+			continue
 		}
 		if !requiredResourceMedia(dependency.Kind, media) {
-			return requiredResourceError(dependency, fmt.Errorf("%w: unexpected resource content type %q for %s", ErrInvalid, media, dependency.Part))
+			if stop, retErr := report(dependency.Part, dependency.Element, dependency.Attribute, requiredResourceError(dependency, fmt.Errorf("%w: unexpected resource content type %q for %s", ErrInvalid, media, dependency.Part))); stop {
+				return retErr
+			}
 		}
 	}
 	checked := make(map[string]bool, len(dependencies))
@@ -2289,11 +2363,16 @@ func (r *Reader) validateRequiredResourcesWithDeps(pagePart string, dependencies
 		checked[key] = true
 		depRels, err := r.pkg.relationships(dependency.Part)
 		if err != nil {
-			return &PartError{Part: dependency.Part, Err: err}
+			if stop, retErr := report(dependency.Part, "Relationships", "", &PartError{Part: dependency.Part, Err: err}); stop {
+				return retErr
+			}
+			continue
 		}
 		for _, relation := range depRels {
 			if relation.Type == typeURI {
-				return &PartError{Part: dependency.Part, Err: fmt.Errorf("%w: Required Resource relationship %q must originate from FixedPage, not a resource part", ErrInvalid, relation.ID)}
+				if stop, retErr := report(dependency.Part, "Relationship", "Type", &PartError{Part: dependency.Part, Err: fmt.Errorf("%w: Required Resource relationship %q must originate from FixedPage, not a resource part", ErrInvalid, relation.ID)}); stop {
+					return retErr
+				}
 			}
 		}
 	}
@@ -2319,45 +2398,115 @@ func (p *Package) changedResourcesWithDeps(pagePart string, dependencies []requi
 // 入参: ctx 取消Context
 // 返回: *Reader 已校验快照, error 结构、资源或取消错误
 func (p *Package) reader(ctx context.Context) (*Reader, error) {
+	r, _, err := p.assembleAndValidate(ctx, false)
+	return r, err
+}
+
+// assembleAndValidate 统一执行包编排、关系合成与全链路校验，collect为false时短路报错返回只读快照，collect为true时非短路收集全部诊断
+// 入参: ctx 已规范化取消Context, collect 是否启用非短路诊断收集模式
+// 返回: *Reader 快照读取器，collect模式可能为部分组装视图, []Diagnostic 非短路诊断列表, error 短路模式校验错误或取消错误
+func (p *Package) assembleAndValidate(ctx context.Context, collect bool) (*Reader, []Diagnostic, error) {
 	if err := checkContext(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	var diagnostics []Diagnostic
+	report := func(part, element, attr string, err error) error {
+		if err == nil {
+			return nil
+		}
+		if !collect {
+			return err
+		}
+		return appendValidationError(&diagnostics, part, element, attr, err)
+	}
+	var onErr func(part, element, attr string, err error) error
+	if collect {
+		onErr = report
 	}
 	if len(p.documents) == 0 {
-		return nil, fmt.Errorf("%w: package needs a document", ErrInvalid)
+		if err := report(p.sequence, "FixedDocumentSequence", "", fmt.Errorf("%w: package needs a document", ErrInvalid)); err != nil {
+			return nil, nil, err
+		}
+	}
+	if collect {
+		for _, key := range slices.Sorted(maps.Keys(p.parts)) {
+			if err := checkContext(ctx); err != nil {
+				return nil, nil, err
+			}
+			part := p.parts[key]
+			if err := report(part.name, "", "ContentType", validatePackageMediaForFormat(p.format, part.media)); err != nil {
+				return nil, nil, err
+			}
+		}
 	}
 	pkg := p.partReader()
+	var allPages []PageReference
 	for _, document := range p.documents {
 		if err := checkContext(ctx); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if len(document.Pages) == 0 {
-			return nil, fmt.Errorf("%w: document %s needs a page", ErrInvalid, document.Part)
+			if err := report(document.Part, "FixedDocument", "", fmt.Errorf("%w: document %s needs a page", ErrInvalid, document.Part)); err != nil {
+				return nil, nil, err
+			}
+		}
+		docTargets := make(map[string]string)
+		for _, pageRef := range document.Pages {
+			allPages = append(allPages, pageRef)
+			if collect && len(pageRef.LinkTargets) != 0 {
+				pageSeen := make(map[string]bool, len(pageRef.LinkTargets))
+				for _, target := range pageRef.LinkTargets {
+					if pageSeen[target] {
+						diagnostics = append(diagnostics, Diagnostic{Part: document.Part, Element: "LinkTarget", Attribute: "Name", Message: fmt.Sprintf("duplicate LinkTarget %q on page %s", target, pageRef.Part)})
+					}
+					pageSeen[target] = true
+					if p.format == FormatXPS {
+						if prev, exists := docTargets[target]; exists {
+							diagnostics = append(diagnostics, Diagnostic{Part: document.Part, Element: "LinkTarget", Attribute: "Name", Message: fmt.Sprintf("duplicate XPS LinkTarget %q on pages %s and %s", target, prev, pageRef.Part)})
+						} else {
+							docTargets[target] = pageRef.Part
+						}
+					}
+				}
+			}
 		}
 		if _, present := p.original[strings.ToLower(document.Part)]; present && !p.dirty[strings.ToLower(document.Part)] {
 			continue
 		}
 		root, err := buildFixedDocumentNode(p.format, document)
 		if err != nil {
-			return nil, err
+			if retErr := report(document.Part, "FixedDocument", "Source", err); retErr != nil {
+				return nil, nil, retErr
+			}
+			continue
 		}
 		data, err := createdMarkup(root, p.limits, ctx)
 		if err != nil {
-			return nil, err
+			if retErr := report(document.Part, "FixedDocument", "", err); retErr != nil {
+				return nil, nil, retErr
+			}
+			continue
 		}
 		createdPut(pkg, document.Part, fixedContentType("fixeddocument"), data)
 	}
 	if _, present := p.original[strings.ToLower(p.sequence)]; !present || p.dirty[strings.ToLower(p.sequence)] {
 		sequence, err := buildFixedDocumentSequenceNode(p.format, p.sequence, p.documents)
 		if err != nil {
-			return nil, err
+			if retErr := report(p.sequence, "FixedDocumentSequence", "Source", err); retErr != nil {
+				return nil, nil, retErr
+			}
+		} else {
+			data, err := createdMarkup(sequence, p.limits, ctx)
+			if err != nil {
+				if retErr := report(p.sequence, "FixedDocumentSequence", "", err); retErr != nil {
+					return nil, nil, retErr
+				}
+			} else {
+				createdPut(pkg, p.sequence, fixedContentType("fixeddocumentsequence"), data)
+			}
 		}
-		data, err := createdMarkup(sequence, p.limits, ctx)
-		if err != nil {
-			return nil, err
-		}
-		createdPut(pkg, p.sequence, fixedContentType("fixeddocumentsequence"), data)
 	}
-	deferred := make(map[string]bool, len(p.documents)+1)
+	deferred := make(map[string]bool, len(p.documents)+len(allPages)+1)
 	deferred["/"] = true
 	for _, document := range p.documents {
 		deferred[strings.ToLower(document.Part)] = true
@@ -2366,60 +2515,97 @@ func (p *Package) reader(ctx context.Context) (*Reader, error) {
 		}
 	}
 	for _, source := range slices.Sorted(maps.Keys(p.relations)) {
+		if err := checkContext(ctx); err != nil {
+			return nil, nil, err
+		}
 		if deferred[source] {
 			continue
 		}
-		if err := p.composeRelationships(pkg, p.relationSourceName(pkg, source), nil, ctx); err != nil {
-			return nil, err
+		sourceName := p.relationSourceName(pkg, source)
+		if err := report(createdRelationshipPart(sourceName), "Relationships", "", p.composeRelationships(pkg, sourceName, nil, ctx)); err != nil {
+			return nil, nil, err
 		}
 	}
 	rootRelations := []Relationship{{Type: formatNamespace(p.format) + "/fixedrepresentation", Target: p.sequence, TargetMode: TargetModeInternal}}
-	if err := p.composeRelationships(pkg, "/", rootRelations, ctx); err != nil {
-		return nil, err
+	if err := report(createdRelationshipPart("/"), "Relationships", "", p.composeRelationships(pkg, "/", rootRelations, ctx)); err != nil {
+		return nil, nil, err
 	}
 	r := &Reader{pkg: pkg, format: p.format, limits: p.limits}
 	if err := r.readSequence(); err != nil {
-		return nil, err
+		if retErr := report(p.sequence, "FixedDocumentSequence", "", err); retErr != nil {
+			return nil, nil, retErr
+		}
+		r.sequence, r.documents, r.pages = p.sequence, p.documents, allPages
 	}
 	if _, err := r.CoreProperties(ctx); err != nil {
-		return nil, err
+		if retErr := report("/", "CoreProperties", "", err); retErr != nil {
+			return nil, nil, retErr
+		}
 	}
 	navigation, err := newCreatedNavigation(r, ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	fonts := fontCache{pkg: pkg, data: make(map[string][]byte), faces: make(map[fontCacheKey]*fontSource), remaining: p.limits.MaxPackageBytes, maxFaces: p.limits.MaxPartCount}
 	restricted := make(map[string][]Relationship)
 	checkedResources := make(map[string]bool)
 	profileChannels := make(map[string]uint32)
+	var failedProfiles map[string]bool
+	if collect {
+		failedProfiles = make(map[string]bool)
+	}
 	ns := formatNamespace(p.format)
 	loadDict := func(part string) (*xmlElement, error) { return r.readResourceDictionaryLoader(part, nil, ctx) }
 	for _, document := range r.documents {
 		docKey := strings.ToLower(document.Part)
 		for _, page := range document.Pages {
 			if err := checkContext(ctx); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			root, err := r.readFixedPartLoader(page.Part, "fixedpage", "FixedPage", nil, ctx)
 			if err != nil {
-				return nil, err
+				if retErr := report(page.Part, "FixedPage", "", err); retErr != nil {
+					return nil, nil, retErr
+				}
+				continue
 			}
 			if _, err := parsePageHeader(root, page.Part, r.format); err != nil {
-				return nil, err
+				if retErr := report(page.Part, "FixedPage", "", err); retErr != nil {
+					return nil, nil, retErr
+				}
+			}
+			if collect && len(page.LinkTargets) != 0 {
+				pageNames := make(map[string]bool)
+				for _, name := range createdPageTargets(root) {
+					pageNames[name] = true
+				}
+				for _, target := range page.LinkTargets {
+					if !pageNames[target] {
+						diagnostics = append(diagnostics, Diagnostic{Part: page.Part, Element: "LinkTarget", Attribute: "Name", Message: fmt.Sprintf("LinkTarget %q is absent from page", target)})
+					}
+				}
 			}
 			graph, err := parseResourceGraphContext(page.Part, root, r.format, r.limits, loadDict, ctx)
 			if err != nil {
-				return nil, err
+				if retErr := report(page.Part, "FixedPage", "", err); retErr != nil {
+					return nil, nil, retErr
+				}
+				continue
 			}
 			if _, err := newSceneParser(r.format, graph).parse(root); err != nil {
-				return nil, err
+				if retErr := report(page.Part, "FixedPage", "", err); retErr != nil {
+					return nil, nil, retErr
+				}
 			}
-			if err := navigation.validate(page.Part, graph, ctx); err != nil {
-				return nil, err
+			if err := navigation.validateCollect(page.Part, graph, ctx, onErr); err != nil {
+				return nil, nil, err
 			}
 			dependencies, err := collectRequiredResources(graph, p.format)
 			if err != nil {
-				return nil, err
+				if retErr := report(page.Part, "FixedPage", "", err); retErr != nil {
+					return nil, nil, retErr
+				}
+				continue
 			}
 			var relations []Relationship
 			seen := make(map[string]bool, len(dependencies))
@@ -2431,19 +2617,19 @@ func (p *Package) reader(ctx context.Context) (*Reader, error) {
 				seen[depKey] = true
 				relations = append(relations, Relationship{Type: ns + "/required-resource", Target: dependency.Part, TargetMode: TargetModeInternal})
 			}
-			if err := p.composeRelationships(pkg, page.Part, relations, ctx); err != nil {
-				return nil, err
+			if err := report(createdRelationshipPart(page.Part), "Relationships", "", p.composeRelationships(pkg, page.Part, relations, ctx)); err != nil {
+				return nil, nil, err
 			}
-			if err := r.validateRequiredResourcesWithDeps(page.Part, dependencies); err != nil {
-				return nil, err
+			if err := r.validateRequiredResourcesCollect(page.Part, dependencies, onErr); err != nil {
+				return nil, nil, err
 			}
-			if p.changedResourcesWithDeps(page.Part, dependencies) {
-				parts, err := validateCreatedFontsCollect(&fonts, graph, p.format, ctx, nil)
+			if collect || p.changedResourcesWithDeps(page.Part, dependencies) {
+				parts, err := validateCreatedFontsCollect(&fonts, graph, p.format, ctx, onErr)
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
-				if err := p.validateCreatedResourcesWithDeps(pkg, graph, dependencies, checkedResources, profileChannels, ctx); err != nil {
-					return nil, err
+				if err := p.validateCreatedResourcesCollect(pkg, graph, dependencies, checkedResources, profileChannels, failedProfiles, ctx, onErr); err != nil {
+					return nil, nil, err
 				}
 				for _, part := range parts {
 					duplicate := false
@@ -2458,8 +2644,8 @@ func (p *Package) reader(ctx context.Context) (*Reader, error) {
 		}
 	}
 	for _, document := range r.documents {
-		if err := p.composeRelationships(pkg, document.Part, restricted[strings.ToLower(document.Part)], ctx); err != nil {
-			return nil, err
+		if err := report(createdRelationshipPart(document.Part), "Relationships", "", p.composeRelationships(pkg, document.Part, restricted[strings.ToLower(document.Part)], ctx)); err != nil {
+			return nil, nil, err
 		}
 	}
 	types := createdNode(opcTypesNS, "Types")
@@ -2473,70 +2659,117 @@ func (p *Package) reader(ctx context.Context) (*Reader, error) {
 		var err error
 		data, err = createdMarkup(types, p.limits, ctx)
 		if err != nil {
-			return nil, err
-		}
-	}
-	createdPut(pkg, opcTypesName, "", data)
-	var total int64
-	if len(pkg.parts) > p.limits.MaxPartCount {
-		return nil, fmt.Errorf("%w: generated package part count", ErrLimit)
-	}
-	for key, data := range pkg.data {
-		if int64(len(data)) > p.limits.MaxPartBytes || int64(len(data)) > p.limits.MaxPackageBytes-total {
-			return nil, fmt.Errorf("%w: generated package byte budget", ErrLimit)
-		}
-		total += int64(len(data))
-		for slash := strings.LastIndexByte(key, '/'); slash > 0; slash = strings.LastIndexByte(key[:slash], '/') {
-			if _, exists := pkg.parts[key[:slash]]; exists {
-				return nil, fmt.Errorf("%w: derived generated part name", ErrInvalid)
+			if retErr := report(opcTypesName, "Types", "", err); retErr != nil {
+				return nil, nil, retErr
 			}
+		}
+	}
+	if data != nil {
+		createdPut(pkg, opcTypesName, "", data)
+	}
+	registry := newPartNameRegistry()
+	if _, hasTypes := pkg.parts[strings.ToLower(opcTypesName)]; !hasTypes {
+		registry.register(opcTypesName)
+	}
+	for _, key := range slices.Sorted(maps.Keys(pkg.parts)) {
+		name := pkg.names[key]
+		if name == "" {
+			continue
+		}
+		if err := registry.available(name); err != nil {
+			if !collect {
+				return nil, nil, fmt.Errorf("%w: derived generated part name", ErrInvalid)
+			}
+			diagnostics = append(diagnostics, Diagnostic{Part: name, Message: err.Error()})
+		}
+		registry.register(name)
+	}
+	if registry.count() > p.limits.MaxPartCount {
+		if !collect {
+			return nil, nil, fmt.Errorf("%w: generated package part count", ErrLimit)
+		}
+		diagnostics = append(diagnostics, Diagnostic{Part: "/", Message: "package exceeds MaxPartCount"})
+	}
+	var total int64
+	packageLimitReported := false
+	for _, key := range slices.Sorted(maps.Keys(pkg.data)) {
+		raw := pkg.data[key]
+		if int64(len(raw)) > p.limits.MaxPartBytes {
+			if !collect {
+				return nil, nil, fmt.Errorf("%w: generated package byte budget", ErrLimit)
+			}
+			diagnostics = append(diagnostics, Diagnostic{Part: pkg.names[key], Message: "part exceeds MaxPartBytes"})
+		}
+		if int64(len(raw)) > p.limits.MaxPackageBytes-total {
+			if !collect {
+				return nil, nil, fmt.Errorf("%w: generated package byte budget", ErrLimit)
+			}
+			if !packageLimitReported {
+				diagnostics = append(diagnostics, Diagnostic{Part: "/", Message: "package exceeds MaxPackageBytes"})
+				packageLimitReported = true
+			}
+		} else {
+			total += int64(len(raw))
 		}
 	}
 	if err := checkContext(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if err := r.validateRequiredResourceLinks(ctx); err != nil {
-		return nil, err
+	if err := report("/", "RequiredResource", "", r.validateRequiredResourceLinks(ctx)); err != nil {
+		return nil, nil, err
 	}
-	if err := r.validatePrintTicketLinks(ctx); err != nil {
-		return nil, err
+	if err := report("/", "PrintTicket", "", r.validatePrintTicketLinks(ctx)); err != nil {
+		return nil, nil, err
 	}
-	if err := r.validateSignatureDefinitionLinks(ctx); err != nil {
-		return nil, err
+	if err := report("/", "SignatureDefinitions", "", r.validateSignatureDefinitionLinks(ctx)); err != nil {
+		return nil, nil, err
 	}
-	if err := p.validateThumbnailLinks(r, ctx); err != nil {
-		return nil, err
+	if err := report("/", "Thumbnail", "", p.validateThumbnailLinks(r, ctx)); err != nil {
+		return nil, nil, err
 	}
 	control, err := r.DiscardControl(ctx)
 	if err != nil {
-		return nil, err
-	}
-	if control != nil {
+		if retErr := report("/", "DiscardControl", "", err); retErr != nil {
+			return nil, nil, retErr
+		}
+	} else if control != nil {
 		if control.Ignored != 0 {
-			return nil, fmt.Errorf("%w: invalid produced discard reference", ErrInvalid)
+			if !collect {
+				return nil, nil, fmt.Errorf("%w: invalid produced discard reference", ErrInvalid)
+			}
+			diagnostics = append(diagnostics, Diagnostic{Part: control.Part.Name, Element: "DiscardControl", Message: "invalid discard reference"})
+		}
+		pageSet := make(map[string]bool, len(r.pages))
+		for _, pageRef := range r.pages {
+			pageSet[strings.ToLower(pageRef.Part)] = true
 		}
 		for _, hint := range control.Hints {
 			if _, exists := pkg.parts[strings.ToLower(hint.Target)]; !exists {
-				return nil, fmt.Errorf("%w: discard target is absent", ErrInvalid)
+				if !collect {
+					return nil, nil, fmt.Errorf("%w: discard target is absent", ErrInvalid)
+				}
+				diagnostics = append(diagnostics, Diagnostic{Part: control.Part.Name, Element: "Discard", Attribute: "Target", Message: fmt.Sprintf("discard target %s is absent", hint.Target)})
 			}
-			page := false
-			for _, value := range r.pages {
-				page = page || strings.EqualFold(value.Part, hint.SentinelPage)
-			}
-			if !page {
-				return nil, fmt.Errorf("%w: discard sentinel is not a fixed page", ErrInvalid)
+			if !pageSet[strings.ToLower(hint.SentinelPage)] {
+				if !collect {
+					return nil, nil, fmt.Errorf("%w: discard sentinel is not a fixed page", ErrInvalid)
+				}
+				diagnostics = append(diagnostics, Diagnostic{Part: control.Part.Name, Element: "Discard", Attribute: "SentinelPage", Message: fmt.Sprintf("discard sentinel %s is not a fixed page", hint.SentinelPage)})
 			}
 		}
 		if len(control.Hints) != 0 {
-			if err := r.validateDiscardLifetime(control, ctx); err != nil {
-				return nil, err
+			if err := report(control.Part.Name, "DiscardControl", "", r.validateDiscardLifetime(control, ctx)); err != nil {
+				return nil, nil, err
 			}
 		}
 	}
-	if err := r.validateStoryLinks(ctx); err != nil {
-		return nil, err
+	if err := report("/", "DocumentStructure", "", r.validateStoryLinks(ctx)); err != nil {
+		return nil, nil, err
 	}
-	return r, nil
+	if err := checkContext(ctx); err != nil {
+		return nil, nil, err
+	}
+	return r, diagnostics, nil
 }
 
 // createdNode 创建标准命名空间中的结构节点

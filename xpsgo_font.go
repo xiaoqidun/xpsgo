@@ -248,11 +248,12 @@ type ResolvedGlyphCluster struct {
 
 // fontUsageCollector 汇总全部原始固定布局标记，包括未选兼容分支和未引用字典
 type fontUsageCollector struct {
-	reader  *Reader
-	fonts   fontCache
-	usage   map[fontCacheKey]map[uint16]bool
-	work    int
-	context context.Context
+	reader   *Reader
+	fonts    fontCache
+	usage    map[fontCacheKey]map[uint16]bool
+	implicit map[fontCacheKey]map[rune]uint16
+	work     int
+	context  context.Context
 }
 
 // readFontFaceLimit 按实际解压数据限制字体读取，不仅依赖ZIP声明的部件长度
@@ -778,6 +779,13 @@ func ExtractFontFace(data []byte, collectionIndex uint32) ([]byte, error) {
 	}
 	tags := slices.Sorted(maps.Keys(face.tables))
 	tags = slices.DeleteFunc(tags, func(tag string) bool { return tag == "DSIG" })
+	return assembleSFNT(nil, face, tags, nil, 0, 12)
+}
+
+// assembleSFNT 按已筛选并排序的表标识列表装配独立单面SFNT二进制，四字节零填充对齐并重算表校验和与head整文件校验和调整值
+// 入参: ctx 可选取消Context, face 原字体面, tags 按ASCII升序排列的目标表标识, replacements 可选替换或新增表数据, maxBytes 可选输出字节上限，非正数时不额外限制, minHeadLen head表最小允许长度
+// 返回: []byte 独立单面SFNT字节, error 表缺失、截断、预算或取消错误
+func assembleSFNT(ctx context.Context, face *fontFace, tags []string, replacements map[string][]byte, maxBytes int64, minHeadLen int) ([]byte, error) {
 	count := len(tags)
 	if count == 0 {
 		return nil, fmt.Errorf("%w: empty font table directory", ErrInvalid)
@@ -788,16 +796,21 @@ func ExtractFontFace(data []byte, collectionIndex uint32) ([]byte, error) {
 	total := uint64(12 + count*16)
 	hasHead := false
 	for _, tag := range tags {
-		table := face.tables[tag]
+		var length uint64
+		if replacement, present := replacements[tag]; present {
+			length = uint64(len(replacement))
+		} else {
+			length = uint64(face.tables[tag].length)
+		}
 		if tag == "head" {
-			if table.length < 12 {
+			if length < uint64(minHeadLen) {
 				return nil, fmt.Errorf("%w: truncated head table", ErrInvalid)
 			}
 			hasHead = true
 		}
-		total += (uint64(table.length) + 3) &^ uint64(3)
-		if total > uint64(int(^uint(0)>>1)) || total > uint64(^uint32(0)) {
-			return nil, fmt.Errorf("%w: extracted font size overflow", ErrLimit)
+		total += (length + 3) &^ uint64(3)
+		if maxBytes > 0 && total > uint64(maxBytes) || total > uint64(int(^uint(0)>>1)) || total > uint64(^uint32(0)) {
+			return nil, fmt.Errorf("%w: font output size budget", ErrLimit)
 		}
 	}
 	if !hasHead {
@@ -813,9 +826,16 @@ func ExtractFontFace(data []byte, collectionIndex uint32) ([]byte, error) {
 	binary.BigEndian.PutUint16(output[10:], uint16(count*16-search))
 	position, headOffset := 12+count*16, -1
 	for index, tag := range tags {
-		raw, err := face.table(tag)
-		if err != nil {
+		if err := checkContext(ctx); err != nil {
 			return nil, err
+		}
+		raw, present := replacements[tag]
+		if !present {
+			var err error
+			raw, err = face.table(tag)
+			if err != nil {
+				return nil, err
+			}
 		}
 		copy(output[position:], raw)
 		if tag == "head" {
@@ -830,6 +850,9 @@ func ExtractFontFace(data []byte, collectionIndex uint32) ([]byte, error) {
 		position += (len(raw) + 3) &^ 3
 	}
 	binary.BigEndian.PutUint32(output[headOffset+8:], 0xb1b0afba-fontChecksum(output))
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
 	return output, nil
 }
 
@@ -1071,7 +1094,10 @@ func fontIsBitmapOnly(face *fontFace) bool {
 	}
 	_, hasEBLC := face.tables["EBLC"]
 	_, hasEBDT := face.tables["EBDT"]
-	return hasEBLC || hasEBDT
+	_, hasCBLC := face.tables["CBLC"]
+	_, hasCBDT := face.tables["CBDT"]
+	_, hasSbix := face.tables["sbix"]
+	return hasEBLC || hasEBDT || hasCBLC || hasCBDT || hasSbix
 }
 
 // fontFaceForResource 获取字体资源关联的只读字体面，无内部源时尝试解析Data字段
@@ -1612,7 +1638,7 @@ func parseFontMetricsWithOS2(face *fontFace, os2 *fontOS2Metrics) (*fontMetrics,
 	if major > 1 || major == 0 && version < 0x00005000 {
 		return nil, fmt.Errorf("%w: maxp version %#x", ErrUnsupported, version)
 	}
-	if face.cff != (major == 0) || major == 1 && len(maxp) < 32 {
+	if face.cff && major != 0 || !face.cff && major == 0 && !fontIsBitmapOnly(face) || major == 1 && len(maxp) < 32 {
 		return nil, fmt.Errorf("%w: maxp format or length", ErrInvalid)
 	}
 	m.numGlyphs = binary.BigEndian.Uint16(maxp[4:])
@@ -2114,9 +2140,16 @@ func (run *glyphRun) placeGlyph(p *positionedGlyph, entry GlyphIndex, metrics *f
 // 入参: ctx 取消Context，nil采用Background, options 累计资源上限，nil采用阅读器上限
 // 返回: []FontUsage 按部件名和字体面索引排列的独立结果，失败为nil, error 标记、字体、资源或取消错误
 func (r *Reader) FontUsage(ctx context.Context, options *OptimizationOptions) ([]FontUsage, error) {
-	ctx = normalizeContext(ctx)
+	usage, _, err := collectFontUsage(normalizeContext(ctx), r, options, false)
+	return usage, err
+}
+
+// collectFontUsage 单遍扫描固定布局及资源字典中的字体与字形使用，按需同步收集隐式cmap查表码点映射
+// 入参: ctx 已规范化取消Context, r 只读阅读器, options 累计资源上限，nil采用阅读器上限, collectImplicit 是否收集隐式码点映射
+// 返回: []FontUsage 按部件名和字体面索引排列的使用结果, map[string]map[uint32]map[rune]uint16 可选小写部件键到各面隐式码点映射, error 标记、字体、资源或取消错误
+func collectFontUsage(ctx context.Context, r *Reader, options *OptimizationOptions, collectImplicit bool) ([]FontUsage, map[string]map[uint32]map[rune]uint16, error) {
 	if err := r.readLock(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer r.mu.RUnlock()
 	configuration := OptimizationOptions{MaxBytes: r.limits.MaxPackageBytes, MaxWork: r.limits.MaxXMLNodes}
@@ -2129,12 +2162,17 @@ func (r *Reader) FontUsage(ctx context.Context, options *OptimizationOptions) ([
 		}
 	}
 	if configuration.MaxBytes < 1 || configuration.MaxWork < 1 {
-		return nil, fmt.Errorf("%w: font usage limits", ErrInvalid)
+		return nil, nil, fmt.Errorf("%w: font usage limits", ErrInvalid)
 	}
 	c := fontUsageCollector{reader: r, fonts: fontCache{pkg: r.pkg, data: make(map[string][]byte), faces: make(map[fontCacheKey]*fontSource), remaining: configuration.MaxBytes, maxFaces: r.limits.MaxPartCount}, usage: make(map[fontCacheKey]map[uint16]bool), work: configuration.MaxWork, context: ctx}
+	if collectImplicit {
+		c.implicit = make(map[fontCacheKey]map[rune]uint16)
+	}
+	namespace := formatNamespace(r.format)
+	keyNS := namespace + "/resourcedictionary-key"
 	for _, key := range slices.Sorted(maps.Keys(r.pkg.parts)) {
 		if err := c.charge(1); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		part := r.pkg.names[key]
 		if key == strings.ToLower(opcTypesName) || opcRelationshipName(part) {
@@ -2142,18 +2180,18 @@ func (r *Reader) FontUsage(ctx context.Context, options *OptimizationOptions) ([
 		}
 		media, err := r.pkg.contentType(part)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		model, err := resourceModelMedia(media)
 		if err != nil {
-			return nil, &PartError{Part: part, Err: err}
+			return nil, nil, &PartError{Part: part, Err: err}
 		}
 		if model {
-			return nil, &PartError{Part: part, Err: fmt.Errorf("%w: font usage in opaque X3D content", ErrUnsupported)}
+			return nil, nil, &PartError{Part: part, Err: fmt.Errorf("%w: font usage in opaque X3D content", ErrUnsupported)}
 		}
 		markup, err := fontUsageMarkup(media)
 		if err != nil {
-			return nil, &PartError{Part: part, Err: err}
+			return nil, nil, &PartError{Part: part, Err: err}
 		}
 		if !markup {
 			continue
@@ -2161,7 +2199,7 @@ func (r *Reader) FontUsage(ctx context.Context, options *OptimizationOptions) ([
 		limit := min(r.limits.MaxMetadataBytes, r.limits.MaxPartBytes, c.fonts.remaining)
 		data, err := r.pkg.readItems(key, limit)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		c.fonts.remaining -= int64(len(data))
 		tracker := newResourceMarkupScopeTracker(r.format, r.format == FormatOpenXPS, ctx)
@@ -2184,11 +2222,10 @@ func (r *Reader) FontUsage(ctx context.Context, options *OptimizationOptions) ([
 			return c.element(part, node)
 		})
 		if err != nil {
-			return nil, &PartError{Part: part, Err: err}
+			return nil, nil, &PartError{Part: part, Err: err}
 		}
-		namespace := formatNamespace(r.format)
-		if _, err := preprocessXMLContext(root, []string{namespace, namespace + "/resourcedictionary-key", structureNamespace(r.format)}, ctx); err != nil {
-			return nil, &PartError{Part: part, Err: err}
+		if _, err := preprocessXMLContext(root, []string{namespace, keyNS, structureNamespace(r.format)}, ctx); err != nil {
+			return nil, nil, &PartError{Part: part, Err: err}
 		}
 	}
 	var result []FontUsage
@@ -2207,10 +2244,20 @@ func (r *Reader) FontUsage(ctx context.Context, options *OptimizationOptions) ([
 		}
 		return 0
 	})
-	if err := checkContext(ctx); err != nil {
-		return nil, err
+	var implicitByPart map[string]map[uint32]map[rune]uint16
+	if len(c.implicit) != 0 {
+		implicitByPart = make(map[string]map[uint32]map[rune]uint16, len(c.implicit))
+		for fontKey, runeMap := range c.implicit {
+			if implicitByPart[fontKey.part] == nil {
+				implicitByPart[fontKey.part] = make(map[uint32]map[rune]uint16)
+			}
+			implicitByPart[fontKey.part][fontKey.index] = runeMap
+		}
 	}
-	return result, nil
+	if err := checkContext(ctx); err != nil {
+		return nil, nil, err
+	}
+	return result, implicitByPart, nil
 }
 
 // charge 在每个读取、节点或字形选择步骤前检查累计工作上限和取消信号
@@ -2259,7 +2306,11 @@ func (c *fontUsageCollector) element(part string, node *xmlElement) error {
 	if err != nil {
 		return err
 	}
-	glyphs := NewGlyphs("", 0, strings.TrimPrefix(attrs["UnicodeString"], "{}"))
+	unescaped, err := UnescapeUnicodeString(attrs["UnicodeString"])
+	if err != nil {
+		return err
+	}
+	glyphs := NewGlyphs("", 0, unescaped)
 	glyphs.FontPart, glyphs.CollectionIndex, glyphs.HasCollectionIndex = fontPart, face, present
 	glyphs.FontRenderingEmSize, _ = xmlNumber(attrs["FontRenderingEmSize"])
 	glyphs.Indices, _ = ParseGlyphIndices(attrs["Indices"])
@@ -2289,6 +2340,12 @@ func (c *fontUsageCollector) element(part string, node *xmlElement) error {
 			return err
 		}
 		indices[gid] = true
+		if c.implicit != nil && !entry.HasIndex && gid != 0 {
+			if c.implicit[key] == nil {
+				c.implicit[key] = make(map[rune]uint16)
+			}
+			c.implicit[key][character] = gid
+		}
 		return nil
 	})
 }
@@ -2310,7 +2367,7 @@ func fontUsageElement(name string) bool {
 	return false
 }
 
-// resolveGlyphRun 结合字形顶部缓存与取消检查解算Glyphs排布，不支持轮廓yMax时回退零值
+// resolveGlyphRun 结合字形顶部缓存与取消检查解算Glyphs排布，纯位图字体按位图度量回退，其余不支持轮廓yMax时回退零值
 // 入参: ctx 取消Context, glyphs 字形元素
 // 返回: *glyphRun 已排布字形运行, error 解算或取消错误
 func (s *fontSource) resolveGlyphRun(ctx context.Context, glyphs *Glyphs) (*glyphRun, error) {
@@ -2322,6 +2379,14 @@ func (s *fontSource) resolveGlyphRun(ctx context.Context, glyphs *Glyphs) (*glyp
 		v, err := s.glyphYMax(gid)
 		if err != nil {
 			if errors.Is(err, ErrUnsupported) {
+				if s.face != nil && s.face.tables["EBLC"] != (fontTable{}) {
+					if bv, bErr := s.bitmapGlyphYMax(gid); bErr == nil {
+						yMaxCache[gid] = bv
+						return bv, nil
+					} else if !errors.Is(bErr, ErrUnsupported) {
+						return 0, bErr
+					}
+				}
 				yMaxCache[gid] = 0
 				return 0, nil
 			}

@@ -60,14 +60,14 @@ type ICCNamedColor struct {
 	Device []float64
 }
 
-// ICCColorant 保存ICC色料表（clrt）单个通道的色料名称、连接空间坐标及显示近似sRGB
+// ICCColorant 保存ICC色料表（clrt/clot）单个通道的色料名称、连接空间坐标及显示近似sRGB，DeviceLink配置的PCS与SRGB为零值
 type ICCColorant struct {
 	Name string
 	PCS  [3]float64
 	SRGB color.NRGBA
 }
 
-// ICCProfileInfo 保存ICC配置文件的头部属性、默认渲染意图、可选命名色表及可选色料表与色料顺序信息
+// ICCProfileInfo 保存ICC配置文件的头部属性、默认渲染意图、可选命名色表及可选输入与输出色料表与色料顺序信息
 type ICCProfileInfo struct {
 	Version          uint32
 	Class            string
@@ -79,6 +79,7 @@ type ICCProfileInfo struct {
 	Colorants        []ICCColorant
 	ColorantOrder    []uint8
 	OrderedColorants []string
+	OutputColorants  []ICCColorant
 }
 
 // iccTag 保存标签的数据范围，多个标签可以共享完全相同的数据
@@ -130,7 +131,7 @@ type iccTransform struct {
 	named       []iccNamedColor
 }
 
-// InspectICCProfile 探测ICC配置文件头部、空间通道、默认渲染意图、可选ncl2命名专色表及可选clrt/clro色料表与铺墨顺序
+// InspectICCProfile 探测ICC配置文件头部、空间通道、默认渲染意图、可选ncl2命名专色表及可选clrt/clot/clro色料表与铺墨顺序
 // 入参: data ICC配置文件完整字节
 // 返回: *ICCProfileInfo 只读配置元数据, error 头部、标签、版本、命名色或色料表错误
 func InspectICCProfile(data []byte) (*ICCProfileInfo, error) {
@@ -169,7 +170,11 @@ func InspectICCProfile(data []byte) (*ICCProfileInfo, error) {
 			}
 		}
 	}
-	colorants, err := parseICCColorantTable(profile)
+	colorants, err := parseICCColorantTable(profile, false)
+	if err != nil {
+		return nil, err
+	}
+	outputColorants, err := parseICCColorantTable(profile, true)
 	if err != nil {
 		return nil, err
 	}
@@ -178,6 +183,7 @@ func InspectICCProfile(data []byte) (*ICCProfileInfo, error) {
 		return nil, err
 	}
 	info.Colorants = colorants
+	info.OutputColorants = outputColorants
 	info.ColorantOrder = order
 	if len(colorants) > 0 {
 		info.OrderedColorants = make([]string, len(colorants))
@@ -194,69 +200,116 @@ func InspectICCProfile(data []byte) (*ICCProfileInfo, error) {
 	return info, nil
 }
 
-// parseICCColorantTable 解析ICC规范clrt色料表标签，严格校验通道数、字节布局、尾随零填充及7位ASCII名称
-// 入参: profile 已解析ICC配置
-// 返回: []ICCColorant 按声明顺序排列的色料条目，缺失clrt时返回nil, error 结构、编码或通道数错误
-func parseICCColorantTable(profile *iccProfile) ([]ICCColorant, error) {
-	data := profile.tag("clrt")
+// parseICCColorantTable 解析ICC规范clrt输入色料表或DeviceLink的clot输出色料表标签
+// 入参: profile 已解析ICC配置, output 是否解析clot输出色料表
+// 返回: []ICCColorant 按声明顺序排列的色料条目，缺失目标标签时返回nil, error 结构、编码或通道数错误
+func parseICCColorantTable(profile *iccProfile, output bool) ([]ICCColorant, error) {
+	tag := "clrt"
+	if output {
+		tag = "clot"
+	}
+	data := profile.tag(tag)
 	if data == nil {
 		return nil, nil
 	}
-	if len(data) < 12 || string(data[:4]) != "clrt" || binary.BigEndian.Uint32(data[4:]) != 0 {
+	return parseICCColorantTableData(data, profile, output, false, nil)
+}
+
+// parseICCColorantTableData 统一校验并解析clrt/clot色料表二进制载荷，供读写两侧复用
+// 严格拒绝空色料名、重复色料名及NUL后非零填充；DeviceLink配置按ICC.1规范跳过PCS与SRGB转换
+// 入参: data 色料表原始标签字节, p 已解析ICC配置, output 是否为DeviceLink输出色料表, strictSize 是否禁止尾随对齐填充字节, step 可选工作量及取消回调
+// 返回: []ICCColorant 解析后的色料条目列表, error 结构、类型、编码、通道数、重复名或取消错误
+func parseICCColorantTableData(data []byte, p *iccProfile, output, strictSize bool, step func(uint64) error) ([]ICCColorant, error) {
+	if err := iccMetadataType(data, "clrt"); err != nil {
+		return nil, err
+	}
+	if len(data) < 12 {
 		return nil, fmt.Errorf("%w: ICC colorant table header", ErrInvalid)
 	}
+	channels := p.channels
+	if output {
+		if p.class != "link" {
+			return nil, fmt.Errorf("%w: ICC output colorant profile class", ErrInvalid)
+		}
+		channels = iccColorChannels(p.pcs)
+	}
+	if channels == 0 {
+		return nil, fmt.Errorf("%w: ICC colorant channels", ErrUnsupported)
+	}
 	count := uint64(binary.BigEndian.Uint32(data[8:]))
-	if count == 0 || count > iccMaxChannels || int(count) != profile.channels {
+	if count == 0 || count > iccMaxChannels || count != uint64(channels) {
 		return nil, fmt.Errorf("%w: ICC colorant table count", ErrInvalid)
 	}
 	const stride = 38
 	expected := uint64(12) + count*stride
-	if uint64(len(data)) < expected || uint64(len(data))-expected > 3 {
-		return nil, fmt.Errorf("%w: ICC colorant table size", ErrInvalid)
-	}
-	for _, value := range data[expected:] {
-		if value != 0 {
-			return nil, fmt.Errorf("%w: ICC colorant table padding", ErrInvalid)
+	if strictSize {
+		if uint64(len(data)) != expected {
+			return nil, fmt.Errorf("%w: ICC colorant table size", ErrInvalid)
+		}
+	} else {
+		if uint64(len(data)) < expected || uint64(len(data))-expected > 3 {
+			return nil, fmt.Errorf("%w: ICC colorant table size", ErrInvalid)
+		}
+		for _, value := range data[expected:] {
+			if value != 0 {
+				return nil, fmt.Errorf("%w: ICC colorant table padding", ErrInvalid)
+			}
 		}
 	}
+	names := make(map[string]bool, int(count))
 	entries := make([]ICCColorant, int(count))
 	for i := range count {
+		if step != nil {
+			if err := step(stride); err != nil {
+				return nil, err
+			}
+		}
 		row := data[12+i*stride : 12+(i+1)*stride]
 		name, err := iccNamedASCIIText(row[:32])
 		if err != nil {
 			return nil, err
 		}
-		var raw [3]uint16
-		for axis := range 3 {
-			raw[axis] = binary.BigEndian.Uint16(row[32+axis*2:])
+		if name == "" {
+			return nil, fmt.Errorf("%w: ICC empty colorant name", ErrInvalid)
 		}
-		var pcsCoord, xyz [3]float64
-		hasXYZ := false
-		if profile.pcs == "XYZ " {
-			for axis := range 3 {
-				xyz[axis] = float64(raw[axis]) / 32768
-			}
-			pcsCoord, hasXYZ = xyz, true
-		} else if profile.pcs == "Lab " {
-			if profile.version >= 0x04000000 {
-				pcsCoord = [3]float64{float64(raw[0]) * 100 / 65535, float64(raw[1])*255/65535 - 128, float64(raw[2])*255/65535 - 128}
-			} else {
-				pcsCoord = [3]float64{min(100, float64(raw[0])*100/65280), float64(raw[1])/256 - 128, float64(raw[2])/256 - 128}
-			}
-			xyz, hasXYZ = iccLabToXYZ(pcsCoord), true
-		} else {
-			for axis := range 3 {
-				pcsCoord[axis] = float64(raw[axis]) / 65535
-			}
+		if names[name] {
+			return nil, fmt.Errorf("%w: ICC duplicate colorant name", ErrInvalid)
 		}
+		names[name] = true
+		var pcsCoord [3]float64
 		var srgb color.NRGBA
-		if hasXYZ {
-			linear := iccMatrixColor(iccPCSDisplayMatrix, xyz)
-			srgb = color.NRGBA{
-				R: colorQuantize8(renderLinearToSRGB(colorClamp(linear[0]))),
-				G: colorQuantize8(renderLinearToSRGB(colorClamp(linear[1]))),
-				B: colorQuantize8(renderLinearToSRGB(colorClamp(linear[2]))),
-				A: 255,
+		if p.class != "link" {
+			var raw [3]uint16
+			for axis := range 3 {
+				raw[axis] = binary.BigEndian.Uint16(row[32+axis*2:])
+			}
+			var xyz [3]float64
+			hasXYZ := false
+			if p.pcs == "XYZ " {
+				for axis := range 3 {
+					xyz[axis] = float64(raw[axis]) / 32768
+				}
+				pcsCoord, hasXYZ = xyz, true
+			} else if p.pcs == "Lab " {
+				if p.version >= 0x04000000 {
+					pcsCoord = [3]float64{float64(raw[0]) * 100 / 65535, float64(raw[1])*255/65535 - 128, float64(raw[2])*255/65535 - 128}
+				} else {
+					pcsCoord = [3]float64{min(100, float64(raw[0])*100/65280), float64(raw[1])/256 - 128, float64(raw[2])/256 - 128}
+				}
+				xyz, hasXYZ = iccLabToXYZ(pcsCoord), true
+			} else {
+				for axis := range 3 {
+					pcsCoord[axis] = float64(raw[axis]) / 65535
+				}
+			}
+			if hasXYZ {
+				linear := iccMatrixColor(iccPCSDisplayMatrix, xyz)
+				srgb = color.NRGBA{
+					R: colorQuantize8(renderLinearToSRGB(colorClamp(linear[0]))),
+					G: colorQuantize8(renderLinearToSRGB(colorClamp(linear[1]))),
+					B: colorQuantize8(renderLinearToSRGB(colorClamp(linear[2]))),
+					A: 255,
+				}
 			}
 		}
 		entries[i] = ICCColorant{Name: name, PCS: pcsCoord, SRGB: srgb}
@@ -404,6 +457,20 @@ func (p *iccProfile) tag(name string) []byte {
 		return nil
 	}
 	return p.data[uint64(tag.offset) : uint64(tag.offset)+uint64(tag.size)]
+}
+
+// inputChannels 返回ICC配置用于颜色分量校验的输入通道数，命名专色配置取ncl2命名色数量
+// 返回: int 输入通道数
+func (p *iccProfile) inputChannels() int {
+	if p == nil {
+		return 0
+	}
+	if p.class == "nmcl" {
+		if ncl2 := p.tag("ncl2"); len(ncl2) >= 16 {
+			return int(binary.BigEndian.Uint32(ncl2[12:16]))
+		}
+	}
+	return p.channels
 }
 
 // iccFixed 解码ICC有符号15.16定点数
@@ -772,7 +839,7 @@ func validateCreatedICCMetadata(p *iccProfile, ctx context.Context) error {
 					err = fmt.Errorf("%w: ICC extension type header", ErrInvalid)
 				}
 			} else {
-				err = v.colorants(data, p, name == "clot")
+				_, err = parseICCColorantTableData(data, p, name == "clot", true, v.step)
 			}
 		case "chad":
 			err = iccMetadataAdaptation(data, major == 4)
@@ -1000,57 +1067,6 @@ func (v *iccMetadataValidator) sequence(data []byte, major uint32) error {
 	}
 	if position != uint64(len(data)) {
 		return fmt.Errorf("%w: ICC sequence size", ErrInvalid)
-	}
-	return nil
-}
-
-// colorants 校验色料表标签的名称、存储长度及对应通道数
-// 入参: data 色料表, p 配置文件, output 是否为设备链接的输出色料表
-// 返回: error 格式、能力、资源或取消错误
-func (v *iccMetadataValidator) colorants(data []byte, p *iccProfile, output bool) error {
-	if err := iccMetadataType(data, "clrt"); err != nil {
-		return err
-	}
-	if len(data) < 12 {
-		return fmt.Errorf("%w: ICC colorant header", ErrInvalid)
-	}
-	channels := p.channels
-	if output {
-		if p.class != "link" {
-			return fmt.Errorf("%w: ICC output colorant profile class", ErrInvalid)
-		}
-		channels = iccColorChannels(p.pcs)
-	}
-	if channels == 0 {
-		return fmt.Errorf("%w: ICC colorant channels", ErrUnsupported)
-	}
-	count := uint64(binary.BigEndian.Uint32(data[8:]))
-	if count != uint64(channels) || 12+38*count != uint64(len(data)) {
-		return fmt.Errorf("%w: ICC colorant count or size", ErrInvalid)
-	}
-	names := make(map[string]bool)
-	for i := uint64(0); i < count; i++ {
-		if err := v.step(38); err != nil {
-			return err
-		}
-		name := data[12+38*i : 44+38*i]
-		end := bytes.IndexByte(name, 0)
-		if end < 0 {
-			return fmt.Errorf("%w: ICC colorant name termination", ErrInvalid)
-		}
-		if err := v.ascii(name[:end+1]); err != nil {
-			return err
-		}
-		for _, value := range name[end:] {
-			if value != 0 {
-				return fmt.Errorf("%w: ICC colorant name padding", ErrInvalid)
-			}
-		}
-		key := string(name[:end])
-		if names[key] {
-			return fmt.Errorf("%w: ICC duplicate colorant name", ErrInvalid)
-		}
-		names[key] = true
 	}
 	return nil
 }
@@ -1335,10 +1351,10 @@ func validateCreatedICCLUT(p *iccProfile, name string, forward bool, inputs, out
 	return nil
 }
 
-// validateCreatedICCNamed 校验命名色表的完整记录，不将OpenXPS绘制时的色调数量限制套用于ICC封装
-// 入参: p 配置文件, ctx 取消Context
-// 返回: error 记录、通道、字符串或取消错误
-func validateCreatedICCNamed(p *iccProfile, ctx context.Context) error {
+// walkICCNamedColor 统一校验并遍历ncl2命名色表全部记录，供读写两侧复用
+// 入参: p 配置文件, ctx 可选取消Context, requireNonEmpty 是否拒绝零条记录, maxCount 可选记录数上限，零表示不限, visit 可选条目消费回调
+// 返回: error 头部、通道、长度、编码、上限或取消错误
+func walkICCNamedColor(p *iccProfile, ctx context.Context, requireNonEmpty bool, maxCount uint64, visit func(count int, prefix, suffix, name string, pcs [3]uint16, devBytes []byte) error) error {
 	data := p.tag("ncl2")
 	if len(data) < 84 || string(data[:4]) != "ncl2" || binary.BigEndian.Uint32(data[4:]) != 0 {
 		return fmt.Errorf("%w: ICC named color header", ErrInvalid)
@@ -1348,7 +1364,7 @@ func validateCreatedICCNamed(p *iccProfile, ctx context.Context) error {
 		return fmt.Errorf("%w: ICC named color device coordinates", ErrInvalid)
 	}
 	stride := uint64(38) + 2*device
-	if count > (uint64(len(data))-84)/stride {
+	if requireNonEmpty && count == 0 || count > (uint64(len(data))-84)/stride {
 		return fmt.Errorf("%w: ICC named color length", ErrInvalid)
 	}
 	expected := uint64(84) + count*stride
@@ -1360,20 +1376,49 @@ func validateCreatedICCNamed(p *iccProfile, ctx context.Context) error {
 			return fmt.Errorf("%w: ICC named color padding", ErrInvalid)
 		}
 	}
-	for _, text := range [][]byte{data[20:52], data[52:84]} {
-		if err := iccNamedASCII(text); err != nil {
-			return err
-		}
+	if maxCount > 0 && count > maxCount {
+		return fmt.Errorf("%w: ICC named color count", ErrLimit)
 	}
-	for index := range count {
+	prefix, err := iccNamedASCIIText(data[20:52])
+	if err != nil {
+		return err
+	}
+	suffix, err := iccNamedASCIIText(data[52:84])
+	if err != nil {
+		return err
+	}
+	for i := range count {
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
-		if err := iccNamedASCII(data[84+index*stride : 116+index*stride]); err != nil {
+		row := data[84+i*stride : 84+(i+1)*stride]
+		name, err := iccNamedASCIIText(row[:32])
+		if err != nil {
 			return err
+		}
+		if visit != nil {
+			pcs := [3]uint16{
+				binary.BigEndian.Uint16(row[32:]),
+				binary.BigEndian.Uint16(row[34:]),
+				binary.BigEndian.Uint16(row[36:]),
+			}
+			var devBytes []byte
+			if device != 0 {
+				devBytes = row[38:]
+			}
+			if err := visit(int(count), prefix, suffix, name, pcs, devBytes); err != nil {
+				return err
+			}
 		}
 	}
 	return checkContext(ctx)
+}
+
+// validateCreatedICCNamed 校验命名色表的完整记录，不将OpenXPS绘制时的色调数量限制套用于ICC封装
+// 入参: p 配置文件, ctx 取消Context
+// 返回: error 记录、通道、字符串或取消错误
+func validateCreatedICCNamed(p *iccProfile, ctx context.Context) error {
+	return walkICCNamedColor(p, ctx, false, 0, nil)
 }
 
 // prepareICCTarget 按目标意图选择B2A，缺省表不存在时使用允许的矩阵或灰阶模型
