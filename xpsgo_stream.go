@@ -95,42 +95,46 @@ type StreamProgress struct {
 
 // streamEntry 保存已经消费并校验的物理载荷范围，不分配完整解压部件
 type streamEntry struct {
-	header       zip.FileHeader
-	offset       int64
-	data         int64
-	finish       int64
-	localZIP64   bool
-	headerFreed  bool
-	payloadFreed bool
+	header            zip.FileHeader
+	offset            int64
+	data              int64
+	finish            int64
+	localZIP64        bool
+	headerFreed       bool
+	payloadFreed      bool
+	headerFreedBytes  int64
+	payloadFreedBytes int64
+	trailerFreedBytes int64
 }
 
 // streamPart 保存完整或待组装的逻辑部件，last为末片编号，whole排除整部件和分片混用
 type streamPart struct {
-	name                string
-	entries             map[int]*streamEntry
-	last                int
-	bytes               uint64
-	whole               bool
-	emitted             bool
-	reclaimed           bool
-	reclaimPending      bool
-	relsVerified        bool
-	relsRecorded        bool
-	pageDelivered       bool
-	deliveredRelsClosed bool
-	deliveredPageTicket string
-	ticketVerified      bool
-	xml                 *streamXMLParser
-	xmlNext             int
-	xmlTokens           int
-	xmlDone             bool
-	xmlDeferred         bool
-	xmlMetadata         bool
-	xmlReplay           int
-	control             *streamPartialDiscard
-	layout              *streamPartialLayout
-	relations           *streamPartialRelationships
-	page                *streamPartialPage
+	name                 string
+	entries              map[int]*streamEntry
+	last                 int
+	bytes                uint64
+	whole                bool
+	emitted              bool
+	reclaimed            bool
+	partiallyReclaimed   bool
+	reclaimPending       bool
+	relsVerified         bool
+	relsRecorded         bool
+	pageDelivered        bool
+	deliveredRelsClosed  bool
+	deliveredPageTicket  string
+	ticketVerifiedScopes uint8
+	xml                  *streamXMLParser
+	xmlNext              int
+	xmlTokens            int
+	xmlDone              bool
+	xmlDeferred          bool
+	xmlMetadata          bool
+	xmlReplay            int
+	control              *streamPartialDiscard
+	layout               *streamPartialLayout
+	relations            *streamPartialRelationships
+	page                 *streamPartialPage
 }
 
 // streamDeliveredPage 保存已交付页面的完结状态、关系快照、依赖资源与三级票据，用于EOF跳过未变更页重复全解析
@@ -160,61 +164,67 @@ type streamCachedTicket struct {
 
 // streamPackage 保存前向读取的物理索引、逻辑部件组装状态及内容类型表
 type streamPackage struct {
-	input               *streamInput
-	options             StreamReadOptions
-	context             context.Context
-	consumeOnly         bool
-	ownedMemory         *streamMemory
-	reclaimed           bool
-	centralVerified     bool
-	entries             []*streamEntry
-	parts               map[string]*streamPart
-	seen                map[string]bool
-	types               *packageReader
-	bytes               uint64
-	deferred            bool
-	pagePkg             *packageReader
-	index               *Reader
-	pages               int
-	pageValidated       bool
-	pageWait            map[string]bool
-	pageMissing         map[string]bool
-	pageResources       []string
-	pageHold            bool
-	deliveredPages      []streamDeliveredPage
-	documents           []string
-	document            int
-	documentKeys        map[string]bool
-	sequenceRead        bool
-	seenPages           map[string]bool
-	pageNames           map[string]bool
-	cache               *streamResourceCache
-	discard             *streamDiscardState
-	discardTarget       string
-	xmlActive           int
-	xmlNodes            int
-	xmlBindings         int
-	xmlQueue            []*streamPart
-	xmlResuming         bool
-	corePropsDelivered  bool
-	corePropsCached     *CoreProperties
-	corePropsTarget     string
-	jobTicketDelivered  bool
-	jobTicketTarget     string
-	ticketTargets       map[string]string
-	deliveredJobSet     bool
-	deliveredJobTicket  string
-	deliveredDocTickets map[int]string
-	docStructDelivered  map[int]bool
-	docStructCached     map[int]*DocumentStructure
-	docStructMaxPage    map[int]int
-	docStructTargets    map[string]string
-	reclaimedDocuments  map[int]bool
-	activeDocument      int
-	nextDocumentStart   int
-	deliveredDocuments  int
-	ticketMu            sync.RWMutex
-	ticketCache         map[streamTicketCacheKey]streamCachedTicket
+	input                *streamInput
+	options              StreamReadOptions
+	context              context.Context
+	consumeOnly          bool
+	ownedMemory          *streamMemory
+	reclaimed            bool
+	centralVerified      bool
+	entries              []*streamEntry
+	parts                map[string]*streamPart
+	seen                 map[string]bool
+	types                *packageReader
+	bytes                uint64
+	deferred             bool
+	pagePkg              *packageReader
+	index                *Reader
+	pages                int
+	pageValidated        bool
+	pageWait             map[string]bool
+	pageMissing          map[string]bool
+	pageResources        []string
+	pageHold             bool
+	deliveredPages       []streamDeliveredPage
+	documents            []string
+	document             int
+	documentKeys         map[string]bool
+	sequenceRead         bool
+	seenPages            map[string]bool
+	pageNames            map[string]bool
+	cache                *streamResourceCache
+	discard              *streamDiscardState
+	discardTarget        string
+	xmlActive            int
+	xmlNodes             int
+	xmlBindings          int
+	xmlQueue             []*streamPart
+	xmlResuming          bool
+	corePropsDelivered   bool
+	corePropsCached      *CoreProperties
+	corePropsTarget      string
+	jobTicketDelivered   bool
+	jobTicketTarget      string
+	ticketTargets        map[string]string
+	ticketSources        map[string]string
+	ticketRequiredScopes map[string]uint8
+	deliveredJobSet      bool
+	deliveredJobTicket   string
+	deliveredDocTickets  map[int]string
+	docStructDelivered   map[int]bool
+	docStructCached      map[int]*DocumentStructure
+	docStructMaxPage     map[int]int
+	docStructTargets     map[string]string
+	reclaimedDocuments   map[int]bool
+	activeDocument       int
+	nextDocumentStart    int
+	deliveredDocuments   int
+	pendingEnvelopes     []*streamEntry
+	pendingParts         map[string]bool
+	pinnedParts          map[string]int
+	onConsumeFinish      func(*Reader, bool) error
+	ticketMu             sync.RWMutex
+	ticketCache          map[streamTicketCacheKey]streamCachedTicket
 }
 
 // streamCachedResource 保存独立且不再修改的部件字节，活动读取器可在缓存淘汰后继续读取
@@ -263,12 +273,14 @@ type streamLimitedInput struct {
 
 // streamInput 记录真正消费的字节并批量存储，为Deflate提供不越过码流结尾的ReadByte
 type streamInput struct {
-	reader  *bufio.Reader
-	storage StreamStorage
-	context context.Context
-	limit   int64
-	count   int64
-	pending []byte
+	reader      *bufio.Reader
+	storage     StreamStorage
+	ownedMemory *streamMemory
+	onLimit     func() int64
+	context     context.Context
+	limit       int64
+	count       int64
+	pending     []byte
 }
 
 // streamPartialDiscard 保存释放提示的根声明和已闭合子元素，不把未结束元素作为完整提示
@@ -487,23 +499,37 @@ func Read(ctx context.Context, input io.Reader, options *StreamReadOptions) (*Re
 // 入参: ctx 取消Context，nil采用Background, input 前向输入, options 存储、预算、票据策略及回调参数，nil采用默认值
 // 返回: error 输入、封装、结构、存储、回调、预算或取消错误
 func ConsumeStream(ctx context.Context, input io.Reader, options *StreamReadOptions) error {
+	return consumeStreamInternal(ctx, input, options, nil)
+}
+
+// consumeStreamInternal 执行纯前向流式消费并在流收尾释放存储前触发可选完成钩子
+// 入参: ctx 取消Context, input 前向输入, options 读取选项, onFinish 流消费完成时的收尾钩子
+// 返回: error 输入、封装、结构、存储、回调、预算或取消错误
+func consumeStreamInternal(ctx context.Context, input io.Reader, options *StreamReadOptions, onFinish func(*Reader, bool) error) error {
 	ctx, configuration, err := normalizeStreamReadOptions(ctx, input, options)
 	if err != nil {
 		return err
 	}
 	var owned *streamMemory
 	storage := configuration.Storage
+	pendingCap := streamBufferBytes
 	if storage == nil {
 		owned = &streamMemory{limit: min(configuration.MaxMemoryBytes, configuration.MaxInputBytes), reclaim: true}
 		storage = owned
 		defer owned.Close()
+		if owned.limit < int64(pendingCap) {
+			pendingCap = int(max(owned.limit, 1))
+		}
 	}
 	inputBytes := configuration.MaxInputBytes
 	if inputBytes < math.MaxInt64 {
 		inputBytes++
 	}
-	feed := &streamInput{reader: bufio.NewReaderSize(io.LimitReader(input, inputBytes), streamBufferBytes), storage: storage, context: ctx, limit: configuration.MaxInputBytes, pending: make([]byte, 0, streamBufferBytes)}
-	p := streamPackage{input: feed, options: configuration, context: ctx, consumeOnly: true, ownedMemory: owned, parts: make(map[string]*streamPart), seen: make(map[string]bool)}
+	feed := &streamInput{reader: bufio.NewReaderSize(io.LimitReader(input, inputBytes), streamBufferBytes), storage: storage, ownedMemory: owned, context: ctx, limit: configuration.MaxInputBytes, pending: make([]byte, 0, pendingCap)}
+	p := streamPackage{input: feed, options: configuration, context: ctx, consumeOnly: true, ownedMemory: owned, parts: make(map[string]*streamPart), seen: make(map[string]bool), onConsumeFinish: onFinish}
+	if owned != nil {
+		feed.onLimit = p.reclaimPendingStorage
+	}
 	defer p.closeXML()
 	if configuration.OnPage != nil {
 		p.cache = &streamResourceCache{limit: min(configuration.MaxCacheBytes, configuration.Limits.MaxPartBytes, configuration.Limits.MaxPackageBytes)}
@@ -532,6 +558,11 @@ func ConsumeStream(ctx context.Context, input io.Reader, options *StreamReadOpti
 	}
 	if err := p.verifyFallbackConsume(r); err != nil {
 		return err
+	}
+	if p.onConsumeFinish != nil {
+		if err := p.onConsumeFinish(r, true); err != nil {
+			return err
+		}
 	}
 	return checkContext(ctx)
 }
@@ -562,7 +593,7 @@ func (p *streamPackage) finalizeRandomAccess(r *Reader) error {
 	if err := p.finishPages(r); err != nil {
 		return err
 	}
-	return p.finishDocumentEvents(r)
+	return p.advanceDocumentEvents(r, true)
 }
 
 // needsIndex 判断当前流式消费是否需要建立临时包后端与文档索引
@@ -588,7 +619,7 @@ func (p *streamPackage) consume() error {
 		if sig != packageZIPLocalSignature {
 			if p.consumeOnly && offset != 0 && (sig == packageZIPCentralSignature || sig == packageZIPEndSignature || sig == packageZIP64EndSignature || sig == packageZIPDigitalSignature) {
 				if p.ownedMemory != nil {
-					p.reclaimRange(offset, p.input.count)
+					p.reclaimRangeProgress(offset, p.input.count, true)
 				}
 				return p.verifyStreamCentralDirectory(sig, offset)
 			}
@@ -645,8 +676,7 @@ func (p *streamPackage) accept(entry *streamEntry) error {
 			}
 		}
 		if p.consumeOnly && p.ownedMemory != nil && !entry.payloadFreed {
-			entry.payloadFreed = true
-			p.reclaimRange(entry.data, entry.data+int64(entry.header.CompressedSize64))
+			p.reclaimEntryPayloadMode(entry, true)
 		}
 		return nil
 	}
@@ -1219,6 +1249,12 @@ func validStreamNextZIPSignature(sig uint32) bool {
 	return sig == packageZIPLocalSignature || sig == packageZIPCentralSignature || sig == packageZIPEndSignature || sig == packageZIP64EndSignature || sig == packageZIPDigitalSignature
 }
 
+// allowRandomAccess 判断当前流式消费状态是否仍保留全部物理字节以允许回退至随机访问解析
+// 返回: bool 是否允许回退随机访问
+func (p *streamPackage) allowRandomAccess() bool {
+	return !p.consumeOnly || !p.reclaimed
+}
+
 // readStoreDescriptorEntry 流式读取Store加Data Descriptor条目，在滑动窗口中以CRC、双尺寸与后续ZIP签名联合确认边界
 // 入参: offset 本地头起点偏移, header 本地头, uncompressed 本地头声明未压缩尺寸, wide 是否启用ZIP64扩展, buffer 复用缓冲
 // 返回: *streamEntry 已校验条目, bool 未找到签名描述符需延迟至中央目录, error 预算、输入或取消错误
@@ -1233,18 +1269,16 @@ func (p *streamPackage) readStoreDescriptorEntry(offset int64, header zip.FileHe
 	}
 	checksum := crc32.NewIEEE()
 	var count uint64
+	var descBuf [24]byte
+	sawBadSigned := false
+	sawEOCD := false
+	passedNextHeader := false
 	consumePayload := func(size int) (bool, error) {
 		for size > 0 {
 			step := min(size, len(buffer))
 			partRemain := uint64(p.options.Limits.MaxPartBytes) - count
 			pkgRemain := uint64(p.options.Limits.MaxPackageBytes) - p.bytes
-			if uint64(step) > partRemain && partRemain < pkgRemain {
-				return true, nil
-			}
-			if uint64(step) > pkgRemain {
-				return false, fmt.Errorf("%w: streamed decoded bytes", ErrLimit)
-			}
-			if uint64(step) > partRemain {
+			if uint64(step) > partRemain || uint64(step) > pkgRemain {
 				return true, nil
 			}
 			if _, err := io.ReadFull(p.input, buffer[:step]); err != nil {
@@ -1257,13 +1291,9 @@ func (p *streamPackage) readStoreDescriptorEntry(offset int64, header zip.FileHe
 		}
 		return false, nil
 	}
-	var descBuf [24]byte
-	sawBadSigned := false
-	sawEOCD := false
-	passedNextHeader := false
 	deferPartLimit := func() (*streamEntry, bool, error) {
 		p.bytes = startBytes
-		if p.reclaimed {
+		if !p.allowRandomAccess() {
 			if sawBadSigned {
 				return nil, false, fmt.Errorf("%w: streamed descriptor CRC or sizes", ErrInvalid)
 			}
@@ -1273,7 +1303,7 @@ func (p *streamPackage) readStoreDescriptorEntry(offset int64, header zip.FileHe
 	}
 	finishEOF := func() (*streamEntry, bool, error) {
 		p.bytes = startBytes
-		if p.reclaimed && (sawBadSigned || !sawEOCD) {
+		if !p.allowRandomAccess() && (sawBadSigned || !sawEOCD) {
 			return nil, false, fmt.Errorf("%w: streamed descriptor CRC or sizes", ErrInvalid)
 		}
 		return nil, true, nil
@@ -1381,7 +1411,7 @@ func (p *streamPackage) readStoreDescriptorEntry(offset int64, header zip.FileHe
 				descUncomp = binary.LittleEndian.Uint64(cand[16:24])
 			}
 			if descCRC != actualCRC || descComp != count || descUncomp != count || header.CRC32 != 0 && header.CRC32 != descCRC || uncompressed != 0 && uncompressed != count {
-				if !passedNextHeader {
+				if !passedNextHeader && (descComp == count && descUncomp == count || descCRC == actualCRC) {
 					sawBadSigned = true
 				}
 				continue
@@ -1544,7 +1574,41 @@ func (s *streamInput) store(data []byte) error {
 	return nil
 }
 
-// flush 将当前缓冲完整写入随机存储，不吞掉短写及原始存储错误
+// flushAvailable 按可回收内存存储当前剩余可用配额增量刷出待写缓冲前缀，不触发递归回收或ErrLimit
+// 返回: int64 本次实际刷入存储的字节数, error 存储或取消错误
+func (s *streamInput) flushAvailable() (int64, error) {
+	if err := checkContext(s.context); err != nil {
+		return 0, err
+	}
+	if len(s.pending) == 0 || s.ownedMemory == nil {
+		return 0, nil
+	}
+	var total int64
+	for len(s.pending) > 0 {
+		avail := s.ownedMemory.availableBytes()
+		if avail <= 0 {
+			break
+		}
+		chunk := int(min(int64(len(s.pending)), avail))
+		n, err := s.storage.WriteAt(s.pending[:chunk], s.count-int64(len(s.pending)))
+		if n < 0 || n > chunk {
+			return total, fmt.Errorf("%w: stream storage write count", ErrInvalid)
+		}
+		if err != nil {
+			return total, err
+		}
+		if n != chunk {
+			return total, io.ErrShortWrite
+		}
+		remaining := len(s.pending) - n
+		copy(s.pending, s.pending[n:])
+		s.pending = s.pending[:remaining]
+		total += int64(n)
+	}
+	return total, nil
+}
+
+// flush 将当前缓冲完整写入随机存储，在可回收内存模式下遇配额不足先推进待回收前缀再续写
 // 返回: error 存储、计数或取消错误
 func (s *streamInput) flush() error {
 	if err := checkContext(s.context); err != nil {
@@ -1553,17 +1617,36 @@ func (s *streamInput) flush() error {
 	if len(s.pending) == 0 {
 		return nil
 	}
-	n, err := s.storage.WriteAt(s.pending, s.count-int64(len(s.pending)))
-	if n < 0 || n > len(s.pending) {
-		return fmt.Errorf("%w: stream storage write count", ErrInvalid)
+	if s.ownedMemory == nil {
+		n, err := s.storage.WriteAt(s.pending, s.count-int64(len(s.pending)))
+		if n < 0 || n > len(s.pending) {
+			return fmt.Errorf("%w: stream storage write count", ErrInvalid)
+		}
+		if err != nil {
+			return err
+		}
+		if n != len(s.pending) {
+			return io.ErrShortWrite
+		}
+		s.pending = s.pending[:0]
+		return nil
 	}
-	if err != nil {
-		return err
+	for len(s.pending) > 0 {
+		wrote, err := s.flushAvailable()
+		if err != nil {
+			return err
+		}
+		if len(s.pending) == 0 {
+			return nil
+		}
+		var freed int64
+		if s.onLimit != nil {
+			freed = s.onLimit()
+		}
+		if wrote == 0 && freed == 0 {
+			return fmt.Errorf("%w: stream memory bytes", ErrLimit)
+		}
 	}
-	if n != len(s.pending) {
-		return io.ErrShortWrite
-	}
-	s.pending = s.pending[:0]
 	return nil
 }
 
@@ -1837,9 +1920,6 @@ func (p *streamPackage) tryReclaimWithoutPage(part *streamPart, key, media strin
 	if p.options.OnJobPrintTicket != nil && !p.jobTicketDelivered && (p.jobTicketTarget == "" && (p.index == nil || streamPotentialPrintTicketMedia(p.index.format, media)) || strings.EqualFold(part.name, p.jobTicketTarget)) {
 		return nil
 	}
-	if known, capabilities := printResourceMedia(base); known && !capabilities && !part.ticketVerified {
-		return nil
-	}
 	if strings.EqualFold(base, fixedContentType("fixedpage")) {
 		if p.index == nil || !p.pageNames[key] {
 			return nil
@@ -2011,7 +2091,7 @@ func (s *streamMemory) WriteAt(data []byte, offset int64) (int, error) {
 			return 0, fmt.Errorf("%w: stream memory bytes", ErrLimit)
 		}
 		if s.chunkSize <= 0 {
-			s.chunkSize = min(int64(streamBufferBytes), max(s.limit, 1))
+			s.chunkSize = min(int64(streamBufferBytes), max(s.limit/32, min(s.limit, 4096)), max(s.limit, 1))
 		}
 		if s.liveChunks == nil {
 			s.liveChunks = make(map[int][]byte)
@@ -2099,6 +2179,20 @@ func (s *streamMemory) ReadAt(output []byte, offset int64) (int, error) {
 	return count, nil
 }
 
+// availableBytes 返回可回收内存存储当前剩余可用驻留字节配额
+// 返回: int64 剩余可用字节配额
+func (s *streamMemory) availableBytes() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return 0
+	}
+	if s.reclaim {
+		return max(s.limit-s.live, 0)
+	}
+	return max(s.limit-s.size, 0)
+}
+
 // writtenSize 返回当前已落入内存存储的逻辑总字节数
 // 返回: int64 已写入字节数
 func (s *streamMemory) writtenSize() int64 {
@@ -2160,44 +2254,189 @@ func (s *streamMemory) Close() error {
 	return nil
 }
 
-// reclaimRange 刷出待提交输入后释放指定逻辑偏移区间的内存块，仅在真实释放底层块后才标记已回收
-// 入参: start 起始偏移, end 结束偏移
-// 返回: int64 释放的块字节数
-func (p *streamPackage) reclaimRange(start, end int64) int64 {
+// reclaimRangeProgress 优先释放已落盘前缀再按需增量刷盘释放尾段，不提前吞错也不重复释放同一区间
+// 入参: start 起始逻辑偏移, end 结束逻辑偏移, allowFlush 是否允许增量刷出待提交输入缓冲
+// 返回: int64 本次实际归还的块字节数, int64 推进后的下一未释放偏移, bool 是否已覆盖整个区间
+func (p *streamPackage) reclaimRangeProgress(start, end int64, allowFlush bool) (int64, int64, bool) {
 	if p.ownedMemory == nil || end <= start {
-		return 0
+		return 0, end, true
 	}
-	if end > p.ownedMemory.writtenSize() {
-		if err := p.input.flush(); err != nil {
-			return 0
+	var total int64
+	pos := start
+	for pos < end {
+		written := p.ownedMemory.writtenSize()
+		if pos < written {
+			prefixEnd := min(end, written)
+			reclaimed, released := p.ownedMemory.releaseRange(pos, prefixEnd)
+			if released {
+				p.reclaimed = true
+			}
+			total += reclaimed
+			pos = prefixEnd
+			if pos >= end {
+				return total, pos, true
+			}
+		}
+		if !allowFlush {
+			return total, pos, false
+		}
+		wrote, err := p.input.flushAvailable()
+		if err != nil || wrote == 0 {
+			return total, pos, false
 		}
 	}
-	reclaimed, released := p.ownedMemory.releaseRange(start, end)
-	if released {
-		p.reclaimed = true
-	}
-	return reclaimed
+	return total, pos, true
 }
 
-// reclaimEntryEnvelope 释放物理条目的本地头与数据描述符字节范围
+// reclaimEntryEnvelopeMode 按指定刷盘模式释放物理条目的本地头与数据描述符范围，全部释放后才置headerFreed
+// 入参: entry 已校验物理条目, allowFlush 是否允许增量刷盘
+// 返回: int64 本次释放的块字节数, bool 条目外层范围是否已全部释放
+func (p *streamPackage) reclaimEntryEnvelopeMode(entry *streamEntry, allowFlush bool) (int64, bool) {
+	if p.ownedMemory == nil || entry == nil {
+		return 0, true
+	}
+	if entry.headerFreed {
+		return 0, true
+	}
+	var total int64
+	headStart := entry.offset + entry.headerFreedBytes
+	headFreed, headPos, headDone := p.reclaimRangeProgress(headStart, entry.data, allowFlush)
+	total += headFreed
+	entry.headerFreedBytes = headPos - entry.offset
+	payloadEnd := entry.data + int64(entry.header.CompressedSize64)
+	tailDone := true
+	if entry.finish > payloadEnd {
+		tailStart := payloadEnd + entry.trailerFreedBytes
+		tailFreed, tailPos, ok := p.reclaimRangeProgress(tailStart, entry.finish, allowFlush)
+		total += tailFreed
+		entry.trailerFreedBytes = tailPos - payloadEnd
+		tailDone = ok
+	}
+	if headDone && tailDone {
+		entry.headerFreed = true
+		return total, true
+	}
+	return total, false
+}
+
+// reclaimEntryEnvelope 释放物理条目的本地头与数据描述符字节范围，未完全落盘时登记延迟重试队列
 // 入参: entry 已校验物理条目
 func (p *streamPackage) reclaimEntryEnvelope(entry *streamEntry) {
 	if p.ownedMemory == nil || entry == nil || entry.headerFreed {
 		return
 	}
-	entry.headerFreed = true
-	p.reclaimRange(entry.offset, entry.data)
-	payloadEnd := entry.data + int64(entry.header.CompressedSize64)
-	if entry.finish > payloadEnd {
-		p.reclaimRange(payloadEnd, entry.finish)
+	if _, done := p.reclaimEntryEnvelopeMode(entry, true); !done {
+		if !slices.Contains(p.pendingEnvelopes, entry) {
+			p.pendingEnvelopes = append(p.pendingEnvelopes, entry)
+		}
 	}
 }
 
-// canReclaimPart 判断逻辑部件是否已经完整到达、已完成关系验证且不阻塞任何未完成的外部回调
+// reclaimEntryPayloadMode 按指定刷盘模式释放物理条目的压缩载荷范围，全部释放后才置payloadFreed
+// 入参: entry 已校验物理条目, allowFlush 是否允许增量刷盘
+// 返回: int64 本次释放的块字节数, bool 载荷范围是否已全部释放
+func (p *streamPackage) reclaimEntryPayloadMode(entry *streamEntry, allowFlush bool) (int64, bool) {
+	if p.ownedMemory == nil || entry == nil {
+		return 0, true
+	}
+	if entry.payloadFreed {
+		return 0, true
+	}
+	payloadEnd := entry.data + int64(entry.header.CompressedSize64)
+	start := entry.data + entry.payloadFreedBytes
+	freed, nextPos, done := p.reclaimRangeProgress(start, payloadEnd, allowFlush)
+	entry.payloadFreedBytes = nextPos - entry.data
+	if done {
+		entry.payloadFreed = true
+	}
+	return freed, done
+}
+
+// reclaimPendingStorage 推进全部延迟未完全释放条目与部件的已落盘前缀回收，供flush在撞限时打破死锁
+// 返回: int64 本次实际释放的块字节数
+func (p *streamPackage) reclaimPendingStorage() int64 {
+	return p.reclaimPendingStorageMode(false)
+}
+
+// reclaimPendingStorageMode 按指定刷盘模式重试全部未完全释放条目与部件的回收并清理已完成项
+// 入参: allowFlush 是否允许增量刷盘
+// 返回: int64 本次实际释放的块字节数
+func (p *streamPackage) reclaimPendingStorageMode(allowFlush bool) int64 {
+	if p.ownedMemory == nil {
+		return 0
+	}
+	var total int64
+	if len(p.pendingEnvelopes) != 0 {
+		remaining := p.pendingEnvelopes[:0]
+		for _, entry := range p.pendingEnvelopes {
+			if entry == nil || entry.headerFreed {
+				continue
+			}
+			freed, done := p.reclaimEntryEnvelopeMode(entry, allowFlush)
+			total += freed
+			if !done {
+				remaining = append(remaining, entry)
+			}
+		}
+		if len(remaining) == 0 {
+			p.pendingEnvelopes = nil
+		} else {
+			p.pendingEnvelopes = remaining
+		}
+	}
+	if len(p.pendingParts) != 0 {
+		for _, key := range slices.Sorted(maps.Keys(p.pendingParts)) {
+			freed, done := p.reclaimPartMode(key, allowFlush)
+			total += freed
+			if done {
+				delete(p.pendingParts, key)
+			}
+		}
+		if len(p.pendingParts) == 0 {
+			p.pendingParts = nil
+		}
+	}
+	return total
+}
+
+// pinPart 增加指定逻辑部件的窗口引用计数以阻止流式内存与丢弃提示提前物理回收
+// 入参: key 小写规范部件键
+func (p *streamPackage) pinPart(key string) {
+	if key == "" {
+		return
+	}
+	if p.pinnedParts == nil {
+		p.pinnedParts = make(map[string]int)
+	}
+	p.pinnedParts[key]++
+}
+
+// unpinPart 减少指定逻辑部件的窗口引用计数，归零且存在待回收标记时立即回收其压缩存储
+// 入参: key 小写规范部件键
+func (p *streamPackage) unpinPart(key string) {
+	if key == "" || p.pinnedParts == nil {
+		return
+	}
+	count := p.pinnedParts[key]
+	if count <= 1 {
+		delete(p.pinnedParts, key)
+		if part := p.parts[key]; part != nil && part.reclaimPending && p.canReclaimPart(part) {
+			p.reclaimPart(key)
+		}
+		return
+	}
+	p.pinnedParts[key] = count - 1
+}
+
+// canReclaimPart 判断逻辑部件是否已经完整到达、已完成关系与多作用域票据验证且未被窗口锁定或阻塞外部回调
 // 入参: part 目标逻辑部件
 // 返回: bool 是否可以立即释放压缩存储
 func (p *streamPackage) canReclaimPart(part *streamPart) bool {
 	if part == nil || part.reclaimed || part.last < 0 || len(part.entries) != part.last+1 {
+		return false
+	}
+	key := strings.ToLower(part.name)
+	if p.pinnedParts[key] > 0 {
 		return false
 	}
 	if p.options.OnPart != nil && !part.emitted {
@@ -2209,15 +2448,21 @@ func (p *streamPackage) canReclaimPart(part *streamPart) bool {
 	if p.consumeOnly && opcRelationshipName(part.name) && (!part.relsVerified || !part.relsRecorded) {
 		return false
 	}
-	if p.consumeOnly && p.types != nil && !part.ticketVerified {
+	if p.consumeOnly && p.types != nil {
 		if known, capabilities := printResourceMedia(opcMediaTypeBase(p.types.declaredContentType(part.name))); known && !capabilities {
-			return false
+			if !p.centralVerified {
+				return false
+			}
+			required := p.ticketRequiredScopes[key]
+			if required == 0 || part.ticketVerifiedScopes&required != required {
+				return false
+			}
 		}
 	}
 	return true
 }
 
-// requestReclaimPart 请求回收逻辑部件存储，若当前被回调或关系检验阻塞则打延迟回收标记
+// requestReclaimPart 请求回收逻辑部件存储，若当前被回调、窗口锁定或验证阻塞则打延迟回收标记
 // 入参: key 小写规范部件键
 // 返回: int64 立即回收的块字节数
 func (p *streamPackage) requestReclaimPart(key string) int64 {
@@ -2235,47 +2480,88 @@ func (p *streamPackage) requestReclaimPart(key string) int64 {
 	return 0
 }
 
-// reclaimPart 释放逻辑部件全部分片的原始压缩载荷、内存树、条目映射与缓存条目
+// reclaimPart 释放逻辑部件全部分片的原始压缩载荷、内存树、条目映射与缓存条目，未完全落盘时保留重试状态
 // 入参: key 小写规范部件键
 // 返回: int64 实际回收的块字节数
 func (p *streamPackage) reclaimPart(key string) int64 {
+	reclaimed, done := p.reclaimPartMode(key, true)
+	if !done {
+		if part := p.parts[key]; part != nil && !part.reclaimed {
+			part.reclaimPending = true
+			if p.pendingParts == nil {
+				p.pendingParts = make(map[string]bool)
+			}
+			p.pendingParts[key] = true
+		}
+	}
+	return reclaimed
+}
+
+// reclaimPartMode 按指定刷盘模式释放逻辑部件各分片存储，仅全部区间释放完成后才标记reclaimed并清空条目表
+// 入参: key 小写规范部件键, allowFlush 是否允许增量刷盘
+// 返回: int64 本次回收的块字节数, bool 该部件是否已完全释放
+func (p *streamPackage) reclaimPartMode(key string, allowFlush bool) (int64, bool) {
 	if p.ownedMemory == nil {
-		return 0
+		return 0, true
 	}
 	part := p.parts[key]
 	if part == nil || part.reclaimed {
-		return 0
+		return 0, true
 	}
 	var reclaimed int64
-	for _, entry := range part.entries {
+	allDone := true
+	anyProgress := false
+	for _, pieceIndex := range slices.Sorted(maps.Keys(part.entries)) {
+		entry := part.entries[pieceIndex]
 		if entry == nil {
 			continue
 		}
 		entry.header.Extra = nil
-		if entry.payloadFreed {
-			continue
+		envFreed, envDone := p.reclaimEntryEnvelopeMode(entry, allowFlush)
+		reclaimed += envFreed
+		if !envDone {
+			allDone = false
+			if !slices.Contains(p.pendingEnvelopes, entry) {
+				p.pendingEnvelopes = append(p.pendingEnvelopes, entry)
+			}
 		}
-		entry.payloadFreed = true
-		p.reclaimEntryEnvelope(entry)
-		reclaimed += p.reclaimRange(entry.data, entry.data+int64(entry.header.CompressedSize64))
+		payFreed, payDone := p.reclaimEntryPayloadMode(entry, allowFlush)
+		reclaimed += payFreed
+		if payFreed > 0 || entry.payloadFreedBytes > 0 {
+			anyProgress = true
+		}
+		if !payDone {
+			allDone = false
+		}
+	}
+	if anyProgress || allDone {
+		if p.cache != nil {
+			p.cache.discard(key)
+			if p.discard == nil || p.discard.targetRefs[key] == 0 {
+				p.cache.forgetProcessed(key)
+			}
+		}
+		if p.pagePkg != nil {
+			delete(p.pagePkg.parts, key)
+		}
+	}
+	if !allDone {
+		if anyProgress {
+			part.partiallyReclaimed = true
+		}
+		part.reclaimPending = true
+		return reclaimed, false
 	}
 	part.reclaimed = true
+	part.partiallyReclaimed = false
 	part.reclaimPending = false
 	part.page = nil
 	part.relations = nil
 	part.layout = nil
 	part.control = nil
 	part.entries = nil
-	if p.cache != nil {
-		p.cache.discard(key)
-		if p.discard == nil || p.discard.targetRefs[key] == 0 {
-			p.cache.forgetProcessed(key)
-		}
-	}
-	if p.pagePkg != nil {
-		delete(p.pagePkg.parts, key)
-	}
-	return reclaimed
+	delete(p.pendingParts, key)
+	return reclaimed, true
 }
 
 // reclaimDeliveredPage 在纯前向消费模式交付完单页后立即释放页面本体、页面关系及私有StoryFragments，并检查文档级回收
@@ -2670,8 +2956,7 @@ func (p *streamPackage) reconcileStreamDirectoryAttribute(name string, entry *st
 		}
 	}
 	if p.ownedMemory != nil && entry != nil && !entry.payloadFreed {
-		entry.payloadFreed = true
-		p.reclaimRange(entry.data, entry.data+int64(entry.header.CompressedSize64))
+		p.reclaimEntryPayloadMode(entry, true)
 	}
 	return nil
 }
@@ -2679,6 +2964,9 @@ func (p *streamPackage) reconcileStreamDirectoryAttribute(name string, entry *st
 // finishConsume 完成纯前向消费模式下的完整性终检、全包关系、票据冲突、DiscardControl与剩余回调收尾
 // 返回: error 完整性、内容类型、结构、关系、票据、回调、预算或取消错误
 func (p *streamPackage) finishConsume() error {
+	if p.ownedMemory != nil {
+		p.reclaimPendingStorageMode(true)
+	}
 	if p.types == nil {
 		return fmt.Errorf("%w: missing content types", ErrInvalid)
 	}
@@ -2801,6 +3089,11 @@ func (p *streamPackage) finishConsume() error {
 			return err
 		}
 	}
+	if p.onConsumeFinish != nil {
+		if err := p.onConsumeFinish(p.index, !p.reclaimed); err != nil {
+			return err
+		}
+	}
 	p.closeXML()
 	return checkContext(p.context)
 }
@@ -2861,7 +3154,7 @@ func (p *streamPackage) verifyConsumeLayout() error {
 		if !matchStandardContentType(p.index.format, pageMedia, fixedContentType("fixedpage")) {
 			return &PartError{Part: page.Part, Err: fmt.Errorf("%w: unexpected content type %q", ErrInvalid, pageMedia)}
 		}
-		if p.options.OnPage == nil && !pagePart.reclaimed {
+		if p.options.OnPage == nil && !pagePart.reclaimed && !pagePart.partiallyReclaimed {
 			if _, err := p.index.readPageHeaderStream(p.context, page.Part); err != nil {
 				return err
 			}
@@ -2905,7 +3198,7 @@ func (p *streamPackage) verifyConsumeDiscard() error {
 	if !matchStandardContentType(p.index.format, media, fixedContentType("discard-control")) {
 		return &PartError{Part: p.discardTarget, Err: fmt.Errorf("%w: discard control content type", ErrInvalid)}
 	}
-	if !targetPart.reclaimed {
+	if !targetPart.reclaimed && !targetPart.partiallyReclaimed {
 		if _, err := p.index.DiscardControl(p.context); err != nil {
 			return err
 		}
@@ -2913,9 +3206,9 @@ func (p *streamPackage) verifyConsumeDiscard() error {
 	return nil
 }
 
-// verifyFallbackConsume 在ConsumeStream回退随机访问路径后补齐固定页面存在性与DiscardControl目标检查
+// verifyFallbackConsume 在ConsumeStream回退随机访问路径后补齐固定页面存在性、票据关联与DiscardControl目标检查
 // 入参: r 已完成构造的随机访问阅读器
-// 返回: error 缺失部件、媒体类型、结构或取消错误
+// 返回: error 缺失部件、媒体类型、结构、票据或取消错误
 func (p *streamPackage) verifyFallbackConsume(r *Reader) error {
 	for _, page := range r.pages {
 		if err := checkContext(p.context); err != nil {
@@ -2932,6 +3225,9 @@ func (p *streamPackage) verifyFallbackConsume(r *Reader) error {
 		if !matchStandardContentType(r.format, media, fixedContentType("fixedpage")) {
 			return &PartError{Part: page.Part, Err: fmt.Errorf("%w: unexpected content type %q", ErrInvalid, media)}
 		}
+	}
+	if err := r.validatePrintTicketLinks(p.context); err != nil {
+		return err
 	}
 	relations, err := r.pkg.relationshipsContext(p.context, "/")
 	if err != nil {

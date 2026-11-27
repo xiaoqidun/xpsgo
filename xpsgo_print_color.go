@@ -1055,11 +1055,7 @@ func printColorPlanSettings(ctx context.Context, model *PrintSettings, options *
 	if err != nil {
 		return nil, nil, err
 	}
-	root, err := printSettingsRoot(model, configuration)
-	if err != nil {
-		return nil, nil, err
-	}
-	validated, err := parsePrintSettings(root, configuration)
+	validated, err := validatePrintSettingsModel(model, configuration, printDocumentTicket)
 	if err != nil {
 		return nil, nil, err
 	}

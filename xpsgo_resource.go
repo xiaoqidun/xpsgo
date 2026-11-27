@@ -464,6 +464,86 @@ func (p *resourceParser) loadRemote(part string, depth int) (*resourceScope, err
 	return scope, nil
 }
 
+// ResourceDictionary 独立读取并按ECMA-388校验指定包内远程资源字典部件，返回按声明顺序排列的类型化资源条目
+// 严格校验远程字典媒体类型、格式命名空间、MCE预处理、名称唯一性及字典内嵌套引用合法性，拒绝声明Source属性的远程字典
+// 入参: ctx 取消Context，nil采用Background, part 远程资源字典部件的包根URI
+// 返回: *ResourceDictionary 独立解析后的远程资源字典, error 状态、URI、媒体类型、结构、引用、预算或取消错误
+func (r *Reader) ResourceDictionary(ctx context.Context, part string) (*ResourceDictionary, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := r.readLock(); err != nil {
+		return nil, err
+	}
+	defer r.mu.RUnlock()
+	canonical, err := opcPartName(part)
+	if err != nil {
+		return nil, err
+	}
+	root, err := r.readResourceDictionaryLoader(canonical, nil, ctx)
+	if err != nil {
+		return nil, err
+	}
+	load := func(target string) (*xmlElement, error) {
+		return r.readResourceDictionaryLoader(target, nil, ctx)
+	}
+	parser := &resourceParser{
+		format: r.format, limits: r.limits, load: load, context: ctx,
+		graph:  &resourceGraph{PagePart: canonical, Bindings: make(map[*xmlElement]map[string]*resourceDefinition), Parts: make(map[*xmlElement]string)},
+		remote: make(map[string]*resourceScope),
+	}
+	if _, err := parser.dictionary(root, canonical, nil, true, 1); err != nil {
+		return nil, err
+	}
+	scene := newSceneParser(r.format, parser.graph)
+	for _, definition := range parser.graph.Definitions {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		switch resourceKind(definition.Kind) {
+		case "geometry":
+			if _, err := scene.geometry(definition.Element, true); err != nil {
+				return nil, err
+			}
+		case "matrix":
+			if _, err := scene.matrix(definition.Element, true); err != nil {
+				return nil, err
+			}
+		case "brush":
+			if _, err := scene.brush(definition.Element, true); err != nil {
+				return nil, err
+			}
+		case "visual":
+			if _, err := scene.elementValue(definition.Element); err != nil {
+				return nil, err
+			}
+		}
+	}
+	keyNS := formatNamespace(r.format) + "/resourcedictionary-key"
+	entries := make([]ResourceEntry, 0, len(root.Children))
+	for _, child := range root.Children {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		key, _ := child.attributeNS(keyNS, "Key")
+		var val any
+		switch resourceKind(child.Name.Local) {
+		case "geometry":
+			val = scene.geometries[child]
+		case "matrix":
+			m := scene.matrices[child]
+			val = &m
+		case "brush":
+			val = scene.brushes[child]
+		case "visual":
+			val = scene.elements[child]
+		}
+		entries = append(entries, ResourceEntry{Key: key, Value: val})
+	}
+	return &ResourceDictionary{Entries: entries}, checkContext(ctx)
+}
+
 // readResourceDictionaryLoader 共用字典媒体类型、MCE及名称校验，支持调用私有读取策略
 // 入参: part 字典部件URI, load 可选XML读取器, ctx 取消Context
 // 返回: *xmlElement 只读预处理字典, error 读取、类型、XML或取消错误

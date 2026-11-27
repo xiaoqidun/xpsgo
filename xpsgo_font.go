@@ -191,7 +191,7 @@ type glyphRun struct {
 	boldRadius float64
 }
 
-// positionedGlyph 保存字形编号、UTF-16簇范围、局部原点及设计单位到局部坐标的变换矩阵
+// positionedGlyph 保存字形编号、UTF-16簇范围、局部原点、竖排原点及设计单位到局部坐标的变换矩阵
 type positionedGlyph struct {
 	gid             uint16
 	cluster         int
@@ -201,6 +201,7 @@ type positionedGlyph struct {
 	explicitAdvance bool
 	nominal         Point
 	origin          Point
+	verticalOrigin  Point
 	advance         float64
 	matrix          Matrix
 }
@@ -2065,6 +2066,7 @@ func (run *glyphRun) placeGlyph(p *positionedGlyph, entry GlyphIndex, metrics *f
 		if err != nil {
 			return err
 		}
+		p.verticalOrigin = Point{X: anchor.X * scale, Y: anchor.Y * scale}
 	} else if run.rtl {
 		width, _, err := metrics.horizontal(p.gid)
 		if err != nil {
@@ -2100,7 +2102,7 @@ func (run *glyphRun) placeGlyph(p *positionedGlyph, entry GlyphIndex, metrics *f
 	}
 	m.E = p.origin.X - (m.A*anchor.X + m.C*anchor.Y)
 	m.F = p.origin.Y - (m.B*anchor.X + m.D*anchor.Y)
-	if !geometryFinite(p.advance, m.A, m.B, m.C, m.D, m.E, m.F) {
+	if !geometryFinite(p.advance, p.verticalOrigin.X, p.verticalOrigin.Y, m.A, m.B, m.C, m.D, m.E, m.F) {
 		return fmt.Errorf("%w: glyph transform or advance overflow", ErrInvalid)
 	}
 	p.matrix = m
@@ -2309,9 +2311,9 @@ func fontUsageElement(name string) bool {
 }
 
 // resolveGlyphRun 结合字形顶部缓存与取消检查解算Glyphs排布，不支持轮廓yMax时回退零值
-// 入参: ctx 取消Context, glyphs 已规范化前导转义的字形元素
-// 返回: *glyphRun 已排布字形运行, func(uint16) (float64, error) 字形yMax缓存查询器, error 解算或取消错误
-func (s *fontSource) resolveGlyphRun(ctx context.Context, glyphs *Glyphs) (*glyphRun, func(uint16) (float64, error), error) {
+// 入参: ctx 取消Context, glyphs 字形元素
+// 返回: *glyphRun 已排布字形运行, error 解算或取消错误
+func (s *fontSource) resolveGlyphRun(ctx context.Context, glyphs *Glyphs) (*glyphRun, error) {
 	yMaxCache := make(map[uint16]float64)
 	yMax := func(gid uint16) (float64, error) {
 		if v, ok := yMaxCache[gid]; ok {
@@ -2328,15 +2330,11 @@ func (s *fontSource) resolveGlyphRun(ctx context.Context, glyphs *Glyphs) (*glyp
 		yMaxCache[gid] = v
 		return v, nil
 	}
-	run, err := resolveGlyphRunWithStep(glyphs, s.metrics, s.glyphIndex, yMax, fontGlyphClusterMax, func() error { return checkContext(ctx) })
-	if err != nil {
-		return nil, nil, err
-	}
-	return run, yMax, nil
+	return resolveGlyphRunWithStep(glyphs, s.metrics, s.glyphIndex, yMax, fontGlyphClusterMax, func() error { return checkContext(ctx) })
 }
 
-// ResolveGlyphClusters 严格按ECMA-388 §5.1解析Glyphs的ClusterMap、UnicodeString与Indices并输出结构化字形簇
-// 自动剥离UnicodeString前导{}转义并正确处理UTF-16代理对，各字形Origin为相对Glyphs.Origin的局部偏移
+// ResolveGlyphClusters 严格按ECMA-388 §5.1解析Glyphs的ClusterMap、已去转义文本与Indices并输出结构化字形簇
+// 视Glyphs.Text为已按ECMA-388 [M5.7]完成前导{}去转义的逻辑Unicode文本，正确处理UTF-16代理对，各字形Origin为相对Glyphs.Origin的局部偏移
 // 入参: ctx 取消Context，nil采用Background, glyphs 待解算字形元素, font 关联字体资源
 // 返回: []ResolvedGlyphCluster 按逻辑顺序排列的结构化字形簇, error 参数、字体、度量、结构、资源或取消错误
 func ResolveGlyphClusters(ctx context.Context, glyphs *Glyphs, font *FontResource) ([]ResolvedGlyphCluster, error) {
@@ -2347,61 +2345,36 @@ func ResolveGlyphClusters(ctx context.Context, glyphs *Glyphs, font *FontResourc
 	if glyphs == nil || font == nil || font.source == nil || font.source.metrics == nil || font.UnitsPerEm == 0 {
 		return nil, fmt.Errorf("%w: glyphs or font resource is unavailable", ErrInvalid)
 	}
-	normalized := *glyphs
-	normalized.Text = strings.TrimPrefix(normalized.Text, "{}")
-	run, yMax, err := font.source.resolveGlyphRun(ctx, &normalized)
+	run, err := font.source.resolveGlyphRun(ctx, glyphs)
 	if err != nil {
 		return nil, err
 	}
-	scale := normalized.FontRenderingEmSize / float64(font.source.metrics.unitsPerEm)
 	direction := 1.0
 	if run.rtl {
 		direction = -1
 	}
-	verticalOriginFor := func(gid uint16) (Point, error) {
-		if !run.sideways {
-			return Point{}, nil
-		}
-		var top float64
-		if font.source.metrics.needsGlyphYMax() {
-			var topErr error
-			top, topErr = yMax(gid)
-			if topErr != nil {
-				return Point{}, topErr
-			}
-		}
-		anchor, vErr := font.source.metrics.verticalOrigin(gid, top)
-		if vErr != nil {
-			return Point{}, vErr
-		}
-		return Point{X: anchor.X * scale, Y: anchor.Y * scale}, nil
-	}
-	buildItem := func(p positionedGlyph) (ResolvedGlyphItem, error) {
-		vOrigin, vErr := verticalOriginFor(p.gid)
-		if vErr != nil {
-			return ResolvedGlyphItem{}, vErr
-		}
+	buildItem := func(p positionedGlyph) ResolvedGlyphItem {
 		return ResolvedGlyphItem{
 			GlyphID:        p.gid,
-			Origin:         Point{X: p.origin.X - normalized.Origin.X, Y: p.origin.Y - normalized.Origin.Y},
+			Origin:         Point{X: p.origin.X - glyphs.Origin.X, Y: p.origin.Y - glyphs.Origin.Y},
 			DeltaX:         direction * p.advance,
 			DeltaY:         0,
 			Advance:        p.advance,
-			VerticalOrigin: vOrigin,
+			VerticalOrigin: p.verticalOrigin,
 			Transform:      p.matrix,
 			IsRTL:          run.rtl,
 			IsSideways:     run.sideways,
-		}, nil
+		}
 	}
 	var clusters []ResolvedGlyphCluster
-	text := normalized.Text
+	text := glyphs.Text
 	runePos, utf8Pos, glyphPos := 0, 0, 0
-	for _, cluster := range normalized.Indices {
+	for _, cluster := range glyphs.Indices {
 		if err := checkContext(ctx); err != nil {
 			return nil, err
 		}
 		runeStart, utf8Start := runePos, utf8Pos
-		if normalized.Text != "" {
+		if glyphs.Text != "" {
 			for remaining := cluster.CodeUnitCount; remaining > 0; {
 				r, size := utf8.DecodeRuneInString(text[utf8Pos:])
 				width := 1
@@ -2420,10 +2393,7 @@ func ResolveGlyphClusters(ctx context.Context, glyphs *Glyphs, font *FontResourc
 		items := make([]ResolvedGlyphItem, glyphCount)
 		deltaX := 0.0
 		for i := range glyphCount {
-			item, itemErr := buildItem(run.glyphs[glyphStart+i])
-			if itemErr != nil {
-				return nil, itemErr
-			}
+			item := buildItem(run.glyphs[glyphStart+i])
 			ids[i] = item.GlyphID
 			items[i] = item
 			deltaX += item.DeltaX
@@ -2453,10 +2423,7 @@ func ResolveGlyphClusters(ctx context.Context, glyphs *Glyphs, font *FontResourc
 			return nil, err
 		}
 		_, size := utf8.DecodeRuneInString(text[utf8Pos:])
-		item, itemErr := buildItem(run.glyphs[glyphPos])
-		if itemErr != nil {
-			return nil, itemErr
-		}
+		item := buildItem(run.glyphs[glyphPos])
 		clusters = append(clusters, ResolvedGlyphCluster{
 			RuneStart:      runePos,
 			RuneCount:      1,

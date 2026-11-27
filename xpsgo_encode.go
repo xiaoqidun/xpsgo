@@ -15,6 +15,7 @@
 package xpsgo
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
 	"fmt"
@@ -70,6 +71,36 @@ func EncodePage(ctx context.Context, output io.Writer, page *Page, options *Enco
 	if output == nil || page == nil {
 		return 0, fmt.Errorf("%w: missing page or output", ErrInvalid)
 	}
+	root, limits, err := encodePageRoot(ctx, page, options)
+	if err != nil {
+		return 0, err
+	}
+	return writeEncodedXMLNode(ctx, output, root, limits.MaxPartBytes)
+}
+
+// encodePageTree 编码并校验页面模型，同时返回已校验XML节点树与UTF-8序列化字节，消除写侧二次解码
+// 入参: ctx 取消Context，nil采用Background, page 页面模型, options 编码选项，nil采用默认值
+// 返回: *xmlElement 已校验FixedPage根节点, []byte UTF-8页面XML字节, error 模型、资源、取消或编码错误
+func encodePageTree(ctx context.Context, page *Page, options *EncodeOptions) (*xmlElement, []byte, error) {
+	ctx = normalizeContext(ctx)
+	if page == nil {
+		return nil, nil, fmt.Errorf("%w: missing page", ErrInvalid)
+	}
+	root, limits, err := encodePageRoot(ctx, page, options)
+	if err != nil {
+		return nil, nil, err
+	}
+	var output bytes.Buffer
+	if _, err := writeEncodedXMLNode(ctx, &output, root, limits.MaxPartBytes); err != nil {
+		return nil, nil, err
+	}
+	return root, output.Bytes(), nil
+}
+
+// encodePageRoot 构造并校验页面XML节点树，编码期间同步验证视觉、画刷、几何与字形属性并完成资源图检查
+// 入参: ctx 已规范化取消Context, page 页面模型, options 编码选项，nil采用默认值
+// 返回: *xmlElement 已校验FixedPage根节点, Limits 生效资源上限, error 模型、资源、取消或预算错误
+func encodePageRoot(ctx context.Context, page *Page, options *EncodeOptions) (*xmlElement, Limits, error) {
 	configuration := EncodeOptions{Format: page.Format, Limits: DefaultLimits()}
 	if options != nil {
 		if options.Format != FormatUnknown {
@@ -82,10 +113,10 @@ func EncodePage(ctx context.Context, output io.Writer, page *Page, options *Enco
 		configuration.Format = FormatOpenXPS
 	}
 	if err := validateLimits(configuration.Limits); err != nil {
-		return 0, err
+		return nil, Limits{}, err
 	}
 	if formatNamespace(configuration.Format) == "" {
-		return 0, fmt.Errorf("%w: invalid page format", ErrInvalid)
+		return nil, Limits{}, fmt.Errorf("%w: invalid page format", ErrInvalid)
 	}
 	p := pageEncoder{format: configuration.Format, ns: formatNamespace(configuration.Format), part: page.Part, limits: configuration.Limits, compact: configuration.Compact, ctx: ctx, active: make(map[any]bool), elemCount: make(map[Element]int), mainElemCount: make(map[Element]int), emittedName: make(map[Element]bool)}
 	p.scope = map[string]string{"": p.ns, "xml": xmlNamespace}
@@ -93,23 +124,23 @@ func EncodePage(ctx context.Context, output io.Writer, page *Page, options *Enco
 	if p.part == "" {
 		p.part = "/"
 	} else if p.part, err = opcPartName(p.part); err != nil {
-		return 0, err
+		return nil, Limits{}, err
 	}
 	if err := p.prescanPage(page); err != nil {
-		return 0, err
+		return nil, Limits{}, err
 	}
 	if p.hasResourceKeys {
 		p.scope["r"] = p.ns + "/resourcedictionary-key"
 	}
 	root, err := p.page(page)
 	if err != nil {
-		return 0, err
+		return nil, Limits{}, err
 	}
 	if err := validateFixedStructure(root, p.format); err != nil {
-		return 0, err
+		return nil, Limits{}, err
 	}
 	if err := validateFixedNames(root, p.format); err != nil {
-		return 0, err
+		return nil, Limits{}, err
 	}
 	part := p.part
 	if part == "/" {
@@ -117,28 +148,104 @@ func EncodePage(ctx context.Context, output io.Writer, page *Page, options *Enco
 	}
 	graph, err := parseResourceGraphMode(part, root, p.format, p.limits, nil, p.ctx, p.hasRemoteDict)
 	if err != nil {
-		return 0, err
-	}
-	parser := newSceneParser(p.format, graph)
-	parser.allowUnresolved = p.hasRemoteDict
-	if _, err := parser.parse(root); err != nil {
-		return 0, err
+		return nil, Limits{}, err
 	}
 	if _, err := collectRequiredResources(graph, p.format); err != nil {
-		return 0, err
+		return nil, Limits{}, err
 	}
 	if err := checkContext(p.ctx); err != nil {
-		return 0, err
+		return nil, Limits{}, err
 	}
-	counted := packageOutput{writer: output, context: p.ctx, limit: p.limits.MaxPartBytes}
+	return root, p.limits, nil
+}
+
+// encodeResourceDictionaryTree 编码并校验独立远程资源字典，同时返回XML节点树与UTF-8序列化字节
+// 入参: ctx 取消Context，nil采用Background, dict 资源字典模型，Source必须为空, options 编码选项，nil采用默认值
+// 返回: *xmlElement 已校验ResourceDictionary根节点, []byte UTF-8字典XML字节, error 模型、校验、取消或编码错误
+func encodeResourceDictionaryTree(ctx context.Context, dict *ResourceDictionary, options *EncodeOptions) (*xmlElement, []byte, error) {
+	ctx = normalizeContext(ctx)
+	if dict == nil {
+		return nil, nil, fmt.Errorf("%w: missing resource dictionary", ErrInvalid)
+	}
+	root, limits, err := encodeResourceDictionaryRoot(ctx, dict, options)
+	if err != nil {
+		return nil, nil, err
+	}
+	var output bytes.Buffer
+	if _, err := writeEncodedXMLNode(ctx, &output, root, limits.MaxPartBytes); err != nil {
+		return nil, nil, err
+	}
+	return root, output.Bytes(), nil
+}
+
+// encodeResourceDictionaryRoot 构造并校验独立远程资源字典XML节点树
+// 入参: ctx 已规范化取消Context, dict 资源字典模型，Source必须为空, options 编码选项，nil采用默认值
+// 返回: *xmlElement 已校验ResourceDictionary根节点, Limits 生效资源上限, error 模型、校验、取消或预算错误
+func encodeResourceDictionaryRoot(ctx context.Context, dict *ResourceDictionary, options *EncodeOptions) (*xmlElement, Limits, error) {
+	if dict.Source != "" {
+		return nil, Limits{}, fmt.Errorf("%w: remote resource dictionary cannot specify Source", ErrInvalid)
+	}
+	configuration := DefaultEncodeOptions()
+	if options != nil {
+		if options.Format != FormatUnknown {
+			configuration.Format = options.Format
+		}
+		configuration.Limits = mergeLimits(configuration.Limits, options.Limits)
+		configuration.Part = options.Part
+		configuration.Compact = options.Compact
+	}
+	if err := validateLimits(configuration.Limits); err != nil {
+		return nil, Limits{}, err
+	}
+	if formatNamespace(configuration.Format) == "" {
+		return nil, Limits{}, fmt.Errorf("%w: invalid resource dictionary format", ErrInvalid)
+	}
+	part := configuration.Part
+	var err error
+	if part == "" {
+		part = "/Resources/Dictionary.dict"
+	} else if part, err = opcPartName(part); err != nil {
+		return nil, Limits{}, err
+	}
+	p := pageEncoder{format: configuration.Format, ns: formatNamespace(configuration.Format), part: part, limits: configuration.Limits, compact: configuration.Compact, ctx: ctx, active: make(map[any]bool), elemCount: make(map[Element]int), mainElemCount: make(map[Element]int), emittedName: make(map[Element]bool)}
+	p.scope = map[string]string{"": p.ns, "xml": xmlNamespace, "r": p.ns + "/resourcedictionary-key"}
+	if err := p.prescanDictionary(dict, 1); err != nil {
+		return nil, Limits{}, err
+	}
+	root, err := p.resourceDictionary(dict, 1, true)
+	if err != nil {
+		return nil, Limits{}, err
+	}
+	if err := validateFixedNames(root, p.format); err != nil {
+		return nil, Limits{}, err
+	}
+	checker := &resourceParser{
+		format: p.format, limits: p.limits, context: ctx,
+		graph:  &resourceGraph{PagePart: part, Bindings: make(map[*xmlElement]map[string]*resourceDefinition), Parts: make(map[*xmlElement]string)},
+		remote: make(map[string]*resourceScope),
+	}
+	if _, err := checker.dictionary(root, part, nil, true, 1); err != nil {
+		return nil, Limits{}, err
+	}
+	if err := checkContext(ctx); err != nil {
+		return nil, Limits{}, err
+	}
+	return root, p.limits, nil
+}
+
+// writeEncodedXMLNode 将已校验XML节点树受预算约束地序列化到目标输出流
+// 入参: ctx 已规范化取消Context, output 输出流, root 根节点, maxBytes 字节上限
+// 返回: int64 已写字节数, error 预算、取消或输出错误
+func writeEncodedXMLNode(ctx context.Context, output io.Writer, root *xmlElement, maxBytes int64) (int64, error) {
+	counted := packageOutput{writer: output, context: ctx, limit: maxBytes}
 	encoder := xml.NewEncoder(&counted)
-	if err := encodePageNode(encoder, root, p.ctx); err != nil {
+	if err := encodePageNode(encoder, root, ctx); err != nil {
 		return counted.count, err
 	}
 	if err := encoder.Flush(); err != nil {
 		return counted.count, err
 	}
-	return counted.count, checkContext(p.ctx)
+	return counted.count, checkContext(ctx)
 }
 
 // prescanStep 累计预扫描工作量并检查深度、复杂度与取消信号
@@ -525,17 +632,23 @@ func (p *pageEncoder) resourceDictionary(dict *ResourceDictionary, depth int, re
 			if typed == nil || typed.Name != "" {
 				return nil, fmt.Errorf("%w: visual resource definition cannot be nil or carry Name", ErrInvalid)
 			}
+			p.inVisualBrush++
 			child, err = p.element(typed, depth+1)
+			p.inVisualBrush--
 		case *Path:
 			if typed == nil || typed.Name != "" {
 				return nil, fmt.Errorf("%w: visual resource definition cannot be nil or carry Name", ErrInvalid)
 			}
+			p.inVisualBrush++
 			child, err = p.element(typed, depth+1)
+			p.inVisualBrush--
 		case *Glyphs:
 			if typed == nil || typed.Name != "" {
 				return nil, fmt.Errorf("%w: visual resource definition cannot be nil or carry Name", ErrInvalid)
 			}
+			p.inVisualBrush++
 			child, err = p.element(typed, depth+1)
+			p.inVisualBrush--
 		default:
 			return nil, fmt.Errorf("%w: unsupported resource definition value for %q", ErrInvalid, entry.Key)
 		}
@@ -775,7 +888,18 @@ func (p *pageEncoder) brush(value *Brush, depth int) (*xmlElement, error) {
 	if value.TileMode > TileFlipXY {
 		return nil, fmt.Errorf("%w: tile brush mode", ErrInvalid)
 	}
-	for _, attr := range []struct{ name, value string }{{"Viewbox", encodeRect(value.Viewbox)}, {"Viewport", encodeRect(value.Viewport)}, {"ViewboxUnits", "Absolute"}, {"ViewportUnits", "Absolute"}} {
+	for _, box := range []struct {
+		name  string
+		value Rect
+	}{{"Viewbox", value.Viewbox}, {"Viewport", value.Viewport}} {
+		if !geometryFinite(box.value.X, box.value.Y, box.value.Width, box.value.Height) || box.value.Width < 0 || box.value.Height < 0 {
+			return nil, fmt.Errorf("%w: invalid brush %s", ErrInvalid, box.name)
+		}
+		if err := p.attr(node, box.name, encodeRect(box.value)); err != nil {
+			return nil, err
+		}
+	}
+	for _, attr := range []struct{ name, value string }{{"ViewboxUnits", "Absolute"}, {"ViewportUnits", "Absolute"}} {
 		if err := p.attr(node, attr.name, attr.value); err != nil {
 			return nil, err
 		}
@@ -875,13 +999,22 @@ func (p *pageEncoder) gradient(node *xmlElement, value *Brush, depth int) error 
 			name  string
 			value Point
 		}{{"Center", value.Center}, {"GradientOrigin", value.GradientOrigin}}
-		for _, attr := range []struct{ name, value string }{{"RadiusX", encodeNumber(value.RadiusX)}, {"RadiusY", encodeNumber(value.RadiusY)}} {
-			if err := p.attr(node, attr.name, attr.value); err != nil {
+		for _, radius := range []struct {
+			name  string
+			value float64
+		}{{"RadiusX", value.RadiusX}, {"RadiusY", value.RadiusY}} {
+			if !geometryFinite(radius.value) || radius.value < 0 {
+				return fmt.Errorf("%w: invalid gradient %s", ErrInvalid, radius.name)
+			}
+			if err := p.attr(node, radius.name, encodeNumber(radius.value)); err != nil {
 				return err
 			}
 		}
 	}
 	for _, point := range points {
+		if !geometryFinite(point.value.X, point.value.Y) {
+			return fmt.Errorf("%w: invalid gradient %s", ErrInvalid, point.name)
+		}
 		if err := p.attr(node, point.name, encodePoint(point.value)); err != nil {
 			return err
 		}
@@ -891,6 +1024,9 @@ func (p *pageEncoder) gradient(node *xmlElement, value *Brush, depth int) error 
 		return err
 	}
 	for _, stop := range value.Stops {
+		if !geometryFinite(stop.Offset) {
+			return fmt.Errorf("%w: invalid gradient stop offset", ErrInvalid)
+		}
 		child, err := p.node("GradientStop", depth+2)
 		if err != nil {
 			return err
@@ -959,6 +1095,9 @@ func (p *pageEncoder) element(value Element, depth int) (*xmlElement, error) {
 	}
 	switch value := value.(type) {
 	case *Canvas:
+		if value.EdgeMode != "" && value.EdgeMode != EdgeModeAliased {
+			return nil, fmt.Errorf("%w: invalid EdgeMode %q", ErrInvalid, value.EdgeMode)
+		}
 		for _, attr := range []struct{ name, value string }{{"RenderOptions.EdgeMode", string(value.EdgeMode)}, {"AutomationProperties.Name", value.AutomationName}, {"AutomationProperties.HelpText", value.AutomationHelpText}} {
 			if attr.value != "" {
 				if err := p.attr(node, attr.name, attr.value); err != nil {
@@ -1014,6 +1153,9 @@ func (p *pageEncoder) properties(node *xmlElement, owner Element, value ElementP
 		}
 	}
 	if value.Language != nil {
+		if *value.Language != "" && !fixedLanguageTag(*value.Language) {
+			return fmt.Errorf("%w: invalid xml:lang on %s", ErrInvalid, node.Name.Local)
+		}
 		if err := p.attribute(node, xml.Name{Space: xmlNamespace, Local: "lang"}, *value.Language); err != nil {
 			return err
 		}
@@ -1083,19 +1225,11 @@ func (p *pageEncoder) geometryProperty(node *xmlElement, name string, value *Geo
 	if value.FillRule > GeometryNonZero {
 		return fmt.Errorf("%w: geometry model", ErrInvalid)
 	}
+	allowAbbreviated := true
 	if value.Transform == nil && value.TransformResource == "" && len(value.Figures) != 0 {
-		abbreviated := true
-		for _, figure := range value.Figures {
-			if err := p.step(depth); err != nil {
-				return err
-			}
-			abbreviated = abbreviated && figure.IsFilled
-			for _, segment := range figure.Segments {
-				if err := p.step(depth); err != nil {
-					return err
-				}
-				abbreviated = abbreviated && segment.IsStroked
-			}
+		abbreviated, err := p.geometryCanAbbreviate(value.Figures, depth)
+		if err != nil {
+			return err
 		}
 		if abbreviated {
 			text, err := p.geometryFigures(value.Figures, depth)
@@ -1107,8 +1241,9 @@ func (p *pageEncoder) geometryProperty(node *xmlElement, name string, value *Geo
 			}
 			return p.attr(node, name, text)
 		}
+		allowAbbreviated = false
 	}
-	geometry, err := p.geometry(value, depth+2)
+	geometry, err := p.geometryWithMode(value, depth+2, allowAbbreviated)
 	if err != nil {
 		return err
 	}
@@ -1119,20 +1254,42 @@ func (p *pageEncoder) geometryProperty(node *xmlElement, name string, value *Geo
 // 入参: node 路径节点, value 路径模型, depth 节点深度
 // 返回: error 属性、几何或预算错误
 func (p *pageEncoder) path(node *xmlElement, value *Path, depth int) error {
+	if !geometryFinite(value.StrokeThickness) || value.StrokeThickness < 0 {
+		return fmt.Errorf("%w: invalid StrokeThickness", ErrInvalid)
+	}
 	if value.Stroke != nil && value.StrokeThickness != 1 || value.Stroke == nil && value.StrokeThickness != 0 && value.StrokeThickness != 1 {
 		if err := p.attr(node, "StrokeThickness", encodeNumber(value.StrokeThickness)); err != nil {
 			return err
 		}
 	}
-	if value.StrokeMiterLimit != 0 && value.StrokeMiterLimit != 10 {
-		if err := p.attr(node, "StrokeMiterLimit", encodeNumber(value.StrokeMiterLimit)); err != nil {
-			return err
+	if value.StrokeMiterLimit != 0 {
+		if !geometryFinite(value.StrokeMiterLimit) || value.StrokeMiterLimit < 1 {
+			return fmt.Errorf("%w: invalid StrokeMiterLimit", ErrInvalid)
 		}
+		if value.StrokeMiterLimit != 10 {
+			if err := p.attr(node, "StrokeMiterLimit", encodeNumber(value.StrokeMiterLimit)); err != nil {
+				return err
+			}
+		}
+	}
+	if !geometryFinite(value.StrokeDashOffset) {
+		return fmt.Errorf("%w: invalid StrokeDashOffset", ErrInvalid)
 	}
 	if value.StrokeDashOffset != 0 {
 		if err := p.attr(node, "StrokeDashOffset", encodeNumber(value.StrokeDashOffset)); err != nil {
 			return err
 		}
+	}
+	for _, capItem := range []struct {
+		name  string
+		value LineCap
+	}{{"StrokeDashCap", value.StrokeDashCap}, {"StrokeStartLineCap", value.StrokeStartLineCap}, {"StrokeEndLineCap", value.StrokeEndLineCap}} {
+		if capItem.value != "" && !strokeOutlineCapValid(capItem.value) {
+			return fmt.Errorf("%w: invalid %s %q", ErrInvalid, capItem.name, capItem.value)
+		}
+	}
+	if value.StrokeLineJoin != "" && value.StrokeLineJoin != LineJoinMiter && value.StrokeLineJoin != LineJoinBevel && value.StrokeLineJoin != LineJoinRound {
+		return fmt.Errorf("%w: invalid StrokeLineJoin %q", ErrInvalid, value.StrokeLineJoin)
 	}
 	for _, attr := range []struct {
 		name  string
@@ -1158,6 +1315,9 @@ func (p *pageEncoder) path(node *xmlElement, value *Path, depth int) error {
 		}
 	}
 	if len(value.StrokeDashArray) != 0 {
+		if len(value.StrokeDashArray) < 2 || len(value.StrokeDashArray)%2 != 0 {
+			return fmt.Errorf("%w: StrokeDashArray requires a nonempty even number of values", ErrInvalid)
+		}
 		if len(value.StrokeDashArray) > p.limits.MaxXMLNodes-p.work {
 			return fmt.Errorf("%w: dash encoding complexity", ErrLimit)
 		}
@@ -1165,6 +1325,9 @@ func (p *pageEncoder) path(node *xmlElement, value *Path, depth int) error {
 		for _, item := range value.StrokeDashArray {
 			if err := p.step(depth); err != nil {
 				return err
+			}
+			if !geometryFinite(item) || item < 0 {
+				return fmt.Errorf("%w: invalid dash length", ErrInvalid)
 			}
 			values = append(values, encodeNumber(item))
 		}
@@ -1192,6 +1355,17 @@ func (p *pageEncoder) path(node *xmlElement, value *Path, depth int) error {
 // 入参: node 字形节点, value 字形模型, depth 节点深度
 // 返回: error 字形、资源或预算错误
 func (p *pageEncoder) glyphs(node *xmlElement, value *Glyphs, depth int) error {
+	if !geometryFinite(value.FontRenderingEmSize, value.Origin.X, value.Origin.Y) || value.FontRenderingEmSize < 0 {
+		return fmt.Errorf("%w: invalid glyphs font size or origin", ErrInvalid)
+	}
+	if value.BidiLevel < 0 || value.BidiLevel > 61 || value.IsSideways && value.BidiLevel%2 != 0 {
+		return fmt.Errorf("%w: invalid glyphs BidiLevel or IsSideways", ErrInvalid)
+	}
+	switch value.StyleSimulations {
+	case "", StyleSimulationNone, StyleSimulationItalic, StyleSimulationBold, StyleSimulationBoldItalic:
+	default:
+		return fmt.Errorf("%w: invalid StyleSimulations %q", ErrInvalid, value.StyleSimulations)
+	}
 	font := value.FontPart
 	index, present := value.CollectionIndex, value.HasCollectionIndex
 	var err error
@@ -1217,6 +1391,28 @@ func (p *pageEncoder) glyphs(node *xmlElement, value *Glyphs, depth int) error {
 	if present {
 		font += "#" + strconv.FormatUint(uint64(index), 10)
 	}
+	rawUnicode := ""
+	if value.Text != "" {
+		rawUnicode = EscapeUnicodeString(value.Text)
+		if err := validateUnicodeString(rawUnicode, p.format); err != nil {
+			return fmt.Errorf("UnicodeString: %w", err)
+		}
+	}
+	rawDeviceFont := ""
+	if value.DeviceFontName != "" {
+		rawDeviceFont = EscapeUnicodeString(value.DeviceFontName)
+		if err := validateUnicodeString(rawDeviceFont, p.format); err != nil {
+			return fmt.Errorf("DeviceFontName: %w", err)
+		}
+	}
+	if value.CaretStops != "" {
+		if _, err := ParseCaretStops(value.CaretStops, rawUnicode); err != nil {
+			return err
+		}
+	}
+	if err := ValidateGlyphIndices(value.Indices, rawUnicode); err != nil {
+		return err
+	}
 	for _, attr := range []struct{ name, value string }{{"FontUri", font}, {"FontRenderingEmSize", encodeNumber(value.FontRenderingEmSize)}, {"OriginX", encodeNumber(value.Origin.X)}, {"OriginY", encodeNumber(value.Origin.Y)}, {"CaretStops", value.CaretStops}} {
 		if attr.value != "" {
 			if err := p.attr(node, attr.name, attr.value); err != nil {
@@ -1239,9 +1435,9 @@ func (p *pageEncoder) glyphs(node *xmlElement, value *Glyphs, depth int) error {
 			return err
 		}
 	}
-	for _, attr := range []struct{ name, value string }{{"UnicodeString", value.Text}, {"DeviceFontName", value.DeviceFontName}} {
+	for _, attr := range []struct{ name, value string }{{"UnicodeString", rawUnicode}, {"DeviceFontName", rawDeviceFont}} {
 		if attr.value != "" {
-			if err := p.attr(node, attr.name, EscapeUnicodeString(attr.value)); err != nil {
+			if err := p.attr(node, attr.name, attr.value); err != nil {
 				return err
 			}
 		}
@@ -1251,7 +1447,11 @@ func (p *pageEncoder) glyphs(node *xmlElement, value *Glyphs, depth int) error {
 		if err != nil {
 			return err
 		}
-		if err := p.attr(node, "Indices", indices); err != nil {
+		if strings.Trim(indices, ";") == "" {
+			if value.Text == "" {
+				return fmt.Errorf("%w: glyphs requires UnicodeString or non-empty Indices", ErrInvalid)
+			}
+		} else if err := p.attr(node, "Indices", indices); err != nil {
 			return err
 		}
 	}
@@ -1274,6 +1474,9 @@ func (p *pageEncoder) glyphIndices(values []GlyphCluster, depth int) (string, er
 		for index, glyph := range cluster.Glyphs {
 			if err := p.step(depth); err != nil {
 				return "", err
+			}
+			if glyph.HasAdvanceWidth && (!geometryFinite(glyph.AdvanceWidth) || glyph.AdvanceWidth < 0) || glyph.HasUOffset && !geometryFinite(glyph.UOffset) || glyph.HasVOffset && !geometryFinite(glyph.VOffset) {
+				return "", fmt.Errorf("%w: invalid glyph index metrics", ErrInvalid)
 			}
 			if entries != 0 {
 				output.WriteByte(';')
@@ -1319,6 +1522,13 @@ func (p *pageEncoder) glyphIndices(values []GlyphCluster, depth int) (string, er
 // 入参: value 几何模型, depth 几何节点深度
 // 返回: *xmlElement 几何节点, error 模型或预算错误
 func (p *pageEncoder) geometry(value *Geometry, depth int) (*xmlElement, error) {
+	return p.geometryWithMode(value, depth, true)
+}
+
+// geometryWithMode 按可选缩写判定编码PathGeometry节点，避免非紧凑路径在属性预检后重复消耗预算
+// 入参: value 几何模型, depth 几何节点深度, allowAbbreviated 是否检查并允许紧凑Figures缩写
+// 返回: *xmlElement 几何节点, error 模型或预算错误
+func (p *pageEncoder) geometryWithMode(value *Geometry, depth int, allowAbbreviated bool) (*xmlElement, error) {
 	if value == nil || value.FillRule > GeometryNonZero {
 		return nil, fmt.Errorf("%w: geometry model", ErrInvalid)
 	}
@@ -1349,32 +1559,28 @@ func (p *pageEncoder) geometry(value *Geometry, depth int) (*xmlElement, error) 
 			return nil, err
 		}
 	}
-	abbreviated := true
-	for _, figure := range value.Figures {
-		if err := p.step(depth); err != nil {
-			return nil, err
-		}
-		abbreviated = abbreviated && figure.IsFilled
-		for _, segment := range figure.Segments {
-			if err := p.step(depth); err != nil {
-				return nil, err
-			}
-			abbreviated = abbreviated && segment.IsStroked
-		}
-	}
-	if abbreviated && len(value.Figures) != 0 {
-		text, err := p.geometryFigures(value.Figures, depth)
+	if allowAbbreviated && len(value.Figures) != 0 {
+		abbreviated, err := p.geometryCanAbbreviate(value.Figures, depth)
 		if err != nil {
 			return nil, err
 		}
-		if err := p.attr(node, "Figures", text); err != nil {
-			return nil, err
+		if abbreviated {
+			text, err := p.geometryFigures(value.Figures, depth)
+			if err != nil {
+				return nil, err
+			}
+			if err := p.attr(node, "Figures", text); err != nil {
+				return nil, err
+			}
+			return node, nil
 		}
-		return node, nil
 	}
 	for _, figure := range value.Figures {
 		if len(figure.Segments) == 0 {
 			return nil, fmt.Errorf("%w: explicit PathFigure requires a segment", ErrInvalid)
+		}
+		if !geometryFinite(figure.StartPoint.X, figure.StartPoint.Y) {
+			return nil, fmt.Errorf("%w: non-finite geometry StartPoint", ErrInvalid)
 		}
 		child, err := p.node("PathFigure", depth+1)
 		if err != nil {
@@ -1397,6 +1603,42 @@ func (p *pageEncoder) geometry(value *Geometry, depth int) (*xmlElement, error) 
 	return node, nil
 }
 
+// geometryCanAbbreviate 判断子路径列表是否全部采用默认填充与描边标志，校验深度与上限但不重复扣减节点工作量
+// 入参: figures 子路径切片, depth 节点深度
+// 返回: bool 是否可缩写编码, error 深度、复杂度或取消错误
+func (p *pageEncoder) geometryCanAbbreviate(figures []GeometryFigure, depth int) (bool, error) {
+	if depth > p.limits.MaxXMLDepth {
+		return false, fmt.Errorf("%w: page encoding complexity", ErrLimit)
+	}
+	scanned := 0
+	remaining := p.limits.MaxXMLNodes - p.work
+	for _, figure := range figures {
+		if err := checkContext(p.ctx); err != nil {
+			return false, err
+		}
+		scanned++
+		if scanned > remaining {
+			return false, fmt.Errorf("%w: page encoding complexity", ErrLimit)
+		}
+		if !figure.IsFilled {
+			return false, nil
+		}
+		for _, segment := range figure.Segments {
+			if err := checkContext(p.ctx); err != nil {
+				return false, err
+			}
+			scanned++
+			if scanned > remaining {
+				return false, fmt.Errorf("%w: page encoding complexity", ErrLimit)
+			}
+			if !segment.IsStroked {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
 // geometryFigures 输出不改变标志语义的绝对坐标缩写，不将圆弧转换为曲线或直线
 // 入参: values 全部采用缺省填充和描边标志的子路径, depth 所属节点深度
 // 返回: string Figures属性, error 类型或预算错误
@@ -1406,26 +1648,41 @@ func (p *pageEncoder) geometryFigures(values []GeometryFigure, depth int) (strin
 		if err := p.step(depth); err != nil {
 			return "", err
 		}
+		if !geometryFinite(figure.StartPoint.X, figure.StartPoint.Y) {
+			return "", fmt.Errorf("%w: non-finite geometry StartPoint", ErrInvalid)
+		}
 		output.WriteString("M")
 		output.WriteString(encodePoint(figure.StartPoint))
 		for _, segment := range figure.Segments {
 			if err := p.step(depth); err != nil {
 				return "", err
 			}
+			if !geometryFinite(segment.Point.X, segment.Point.Y) {
+				return "", fmt.Errorf("%w: non-finite geometry point", ErrInvalid)
+			}
 			switch segment.Kind {
 			case GeometryLine:
 				output.WriteString(" L")
 			case GeometryCubic:
+				if !geometryFinite(segment.Control1.X, segment.Control1.Y, segment.Control2.X, segment.Control2.Y) {
+					return "", fmt.Errorf("%w: non-finite geometry control point", ErrInvalid)
+				}
 				output.WriteString(" C")
 				output.WriteString(encodePoint(segment.Control1))
 				output.WriteByte(' ')
 				output.WriteString(encodePoint(segment.Control2))
 				output.WriteByte(' ')
 			case GeometryQuadratic:
+				if !geometryFinite(segment.Control1.X, segment.Control1.Y) {
+					return "", fmt.Errorf("%w: non-finite geometry control point", ErrInvalid)
+				}
 				output.WriteString(" Q")
 				output.WriteString(encodePoint(segment.Control1))
 				output.WriteByte(' ')
 			case GeometryArc:
+				if !geometryFinite(segment.RadiusX, segment.RadiusY, segment.RotationAngle) || segment.RadiusX < 0 || segment.RadiusY < 0 {
+					return "", fmt.Errorf("%w: invalid geometry arc parameters", ErrInvalid)
+				}
 				output.WriteString(" A")
 				output.WriteString(encodeNumber(segment.RadiusX))
 				output.WriteByte(',')
@@ -1457,15 +1714,27 @@ func (p *pageEncoder) geometryFigures(values []GeometryFigure, depth int) (strin
 // 入参: value 路径段, depth 段节点深度
 // 返回: *xmlElement 段元素, error 类型或预算错误
 func (p *pageEncoder) geometrySegment(value GeometrySegment, depth int) (*xmlElement, error) {
+	if !geometryFinite(value.Point.X, value.Point.Y) {
+		return nil, fmt.Errorf("%w: non-finite geometry point", ErrInvalid)
+	}
 	name, points := "", ""
 	switch value.Kind {
 	case GeometryLine:
 		name, points = "PolyLineSegment", encodePoint(value.Point)
 	case GeometryCubic:
+		if !geometryFinite(value.Control1.X, value.Control1.Y, value.Control2.X, value.Control2.Y) {
+			return nil, fmt.Errorf("%w: non-finite geometry control point", ErrInvalid)
+		}
 		name, points = "PolyBezierSegment", encodePoint(value.Control1)+" "+encodePoint(value.Control2)+" "+encodePoint(value.Point)
 	case GeometryQuadratic:
+		if !geometryFinite(value.Control1.X, value.Control1.Y) {
+			return nil, fmt.Errorf("%w: non-finite geometry control point", ErrInvalid)
+		}
 		name, points = "PolyQuadraticBezierSegment", encodePoint(value.Control1)+" "+encodePoint(value.Point)
 	case GeometryArc:
+		if !geometryFinite(value.RadiusX, value.RadiusY, value.RotationAngle) || value.RadiusX < 0 || value.RadiusY < 0 {
+			return nil, fmt.Errorf("%w: invalid geometry arc parameters", ErrInvalid)
+		}
 		name = "ArcSegment"
 	default:
 		return nil, fmt.Errorf("%w: unknown geometry segment", ErrInvalid)

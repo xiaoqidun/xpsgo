@@ -2067,7 +2067,7 @@ func StrokeOutline(ctx context.Context, path *Path, transform Matrix, options *S
 	if err != nil {
 		return nil, err
 	}
-	return strokeEdgesToGeometryContext(ctx, edges)
+	return edgesToClosedGeometryContext(ctx, edges, true)
 }
 
 // normalizePathStrokeDefaults 为未显式指定的路径描边端帽、连接样式与斜接上限补齐ECMA-388默认值
@@ -2090,10 +2090,10 @@ func normalizePathStrokeDefaults(path *Path) {
 	}
 }
 
-// strokeEdgesToGeometryContext 在支持取消检查的条件下抵消反向共享边并还原非零规则闭合多边形子路径几何
-// 入参: ctx 取消Context, edges 描边引擎生成的有向边切片
+// edgesToClosedGeometryContext 将有向边集还原为非零规则闭合多边形子路径几何，可选先执行反向共享边抵消与Context取消检查
+// 入参: ctx 可选取消Context, edges 输入有向边切片, cancelReverse 是否检查有限性并抵消反向共享边
 // 返回: *Geometry 非零规则闭合几何, error 非有限坐标或取消错误
-func strokeEdgesToGeometryContext(ctx context.Context, edges []geometryEdge) (*Geometry, error) {
+func edgesToClosedGeometryContext(ctx context.Context, edges []geometryEdge, cancelReverse bool) (*Geometry, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
@@ -2101,44 +2101,47 @@ func strokeEdgesToGeometryContext(ctx context.Context, edges []geometryEdge) (*G
 	if len(edges) == 0 {
 		return result, nil
 	}
-	counts := make(map[geometryEdge]int, len(edges))
-	for i, edge := range edges {
-		if i&255 == 0 {
-			if err := checkContext(ctx); err != nil {
-				return nil, err
+	filtered := edges
+	if cancelReverse {
+		counts := make(map[geometryEdge]int, len(edges))
+		for i, edge := range edges {
+			if i&255 == 0 {
+				if err := checkContext(ctx); err != nil {
+					return nil, err
+				}
+			}
+			if !geometryFinite(edge.start.X, edge.start.Y, edge.end.X, edge.end.Y) {
+				return nil, fmt.Errorf("%w: non-finite stroke outline edge", ErrLimit)
+			}
+			if edge.start == edge.end {
+				continue
+			}
+			reverse := geometryEdge{start: edge.end, end: edge.start}
+			if counts[reverse] > 0 {
+				counts[reverse]--
+			} else {
+				counts[edge]++
 			}
 		}
-		if !geometryFinite(edge.start.X, edge.start.Y, edge.end.X, edge.end.Y) {
-			return nil, fmt.Errorf("%w: non-finite stroke outline edge", ErrLimit)
-		}
-		if edge.start == edge.end {
-			continue
-		}
-		reverse := geometryEdge{start: edge.end, end: edge.start}
-		if counts[reverse] > 0 {
-			counts[reverse]--
-		} else {
-			counts[edge]++
-		}
-	}
-	filtered := make([]geometryEdge, 0, len(edges))
-	emitted := make(map[geometryEdge]int, len(counts))
-	for i, edge := range edges {
-		if i&255 == 0 {
-			if err := checkContext(ctx); err != nil {
-				return nil, err
+		filtered = make([]geometryEdge, 0, len(edges))
+		emitted := make(map[geometryEdge]int, len(counts))
+		for i, edge := range edges {
+			if i&255 == 0 {
+				if err := checkContext(ctx); err != nil {
+					return nil, err
+				}
+			}
+			if edge.start == edge.end {
+				continue
+			}
+			if emitted[edge] < counts[edge] {
+				emitted[edge]++
+				filtered = append(filtered, edge)
 			}
 		}
-		if edge.start == edge.end {
-			continue
+		if len(filtered) == 0 {
+			return result, nil
 		}
-		if emitted[edge] < counts[edge] {
-			emitted[edge]++
-			filtered = append(filtered, edge)
-		}
-	}
-	if len(filtered) == 0 {
-		return result, nil
 	}
 	outgoing := make(map[Point][]int, len(filtered))
 	used := make([]bool, len(filtered))
@@ -2147,6 +2150,10 @@ func strokeEdgesToGeometryContext(ctx context.Context, edges []geometryEdge) (*G
 			if err := checkContext(ctx); err != nil {
 				return nil, err
 			}
+		}
+		if edge.start == edge.end {
+			used[i] = true
+			continue
 		}
 		outgoing[edge.start] = append(outgoing[edge.start], i)
 	}

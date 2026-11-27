@@ -104,6 +104,12 @@ type zipMetadataWriter struct {
 	context context.Context
 }
 
+// partNameRegistry 维护已占用部件名称及祖先路径引用计数，统一执行OPC M1.11派生路径冲突检测与回滚
+type partNameRegistry struct {
+	names   map[string]bool
+	parents map[string]int
+}
+
 // String 返回压缩方式的可读名称
 // 返回: string 压缩方式名称
 func (c Compression) String() string {
@@ -773,55 +779,7 @@ func interleavePieceHeader(part *interleavePart, index int, last bool) zip.FileH
 // 返回: error 压缩、取消或输出错误
 func writeInterleavePiece(ctx context.Context, archive zipEntryWriter, part *interleavePart, last bool, data []byte, options WriteOptions, compressor *flate.Writer, candidate *compressionBuffer, buffer []byte) error {
 	header := interleavePieceHeader(part, part.index, last)
-	if options.Compression == CompressionStore {
-		header.Method = zip.Store
-	} else if options.Compression == CompressionDeflate {
-		header.Method = zip.Deflate
-	}
-	if options.Compression != CompressionOptimize {
-		if header.Method == zip.Store {
-			header.CRC32 = crc32.ChecksumIEEE(data)
-			header.CompressedSize64, header.UncompressedSize64 = uint64(len(data)), uint64(len(data))
-			header.CompressedSize, header.UncompressedSize = uint32(len(data)), uint32(len(data))
-			writer, err := archive.CreateRaw(&header)
-			if err != nil {
-				return err
-			}
-			return writeCompressionInput(writer, bytes.NewReader(data), buffer, ctx)
-		}
-		writer, err := archive.CreateHeader(&header)
-		if err != nil {
-			return err
-		}
-		return writeCompressionInput(writer, bytes.NewReader(data), buffer, ctx)
-	}
-	candidate.reset(len(data))
-	compressor.Reset(candidate)
-	copyErr := writeCompressionInput(compressor, bytes.NewReader(data), buffer, ctx)
-	closeErr := compressor.Close()
-	if err := checkContext(ctx); err != nil {
-		return err
-	}
-	if copyErr != nil && !errors.Is(copyErr, errCompressionBuffer) {
-		return copyErr
-	}
-	if closeErr != nil && !errors.Is(closeErr, errCompressionBuffer) {
-		return closeErr
-	}
-	header.Method = zip.Store
-	payload := data
-	if copyErr == nil && closeErr == nil && candidate.Len() < len(data) {
-		header.Method = zip.Deflate
-		payload = candidate.Bytes()
-	}
-	header.CRC32 = crc32.ChecksumIEEE(data)
-	header.UncompressedSize, header.UncompressedSize64 = uint32(len(data)), uint64(len(data))
-	header.CompressedSize, header.CompressedSize64 = uint32(len(payload)), uint64(len(payload))
-	writer, err := archive.CreateRaw(&header)
-	if err != nil {
-		return err
-	}
-	return writeCompressionInput(writer, bytes.NewReader(payload), buffer, ctx)
+	return writeZIPBufferEntry(ctx, archive, header, data, options.Compression, compressor, candidate, buffer)
 }
 
 // writeMemory 写出内存包，保留未修改条目的元数据与分片，Original沿用导入压缩方法且新条目采用Deflate
@@ -879,59 +837,7 @@ func (r *Reader) writeMemory(ctx context.Context, output io.Writer, options Writ
 			return counted.count, err
 		}
 		data := r.pkg.data[item.key][item.start:item.end]
-		header := item.header
-		if options.Compression == CompressionStore {
-			header.Method = zip.Store
-		} else if options.Compression == CompressionDeflate {
-			header.Method = zip.Deflate
-		}
-		if options.Compression == CompressionOptimize {
-			limit := min(len(data), compressionBufferLimit)
-			candidate.reset(limit)
-			optimizer.Reset(&candidate)
-			copyErr := writeCompressionInput(optimizer, bytes.NewReader(data), buffer, ctx)
-			closeErr := optimizer.Close()
-			if err := checkContext(ctx); err != nil {
-				return counted.count, err
-			}
-			if copyErr != nil && !errors.Is(copyErr, errCompressionBuffer) {
-				return counted.count, copyErr
-			}
-			if closeErr != nil && !errors.Is(closeErr, errCompressionBuffer) {
-				return counted.count, closeErr
-			}
-			header.Method = zip.Store
-			checksum := crc32.NewIEEE()
-			for start := 0; start < len(data); start += len(buffer) {
-				if err := checkContext(ctx); err != nil {
-					return counted.count, err
-				}
-				_, _ = checksum.Write(data[start:min(start+len(buffer), len(data))])
-			}
-			header.CRC32 = checksum.Sum32()
-			header.UncompressedSize64 = uint64(len(data))
-			payload := data
-			if copyErr == nil && closeErr == nil && candidate.Len() < len(data) {
-				header.Method = zip.Deflate
-				payload = candidate.Bytes()
-			}
-			header.CompressedSize64 = uint64(len(payload))
-			header.Flags &^= 0xe
-			header.ReaderVersion, header.CreatorVersion = 20, header.CreatorVersion&0xff00|20
-			writer, err := archive.CreateRaw(&header)
-			if err != nil {
-				return counted.count, err
-			}
-			if err := writeCompressionInput(writer, bytes.NewReader(payload), buffer, ctx); err != nil {
-				return counted.count, err
-			}
-			continue
-		}
-		writer, err := archive.CreateHeader(&header)
-		if err != nil {
-			return counted.count, err
-		}
-		if err := writeCompressionInput(writer, bytes.NewReader(data), buffer, ctx); err != nil {
+		if err := writeZIPBufferEntry(ctx, archive, item.header, data, options.Compression, optimizer, &candidate, buffer); err != nil {
 			return counted.count, err
 		}
 	}
@@ -1042,4 +948,183 @@ func (w *zipMetadataWriter) Close() error {
 		}
 	}
 	return checkContext(w.context)
+}
+
+// writeZIPBufferEntry 将内存载荷按指定压缩策略写入单个ZIP条目，支持Store、Deflate与无损Optimize模式
+// 入参: ctx 已规范化取消Context, archive 输出ZIP写入器, header 目标条目头, data 未压缩载荷字节, compression 压缩策略, optimizer Optimize模式复用压缩器, candidate Optimize模式复用候选缓冲, buffer 复制缓冲区
+// 返回: error 压缩、取消或ZIP写出错误
+func writeZIPBufferEntry(ctx context.Context, archive zipEntryWriter, header zip.FileHeader, data []byte, compression Compression, optimizer *flate.Writer, candidate *compressionBuffer, buffer []byte) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if compression == CompressionStore {
+		header.Method = zip.Store
+	} else if compression == CompressionDeflate {
+		header.Method = zip.Deflate
+	}
+	if compression == CompressionOptimize {
+		limit := min(len(data), compressionBufferLimit)
+		candidate.reset(limit)
+		optimizer.Reset(candidate)
+		copyErr := writeCompressionInput(optimizer, bytes.NewReader(data), buffer, ctx)
+		closeErr := optimizer.Close()
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		if copyErr != nil && !errors.Is(copyErr, errCompressionBuffer) {
+			return copyErr
+		}
+		if closeErr != nil && !errors.Is(closeErr, errCompressionBuffer) {
+			return closeErr
+		}
+		crc, err := zipChunkedCRC32(ctx, data, len(buffer))
+		if err != nil {
+			return err
+		}
+		header.Method = zip.Store
+		payload := data
+		if copyErr == nil && closeErr == nil && candidate.Len() < len(data) {
+			header.Method = zip.Deflate
+			payload = candidate.Bytes()
+		}
+		header.CRC32 = crc
+		header.UncompressedSize64 = uint64(len(data))
+		header.CompressedSize64 = uint64(len(payload))
+		header.UncompressedSize, header.CompressedSize = 0, 0
+		if header.UncompressedSize64 < uint64(^uint32(0)) && header.CompressedSize64 < uint64(^uint32(0)) {
+			header.UncompressedSize = uint32(len(data))
+			header.CompressedSize = uint32(len(payload))
+		}
+		header.Flags &^= 0xe
+		header.ReaderVersion, header.CreatorVersion = 20, header.CreatorVersion&0xff00|20
+		writer, err := archive.CreateRaw(&header)
+		if err != nil {
+			return err
+		}
+		return writeCompressionInput(writer, bytes.NewReader(payload), buffer, ctx)
+	}
+	if header.Method == zip.Store && (compression == CompressionStore || header.Modified.IsZero()) {
+		crc, err := zipChunkedCRC32(ctx, data, len(buffer))
+		if err != nil {
+			return err
+		}
+		header.CRC32 = crc
+		header.UncompressedSize64, header.CompressedSize64 = uint64(len(data)), uint64(len(data))
+		header.UncompressedSize, header.CompressedSize = 0, 0
+		if header.UncompressedSize64 < uint64(^uint32(0)) {
+			header.UncompressedSize, header.CompressedSize = uint32(len(data)), uint32(len(data))
+		}
+		header.Flags &^= 0xe
+		header.ReaderVersion, header.CreatorVersion = 20, header.CreatorVersion&0xff00|20
+		writer, err := archive.CreateRaw(&header)
+		if err != nil {
+			return err
+		}
+		return writeCompressionInput(writer, bytes.NewReader(data), buffer, ctx)
+	}
+	writer, err := archive.CreateHeader(&header)
+	if err != nil {
+		return err
+	}
+	return writeCompressionInput(writer, bytes.NewReader(data), buffer, ctx)
+}
+
+// zipChunkedCRC32 分块计算内存载荷的IEEE CRC32并在块间响应取消信号
+// 入参: ctx 取消Context, data 待校验字节, chunk 单块大小
+// 返回: uint32 CRC32校验值, error 取消错误
+func zipChunkedCRC32(ctx context.Context, data []byte, chunk int) (uint32, error) {
+	if chunk < 1 {
+		chunk = 32 << 10
+	}
+	checksum := crc32.NewIEEE()
+	for start := 0; start < len(data); start += chunk {
+		if err := checkContext(ctx); err != nil {
+			return 0, err
+		}
+		_, _ = checksum.Write(data[start:min(start+chunk, len(data))])
+	}
+	return checksum.Sum32(), nil
+}
+
+// newPartNameRegistry 创建空OPC部件名称与派生路径冲突登记表
+// 返回: partNameRegistry 初始化完成的登记表
+func newPartNameRegistry() partNameRegistry {
+	return partNameRegistry{names: make(map[string]bool), parents: make(map[string]int)}
+}
+
+// init 惰性初始化零值登记表的底层映射
+func (r *partNameRegistry) init() {
+	if r.names == nil {
+		r.names = make(map[string]bool)
+	}
+	if r.parents == nil {
+		r.parents = make(map[string]int)
+	}
+}
+
+// clone 复制独立的部件名称与祖先计数登记表，用于事务回滚快照
+// 返回: partNameRegistry 独立副本
+func (r *partNameRegistry) clone() partNameRegistry {
+	return partNameRegistry{names: maps.Clone(r.names), parents: maps.Clone(r.parents)}
+}
+
+// count 返回当前已登记的逻辑部件名称总数
+// 返回: int 名称数量
+func (r *partNameRegistry) count() int {
+	return len(r.names)
+}
+
+// has 判断已规范化部件名称是否已被占用
+// 入参: part 规范化部件URI
+// 返回: bool 是否已登记
+func (r *partNameRegistry) has(part string) bool {
+	return r.names[strings.ToLower(part)]
+}
+
+// available 检查部件名称及其祖先、后代路径是否均未被占用，强制遵守OPC M1.11派生路径约束
+// 入参: part 已规范化部件URI
+// 返回: error 同名或派生路径冲突错误
+func (r *partNameRegistry) available(part string) error {
+	key := strings.ToLower(part)
+	if r.names[key] || r.parents[key] != 0 {
+		return fmt.Errorf("%w: part name collision %s", ErrInvalid, part)
+	}
+	for slash := strings.LastIndexByte(key, '/'); slash > 0; slash = strings.LastIndexByte(key[:slash], '/') {
+		if r.names[key[:slash]] {
+			return fmt.Errorf("%w: derived part name %s", ErrInvalid, part)
+		}
+	}
+	return nil
+}
+
+// register 幂等登记部件名称并递增全部祖先路径占用计数
+// 入参: part 已规范化部件URI
+func (r *partNameRegistry) register(part string) {
+	r.init()
+	key := strings.ToLower(part)
+	if r.names[key] {
+		return
+	}
+	r.names[key] = true
+	for slash := strings.LastIndexByte(key, '/'); slash > 0; slash = strings.LastIndexByte(key[:slash], '/') {
+		r.parents[key[:slash]]++
+	}
+}
+
+// unregister 幂等撤销部件名称并递减全部祖先路径占用计数
+// 入参: part 已规范化部件URI
+func (r *partNameRegistry) unregister(part string) {
+	key := strings.ToLower(part)
+	if !r.names[key] {
+		return
+	}
+	delete(r.names, key)
+	for slash := strings.LastIndexByte(key, '/'); slash > 0; slash = strings.LastIndexByte(key[:slash], '/') {
+		parent := key[:slash]
+		if r.parents[parent] <= 1 {
+			delete(r.parents, parent)
+		} else {
+			r.parents[parent]--
+		}
+	}
 }

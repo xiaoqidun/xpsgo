@@ -433,11 +433,11 @@ func (s PrintSheet) BackFlipTransform() Matrix {
 	if s.Back == nil || s.Duplex == PrintSimplex || !geometryFinite(s.Back.Width, s.Back.Height) || s.Back.Width <= 0 || s.Back.Height <= 0 {
 		return IdentityMatrix()
 	}
-	rotates := printBackRotates(s.Duplex, s.Back.Width, s.Back.Height)
+	duplex := s.Duplex
 	if s.Booklet {
-		rotates = s.Back.Height > s.Back.Width
+		duplex = PrintDuplexShortEdge
 	}
-	if !rotates {
+	if !printBackRotates(duplex, s.Back.Width, s.Back.Height) {
 		return IdentityMatrix()
 	}
 	return Matrix{A: -1, D: -1, E: s.Back.Width, F: s.Back.Height}
@@ -592,7 +592,7 @@ func (b *printPlanBuilder) build() (*PrintPlan, error) {
 func (b *printPlanBuilder) assembleSheets(plan *PrintPlan, documents []printPlanDocument, jobFinishing PrintFinishing, copies int, collated, reverse bool, nup int, duplex PrintDuplex, manual, jobHasDuplex bool) error {
 	if jobFinishing.Binding == PrintBindingBooklet {
 		var jobPages []printPlanPage
-		bookletDuplex, bookletManual := duplex, manual
+		bookletManual := manual
 		seenDocDuplex := false
 		var docDuplexMode PrintDuplex
 		var docManualMode bool
@@ -641,11 +641,11 @@ func (b *printPlanBuilder) assembleSheets(plan *PrintPlan, documents []printPlan
 			if jobHasDuplex && (duplex != docDuplexMode || manual != docManualMode) {
 				return fmt.Errorf("%w: job and document duplex conflict in booklet", ErrUnsupported)
 			}
-			bookletDuplex, bookletManual = docDuplexMode, docManualMode
+			bookletManual = docManualMode
 		}
 		template := &PrintPlan{}
 		packer := printSheetPacker{builder: b, output: template, temporary: true}
-		if err := packer.bookletPages(jobPages, jobFinishing, bookletDuplex, bookletManual); err != nil {
+		if err := packer.bookletPages(jobPages, jobFinishing, bookletManual); err != nil {
 			return err
 		}
 		if err := b.copyDocument(plan, template.Sheets, copies, collated); err != nil {
@@ -1087,27 +1087,13 @@ func (b *printPlanBuilder) page(index int, source string, document *PrintSetting
 	if err != nil {
 		return result, err
 	}
-	model, result.watermark, err = printWatermarkSettings(model, b.settings)
-	if err != nil {
-		return result, err
-	}
-	model, result.negative, result.color, err = printColorSettings(model, b.settings)
-	if err != nil {
-		return result, err
-	}
 	ignoreUnsupported := b.options.IgnoreUnsupportedFeatures || b.options.Print.IgnoreUnsupportedFeatures
-	cleaned, colorPlan, err := printColorPlanSettings(b.settings.context, model, &b.settings.PrintSettingsOptions)
-	if err != nil {
-		if !ignoreUnsupported || !errors.Is(err, ErrUnsupported) {
-			return result, err
-		}
-		model = printStripColorPlanFeatures(model)
-		result.colorPlan = nil
-	} else {
-		model = cleaned
-		result.colorPlan = colorPlan
-	}
-	layoutSettings, err := printPlanLayoutSettings(model, b.signatures != nil, ignoreUnsupported)
+	state, err := preparePrintPageState(b.settings.context, model, b.settings, nil, PrintMedia{}, printPageStateOptions{
+		stripSignatures:      b.signatures != nil,
+		stripPlanFeatures:    true,
+		ignoreUnsupported:    ignoreUnsupported,
+		ignoreColorPlanError: ignoreUnsupported,
+	})
 	if err != nil {
 		return result, err
 	}
@@ -1126,22 +1112,16 @@ func (b *printPlanBuilder) page(index int, source string, document *PrintSetting
 	if err != nil {
 		return result, err
 	}
-	layout, rotation, err := layoutSettings.layoutWithRotation(b.settings.context, page, b.options.Print.Media, &b.settings.PrintSettingsOptions)
-	if err != nil {
+	if err := state.computeLayout(b.settings.context, b.settings, page, b.options.Print.Media, true); err != nil {
 		return result, err
 	}
-	if backClip := printRotateBox180(layout.MediaClip, layout.Width, layout.Height); backClip != layout.MediaClip {
-		backMedia := b.options.Print.Media
-		backMedia.Width, backMedia.Height = layout.Width, layout.Height
-		backMedia.ImageableArea = &backClip
-		backLayout, _, err := layoutSettings.layoutWithRotation(b.settings.context, page, backMedia, &b.settings.PrintSettingsOptions)
-		if err != nil {
-			return result, err
-		}
-		result.backLayout = backLayout
-	}
-	result.layout = *layout
-	result.rotation = rotation
+	result.watermark = state.watermark
+	result.negative = state.negative
+	result.color = state.outputColor
+	result.colorPlan = state.colorPlan
+	result.layout = *state.layout
+	result.rotation = state.rotation
+	result.backLayout = state.backLayout
 	return result, nil
 }
 
@@ -1434,7 +1414,7 @@ func (p *printSheetPacker) document(document printPlanDocument) error {
 				pages = append(pages, page)
 			}
 		}
-		return p.bookletPages(pages, document.finishing, document.duplex, document.manual)
+		return p.bookletPages(pages, document.finishing, document.manual)
 	}
 	for _, page := range document.pages {
 		for range page.copies {
@@ -1453,15 +1433,12 @@ func (p *printSheetPacker) document(document printPlanDocument) error {
 }
 
 // bookletPages 按标准骑马订小册子规则将页流补齐至四的倍数并生成双面对折拼版纸张
-// 正反面页面布局统一保持正常阅读方向，物理背面翻转统一交由PrintSheet.BackFlipTransform承载
-// 入参: pages 已展开的逻辑页流, finishing 小册子装订参数, duplex 显式双面方式，单面时默认改用短边双面, manual 是否手动双面
+// 骑马钉折脊始终沿物理介质较短边对折，实际纸张双面轴统一规范为短边双面，正反面页面保持正常阅读方向并由BackFlipTransform承载背面翻转
+// 入参: pages 已展开的逻辑页流, finishing 小册子装订参数, manual 是否手动双面
 // 返回: error 几何、强制正面冲突、容量或取消错误
-func (p *printSheetPacker) bookletPages(pages []printPlanPage, finishing PrintFinishing, duplex PrintDuplex, manual bool) error {
+func (p *printSheetPacker) bookletPages(pages []printPlanPage, finishing PrintFinishing, manual bool) error {
 	if len(pages) == 0 {
 		return nil
-	}
-	if duplex == PrintSimplex {
-		duplex = PrintDuplexShortEdge
 	}
 	padded := ((len(pages) + 3) / 4) * 4
 	sheets := padded / 4
@@ -1478,19 +1455,19 @@ func (p *printSheetPacker) bookletPages(pages []printPlanPage, finishing PrintFi
 			frontSlots = [2]int{frontCover, backCover}
 			backSlots = [2]int{insideBack, insideFront}
 		}
-		front, err := p.bookletSide(pages, frontSlots, ref, finishing, duplex, false)
+		front, err := p.bookletSide(pages, frontSlots, ref, finishing, false)
 		if err != nil {
 			return err
 		}
 		var back *PrintSide
 		if backSlots[0] < len(pages) || backSlots[1] < len(pages) {
-			side, err := p.bookletSide(pages, backSlots, ref, finishing, duplex, true)
+			side, err := p.bookletSide(pages, backSlots, ref, finishing, true)
 			if err != nil {
 				return err
 			}
 			back = &side
 		}
-		sheet := PrintSheet{Front: front, Back: back, Duplex: duplex, ManualDuplex: manual, Booklet: true}
+		sheet := PrintSheet{Front: front, Back: back, Duplex: PrintDuplexShortEdge, ManualDuplex: manual, Booklet: true}
 		if err := p.builder.appendSheet(p.output, sheet, p.temporary); err != nil {
 			return err
 		}
@@ -1547,11 +1524,11 @@ func printMergeBookletColor(first, second PrintColor) PrintColor {
 }
 
 // bookletSide 将小册子正反面的最多两个书帖槽位按正常阅读方向映射到折脊两侧的有效可打印区域并避开中心装订留白
-// 入参: pages 逻辑页流, slots 左右或上下槽位逻辑页序号, ref 纸张介质基准页, finishing 装订设置, duplex 双面方式, back 是否为背面
+// 入参: pages 逻辑页流, slots 左右或上下槽位逻辑页序号, ref 纸张介质基准页, finishing 装订设置, back 是否为背面
 // 返回: PrintSide 独立纸面, error 强制正面冲突、变换或范围错误
-func (p *printSheetPacker) bookletSide(pages []printPlanPage, slots [2]int, ref printPlanPage, finishing PrintFinishing, duplex PrintDuplex, back bool) (PrintSide, error) {
+func (p *printSheetPacker) bookletSide(pages []printPlanPage, slots [2]int, ref printPlanPage, finishing PrintFinishing, back bool) (PrintSide, error) {
 	mediaClip := ref.layout.MediaClip
-	if back && ref.layout.Height > ref.layout.Width {
+	if back && printBackRotates(PrintDuplexShortEdge, ref.layout.Width, ref.layout.Height) {
 		mediaClip = printRotateBox180(mediaClip, ref.layout.Width, ref.layout.Height)
 	}
 	side := PrintSide{Width: ref.layout.Width, Height: ref.layout.Height, MediaClip: mediaClip}
@@ -1567,7 +1544,7 @@ func (p *printSheetPacker) bookletSide(pages []printPlanPage, slots [2]int, ref 
 			side.Color = printMergeBookletColor(side.Color, pages[index].color)
 		}
 	}
-	side.Gutter = printBindingGutter(finishing, side, duplex, back)
+	side.Gutter = printBindingGutter(finishing, side, PrintDuplexShortEdge, back)
 	phys, base, usable := printBookletCells(side)
 	for slot, index := range slots {
 		if index >= len(pages) {
@@ -1827,32 +1804,9 @@ func (s PrintSide) ContentBounds() Rect {
 	if len(s.Pages) == 0 || !geometryFinite(s.Width, s.Height) || s.Width <= 0 || s.Height <= 0 || !printBoxWithin(s.MediaClip, Rect{Width: s.Width, Height: s.Height}) || s.MediaClip.Width <= 0 || s.MediaClip.Height <= 0 {
 		return Rect{}
 	}
-	var visible []Rect
-	if s.Gutter != nil {
-		gutter := *s.Gutter
-		if !printBoxWithin(gutter, s.MediaClip) {
-			return Rect{}
-		}
-		if gutter.Width > 0 && gutter.Height > 0 {
-			right, bottom := gutter.X+gutter.Width, gutter.Y+gutter.Height
-			for _, region := range [4]Rect{
-				{X: s.MediaClip.X, Y: s.MediaClip.Y, Width: s.MediaClip.Width, Height: gutter.Y - s.MediaClip.Y},
-				{X: s.MediaClip.X, Y: bottom, Width: s.MediaClip.Width, Height: s.MediaClip.Y + s.MediaClip.Height - bottom},
-				{X: s.MediaClip.X, Y: gutter.Y, Width: gutter.X - s.MediaClip.X, Height: gutter.Height},
-				{X: right, Y: gutter.Y, Width: s.MediaClip.X + s.MediaClip.Width - right, Height: gutter.Height},
-			} {
-				if region.Width > 0 && region.Height > 0 {
-					visible = append(visible, region)
-				}
-			}
-			if len(visible) == 0 {
-				return Rect{}
-			}
-		} else {
-			visible = []Rect{s.MediaClip}
-		}
-	} else {
-		visible = []Rect{s.MediaClip}
+	visible, ok := printSideVisibleRegions(s.MediaClip, s.Gutter)
+	if !ok {
+		return Rect{}
 	}
 	found := false
 	var minX, minY, maxX, maxY float64
@@ -2114,27 +2068,16 @@ func countPrintElements(elements []Element, remaining, depth, maximumDepth int) 
 // 入参: media 已校验的纸面物理裁剪区域, gutter 可选留白，须有限、尺寸非负且完整位于media内
 // 返回: *Geometry 非nil裁剪，全覆盖时为空几何，零面积留白无效果, error 非法留白错误
 func printSideGutterClip(media Rect, gutter *Rect) (*Geometry, error) {
-	if gutter == nil {
-		return renderBoxGeometry(media), nil
-	}
-	box := *gutter
-	if !printBoxWithin(box, media) {
+	regions, ok := printSubtractGutter(media, gutter)
+	if !ok {
 		return nil, fmt.Errorf("%w: print side gutter", ErrInvalid)
 	}
-	if box.Width == 0 || box.Height == 0 {
+	if len(regions) == 1 && regions[0] == media {
 		return renderBoxGeometry(media), nil
 	}
-	right, bottom := box.X+box.Width, box.Y+box.Height
 	clip := &Geometry{FillRule: GeometryNonZero}
-	for _, remaining := range [4]Rect{
-		{X: media.X, Y: media.Y, Width: media.Width, Height: box.Y - media.Y},
-		{X: media.X, Y: bottom, Width: media.Width, Height: media.Y + media.Height - bottom},
-		{X: media.X, Y: box.Y, Width: box.X - media.X, Height: box.Height},
-		{X: right, Y: box.Y, Width: media.X + media.Width - right, Height: box.Height},
-	} {
-		if remaining.Width > 0 && remaining.Height > 0 {
-			clip.Figures = append(clip.Figures, renderBoxGeometry(remaining).Figures...)
-		}
+	for _, remaining := range regions {
+		clip.Figures = append(clip.Figures, renderBoxGeometry(remaining).Figures...)
 	}
 	return clip, nil
 }
@@ -2826,9 +2769,15 @@ func (s *PrintSettings) Summary(ctx context.Context, opts *PrintLayoutOptions) (
 	if layoutOpts.Defaults != nil && s != nil {
 		model, err = MergePrintSettings(configuration.context, layoutOpts.Defaults, s, &configuration.PrintSettingsOptions)
 	} else if s != nil {
-		model, err = MergePrintSettings(configuration.context, s, &PrintSettings{Version: s.Version}, &configuration.PrintSettingsOptions)
+		model, err = validatePrintSettingsModel(s, configuration, printDocumentTicket)
+		if err == nil {
+			err = validatePrintSettingsOutputBudget(model, configuration, printDocumentTicket)
+		}
 	} else if layoutOpts.Defaults != nil {
-		model, err = MergePrintSettings(configuration.context, layoutOpts.Defaults, &PrintSettings{Version: layoutOpts.Defaults.Version}, &configuration.PrintSettingsOptions)
+		model, err = validatePrintSettingsModel(layoutOpts.Defaults, configuration, printDocumentTicket)
+		if err == nil {
+			err = validatePrintSettingsOutputBudget(model, configuration, printDocumentTicket)
+		}
 	} else {
 		model = &PrintSettings{Version: 1}
 	}
@@ -2859,7 +2808,10 @@ func (s *PrintSettings) Summary(ctx context.Context, opts *PrintLayoutOptions) (
 		summary.PhotoPrintingIntent = intent
 	}
 	if placement, err := control.mediaSize(&media); err != nil {
-		if !layoutOpts.IgnoreUnsupportedFeatures || !errors.Is(err, ErrUnsupported) {
+		if placement.rollNoLength {
+			summary.MediaSizeName = placement.mediaName
+			summary.MediaWidthMicrons = placement.widthMicrons
+		} else if !layoutOpts.IgnoreUnsupportedFeatures || !errors.Is(err, ErrUnsupported) {
 			return nil, err
 		}
 	} else {
@@ -2958,18 +2910,21 @@ func (s *PrintSettings) Summary(ctx context.Context, opts *PrintLayoutOptions) (
 		return nil, fmt.Errorf("%w: print summary copy count", ErrLimit)
 	}
 	summary.Copies = jobCopies * docCopies * pageCopies
-	if docCollateOpt, _, err := control.option(model.Elements, "DocumentCollate"); err != nil {
+	jobCollate, err := control.choice("JobCollateAllDocuments", "Collated", "Collated", "Uncollated")
+	if err != nil {
 		return nil, err
-	} else if docCollateOpt != nil {
+	}
+	docCollateOpt, _, err := control.option(model.Elements, "DocumentCollate")
+	if err != nil {
+		return nil, err
+	}
+	if docCollateOpt != nil {
 		summary.Collate, err = control.choice("DocumentCollate", "Collated", "Collated", "Uncollated")
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		summary.Collate, err = control.choice("JobCollateAllDocuments", "Collated", "Collated", "Uncollated")
-		if err != nil {
-			return nil, err
-		}
+		summary.Collate = jobCollate
 	}
 	summary.PageOrder, err = control.choice("JobPageOrder", "Standard", "Standard", "Reverse")
 	if err != nil {
@@ -3259,23 +3214,23 @@ func printCloneRectPtr(src *Rect) *Rect {
 	return &copied
 }
 
-// printSideVisibleRegions 计算纸面MediaClip扣除Gutter留白后的最多四个非空可见互补矩形
+// printSubtractGutter 计算mediaClip扣除合法gutter后的最多四个非空互补矩形，零面积或全覆盖返回空切片与true，几何非法返回false
 // 入参: mediaClip 纸面可打印区域, gutter 可选装订留白区域
-// 返回: []Rect 可见子区域列表, bool 纸面与留白几何是否合法且存在可见区域
-func printSideVisibleRegions(mediaClip Rect, gutter *Rect) ([]Rect, bool) {
-	if !geometryFinite(mediaClip.X, mediaClip.Y, mediaClip.Width, mediaClip.Height, mediaClip.X+mediaClip.Width, mediaClip.Y+mediaClip.Height) || mediaClip.Width <= 0 || mediaClip.Height <= 0 {
+// 返回: []Rect 互补可见子区域切片, bool 纸面与留白几何是否合法
+func printSubtractGutter(mediaClip Rect, gutter *Rect) ([]Rect, bool) {
+	if !geometryFinite(mediaClip.X, mediaClip.Y, mediaClip.Width, mediaClip.Height, mediaClip.X+mediaClip.Width, mediaClip.Y+mediaClip.Height) || mediaClip.Width < 0 || mediaClip.Height < 0 {
 		return nil, false
 	}
-	if gutter == nil {
+	if gutter != nil && !printBoxWithin(*gutter, mediaClip) {
+		return nil, false
+	}
+	if mediaClip.Width == 0 || mediaClip.Height == 0 {
+		return nil, true
+	}
+	if gutter == nil || gutter.Width == 0 || gutter.Height == 0 {
 		return []Rect{mediaClip}, true
 	}
 	box := *gutter
-	if !printBoxWithin(box, mediaClip) {
-		return nil, false
-	}
-	if box.Width == 0 || box.Height == 0 {
-		return []Rect{mediaClip}, true
-	}
 	right, bottom := box.X+box.Width, box.Y+box.Height
 	var visible []Rect
 	for _, region := range [4]Rect{
@@ -3288,7 +3243,15 @@ func printSideVisibleRegions(mediaClip Rect, gutter *Rect) ([]Rect, bool) {
 			visible = append(visible, region)
 		}
 	}
-	return visible, len(visible) > 0
+	return visible, true
+}
+
+// printSideVisibleRegions 计算纸面MediaClip扣除Gutter留白后的最多四个非空可见互补矩形
+// 入参: mediaClip 纸面可打印区域, gutter 可选装订留白区域
+// 返回: []Rect 可见子区域列表, bool 纸面与留白几何是否合法且存在可见区域
+func printSideVisibleRegions(mediaClip Rect, gutter *Rect) ([]Rect, bool) {
+	visible, ok := printSubtractGutter(mediaClip, gutter)
+	return visible, ok && len(visible) > 0
 }
 
 // MapPage 查找指定零基源页面在打印计划全部纸张正反面中的所有放置映射，返回含所在纸面上下文的独立副本列表
@@ -3513,11 +3476,7 @@ func AnalyzePrintStreamCapability(ctx context.Context, settings *PrintSettings, 
 	if settings == nil {
 		settings = &PrintSettings{Version: 1}
 	}
-	root, err := printSettingsRoot(settings, configuration)
-	if err != nil {
-		return PrintStreamCapability{}, err
-	}
-	model, err := parsePrintSettings(root, configuration)
+	model, err := validatePrintSettingsModel(settings, configuration, printDocumentTicket)
 	if err != nil {
 		return PrintStreamCapability{}, err
 	}
@@ -3553,7 +3512,15 @@ func AnalyzePrintStreamCapability(ctx context.Context, settings *PrintSettings, 
 	if err != nil {
 		return PrintStreamCapability{}, err
 	}
+	jobDuplex, _, err := control.duplex("JobDuplexAllDocumentsContiguously")
+	if err != nil {
+		return PrintStreamCapability{}, err
+	}
 	duplex, _, err := control.effectiveDuplex()
+	if err != nil {
+		return PrintStreamCapability{}, err
+	}
+	jobNUp, _, err := control.nup("JobNUpAllDocumentsContiguously", maxInt)
 	if err != nil {
 		return PrintStreamCapability{}, err
 	}
@@ -3579,6 +3546,10 @@ func AnalyzePrintStreamCapability(ctx context.Context, settings *PrintSettings, 
 	}
 	if poster > 1 && (booklet || nup > 1) {
 		return PrintStreamCapability{}, fmt.Errorf("%w: poster conflicts with booklet or NUp", ErrUnsupported)
+	}
+	continuous := jobNUp > 1 || jobDuplex != PrintSimplex
+	if jobFin.Binding != PrintBindingBooklet && continuous && docCollate == "Uncollated" && (docCopies > 1 || jobCollate == "Uncollated" && jobCopies > 1) {
+		return PrintStreamCapability{}, fmt.Errorf("%w: uncollated copies conflict with job-contiguous sheet packing", ErrUnsupported)
 	}
 	result := PrintStreamCapability{
 		Mode:               PrintStreamPassthrough,

@@ -1138,11 +1138,19 @@ func decodeJXRImageRows(ctx context.Context, data []byte, maxPixels, maxBytes ui
 	toneMapPeak := jxrExtraToneMapPeak(info, cfg)
 	fastNRGBA := cfg.Background == nil && !cfg.Negative && cfg.ColorMode == PrintColorOriginal && toneMapPeak == 0
 	var bgLinear [3]float64
+	bgAlpha := 0.0
 	hasBG := cfg.Background != nil
 	if hasBG {
-		bgLinear, _ = imageConvertBackground(cfg.Background)
+		bgLinear, bgAlpha, _ = imageConvertBackground(cfg.Background)
 	}
 	directStream := info.Orientation == jxrgo.OrientationNone || info.Orientation == jxrgo.OrientationFlipX
+	needNeighbors := false
+	for _, comp := range info.Components {
+		if comp.XStep > 1 || comp.YStep > 1 {
+			needNeighbors = true
+			break
+		}
+	}
 	var frameBuf []byte
 	if !directStream {
 		need := uint64(fullW) * uint64(fullH) * 4
@@ -1186,7 +1194,7 @@ func decodeJXRImageRows(ctx context.Context, data []byte, maxPixels, maxBytes ui
 				if err := conv.ConvertStripRegionLinear(ctx, prev, curr, next, ly, rowLinear); err != nil {
 					return jxrImageError(err)
 				}
-				if err := finishLinearRowToNRGBA(rowLinear, sw, toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode, rowBytes); err != nil {
+				if err := finishLinearRowToNRGBA(rowLinear, sw, toneMapPeak, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode, rowBytes); err != nil {
 					return err
 				}
 			}
@@ -1213,6 +1221,9 @@ func decodeJXRImageRows(ctx context.Context, data []byte, maxPixels, maxBytes ui
 	}
 	var prev, curr jxrgo.StripRegion
 	stripErr := imgDec.DecodeStrips(ctx, func(cbCtx context.Context, region image.Rectangle, source *jxrgo.Raster) error {
+		if !needNeighbors {
+			return processStrip(jxrgo.StripRegion{}, jxrgo.StripRegion{Region: region, Raster: source}, jxrgo.StripRegion{})
+		}
 		cloned, cloneErr := source.Clone(cbCtx, limits)
 		if cloneErr != nil {
 			return jxrImageError(cloneErr)

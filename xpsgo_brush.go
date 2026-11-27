@@ -152,7 +152,7 @@ type GradientResolveOptions struct {
 	MaxStops      int
 }
 
-// ResolvedGradient 保存规范化渐变停靠点、变换后几何、径向椭圆分解及页面映射矩阵
+// ResolvedGradient 保存规范化渐变停靠点、变换后几何、径向椭圆分解、页面映射矩阵及后置打印色彩变换标记
 type ResolvedGradient struct {
 	Kind                   BrushKind
 	SpreadMethod           SpreadMethod
@@ -164,10 +164,16 @@ type ResolvedGradient struct {
 	Center                 Point
 	Focus                  Point
 	Radius                 float64
+	RadiusX                float64
+	RadiusY                float64
+	Degenerate             bool
 	ShadingToPage          Matrix
 	FocusOutsideEllipse    bool
 	Constant               bool
 	ConstantColor          ResolvedColor
+	Negative               bool
+	PrintColor             PrintColorMode
+	PostProcessColor       bool
 }
 
 // resolvedGradientEntry 保存规范化渐变处理过程中的偏移、插值空间分量及关联解析颜色
@@ -175,7 +181,6 @@ type resolvedGradientEntry struct {
 	offset   float64
 	values   [4]float64
 	resolved ResolvedColor
-	exact    bool
 }
 
 // gradientSampleStop 保存已转换到插值空间的非预乘颜色及透明度
@@ -743,22 +748,17 @@ func newGradientSampler(brush *Brush, transform Matrix) (*gradientSampler, error
 		}
 		s.stops[i] = gradientSampleStop{stop.Offset, values}
 	}
-	sort.SliceStable(s.stops, func(i, j int) bool { return s.stops[i].offset < s.stops[j].offset })
-	stops := s.stops[:0]
-	for i := 0; i < len(s.stops); {
-		j := i + 1
-		for j < len(s.stops) && s.stops[j].offset == s.stops[i].offset {
-			j++
-		}
-		stops = append(stops, s.stops[i])
-		if j-i > 1 {
-			stops = append(stops, s.stops[j-1])
-		}
-		i = j
-	}
-	s.stops = stops
-	s.boundary(0)
-	s.boundary(1)
+	s.stops = normalizeGradientStops(
+		s.stops,
+		func(stop gradientSampleStop) float64 { return stop.offset },
+		func(stop gradientSampleStop, offset float64) gradientSampleStop {
+			stop.offset = offset
+			return stop
+		},
+		func(lo, hi gradientSampleStop, offset, t float64) gradientSampleStop {
+			return gradientSampleStop{offset: offset, values: gradientBlend(lo.values, hi.values, t)}
+		},
+	)
 	if len(s.stops) == 2 && s.stops[0].offset == 0 && s.stops[1].offset == 1 {
 		s.unitStops = true
 	} else if len(s.stops) > 4 && len(s.stops) < 65535 {
@@ -855,38 +855,60 @@ func gradientColorValues(color Color, space ColorSpace) ([4]float64, error) {
 	return [4]float64{converted.r, converted.g, converted.b, alpha}, nil
 }
 
-// boundary 补齐或保留指定端点并裁剪该侧单位区间外的全部停靠点
-// 入参: offset 端点偏移零或一
-func (s *gradientSampler) boundary(offset float64) {
-	i := sort.Search(len(s.stops), func(i int) bool { return s.stops[i].offset >= offset })
-	if i < len(s.stops) && s.stops[i].offset == offset {
-		if offset == 0 {
-			s.stops = s.stops[i:]
-			return
-		}
-		j := i
-		for j+1 < len(s.stops) && s.stops[j+1].offset == offset {
+// normalizeGradientStops 对渐变停靠点执行稳定排序、重合偏移折叠及零与一端点裁剪补齐
+// 入参: stops 源停靠点切片, getOffset 读取停靠点偏移, withOffset 克隆停靠点并替换偏移, interpolate 线性插值构造边界停靠点
+// 返回: []T 规范化至单位区间的停靠点切片
+func normalizeGradientStops[T any](stops []T, getOffset func(T) float64, withOffset func(T, float64) T, interpolate func(T, T, float64, float64) T) []T {
+	sort.SliceStable(stops, func(i, j int) bool { return getOffset(stops[i]) < getOffset(stops[j]) })
+	folded := stops[:0]
+	for i := 0; i < len(stops); {
+		j := i + 1
+		for j < len(stops) && getOffset(stops[j]) == getOffset(stops[i]) {
 			j++
 		}
-		s.stops = s.stops[:j+1]
-		return
+		folded = append(folded, stops[i])
+		if j-i > 1 {
+			folded = append(folded, stops[j-1])
+		}
+		i = j
 	}
-	var values [4]float64
+	folded = clipGradientStopBoundary(folded, 0, getOffset, withOffset, interpolate)
+	return clipGradientStopBoundary(folded, 1, getOffset, withOffset, interpolate)
+}
+
+// clipGradientStopBoundary 补齐或保留指定渐变端点并裁剪该侧单位区间外的停靠点
+// 入参: stops 已排序并折叠重合点的停靠点序列, offset 端点偏移零或一, getOffset 读取停靠点偏移, withOffset 克隆停靠点并替换偏移, interpolate 区间线性插值回调
+// 返回: []T 裁剪并补齐端点后的停靠点序列
+func clipGradientStopBoundary[T any](stops []T, offset float64, getOffset func(T) float64, withOffset func(T, float64) T, interpolate func(T, T, float64, float64) T) []T {
+	i := sort.Search(len(stops), func(i int) bool { return getOffset(stops[i]) >= offset })
+	if i < len(stops) && getOffset(stops[i]) == offset {
+		if offset == 0 {
+			return stops[i:]
+		}
+		j := i
+		for j+1 < len(stops) && getOffset(stops[j+1]) == offset {
+			j++
+		}
+		return stops[:j+1]
+	}
+	var edge T
 	switch {
 	case i == 0:
-		values = s.stops[0].values
-	case i == len(s.stops):
-		values = s.stops[i-1].values
+		edge = withOffset(stops[0], offset)
+	case i == len(stops):
+		edge = withOffset(stops[i-1], offset)
 	default:
-		lo, hi := s.stops[i-1], s.stops[i]
-		values = gradientBlend(lo.values, hi.values, gradientFraction(offset, lo.offset, hi.offset))
+		lo, hi := stops[i-1], stops[i]
+		edge = interpolate(lo, hi, offset, gradientFraction(offset, getOffset(lo), getOffset(hi)))
 	}
-	stop := gradientSampleStop{offset, values}
 	if offset == 0 {
-		s.stops = append([]gradientSampleStop{stop}, s.stops[i:]...)
-	} else {
-		s.stops = append(s.stops[:i], stop)
+		out := make([]T, 0, len(stops)-i+1)
+		out = append(out, edge)
+		return append(out, stops[i:]...)
 	}
+	out := make([]T, 0, i+1)
+	out = append(out, stops[:i]...)
+	return append(out, edge)
 }
 
 // gradientFraction 计算有序区间内的比例，避免相反符号端点相减溢出
@@ -898,6 +920,22 @@ func gradientFraction(value, lo, hi float64) float64 {
 		return (value/2 - lo/2) / (hi/2 - lo/2)
 	}
 	return (value - lo) / span
+}
+
+// gradientLerp 对单分量执行溢出安全的线性插值
+// 入参: lo 左端值, hi 右端值, t 单位区间比例
+// 返回: float64 插值结果
+func gradientLerp(lo, hi, t float64) float64 {
+	if t <= 0 {
+		return lo
+	}
+	if t >= 1 {
+		return hi
+	}
+	if math.Signbit(lo) != math.Signbit(hi) {
+		return (1-t)*lo + t*hi
+	}
+	return lo + t*(hi-lo)
 }
 
 // gradientBlend 分别线性插值非预乘颜色和alpha，避免有限扩展分量相减溢出
@@ -912,11 +950,7 @@ func gradientBlend(lo, hi [4]float64, t float64) [4]float64 {
 	}
 	var result [4]float64
 	for i := range result {
-		if math.Signbit(lo[i]) != math.Signbit(hi[i]) {
-			result[i] = (1-t)*lo[i] + t*hi[i]
-		} else {
-			result[i] = lo[i] + t*(hi[i]-lo[i])
-		}
+		result[i] = gradientLerp(lo[i], hi[i], t)
 	}
 	return result
 }
@@ -1268,7 +1302,7 @@ func ResolveBrushTilePattern(brush *Brush, stateMatrix Matrix) (*BrushTilePatter
 	if !geometryFillMatrixFinite(stateMatrix) {
 		return nil, fmt.Errorf("%w: non-finite tile pattern state matrix", ErrInvalid)
 	}
-	if !geometryFinite(brush.Viewbox.X, brush.Viewbox.Y, brush.Viewbox.Width, brush.Viewbox.Height, brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height) || brush.Viewbox.Width <= 0 || brush.Viewbox.Height <= 0 || brush.Viewport.Width <= 0 || brush.Viewport.Height <= 0 {
+	if !geometryFinite(brush.Viewbox.X, brush.Viewbox.Y, brush.Viewbox.Width, brush.Viewbox.Height, brush.Viewbox.X+brush.Viewbox.Width, brush.Viewbox.Y+brush.Viewbox.Height, brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height, brush.Viewport.X+brush.Viewport.Width, brush.Viewport.Y+brush.Viewport.Height) || brush.Viewbox.Width <= 0 || brush.Viewbox.Height <= 0 || brush.Viewport.Width <= 0 || brush.Viewport.Height <= 0 {
 		return nil, fmt.Errorf("%w: invalid brush viewbox or viewport", ErrInvalid)
 	}
 	brushMatrix := stateMatrix
@@ -1289,6 +1323,9 @@ func ResolveBrushTilePattern(brush *Brush, stateMatrix Matrix) (*BrushTilePatter
 	sy := brush.Viewport.Height / brush.Viewbox.Height
 	viewboxToTile := Matrix{A: sx, D: sy, E: -brush.Viewbox.X * sx, F: -brush.Viewbox.Y * sy}
 	if !geometryFillMatrixFinite(viewboxToTile) {
+		return nil, fmt.Errorf("%w: brush viewbox mapping overflow", ErrLimit)
+	}
+	if _, err := geometryFillPoint(viewboxToTile, Point{X: brush.Viewbox.X + brush.Viewbox.Width, Y: brush.Viewbox.Y + brush.Viewbox.Height}); err != nil {
 		return nil, fmt.Errorf("%w: brush viewbox mapping overflow", ErrLimit)
 	}
 	w, h := brush.Viewport.Width, brush.Viewport.Height
@@ -1322,6 +1359,11 @@ func ResolveBrushTilePattern(brush *Brush, stateMatrix Matrix) (*BrushTilePatter
 	if !geometryFinite(stepX, stepY) {
 		return nil, fmt.Errorf("%w: brush super tile period overflow", ErrLimit)
 	}
+	for _, corner := range [6]Point{{X: w, Y: 0}, {X: 0, Y: h}, {X: w, Y: h}, {X: stepX, Y: 0}, {X: 0, Y: stepY}, {X: stepX, Y: stepY}} {
+		if _, err := geometryFillPoint(patternToPage, corner); err != nil {
+			return nil, fmt.Errorf("%w: brush pattern tile corner overflow", ErrLimit)
+		}
+	}
 	return &BrushTilePattern{
 		TileWidth:     w,
 		TileHeight:    h,
@@ -1335,6 +1377,7 @@ func ResolveBrushTilePattern(brush *Brush, stateMatrix Matrix) (*BrushTilePatter
 }
 
 // ResolveGradientStops 按XPS标准规范化渐变停靠点、完成色彩解析、按需重采样scRGB线性渐变并输出径向椭圆分解几何
+// 停靠点保留打印后处理前的源色彩并在结果中记录Negative与PrintColor后置标记，供SampleOffset或渲染后端在插值后应用负片与灰度黑白转换
 // 入参: ctx 取消Context，nil采用Background, r 可选阅读器用于解析ContextColor, brush 线性或径向渐变画刷, basePart 相对资源解析基准部件, state 当前图形与打印色彩状态, options 可选解算参数
 // 返回: *ResolvedGradient 规范化渐变模型, error 参数、色彩、几何、数值或取消错误
 func ResolveGradientStops(ctx context.Context, r *Reader, brush *Brush, basePart string, state WalkState, options *GradientResolveOptions) (*ResolvedGradient, error) {
@@ -1390,9 +1433,7 @@ func ResolveGradientStops(ctx context.Context, r *Reader, brush *Brush, basePart
 		intent = state.PrintColorPlan.Intent
 	}
 	colorOpts := ColorResolveOptions{
-		Intent:     intent,
-		PrintColor: state.PrintColor.Mode,
-		Negative:   state.Negative,
+		Intent: intent,
 	}
 	isScRGB := brush.ColorInterpolationMode == ColorInterpolationScRGB
 	entries := make([]resolvedGradientEntry, len(brush.Stops))
@@ -1407,34 +1448,25 @@ func ResolveGradientStops(ctx context.Context, r *Reader, brush *Brush, basePart
 		if err != nil {
 			return nil, fmt.Errorf("gradient stop %d: %w", i, err)
 		}
-		var vals [4]float64
-		if isScRGB {
-			vals = [4]float64{resolved.Linear[0], resolved.Linear[1], resolved.Linear[2], resolved.Alpha}
-		} else {
-			vals = [4]float64{
-				renderLinearToSRGB(colorClamp(resolved.Linear[0])),
-				renderLinearToSRGB(colorClamp(resolved.Linear[1])),
-				renderLinearToSRGB(colorClamp(resolved.Linear[2])),
-				resolved.Alpha,
+		entries[i] = resolvedGradientEntry{offset: stop.Offset, values: gradientValuesFromResolved(resolved, isScRGB), resolved: resolved}
+	}
+	entries = normalizeGradientStops(
+		entries,
+		func(entry resolvedGradientEntry) float64 { return entry.offset },
+		func(entry resolvedGradientEntry, offset float64) resolvedGradientEntry {
+			entry.offset = offset
+			entry.resolved = cloneResolvedColor(entry.resolved)
+			return entry
+		},
+		func(lo, hi resolvedGradientEntry, offset, t float64) resolvedGradientEntry {
+			vals := gradientBlend(lo.values, hi.values, t)
+			return resolvedGradientEntry{
+				offset:   offset,
+				values:   vals,
+				resolved: blendResolvedGradientColor(lo.resolved, hi.resolved, vals, t, isScRGB),
 			}
-		}
-		entries[i] = resolvedGradientEntry{offset: stop.Offset, values: vals, resolved: resolved, exact: true}
-	}
-	sort.SliceStable(entries, func(i, j int) bool { return entries[i].offset < entries[j].offset })
-	folded := entries[:0]
-	for i := 0; i < len(entries); {
-		j := i + 1
-		for j < len(entries) && entries[j].offset == entries[i].offset {
-			j++
-		}
-		folded = append(folded, entries[i])
-		if j-i > 1 {
-			folded = append(folded, entries[j-1])
-		}
-		i = j
-	}
-	entries = resolvedGradientBoundary(folded, 0)
-	entries = resolvedGradientBoundary(entries, 1)
+		},
+	)
 	if isScRGB && (cfg.ResampleScRGB || cfg.MaxColorError > 0) {
 		maxErr := cfg.MaxColorError
 		if maxErr == 0 {
@@ -1452,12 +1484,9 @@ func ResolveGradientStops(ctx context.Context, r *Reader, brush *Brush, basePart
 	}
 	stops := make([]ResolvedGradientStop, len(entries))
 	for i, entry := range entries {
-		col := entry.resolved
-		if !entry.exact {
-			col = resolvedColorFromGradientValues(entry.values, isScRGB)
-		}
-		stops[i] = ResolvedGradientStop{Offset: entry.offset, Color: col}
+		stops[i] = ResolvedGradientStop{Offset: entry.offset, Color: entry.resolved}
 	}
+	postProcess := state.Negative || state.PrintColor.Mode == PrintColorGrayscale || state.PrintColor.Mode == PrintColorMonochrome
 	result := &ResolvedGradient{
 		Kind:                   brush.Kind,
 		SpreadMethod:           brush.SpreadMethod,
@@ -1465,6 +1494,9 @@ func ResolveGradientStops(ctx context.Context, r *Reader, brush *Brush, basePart
 		Opacity:                brush.Opacity,
 		Stops:                  stops,
 		ShadingToPage:          totalMatrix,
+		Negative:               state.Negative,
+		PrintColor:             state.PrintColor.Mode,
+		PostProcessColor:       postProcess,
 	}
 	if brush.Kind == BrushLinearGradient {
 		if !geometryFinite(brush.StartPoint.X, brush.StartPoint.Y, brush.EndPoint.X, brush.EndPoint.Y) {
@@ -1479,6 +1511,7 @@ func ResolveGradientStops(ctx context.Context, r *Reader, brush *Brush, basePart
 			return nil, err
 		}
 		result.StartPoint, result.EndPoint = start, end
+		result.ShadingToPage = IdentityMatrix()
 		if start == end {
 			sampleStops := make([]gradientSampleStop, len(entries))
 			for i, entry := range entries {
@@ -1506,13 +1539,18 @@ func ResolveGradientStops(ctx context.Context, r *Reader, brush *Brush, basePart
 		result.Center = Point{X: 0, Y: 0}
 		result.Focus = Point{X: fx, Y: fy}
 		result.Radius = 1
+		result.RadiusX = 1
+		result.RadiusY = 1
 		result.ShadingToPage = shadingToPage
 		result.FocusOutsideEllipse = math.Hypot(fx, fy) > 1
 		return result, nil
 	}
 	result.Center = brush.Center
 	result.Focus = brush.GradientOrigin
-	result.Radius = max(brush.RadiusX, brush.RadiusY)
+	result.Radius = 0
+	result.RadiusX = brush.RadiusX
+	result.RadiusY = brush.RadiusY
+	result.Degenerate = true
 	if brush.RadiusX == 0 && brush.RadiusY == 0 {
 		result.FocusOutsideEllipse = brush.GradientOrigin != brush.Center
 	} else if brush.RadiusX == 0 {
@@ -1521,6 +1559,63 @@ func ResolveGradientStops(ctx context.Context, r *Reader, brush *Brush, basePart
 		result.FocusOutsideEllipse = brush.GradientOrigin.Y != brush.Center.Y || math.Abs(brush.GradientOrigin.X-brush.Center.X) > brush.RadiusX
 	}
 	return result, nil
+}
+
+// SampleOffset 按渐变的延展方式与插值空间在指定偏移处插值，再按需后置应用负片与打印灰度或黑白转换
+// 入参: offset 渐变轴或椭圆参数偏移
+// 返回: ResolvedColor 插值并完成可选后置色彩处理的颜色, error 参数或算术范围错误
+func (g *ResolvedGradient) SampleOffset(offset float64) (ResolvedColor, error) {
+	if g == nil || len(g.Stops) == 0 || !geometryFinite(offset) {
+		return ResolvedColor{}, fmt.Errorf("%w: invalid resolved gradient sample", ErrInvalid)
+	}
+	var col ResolvedColor
+	if g.Constant {
+		col = cloneResolvedColor(g.ConstantColor)
+	} else {
+		t := offset
+		switch g.SpreadMethod {
+		case SpreadRepeat:
+			t -= math.Floor(t)
+		case SpreadReflect:
+			t = math.Mod(t, 2)
+			if t < 0 {
+				t += 2
+			}
+			if t > 1 {
+				t = 2 - t
+			}
+		}
+		if t <= 0 {
+			col = cloneResolvedColor(g.Stops[0].Color)
+		} else if t >= 1 {
+			col = cloneResolvedColor(g.Stops[len(g.Stops)-1].Color)
+		} else {
+			i := sort.Search(len(g.Stops), func(i int) bool { return g.Stops[i].Offset > t })
+			if i == 0 {
+				col = cloneResolvedColor(g.Stops[0].Color)
+			} else if i == len(g.Stops) {
+				col = cloneResolvedColor(g.Stops[i-1].Color)
+			} else {
+				lo, hi := g.Stops[i-1], g.Stops[i]
+				if lo.Offset == t {
+					col = cloneResolvedColor(lo.Color)
+				} else {
+					isScRGB := g.ColorInterpolationMode == ColorInterpolationScRGB
+					frac := gradientFraction(t, lo.Offset, hi.Offset)
+					vals := gradientBlend(gradientValuesFromResolved(lo.Color, isScRGB), gradientValuesFromResolved(hi.Color, isScRGB), frac)
+					col = blendResolvedGradientColor(lo.Color, hi.Color, vals, frac, isScRGB)
+				}
+			}
+		}
+	}
+	if g.PostProcessColor {
+		col.HasCMYK = false
+		col.CMYK = [4]float64{}
+		if err := finalizeResolvedColor(&col, col.Linear, ColorResolveOptions{Negative: g.Negative, PrintColor: g.PrintColor}); err != nil {
+			return ResolvedColor{}, err
+		}
+	}
+	return col, nil
 }
 
 // resolveGradientStopColor 解析单个渐变停靠点颜色，优先使用ColorResolver缓存，无阅读器时纯内存解析sRGB与scRGB
@@ -1536,42 +1631,74 @@ func resolveGradientStopColor(ctx context.Context, r *Reader, resolver *ColorRes
 	return resolveLocalColor(value, opts)
 }
 
-// resolvedGradientBoundary 按与gradientSampler一致的规则裁剪域外停靠点并在缺失边界时插值补点
-// 入参: entries 已排序并折叠重合点的停靠点序列, offset 端点偏移零或一
-// 返回: []resolvedGradientEntry 裁剪并补齐端点后的停靠点序列
-func resolvedGradientBoundary(entries []resolvedGradientEntry, offset float64) []resolvedGradientEntry {
-	i := sort.Search(len(entries), func(i int) bool { return entries[i].offset >= offset })
-	if i < len(entries) && entries[i].offset == offset {
-		if offset == 0 {
-			return entries[i:]
+// gradientValuesFromResolved 将已解析颜色转换为渐变插值空间内的非预乘四分量
+// 入参: col 已解析颜色, isScRGB 是否处于线性scRGB插值空间
+// 返回: [4]float64 插值空间RGB与alpha分量
+func gradientValuesFromResolved(col ResolvedColor, isScRGB bool) [4]float64 {
+	if isScRGB {
+		return [4]float64{col.Linear[0], col.Linear[1], col.Linear[2], col.Alpha}
+	}
+	return [4]float64{
+		renderLinearToSRGB(colorClamp(col.Linear[0])),
+		renderLinearToSRGB(colorClamp(col.Linear[1])),
+		renderLinearToSRGB(colorClamp(col.Linear[2])),
+		col.Alpha,
+	}
+}
+
+// cloneResolvedColor 深拷贝已解析颜色中的切片元数据，避免停靠点之间共享可变底层数组
+// 入参: col 源解析颜色
+// 返回: ResolvedColor 独立副本
+func cloneResolvedColor(col ResolvedColor) ResolvedColor {
+	col.Components = slices.Clone(col.Components)
+	col.DeviceComponents = slices.Clone(col.DeviceComponents)
+	if len(col.SpotColors) > 0 {
+		spots := make([]ResolvedSpotColor, len(col.SpotColors))
+		for i, spot := range col.SpotColors {
+			spot.FullDevice = slices.Clone(spot.FullDevice)
+			spot.Device = slices.Clone(spot.Device)
+			spots[i] = spot
 		}
-		j := i
-		for j+1 < len(entries) && entries[j+1].offset == offset {
-			j++
+		col.SpotColors = spots
+	}
+	return col
+}
+
+// blendResolvedGradientColor 在构造插值渐变停靠点时同步保留同色域ICC配置、设备分量与CMYK元数据
+// 入参: lo 左端解析颜色, hi 右端解析颜色, values 插值空间已混合的四分量, t 单位区间比例, isScRGB 是否处于线性scRGB空间
+// 返回: ResolvedColor 保留兼容色彩空间元数据的插值结果
+func blendResolvedGradientColor(lo, hi ResolvedColor, values [4]float64, t float64, isScRGB bool) ResolvedColor {
+	col := resolvedColorFromGradientValues(values, isScRGB)
+	sameContext := lo.Space == ColorContext && hi.Space == ColorContext &&
+		lo.ProfilePart != "" && lo.ProfilePart == hi.ProfilePart &&
+		lo.ProfileSpace == hi.ProfileSpace &&
+		len(lo.Components) > 0 && len(lo.Components) == len(hi.Components) &&
+		lo.SpotName == "" && hi.SpotName == "" && len(lo.SpotColors) == 0 && len(hi.SpotColors) == 0
+	if sameContext {
+		col.Space = ColorContext
+		col.ColorSpace = lo.ColorSpace
+		col.ProfilePart = lo.ProfilePart
+		col.ProfileSpace = lo.ProfileSpace
+		comps := make([]float64, len(lo.Components))
+		for i := range comps {
+			comps[i] = colorClamp(gradientLerp(lo.Components[i], hi.Components[i], t))
 		}
-		return entries[:j+1]
+		col.Components = comps
+		if len(lo.DeviceComponents) == len(lo.Components) && len(hi.DeviceComponents) == len(hi.Components) {
+			dev := make([]float64, len(lo.DeviceComponents))
+			for i := range dev {
+				dev[i] = colorClamp(gradientLerp(lo.DeviceComponents[i], hi.DeviceComponents[i], t))
+			}
+			col.DeviceComponents = dev
+		}
 	}
-	var entry resolvedGradientEntry
-	switch {
-	case i == 0:
-		entry = entries[0]
-		entry.offset = offset
-	case i == len(entries):
-		entry = entries[i-1]
-		entry.offset = offset
-	default:
-		lo, hi := entries[i-1], entries[i]
-		vals := gradientBlend(lo.values, hi.values, gradientFraction(offset, lo.offset, hi.offset))
-		entry = resolvedGradientEntry{offset: offset, values: vals}
+	if lo.HasCMYK && hi.HasCMYK && lo.ProfilePart == hi.ProfilePart {
+		col.HasCMYK = true
+		for i := range 4 {
+			col.CMYK[i] = colorClamp(gradientLerp(lo.CMYK[i], hi.CMYK[i], t))
+		}
 	}
-	if offset == 0 {
-		out := make([]resolvedGradientEntry, 0, len(entries)-i+1)
-		out = append(out, entry)
-		return append(out, entries[i:]...)
-	}
-	out := make([]resolvedGradientEntry, 0, i+1)
-	out = append(out, entries[:i]...)
-	return append(out, entry)
+	return col
 }
 
 // resampleScRGBGradientEntries 在scRGB线性光区间按最大sRGB偏差贪心插入中点，使分段sRGB线性插值逼近真实线性渐变
@@ -1615,7 +1742,11 @@ func resampleScRGBGradientEntries(ctx context.Context, entries []resolvedGradien
 			break
 		}
 		midOffset := 0.5 * (out[bestIdx].offset + out[bestIdx+1].offset)
-		inserted := resolvedGradientEntry{offset: midOffset, values: bestMid}
+		inserted := resolvedGradientEntry{
+			offset:   midOffset,
+			values:   bestMid,
+			resolved: blendResolvedGradientColor(out[bestIdx].resolved, out[bestIdx+1].resolved, bestMid, 0.5, true),
+		}
 		out = slices.Insert(out, bestIdx+1, inserted)
 	}
 	return out, nil

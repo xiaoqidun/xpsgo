@@ -102,27 +102,15 @@ func (p *Package) SetPage(ctx context.Context, docIndex, pageIndex int, page *Pa
 	if p.hasStoryRelationship(part, "storyfragments") {
 		return p.setStoryPage(docIndex, pageIndex, &value, ctx)
 	}
-	if p.hasDiscardControl() {
-		q := p.storyCopy()
-		targets, err := q.storePage(&value, docIndex, pageIndex, ctx)
+	return p.mutateWithDiscardSync(func(target *Package) error {
+		targets, err := target.storePage(&value, docIndex, pageIndex, ctx)
 		if err != nil {
 			return err
 		}
-		q.documents[docIndex].Pages[pageIndex] = PageReference{Part: part, Width: value.Width, Height: value.Height, LinkTargets: targets}
-		q.dirty[strings.ToLower(q.documents[docIndex].Part)] = true
-		if err := q.syncDiscardControl(); err != nil {
-			return err
-		}
-		p.commitStory(q)
+		target.documents[docIndex].Pages[pageIndex] = PageReference{Part: part, Width: value.Width, Height: value.Height, LinkTargets: targets}
+		target.dirty[strings.ToLower(target.documents[docIndex].Part)] = true
 		return nil
-	}
-	targets, err := p.storePage(&value, docIndex, pageIndex, ctx)
-	if err != nil {
-		return err
-	}
-	p.documents[docIndex].Pages[pageIndex] = PageReference{Part: part, Width: value.Width, Height: value.Height, LinkTargets: targets}
-	p.dirty[strings.ToLower(p.documents[docIndex].Part)] = true
-	return nil
+	})
 }
 
 // MovePage 调整页面位置并维护故事归属，页面部件名及绘制内容保持不变
@@ -152,17 +140,10 @@ func (p *Package) MovePage(docIndex, pageIndex, targetDocIndex, targetPageIndex 
 	if p.hasDocumentStructure() {
 		return p.moveStoryPage(docIndex, pageIndex, targetDocIndex, targetPageIndex)
 	}
-	if p.hasDiscardControl() {
-		q := p.storyCopy()
-		q.movePage(docIndex, pageIndex, targetDocIndex, targetPageIndex)
-		if err := q.syncDiscardControl(); err != nil {
-			return err
-		}
-		p.commitStory(q)
+	return p.mutateWithDiscardSync(func(target *Package) error {
+		target.movePage(docIndex, pageIndex, targetDocIndex, targetPageIndex)
 		return nil
-	}
-	p.movePage(docIndex, pageIndex, targetDocIndex, targetPageIndex)
-	return nil
+	})
 }
 
 // movePage 更新已校验位置的页面索引，调用方持有写锁且拥有页面切片
@@ -193,17 +174,10 @@ func (p *Package) DeletePage(docIndex, pageIndex int) error {
 	if p.hasDocumentStructure() {
 		return p.deleteStoryPage(docIndex, pageIndex)
 	}
-	if p.hasDiscardControl() {
-		q := p.storyCopy()
-		q.deletePage(docIndex, pageIndex)
-		if err := q.syncDiscardControl(); err != nil {
-			return err
-		}
-		p.commitStory(q)
+	return p.mutateWithDiscardSync(func(target *Package) error {
+		target.deletePage(docIndex, pageIndex)
 		return nil
-	}
-	p.deletePage(docIndex, pageIndex)
-	return nil
+	})
 }
 
 // deletePage 删除已校验的页面及其源关系，调用方持有写锁且拥有页面切片
@@ -235,17 +209,10 @@ func (p *Package) MoveDocument(docIndex, position int) error {
 	if p.hasDocumentStructure() {
 		return p.moveStoryDocument(docIndex, position)
 	}
-	if p.hasDiscardControl() {
-		q := p.storyCopy()
-		q.moveDocument(docIndex, position)
-		if err := q.syncDiscardControl(); err != nil {
-			return err
-		}
-		p.commitStory(q)
+	return p.mutateWithDiscardSync(func(target *Package) error {
+		target.moveDocument(docIndex, position)
 		return nil
-	}
-	p.moveDocument(docIndex, position)
-	return nil
+	})
 }
 
 // moveDocument 调整已校验的文档顺序并标记序列变更，调用方须持有写锁
@@ -279,17 +246,10 @@ func (p *Package) DeleteDocument(docIndex int) error {
 	if p.hasDocumentStructure() {
 		return p.deleteStoryDocument(docIndex)
 	}
-	if p.hasDiscardControl() {
-		q := p.storyCopy()
-		q.deleteDocument(docIndex)
-		if err := q.syncDiscardControl(); err != nil {
-			return err
-		}
-		p.commitStory(q)
+	return p.mutateWithDiscardSync(func(target *Package) error {
+		target.deleteDocument(docIndex)
 		return nil
-	}
-	p.deleteDocument(docIndex)
-	return nil
+	})
 }
 
 // deleteDocument 删除已校验文档及其全部页面和源关系，调用方须持有写锁
@@ -302,6 +262,84 @@ func (p *Package) deleteDocument(docIndex int) {
 	p.removePart(p.documents[docIndex].Part)
 	p.documents = slices.Delete(p.documents, docIndex, docIndex+1)
 	p.dirty[strings.ToLower(p.sequence)] = true
+}
+
+// DeleteCoreProperties 移除包级OPC核心属性关系，并在原属性部件不再被其他关系共享时一并清理
+// 未关联核心属性时幂等返回nil，保留其他包根关系，失败时不改变包状态
+// 返回: error 关系校验、编辑许可或资源错误
+func (p *Package) DeleteCoreProperties() error {
+	if err := p.lock(); err != nil {
+		return err
+	}
+	defer p.mu.Unlock()
+	relations := slices.Clone(p.relations["/"])
+	target := ""
+	retained := make([]Relationship, 0, len(relations))
+	for _, relation := range relations {
+		if relation.Type != opcCoreRel {
+			retained = append(retained, relation)
+			continue
+		}
+		if target != "" {
+			return fmt.Errorf("%w: multiple package core properties relationships", ErrInvalid)
+		}
+		if relation.TargetMode != "" && relation.TargetMode != TargetModeInternal {
+			return fmt.Errorf("%w: external package core properties", ErrInvalid)
+		}
+		resolved, err := resolvePart("/", relation.Target)
+		if err != nil {
+			return err
+		}
+		target = resolved
+	}
+	if target == "" {
+		return nil
+	}
+	q := p.signingCopy()
+	if err := q.editable("/"); err != nil {
+		return err
+	}
+	if err := q.setRelationships("/", retained); err != nil {
+		return err
+	}
+	key := strings.ToLower(target)
+	if _, exists := q.parts[key]; exists && !q.managed(target) && !opcRelationshipName(target) && !q.storyPartSharedWithOther("/", target) {
+		if err := q.editable(target); err != nil {
+			return err
+		}
+		q.removePart(target)
+		if q.deleted == nil {
+			q.deleted = make(map[string]bool)
+		}
+		q.deleted[key] = true
+	}
+	p.commitSigning(q)
+	return nil
+}
+
+// mutateWithDiscardSync 在持有写锁时执行结构变更，若包已关联DiscardControl则在候选副本上原子同步并提交
+// 入参: apply 执行目标包状态变更的回调函数
+// 返回: error 变更或释放提示同步错误
+func (p *Package) mutateWithDiscardSync(apply func(*Package) error) error {
+	if !p.hasDiscardControl() {
+		return apply(p)
+	}
+	q := p.storyCopy()
+	if err := apply(q); err != nil {
+		return err
+	}
+	if err := q.syncDiscardControl(); err != nil {
+		return err
+	}
+	p.commitStory(q)
+	return nil
+}
+
+// commitSigning 将候选元数据/部件副本状态原子提交回当前包，调用方须持有写锁
+// 入参: q 已校验的候选副本
+func (p *Package) commitSigning(q *Package) {
+	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
+	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels, p.deleted = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels, q.deleted
 }
 
 // DeletePart 删除资源或扩展部件及其源关系，不接受由固定布局模型管理的名称
@@ -369,18 +407,8 @@ func (p *Package) editable(parts ...string) error {
 // unregisterName 释放部件及其祖先的占用，不删除仍由其他部件占用的父路径
 // 入参: part 已登记的部件名称
 func (p *Package) unregisterName(part string) {
-	key := strings.ToLower(part)
-	if !p.names[key] {
-		return
-	}
-	delete(p.names, key)
-	for slash := strings.LastIndexByte(key, '/'); slash > 0; slash = strings.LastIndexByte(key[:slash], '/') {
-		parent := key[:slash]
-		p.parents[parent]--
-		if p.parents[parent] == 0 {
-			delete(p.parents, parent)
-		}
-	}
+	registry := partNameRegistry{names: p.names, parents: p.parents}
+	registry.unregister(part)
 }
 
 // SetPrintTicket 替换固定布局部件的打印票据关联，保留其他关系及已有关系ID，空目标仅移除关联
@@ -453,9 +481,6 @@ func (p *Package) SetPrintTicketSettings(ctx context.Context, targetPart string,
 		return "", err
 	}
 	defer p.mu.Unlock()
-	if err := checkContext(ctx); err != nil {
-		return "", err
-	}
 	source := targetPart
 	if source == "" {
 		source = p.sequence
@@ -509,8 +534,7 @@ func (p *Package) SetPrintTicketSettings(ctx context.Context, targetPart string,
 	if err := checkContext(ctx); err != nil {
 		return "", err
 	}
-	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
-	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
+	p.commitSigning(q)
 	return part, nil
 }
 
@@ -652,8 +676,7 @@ func (p *Package) SetThumbnail(ctx context.Context, source, part string) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
-	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
-	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
+	p.commitSigning(q)
 	return nil
 }
 
@@ -672,9 +695,6 @@ func (p *Package) SetThumbnailImage(ctx context.Context, targetPart string, data
 		return "", err
 	}
 	defer p.mu.Unlock()
-	if err := checkContext(ctx); err != nil {
-		return "", err
-	}
 	source := targetPart
 	if source == "" {
 		source = "/"
@@ -734,8 +754,7 @@ func (p *Package) SetThumbnailImage(ctx context.Context, targetPart string, data
 	if err := checkContext(ctx); err != nil {
 		return "", err
 	}
-	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
-	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
+	p.commitSigning(q)
 	return part, nil
 }
 
@@ -905,6 +924,21 @@ func (p *Package) validateBatch(ctx context.Context) ([]Diagnostic, error) {
 			return nil, err
 		}
 	}
+	if len(pkg.parts)+1 > p.limits.MaxPartCount {
+		diagnostics = append(diagnostics, Diagnostic{Part: "/", Message: "package exceeds MaxPartCount"})
+	}
+	registry := newPartNameRegistry()
+	registry.register(opcTypesName)
+	for _, key := range slices.Sorted(maps.Keys(pkg.parts)) {
+		name := pkg.names[key]
+		if name == "" {
+			continue
+		}
+		if err := registry.available(name); err != nil {
+			diagnostics = append(diagnostics, Diagnostic{Part: name, Message: err.Error()})
+		}
+		registry.register(name)
+	}
 	r := &Reader{pkg: pkg, format: p.format, limits: p.limits, sequence: p.sequence, documents: p.documents, pages: allPages}
 	if _, err := r.CoreProperties(ctx); err != nil {
 		if err := appendValidationError(&diagnostics, "/", "CoreProperties", "", err); err != nil {
@@ -918,22 +952,18 @@ func (p *Package) validateBatch(ctx context.Context) ([]Diagnostic, error) {
 	fonts := fontCache{pkg: pkg, data: make(map[string][]byte), faces: make(map[fontCacheKey]*fontSource), remaining: p.limits.MaxPackageBytes, maxFaces: p.limits.MaxPartCount}
 	checkedResources := make(map[string]bool)
 	profileChannels := make(map[string]uint32)
+	failedProfiles := make(map[string]bool)
+	loadDict := func(part string) (*xmlElement, error) { return r.readResourceDictionaryLoader(part, nil, ctx) }
 	for _, pageRef := range allPages {
 		if err := checkContext(ctx); err != nil {
 			return nil, err
 		}
-		root, err := r.readFixedPart(pageRef.Part, "fixedpage", "FixedPage")
+		root, err := r.readFixedPartLoader(pageRef.Part, "fixedpage", "FixedPage", nil, ctx)
 		if err != nil {
 			if err := appendValidationError(&diagnostics, pageRef.Part, "FixedPage", "", err); err != nil {
 				return nil, err
 			}
 			continue
-		}
-		if err := appendValidationError(&diagnostics, pageRef.Part, "FixedPage", "", validateFixedStructure(root, p.format)); err != nil {
-			return nil, err
-		}
-		if err := appendValidationError(&diagnostics, pageRef.Part, "FixedPage", "", validateFixedNames(root, p.format)); err != nil {
-			return nil, err
 		}
 		if len(pageRef.LinkTargets) != 0 {
 			pageNames := make(map[string]bool)
@@ -946,7 +976,7 @@ func (p *Package) validateBatch(ctx context.Context) ([]Diagnostic, error) {
 				}
 			}
 		}
-		graph, err := parseResourceGraphContext(pageRef.Part, root, p.format, p.limits, func(part string) (*xmlElement, error) { return r.readResourceDictionaryLoader(part, nil, ctx) }, ctx)
+		graph, err := parseResourceGraphContext(pageRef.Part, root, p.format, p.limits, loadDict, ctx)
 		if err != nil {
 			if err := appendValidationError(&diagnostics, pageRef.Part, "FixedPage", "", err); err != nil {
 				return nil, err
@@ -973,7 +1003,7 @@ func (p *Package) validateBatch(ctx context.Context) ([]Diagnostic, error) {
 				}
 			}
 		}
-		if err := p.validatePageResourcesBatch(ctx, pkg, &fonts, graph, checkedResources, profileChannels, &diagnostics); err != nil {
+		if err := p.validatePageResourcesBatch(ctx, pkg, &fonts, graph, checkedResources, profileChannels, failedProfiles, &registry, &diagnostics); err != nil {
 			return nil, err
 		}
 	}
@@ -1000,9 +1030,16 @@ func (p *Package) validateBatch(ctx context.Context) ([]Diagnostic, error) {
 		if control.Ignored != 0 {
 			diagnostics = append(diagnostics, Diagnostic{Part: control.Part.Name, Element: "DiscardControl", Message: "invalid discard reference"})
 		}
+		pageSet := make(map[string]bool, len(allPages))
+		for _, pageRef := range allPages {
+			pageSet[strings.ToLower(pageRef.Part)] = true
+		}
 		for _, hint := range control.Hints {
 			if _, exists := pkg.parts[strings.ToLower(hint.Target)]; !exists {
 				diagnostics = append(diagnostics, Diagnostic{Part: control.Part.Name, Element: "Discard", Attribute: "Target", Message: fmt.Sprintf("discard target %s is absent", hint.Target)})
+			}
+			if !pageSet[strings.ToLower(hint.SentinelPage)] {
+				diagnostics = append(diagnostics, Diagnostic{Part: control.Part.Name, Element: "Discard", Attribute: "SentinelPage", Message: fmt.Sprintf("discard sentinel %s is not a fixed page", hint.SentinelPage)})
 			}
 		}
 		if len(control.Hints) != 0 {
@@ -1018,17 +1055,28 @@ func (p *Package) validateBatch(ctx context.Context) ([]Diagnostic, error) {
 }
 
 // validatePageResourcesBatch 非短路检查单页资源图中的全部字体、图像、ICC配置及上下文颜色通道匹配
-// 入参: ctx 取消Context, pkg 快照读取器, fonts 字体缓存, graph 页面资源图, checked 已检查资源集合, channels 配置文件通道数缓存, diagnostics 诊断收集切片
+// 入参: ctx 取消Context, pkg 快照读取器, fonts 字体缓存, graph 页面资源图, checked 已检查资源集合, channels 配置文件通道数缓存, failedProfiles 已损坏无法解析的ICC部件小写键集合, registry 包部件名称登记表, diagnostics 诊断收集切片
 // 返回: error 取消错误
-func (p *Package) validatePageResourcesBatch(ctx context.Context, pkg *packageReader, fonts *fontCache, graph *resourceGraph, checked map[string]bool, channels map[string]uint32, diagnostics *[]Diagnostic) error {
-	if _, err := validateCreatedFonts(fonts, graph, p.format, ctx); err != nil {
-		if cancelErr := appendValidationError(diagnostics, graph.PagePart, "Glyphs", "FontUri", err); cancelErr != nil {
-			return cancelErr
-		}
+func (p *Package) validatePageResourcesBatch(ctx context.Context, pkg *packageReader, fonts *fontCache, graph *resourceGraph, checked map[string]bool, channels map[string]uint32, failedProfiles map[string]bool, registry *partNameRegistry, diagnostics *[]Diagnostic) error {
+	onErr := func(part, element, attr string, err error) error {
+		return appendValidationError(diagnostics, part, element, attr, err)
+	}
+	if _, err := validateCreatedFontsCollect(fonts, graph, p.format, ctx, onErr); err != nil {
+		return err
 	}
 	resources, err := collectRequiredResources(graph, p.format)
 	if err != nil {
 		return appendValidationError(diagnostics, graph.PagePart, "", "", err)
+	}
+	if len(resources) != 0 && registry != nil {
+		relPart := createdRelationshipPart(graph.PagePart)
+		if !registry.has(relPart) {
+			if err := registry.available(relPart); err != nil {
+				*diagnostics = append(*diagnostics, Diagnostic{Part: relPart, Message: err.Error()})
+			} else {
+				registry.register(relPart)
+			}
+		}
 	}
 	for _, resource := range resources {
 		if err := checkContext(ctx); err != nil {
@@ -1044,6 +1092,9 @@ func (p *Package) validatePageResourcesBatch(ctx context.Context, pkg *packageRe
 		checked[key] = true
 		data, err := pkg.readPart(resource.Part)
 		if err != nil {
+			if resource.Kind == requiredProfile {
+				failedProfiles[strings.ToLower(resource.Part)] = true
+			}
 			if cancelErr := appendValidationError(diagnostics, resource.Part, resource.Element, resource.Attribute, err); cancelErr != nil {
 				return cancelErr
 			}
@@ -1052,6 +1103,7 @@ func (p *Package) validatePageResourcesBatch(ctx context.Context, pkg *packageRe
 		if resource.Kind == requiredProfile {
 			profile, err := validateCreatedICCProfile(data, ctx)
 			if err != nil {
+				failedProfiles[strings.ToLower(resource.Part)] = true
 				if cancelErr := appendValidationError(diagnostics, resource.Part, resource.Element, resource.Attribute, err); cancelErr != nil {
 					return cancelErr
 				}
@@ -1097,12 +1149,7 @@ func (p *Package) validatePageResourcesBatch(ctx context.Context, pkg *packageRe
 			}
 		}
 	}
-	if err := validateCreatedContextColors(graph, channels, ctx); err != nil {
-		if cancelErr := appendValidationError(diagnostics, graph.PagePart, "", "Color", err); cancelErr != nil {
-			return cancelErr
-		}
-	}
-	return checkContext(ctx)
+	return validateCreatedContextColorsCollect(graph, channels, failedProfiles, ctx, onErr)
 }
 
 // SetDiscardControl 编码并关联包级释放提示，传入nil时移除包根释放提示关联
@@ -1118,9 +1165,6 @@ func (p *Package) SetDiscardControl(ctx context.Context, hints []DiscardHint) er
 		return err
 	}
 	defer p.mu.Unlock()
-	if err := checkContext(ctx); err != nil {
-		return err
-	}
 	relations := slices.Clone(p.relations["/"])
 	existing, err := discardControlTarget(relations, p.format)
 	if err != nil {
@@ -1146,8 +1190,7 @@ func (p *Package) SetDiscardControl(ctx context.Context, hints []DiscardHint) er
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
-		p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
-		p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
+		p.commitSigning(q)
 		return nil
 	}
 	q := p.signingCopy()
@@ -1172,27 +1215,31 @@ func (p *Package) SetDiscardControl(ctx context.Context, hints []DiscardHint) er
 	if _, err := EncodeDiscardControl(ctx, &buffer, hints, &EncodeOptions{Format: p.format, Limits: p.limits, Part: part}); err != nil {
 		return err
 	}
-	control, err := readDiscardControl(buffer.Bytes(), part, p.format, p.limits, ctx)
-	if err != nil {
-		return err
-	}
-	if control.Ignored != 0 {
-		return fmt.Errorf("%w: invalid produced discard reference", ErrInvalid)
-	}
+	normalizedHints := make([]DiscardHint, len(hints))
 	pages := make(map[string]bool, p.pageCount)
 	for _, doc := range p.documents {
 		for _, page := range doc.Pages {
 			pages[strings.ToLower(page.Part)] = true
 		}
 	}
-	for _, hint := range control.Hints {
+	for i, hint := range hints {
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
-		if !p.names[strings.ToLower(hint.Target)] || !pages[strings.ToLower(hint.SentinelPage)] {
+		target, err := resolvePart("/", hint.Target)
+		if err != nil {
+			return err
+		}
+		sentinel, err := resolvePart("/", hint.SentinelPage)
+		if err != nil {
+			return err
+		}
+		if !p.names[strings.ToLower(target)] || !pages[strings.ToLower(sentinel)] {
 			return fmt.Errorf("%w: discard resource or sentinel page is absent", ErrInvalid)
 		}
+		normalizedHints[i] = DiscardHint{Target: target, SentinelPage: sentinel}
 	}
+	control := &DiscardControl{Hints: normalizedHints}
 	if index < 0 {
 		nextID := createdRelationshipIDs(append(slices.Clone(relations), p.originalRels["/"]...))
 		relations = append(relations, Relationship{ID: nextID(), Type: kind, Target: part, TargetMode: TargetModeInternal})
@@ -1225,8 +1272,7 @@ func (p *Package) SetDiscardControl(ctx context.Context, hints []DiscardHint) er
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
-	p.parts, p.relations, p.relationSizes, p.total = q.parts, q.relations, q.relationSizes, q.total
-	p.names, p.parents, p.allocated, p.dirty, p.dirtyRels = q.names, q.parents, q.allocated, q.dirty, q.dirtyRels
+	p.commitSigning(q)
 	return nil
 }
 
@@ -1490,25 +1536,6 @@ func (p *Package) originalTypes(pkg *packageReader) []byte {
 	return p.original[strings.ToLower(opcTypesName)].data
 }
 
-// changedResources 检查页面及其依赖是否被修改，未改变资源的导入页面沿用消费规则
-// 入参: graph 完整页面资源图
-// 返回: bool 是否需要生产者资源校验, error 依赖错误
-func (p *Package) changedResources(graph *resourceGraph) (bool, error) {
-	if p.original == nil || p.dirty[strings.ToLower(graph.PagePart)] {
-		return true, nil
-	}
-	dependencies, err := collectRequiredResources(graph, p.format)
-	if err != nil {
-		return false, err
-	}
-	for _, resource := range dependencies {
-		if p.dirty[strings.ToLower(resource.Part)] {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 // Edit 复制已有包为独立编辑模型，不修改源数据，未修改的XML、关系、签名和扩展部件保留原字节
 // 字体编辑限制按受限字体关系单独校验，缺少必需Restricted Font关系时返回错误
 // 入参: ctx 取消Context，nil采用Background, options 模型资源选项，nil沿用读取上限
@@ -1526,6 +1553,7 @@ func (r *Reader) Edit(ctx context.Context, options *PackageOptions) (*Package, e
 	if options != nil {
 		configuration.Limits = mergeLimits(configuration.Limits, options.Limits)
 		configuration.MaxImagePixels = options.MaxImagePixels
+		configuration.Compact = options.Compact
 	}
 	p, err := NewPackage(r.format, &configuration)
 	if err != nil {
@@ -2252,20 +2280,7 @@ func (p *Package) sourcePartName(key string) string {
 	if part, ok := p.parts[key]; ok {
 		return part.name
 	}
-	if strings.EqualFold(p.sequence, key) {
-		return p.sequence
-	}
-	for _, doc := range p.documents {
-		if strings.EqualFold(doc.Part, key) {
-			return doc.Part
-		}
-		for _, pg := range doc.Pages {
-			if strings.EqualFold(pg.Part, key) {
-				return pg.Part
-			}
-		}
-	}
-	return ""
+	return resolveLayoutPartName(p.sequence, p.documents, key)
 }
 
 // storyPartSharedWithOther 判断目标结构部件是否正被包内除当前来源外的任意其他来源引用
@@ -2444,6 +2459,7 @@ func (p *Package) editStoryReader(ctx context.Context) (*Reader, error) {
 // 返回: *Package 独立候选状态
 func (p *Package) storyCopy() *Package {
 	q := p.signingCopy()
+	q.compact = p.compact
 	q.layout = maps.Clone(p.layout)
 	q.documents = slices.Clone(p.documents)
 	for index := range q.documents {

@@ -1031,20 +1031,44 @@ func (f *fontSource) glyphBitmapOutline(gid uint16, ppem uint16, vertical bool) 
 // 入参: ppem 请求像素字号，0表示最大默认strike, vertical 是否竖排方向
 // 返回: fontBitmapSelection 选中的strike与缩放信息, error 缺位图表或strike选择错误
 func (f *fontSource) selectBitmapOutlineStrike(ppem uint16, vertical bool) (fontBitmapSelection, error) {
-	if ppem > 0 && ppem <= 255 {
-		selection, present, err := f.selectBitmapStrikeWithWork(ppem, ppem, vertical, nil)
-		if err != nil {
-			return fontBitmapSelection{}, err
-		}
-		if present {
-			return selection, nil
-		}
-	}
-	if err := f.loadBitmaps(nil); err != nil {
+	selection, present, err := f.selectBitmapStrikeNearest(float64(ppem), float64(ppem), vertical, nil)
+	if err != nil {
 		return fontBitmapSelection{}, err
 	}
+	if !present {
+		if f.bitmaps == nil || len(f.bitmaps.strikes) == 0 {
+			return fontBitmapSelection{}, fmt.Errorf("%w: font has no embedded bitmaps", ErrUnsupported)
+		}
+		return fontBitmapSelection{}, fmt.Errorf("%w: no matching bitmap strike", ErrUnsupported)
+	}
+	return selection, nil
+}
+
+// selectBitmapStrikeNearest 优先匹配精确或EBSC代用strike，未命中时按方向优先原则选择欧氏距离最近或最大分辨率的可用strike
+// 当targetX与targetY均为零时选择最大面积strike；正有限目标若近似整数且在1至255范围内优先尝试精确及EBSC代用匹配
+// 入参: targetX 目标横轴像素字号, targetY 目标纵轴像素字号, vertical 是否竖排方向, charge 可选预算及取消回调
+// 返回: fontBitmapSelection 选中的strike与缩放信息, bool 是否找到可用strike, error 参数、目录、预算或取消错误
+func (f *fontSource) selectBitmapStrikeNearest(targetX, targetY float64, vertical bool, charge func(uint64) error) (fontBitmapSelection, bool, error) {
+	if f == nil || f.metrics == nil || !geometryFinite(targetX, targetY) || targetX < 0 || targetY < 0 || (targetX == 0) != (targetY == 0) {
+		return fontBitmapSelection{}, false, fmt.Errorf("%w: bitmap source or target ppem", ErrInvalid)
+	}
+	if targetX > 0 {
+		px, py := math.Round(targetX), math.Round(targetY)
+		if px >= 1 && py >= 1 && px <= 255 && py <= 255 && math.Abs(targetX-px) <= 1e-9 && math.Abs(targetY-py) <= 1e-9 {
+			selection, present, err := f.selectBitmapStrikeWithWork(uint16(px), uint16(py), vertical, charge)
+			if err != nil || present {
+				return selection, present, err
+			}
+		}
+	}
+	if err := f.loadBitmaps(charge); err != nil {
+		return fontBitmapSelection{}, false, err
+	}
 	if f.bitmaps == nil || len(f.bitmaps.strikes) == 0 {
-		return fontBitmapSelection{}, fmt.Errorf("%w: font has no embedded bitmaps", ErrUnsupported)
+		return fontBitmapSelection{}, false, nil
+	}
+	if err := fontBitmapWork(charge, uint64(len(f.bitmaps.strikes))); err != nil {
+		return fontBitmapSelection{}, false, err
 	}
 	wantFlag := uint8(fontBitmapFlagHorizontal)
 	if vertical {
@@ -1061,7 +1085,7 @@ func (f *fontSource) selectBitmapOutlineStrike(ppem uint16, vertical bool) (font
 			if matchDirection && candidate.flags&wantFlag == 0 {
 				continue
 			}
-			if ppem == 0 {
+			if targetX == 0 {
 				area := int(candidate.ppemX) * int(candidate.ppemY)
 				edge := max(int(candidate.ppemX), int(candidate.ppemY))
 				if best < 0 || area > bestArea || area == bestArea && edge > bestEdge {
@@ -1069,7 +1093,7 @@ func (f *fontSource) selectBitmapOutlineStrike(ppem uint16, vertical bool) (font
 				}
 				continue
 			}
-			dist := math.Hypot(float64(candidate.ppemX)-float64(ppem), float64(candidate.ppemY)-float64(ppem))
+			dist := math.Hypot(float64(candidate.ppemX)-targetX, float64(candidate.ppemY)-targetY)
 			if best < 0 || dist < bestDist {
 				best, bestDist = i, dist
 			}
@@ -1079,10 +1103,10 @@ func (f *fontSource) selectBitmapOutlineStrike(ppem uint16, vertical bool) (font
 		}
 	}
 	if best < 0 {
-		return fontBitmapSelection{}, fmt.Errorf("%w: no matching bitmap strike", ErrUnsupported)
+		return fontBitmapSelection{}, false, nil
 	}
 	strike := f.bitmaps.strikes[best]
-	return fontBitmapSelection{strike: best, ppemX: strike.ppemX, ppemY: strike.ppemY, scaleX: 1, scaleY: 1}, nil
+	return fontBitmapSelection{strike: best, ppemX: strike.ppemX, ppemY: strike.ppemY, scaleX: 1, scaleY: 1}, true, nil
 }
 
 // fontBitmapMaskToGeometry 将位图掩码中覆盖值不小于128的像素按水平行程及垂直相同区间合并导出为闭合矢量几何
@@ -1161,30 +1185,37 @@ func fontBitmapMaskToGeometry(mask *image.Alpha, designX, designY func(int) floa
 	return &Geometry{FillRule: GeometryNonZero, Figures: figures}, nil
 }
 
-// glyphYMax 读取TrueType声明上边界或计算CFF曲线的实际设计单位上边界
+// glyphDesignBox 读取字形在设计单位坐标系（Y轴向上）下的墨迹边界框，空字形返回false
 // 入参: gid 字形编号
-// 返回: float64 纵轴向上的最大坐标，空字形返回零, error 轮廓或范围错误
-func (f *fontSource) glyphYMax(gid uint16) (float64, error) {
+// 返回: Rect 设计单位墨迹边界框, bool 字形是否包含非空轮廓, error 轮廓或范围错误
+func (f *fontSource) glyphDesignBox(gid uint16) (Rect, bool, error) {
 	if gid >= f.metrics.numGlyphs {
-		return 0, fmt.Errorf("%w: font glyph index %d", ErrInvalid, gid)
+		return Rect{}, false, fmt.Errorf("%w: font glyph index %d", ErrInvalid, gid)
 	}
 	f.outlineOnce.Do(f.loadOutline)
 	if f.outlineErr != nil {
-		return 0, f.outlineErr
+		return Rect{}, false, f.outlineErr
 	}
 	if f.trueType != nil {
 		start, end := f.trueType.locations[gid], f.trueType.locations[int(gid)+1]
 		if start == end {
-			return 0, nil
+			return Rect{}, false, nil
 		}
 		if end-start < 10 {
-			return 0, fmt.Errorf("%w: truncated TrueType glyph header", ErrInvalid)
+			return Rect{}, false, fmt.Errorf("%w: truncated TrueType glyph header", ErrInvalid)
 		}
-		return float64(int16(binary.BigEndian.Uint16(f.trueType.glyf[start+8:]))), nil
+		xMin := float64(int16(binary.BigEndian.Uint16(f.trueType.glyf[start+2:])))
+		yMin := float64(int16(binary.BigEndian.Uint16(f.trueType.glyf[start+4:])))
+		xMax := float64(int16(binary.BigEndian.Uint16(f.trueType.glyf[start+6:])))
+		yMax := float64(int16(binary.BigEndian.Uint16(f.trueType.glyf[start+8:])))
+		if xMin > xMax || yMin > yMax {
+			return Rect{}, false, fmt.Errorf("%w: invalid TrueType glyph bounds", ErrInvalid)
+		}
+		return Rect{X: xMin, Y: yMin, Width: xMax - xMin, Height: yMax - yMin}, true, nil
 	}
 	geometry, err := f.glyphOutline(gid)
 	if err != nil {
-		return 0, err
+		return Rect{}, false, err
 	}
 	figures := geometry.Figures[:0]
 	for _, figure := range geometry.Figures {
@@ -1192,9 +1223,26 @@ func (f *fontSource) glyphYMax(gid uint16) (float64, error) {
 			figures = append(figures, figure)
 		}
 	}
+	if len(figures) == 0 {
+		return Rect{}, false, nil
+	}
 	geometry.Figures = figures
 	bounds, err := geometry.Bounds()
-	return bounds.Y + bounds.Height, err
+	if err != nil {
+		return Rect{}, false, err
+	}
+	return bounds, true, nil
+}
+
+// glyphYMax 读取TrueType声明上边界或计算CFF曲线的实际设计单位上边界
+// 入参: gid 字形编号
+// 返回: float64 纵轴向上的最大坐标，空字形返回零, error 轮廓或范围错误
+func (f *fontSource) glyphYMax(gid uint16) (float64, error) {
+	box, ok, err := f.glyphDesignBox(gid)
+	if err != nil || !ok {
+		return 0, err
+	}
+	return box.Y + box.Height, nil
 }
 
 // designMatrix 计算CFF字形坐标到SFNT设计单位的变换矩阵，CID字体按先FD后Top组合

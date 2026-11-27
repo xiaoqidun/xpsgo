@@ -159,49 +159,14 @@ func (r *sceneRenderer) glyphBitmapStrike(source *fontSource, glyphs *Glyphs, tr
 	if err := r.charge(uint64(source.face.tables["EBLC"].length) + uint64(source.face.tables["EBSC"].length) + 1); err != nil {
 		return fontBitmapSelection{}, false, err
 	}
-	px, py := math.Round(x), math.Round(y)
-	if px >= 1 && py >= 1 && px <= 255 && py <= 255 && math.Abs(x-px) <= 1e-9 && math.Abs(y-py) <= 1e-9 {
-		selection, present, err := source.selectBitmapStrikeWithWork(uint16(px), uint16(py), glyphs.IsSideways, r.charge)
-		if err != nil || present {
-			return selection, present, err
-		}
-	}
-	if err := source.loadBitmaps(r.charge); err != nil {
+	selection, present, err := source.selectBitmapStrikeNearest(x, y, glyphs.IsSideways, r.charge)
+	if err != nil {
 		return fontBitmapSelection{}, false, err
 	}
-	if source.bitmaps == nil || len(source.bitmaps.strikes) == 0 {
+	if !present {
 		return fontBitmapSelection{}, false, fmt.Errorf("%w: no matching page bitmap strike", ErrUnsupported)
 	}
-	if err := r.charge(uint64(len(source.bitmaps.strikes))); err != nil {
-		return fontBitmapSelection{}, false, err
-	}
-	wantFlag := uint8(fontBitmapFlagHorizontal)
-	if glyphs.IsSideways {
-		wantFlag = fontBitmapFlagVertical
-	}
-	best, bestDist := -1, math.Inf(1)
-	for _, matchDirection := range []bool{true, false} {
-		for i, candidate := range source.bitmaps.strikes {
-			if candidate.ppemX == 0 || candidate.ppemY == 0 {
-				continue
-			}
-			if matchDirection && candidate.flags&wantFlag == 0 {
-				continue
-			}
-			dist := math.Hypot(float64(candidate.ppemX)-x, float64(candidate.ppemY)-y)
-			if best < 0 || dist < bestDist {
-				best, bestDist = i, dist
-			}
-		}
-		if best >= 0 {
-			break
-		}
-	}
-	if best < 0 {
-		return fontBitmapSelection{}, false, fmt.Errorf("%w: no matching page bitmap strike", ErrUnsupported)
-	}
-	strike := source.bitmaps.strikes[best]
-	return fontBitmapSelection{strike: best, ppemX: strike.ppemX, ppemY: strike.ppemY, scaleX: 1, scaleY: 1}, true, nil
+	return selection, true, nil
 }
 
 // glyphBitmapPaint 解码位图字形并合并覆盖索引，按单次覆盖结果采样画刷

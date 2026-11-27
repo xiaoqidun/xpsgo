@@ -146,13 +146,23 @@ type ColorResolveOptions struct {
 	Negative   bool
 }
 
-// ResolvedColor 保存颜色经ICC与打印色彩策略解析后的精确线性值、量化sRGB、源色彩空间、专色、设备分量及灰度结果
+// ResolvedSpotColor 保存ICC命名专色表（nmcl）中单个命中的专色名称、有效色调、连接空间坐标、满墨参考设备坐标及按色调缩放后的有效设备坐标
+type ResolvedSpotColor struct {
+	Name       string
+	Tint       float64
+	PCS        [3]float64
+	FullDevice []float64
+	Device     []float64
+}
+
+// ResolvedColor 保存颜色经ICC与打印色彩策略解析后的精确线性值、量化sRGB、源色彩空间、专色、有效设备分量及灰度结果
 type ResolvedColor struct {
 	Space            ColorSpace
 	ColorSpace       string
 	ProfilePart      string
 	ProfileSpace     string
 	SpotName         string
+	SpotColors       []ResolvedSpotColor
 	DeviceComponents []float64
 	Components       []float64
 	Alpha            float64
@@ -401,9 +411,8 @@ func resolveLocalColor(value Color, opts ColorResolveOptions) (ResolvedColor, er
 		}
 	}
 	result := ResolvedColor{
-		Space:      value.Space,
-		Alpha:      value.Alpha,
-		Components: slices.Clone(value.Components),
+		Space: value.Space,
+		Alpha: value.Alpha,
 	}
 	var linear [3]float64
 	switch value.Space {
@@ -432,6 +441,7 @@ func resolveLocalColor(value Color, opts ColorResolveOptions) (ResolvedColor, er
 	if err := finalizeResolvedColor(&result, linear, opts); err != nil {
 		return ResolvedColor{}, err
 	}
+	result.Components = slices.Clone(value.Components)
 	return result, nil
 }
 
@@ -466,9 +476,8 @@ func (r *Reader) resolveColorWithCache(ctx context.Context, basePart string, val
 		}
 	}
 	result := ResolvedColor{
-		Space:      value.Space,
-		Alpha:      value.Alpha,
-		Components: slices.Clone(value.Components),
+		Space: value.Space,
+		Alpha: value.Alpha,
 	}
 	sourceBase := basePart
 	if sourceBase == "" && strings.HasPrefix(value.ProfileURI, "/") {
@@ -533,11 +542,15 @@ func (r *Reader) resolveColorWithCache(ctx context.Context, basePart string, val
 	if err != nil {
 		return ResolvedColor{}, wrapPartError(part, "", err)
 	}
+	if err := finalizeResolvedColor(&result, linear, cfg); err != nil {
+		return ResolvedColor{}, err
+	}
 	result.ProfilePart = part
 	result.ProfileSpace = profile.space
 	result.ColorSpace = strings.TrimSpace(profile.space)
+	result.Components = slices.Clone(value.Components)
 	if profile.class == "nmcl" && len(transform.named) > 0 {
-		result.SpotName, result.DeviceComponents = resolveICCNamedSpotMetadata(transform.named, value.Components)
+		result.SpotName, result.DeviceComponents, result.SpotColors = resolveICCNamedSpotMetadata(transform.named, value.Components)
 	} else {
 		result.DeviceComponents = slices.Clone(value.Components)
 	}
@@ -550,42 +563,56 @@ func (r *Reader) resolveColorWithCache(ctx context.Context, basePart string, val
 		}
 		result.HasCMYK = true
 	}
-	if err := finalizeResolvedColor(&result, linear, cfg); err != nil {
-		return ResolvedColor{}, err
-	}
 	return result, nil
 }
 
-// resolveICCNamedSpotMetadata 根据命名色配置与各色调分量提取命中的完整专色名及可选设备坐标
+// resolveICCNamedSpotMetadata 根据命名色配置与各色调分量提取完整专色名、当前色调有效设备坐标及结构化专色列表
+// 当tint为零时有效设备坐标清零，满墨参考设备坐标始终保留在对应ResolvedSpotColor.FullDevice中
 // 入参: named 命名色表条目, tints 各命名色色调分量
-// 返回: string 命中的完整专色名, []float64 对应设备坐标副本或nil
-func resolveICCNamedSpotMetadata(named []iccNamedColor, tints []float64) (string, []float64) {
-	if len(named) == 0 {
-		return "", nil
-	}
-	var active []int
-	for i := range named {
-		if i < len(tints) && colorClamp(tints[i]) > 0 {
-			active = append(active, i)
+// 返回: string 命中的完整专色名, []float64 单专色当前色调有效设备坐标或nil, []ResolvedSpotColor 结构化专色列表
+func resolveICCNamedSpotMetadata(named []iccNamedColor, tints []float64) (string, []float64, []ResolvedSpotColor) {
+	makeSpot := func(entry iccNamedColor, tint float64) ResolvedSpotColor {
+		var fullDev, effDev []float64
+		if len(entry.device) > 0 {
+			fullDev = slices.Clone(entry.device)
+			effDev = make([]float64, len(entry.device))
+			if tint > 0 {
+				for i, value := range entry.device {
+					effDev[i] = value * tint
+				}
+			}
+		}
+		return ResolvedSpotColor{
+			Name:       entry.prefix + entry.name + entry.suffix,
+			Tint:       tint,
+			PCS:        entry.pcs,
+			FullDevice: fullDev,
+			Device:     effDev,
 		}
 	}
-	if len(active) == 1 {
-		entry := named[active[0]]
-		return entry.prefix + entry.name + entry.suffix, slices.Clone(entry.device)
-	}
-	if len(active) == 0 && len(named) == 1 {
-		entry := named[0]
-		return entry.prefix + entry.name + entry.suffix, slices.Clone(entry.device)
-	}
-	if len(active) > 1 {
-		names := make([]string, len(active))
-		for i, idx := range active {
-			entry := named[idx]
-			names[i] = entry.prefix + entry.name + entry.suffix
+	var spots []ResolvedSpotColor
+	for i, entry := range named {
+		if i < len(tints) {
+			if tint := colorClamp(tints[i]); tint > 0 {
+				spots = append(spots, makeSpot(entry, tint))
+			}
 		}
-		return strings.Join(names, ", "), nil
 	}
-	return "", nil
+	if len(spots) == 1 {
+		return spots[0].Name, slices.Clone(spots[0].Device), spots
+	}
+	if len(spots) == 0 && len(named) == 1 {
+		spot := makeSpot(named[0], 0)
+		return spot.Name, slices.Clone(spot.Device), []ResolvedSpotColor{spot}
+	}
+	if len(spots) > 1 {
+		names := make([]string, len(spots))
+		for i, spot := range spots {
+			names[i] = spot.Name
+		}
+		return strings.Join(names, ", "), nil, spots
+	}
+	return "", nil, nil
 }
 
 // applyPrintLinearColor 对非预乘线性RGB依次施加负片反相及灰度或黑白单色转换，并返回最终线性RGB与BT.709线性亮度

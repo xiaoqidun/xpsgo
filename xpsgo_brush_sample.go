@@ -22,6 +22,7 @@ import (
 	"image/color"
 	"math"
 	"math/bits"
+	"strings"
 	"sync"
 
 	"github.com/xiaoqidun/jxrgo"
@@ -1718,11 +1719,11 @@ func (r *Reader) RenderBrushTileWithState(ctx context.Context, brush *Brush, bas
 	if err != nil {
 		return nil, Rect{}, err
 	}
-	if viewport.Width == 0 || viewport.Height == 0 || brush.Opacity == 0 {
-		return image.NewNRGBA(image.Rectangle{}), viewport, nil
-	}
 	scaleMatrix := IdentityMatrix()
 	if configuration.Transform != nil {
+		if geometryMatrixSingular(*configuration.Transform) {
+			return nil, Rect{}, fmt.Errorf("%w: singular brush tile render transform", ErrInvalid)
+		}
 		scaleMatrix = strokePathCompose(scaleMatrix, *configuration.Transform)
 	}
 	if state.Matrix != (Matrix{}) {
@@ -1733,9 +1734,6 @@ func (r *Reader) RenderBrushTileWithState(ctx context.Context, brush *Brush, bas
 	}
 	isTileBrush := brush.Kind == BrushVisual || brush.Kind == BrushImage
 	if isTileBrush && brush.Transform != nil {
-		if !geometryFillMatrixFinite(*brush.Transform) {
-			return nil, Rect{}, fmt.Errorf("%w: brush tile transform", ErrInvalid)
-		}
 		scaleMatrix = strokePathCompose(scaleMatrix, *brush.Transform)
 	}
 	if !geometryFillMatrixFinite(scaleMatrix) {
@@ -1746,7 +1744,7 @@ func (r *Reader) RenderBrushTileWithState(ctx context.Context, brush *Brush, bas
 	if !geometryFinite(axisX, axisY) {
 		return nil, Rect{}, fmt.Errorf("%w: brush tile scale range", ErrLimit)
 	}
-	if axisX == 0 || axisY == 0 {
+	if viewport.Width == 0 || viewport.Height == 0 || brush.Opacity == 0 || axisX == 0 || axisY == 0 || geometryMatrixSingular(scaleMatrix) {
 		return image.NewNRGBA(image.Rectangle{}), viewport, nil
 	}
 	dpi := configuration.DPI
@@ -1816,6 +1814,9 @@ func brushTileViewport(brush *Brush) (Rect, error) {
 		if brush.Visual == nil || brush.TileMode > TileFlipXY {
 			return Rect{}, fmt.Errorf("%w: visual brush tile source", ErrInvalid)
 		}
+		if brush.Transform != nil && !geometryFillMatrixFinite(*brush.Transform) {
+			return Rect{}, fmt.Errorf("%w: visual brush tile transform", ErrInvalid)
+		}
 		for _, box := range []Rect{brush.Viewbox, brush.Viewport} {
 			if !geometryFinite(box.X, box.Y, box.Width, box.Height, box.X+box.Width, box.Y+box.Height) || box.Width < 0 || box.Height < 0 {
 				return Rect{}, fmt.Errorf("%w: visual brush tile rectangle", ErrInvalid)
@@ -1826,6 +1827,9 @@ func brushTileViewport(brush *Brush) (Rect, error) {
 		if brush.ImageSource == "" || brush.TileMode > TileFlipXY {
 			return Rect{}, fmt.Errorf("%w: image brush tile source", ErrInvalid)
 		}
+		if brush.Transform != nil && !geometryFillMatrixFinite(*brush.Transform) {
+			return Rect{}, fmt.Errorf("%w: image brush tile transform", ErrInvalid)
+		}
 		for _, box := range []Rect{brush.Viewbox, brush.Viewport} {
 			if !geometryFinite(box.X, box.Y, box.Width, box.Height, box.X+box.Width, box.Y+box.Height) || box.Width < 0 || box.Height < 0 {
 				return Rect{}, fmt.Errorf("%w: image brush tile rectangle", ErrInvalid)
@@ -1833,6 +1837,9 @@ func brushTileViewport(brush *Brush) (Rect, error) {
 		}
 		return brush.Viewport, nil
 	case BrushLinearGradient:
+		if err := validateBrushTileGradient(brush); err != nil {
+			return Rect{}, err
+		}
 		if !geometryFinite(brush.StartPoint.X, brush.StartPoint.Y, brush.EndPoint.X, brush.EndPoint.Y) {
 			return Rect{}, fmt.Errorf("%w: linear gradient brush points", ErrInvalid)
 		}
@@ -1871,6 +1878,9 @@ func brushTileViewport(brush *Brush) (Rect, error) {
 		}
 		return Rect{X: minX, Y: minY, Width: w, Height: h}, nil
 	case BrushRadialGradient:
+		if err := validateBrushTileGradient(brush); err != nil {
+			return Rect{}, err
+		}
 		if !geometryFinite(brush.Center.X, brush.Center.Y, brush.GradientOrigin.X, brush.GradientOrigin.Y, brush.RadiusX, brush.RadiusY) || brush.RadiusX < 0 || brush.RadiusY < 0 {
 			return Rect{}, fmt.Errorf("%w: radial gradient brush geometry", ErrInvalid)
 		}
@@ -1918,6 +1928,9 @@ func brushTileViewport(brush *Brush) (Rect, error) {
 		}
 		return Rect{X: minX, Y: minY, Width: w, Height: h}, nil
 	case BrushSolidColor:
+		if err := validateBrushTileColor(brush.Color); err != nil {
+			return Rect{}, err
+		}
 		if brush.Viewport != (Rect{}) {
 			if !geometryFinite(brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height, brush.Viewport.X+brush.Viewport.Width, brush.Viewport.Y+brush.Viewport.Height) || brush.Viewport.Width < 0 || brush.Viewport.Height < 0 {
 				return Rect{}, fmt.Errorf("%w: solid brush viewport", ErrInvalid)
@@ -1927,5 +1940,61 @@ func brushTileViewport(brush *Brush) (Rect, error) {
 		return Rect{Width: 1, Height: 1}, nil
 	default:
 		return Rect{}, fmt.Errorf("%w: unsupported brush tile kind %d", ErrUnsupported, brush.Kind)
+	}
+}
+
+// validateBrushTileGradient 校验渐变画刷的插值模式、延展方式与停靠点基础合法性，防止零透明度提前返回跳过错误校验
+// 入参: brush 线性或径向渐变画刷
+// 返回: error 渐变属性或停靠点错误
+func validateBrushTileGradient(brush *Brush) error {
+	if brush.ColorInterpolationMode > ColorInterpolationScRGB || brush.SpreadMethod > SpreadRepeat || len(brush.Stops) < 2 {
+		return fmt.Errorf("%w: invalid gradient attributes or stops", ErrInvalid)
+	}
+	for i, stop := range brush.Stops {
+		if !geometryFinite(stop.Offset) {
+			return fmt.Errorf("%w: gradient stop %d offset", ErrInvalid, i)
+		}
+		if err := validateBrushTileColor(stop.Color); err != nil {
+			return fmt.Errorf("gradient stop %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// validateBrushTileColor 校验单瓦片画刷中纯色或渐变停靠点颜色的色彩空间、透明度与分量有限性
+// 入参: value 待校验颜色
+// 返回: error 颜色格式、空间或分量范围错误
+func validateBrushTileColor(value Color) error {
+	if !geometryFinite(value.Alpha) || value.Alpha < 0 || value.Alpha > 1 {
+		return fmt.Errorf("%w: invalid brush color alpha", ErrInvalid)
+	}
+	for _, component := range value.Components {
+		if !geometryFinite(component) {
+			return fmt.Errorf("%w: non-finite brush color component", ErrInvalid)
+		}
+	}
+	switch value.Space {
+	case ColorSRGB:
+		if len(value.Components) != 3 {
+			return fmt.Errorf("%w: sRGB color requires three components", ErrInvalid)
+		}
+		for _, component := range value.Components {
+			if component < 0 || component > 1 {
+				return fmt.Errorf("%w: sRGB component outside unit range", ErrInvalid)
+			}
+		}
+		return nil
+	case ColorScRGB:
+		if len(value.Components) != 3 {
+			return fmt.Errorf("%w: scRGB color requires three components", ErrInvalid)
+		}
+		return nil
+	case ColorContext:
+		if strings.Trim(value.ProfileURI, " \t\r\n") == "" || len(value.Components) == 0 || len(value.Components) > iccMaxChannels {
+			return fmt.Errorf("%w: invalid ContextColor profile or components", ErrInvalid)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown brush color space", ErrInvalid)
 	}
 }

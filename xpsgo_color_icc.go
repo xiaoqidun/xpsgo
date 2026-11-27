@@ -60,15 +60,25 @@ type ICCNamedColor struct {
 	Device []float64
 }
 
-// ICCProfileInfo 保存ICC配置文件的头部属性、默认渲染意图及可选命名色表信息
+// ICCColorant 保存ICC色料表（clrt）单个通道的色料名称、连接空间坐标及显示近似sRGB
+type ICCColorant struct {
+	Name string
+	PCS  [3]float64
+	SRGB color.NRGBA
+}
+
+// ICCProfileInfo 保存ICC配置文件的头部属性、默认渲染意图、可选命名色表及可选色料表与色料顺序信息
 type ICCProfileInfo struct {
-	Version       uint32
-	Class         string
-	ColorSpace    string
-	PCS           string
-	Channels      int
-	DefaultIntent RenderingIntent
-	NamedColors   []ICCNamedColor
+	Version          uint32
+	Class            string
+	ColorSpace       string
+	PCS              string
+	Channels         int
+	DefaultIntent    RenderingIntent
+	NamedColors      []ICCNamedColor
+	Colorants        []ICCColorant
+	ColorantOrder    []uint8
+	OrderedColorants []string
 }
 
 // iccTag 保存标签的数据范围，多个标签可以共享完全相同的数据
@@ -120,9 +130,9 @@ type iccTransform struct {
 	named       []iccNamedColor
 }
 
-// InspectICCProfile 探测ICC配置文件头部、空间通道、默认渲染意图及可选ncl2命名专色表与sRGB近似值
+// InspectICCProfile 探测ICC配置文件头部、空间通道、默认渲染意图、可选ncl2命名专色表及可选clrt/clro色料表与铺墨顺序
 // 入参: data ICC配置文件完整字节
-// 返回: *ICCProfileInfo 只读配置元数据, error 头部、标签、版本或命名色错误
+// 返回: *ICCProfileInfo 只读配置元数据, error 头部、标签、版本、命名色或色料表错误
 func InspectICCProfile(data []byte) (*ICCProfileInfo, error) {
 	profile, err := parseICCProfile(data)
 	if err != nil {
@@ -159,7 +169,136 @@ func InspectICCProfile(data []byte) (*ICCProfileInfo, error) {
 			}
 		}
 	}
+	colorants, err := parseICCColorantTable(profile)
+	if err != nil {
+		return nil, err
+	}
+	order, err := parseICCColorantOrder(profile)
+	if err != nil {
+		return nil, err
+	}
+	info.Colorants = colorants
+	info.ColorantOrder = order
+	if len(colorants) > 0 {
+		info.OrderedColorants = make([]string, len(colorants))
+		if len(order) > 0 {
+			for i, idx := range order {
+				info.OrderedColorants[i] = colorants[idx].Name
+			}
+		} else {
+			for i, entry := range colorants {
+				info.OrderedColorants[i] = entry.Name
+			}
+		}
+	}
 	return info, nil
+}
+
+// parseICCColorantTable 解析ICC规范clrt色料表标签，严格校验通道数、字节布局、尾随零填充及7位ASCII名称
+// 入参: profile 已解析ICC配置
+// 返回: []ICCColorant 按声明顺序排列的色料条目，缺失clrt时返回nil, error 结构、编码或通道数错误
+func parseICCColorantTable(profile *iccProfile) ([]ICCColorant, error) {
+	data := profile.tag("clrt")
+	if data == nil {
+		return nil, nil
+	}
+	if len(data) < 12 || string(data[:4]) != "clrt" || binary.BigEndian.Uint32(data[4:]) != 0 {
+		return nil, fmt.Errorf("%w: ICC colorant table header", ErrInvalid)
+	}
+	count := uint64(binary.BigEndian.Uint32(data[8:]))
+	if count == 0 || count > iccMaxChannels || int(count) != profile.channels {
+		return nil, fmt.Errorf("%w: ICC colorant table count", ErrInvalid)
+	}
+	const stride = 38
+	expected := uint64(12) + count*stride
+	if uint64(len(data)) < expected || uint64(len(data))-expected > 3 {
+		return nil, fmt.Errorf("%w: ICC colorant table size", ErrInvalid)
+	}
+	for _, value := range data[expected:] {
+		if value != 0 {
+			return nil, fmt.Errorf("%w: ICC colorant table padding", ErrInvalid)
+		}
+	}
+	entries := make([]ICCColorant, int(count))
+	for i := range count {
+		row := data[12+i*stride : 12+(i+1)*stride]
+		name, err := iccNamedASCIIText(row[:32])
+		if err != nil {
+			return nil, err
+		}
+		var raw [3]uint16
+		for axis := range 3 {
+			raw[axis] = binary.BigEndian.Uint16(row[32+axis*2:])
+		}
+		var pcsCoord, xyz [3]float64
+		hasXYZ := false
+		if profile.pcs == "XYZ " {
+			for axis := range 3 {
+				xyz[axis] = float64(raw[axis]) / 32768
+			}
+			pcsCoord, hasXYZ = xyz, true
+		} else if profile.pcs == "Lab " {
+			if profile.version >= 0x04000000 {
+				pcsCoord = [3]float64{float64(raw[0]) * 100 / 65535, float64(raw[1])*255/65535 - 128, float64(raw[2])*255/65535 - 128}
+			} else {
+				pcsCoord = [3]float64{min(100, float64(raw[0])*100/65280), float64(raw[1])/256 - 128, float64(raw[2])/256 - 128}
+			}
+			xyz, hasXYZ = iccLabToXYZ(pcsCoord), true
+		} else {
+			for axis := range 3 {
+				pcsCoord[axis] = float64(raw[axis]) / 65535
+			}
+		}
+		var srgb color.NRGBA
+		if hasXYZ {
+			linear := iccMatrixColor(iccPCSDisplayMatrix, xyz)
+			srgb = color.NRGBA{
+				R: colorQuantize8(renderLinearToSRGB(colorClamp(linear[0]))),
+				G: colorQuantize8(renderLinearToSRGB(colorClamp(linear[1]))),
+				B: colorQuantize8(renderLinearToSRGB(colorClamp(linear[2]))),
+				A: 255,
+			}
+		}
+		entries[i] = ICCColorant{Name: name, PCS: pcsCoord, SRGB: srgb}
+	}
+	return entries, nil
+}
+
+// parseICCColorantOrder 解析ICC规范clro色料顺序标签，校验长度为设备通道数的完整无重复置换
+// 入参: profile 已解析ICC配置
+// 返回: []uint8 零基色料通道顺序索引，缺失clro时返回nil, error 结构、通道数或索引置换错误
+func parseICCColorantOrder(profile *iccProfile) ([]uint8, error) {
+	data := profile.tag("clro")
+	if data == nil {
+		return nil, nil
+	}
+	if len(data) < 12 || string(data[:4]) != "clro" || binary.BigEndian.Uint32(data[4:]) != 0 {
+		return nil, fmt.Errorf("%w: ICC colorant order header", ErrInvalid)
+	}
+	count := uint64(binary.BigEndian.Uint32(data[8:]))
+	if count == 0 || count > iccMaxChannels || int(count) != profile.channels {
+		return nil, fmt.Errorf("%w: ICC colorant order count", ErrInvalid)
+	}
+	expected := uint64(12) + count
+	if uint64(len(data)) < expected || uint64(len(data))-expected > 3 {
+		return nil, fmt.Errorf("%w: ICC colorant order size", ErrInvalid)
+	}
+	for _, value := range data[expected:] {
+		if value != 0 {
+			return nil, fmt.Errorf("%w: ICC colorant order padding", ErrInvalid)
+		}
+	}
+	var seen [iccMaxChannels]bool
+	order := make([]uint8, int(count))
+	for i := range int(count) {
+		idx := data[12+i]
+		if uint64(idx) >= count || seen[idx] {
+			return nil, fmt.Errorf("%w: ICC colorant order index", ErrInvalid)
+		}
+		seen[idx] = true
+		order[i] = idx
+	}
+	return order, nil
 }
 
 // parseICCProfile 校验ICC封装和标签范围，输入在配置文件使用期间不得修改

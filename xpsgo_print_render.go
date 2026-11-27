@@ -133,6 +133,29 @@ type printResourceCollector struct {
 	references []printResourceReference
 }
 
+// printPageStateOptions 配置单页打印票据拆解与布局准备的可选策略
+type printPageStateOptions struct {
+	stripPrivate         bool
+	stripSignatures      bool
+	stripSinglePoster    bool
+	stripPlanFeatures    bool
+	ignoreUnsupported    bool
+	ignoreColorPlanError bool
+	computeBackLayout    bool
+}
+
+// preparedPrintPageState 保存单页打印票据拆解后的水印、反相、输出色彩、色彩计划、剩余设置与可选物理布局
+type preparedPrintPageState struct {
+	settings    *PrintSettings
+	watermark   *PrintWatermark
+	negative    bool
+	outputColor PrintColor
+	colorPlan   *PrintColorPlan
+	layout      *PrintLayout
+	rotation    Matrix
+	backLayout  *PrintLayout
+}
+
 // DefaultPrintRenderOptions 返回白色背景及默认打印设置、绘制与拼版加载预算的打印绘制配置
 // 返回: PrintRenderOptions 打印绘制参数
 func DefaultPrintRenderOptions() PrintRenderOptions {
@@ -215,38 +238,21 @@ func (r *Reader) renderPrint(ctx context.Context, pageIndex int, options *PrintR
 		return nil, fmt.Errorf("%w: signature error sheet requires a print job plan", ErrUnsupported)
 	}
 	printConfig := printSettingsConfig{PrintSettingsOptions: configuration.Print.Settings, context: ctx}
-	if configuration.Print.IgnoreUnsupportedFeatures {
-		ticket = printStripPrivateExtensions(ticket)
-	}
-	ticket = printSignatureLayoutSettings(ticket)
-	ticket, err = printSinglePosterSettings(ticket, printConfig)
+	state, err := preparePrintPageState(ctx, ticket, printConfig, nil, PrintMedia{}, printPageStateOptions{
+		stripPrivate:         configuration.Print.IgnoreUnsupportedFeatures,
+		stripSignatures:      true,
+		stripSinglePoster:    true,
+		ignoreUnsupported:    configuration.Print.IgnoreUnsupportedFeatures,
+		ignoreColorPlanError: device == nil && configuration.Print.IgnoreUnsupportedFeatures,
+	})
 	if err != nil {
 		return nil, err
 	}
-	ticket, mark, err := printWatermarkSettings(ticket, printConfig)
-	if err != nil {
-		return nil, err
-	}
-	ticket, negative, outputColor, err := printColorSettings(ticket, printConfig)
-	if err != nil {
-		return nil, err
-	}
-	settings.outputColor = outputColor.Mode
-	cleaned, colorPlan, err := printColorPlanSettings(ctx, ticket, &configuration.Print.Settings)
-	if err != nil {
-		if device == nil && configuration.Print.IgnoreUnsupportedFeatures && errors.Is(err, ErrUnsupported) {
-			ticket = printStripColorPlanFeatures(ticket)
-			colorPlan = nil
-		} else {
-			return nil, err
-		}
-	} else {
-		ticket = cleaned
-	}
-	if device == nil && (configuration.Color != nil || colorPlan != nil && !configuration.Print.IgnoreUnsupportedFeatures) {
+	settings.outputColor = state.outputColor.Mode
+	if device == nil && (configuration.Color != nil || state.colorPlan != nil && !configuration.Print.IgnoreUnsupportedFeatures) {
 		return nil, fmt.Errorf("%w: print color requires explicit device output", ErrUnsupported)
 	}
-	if err := validatePrintLayoutFeatures(ticket, configuration.Print.IgnoreUnsupportedFeatures); err != nil {
+	if err := validatePrintLayoutFeatures(state.settings, configuration.Print.IgnoreUnsupportedFeatures); err != nil {
 		return nil, err
 	}
 	var bounds image.Rectangle
@@ -266,16 +272,16 @@ func (r *Reader) renderPrint(ctx context.Context, pageIndex int, options *PrintR
 		return nil, err
 	}
 	watermarks := newPrintWatermarkRenderer(r, configuration.Watermark, settings)
-	elements, err := watermarks.elements(page.Part, page.Elements, mark)
+	elements, err := watermarks.elements(page.Part, page.Elements, state.watermark)
 	if err != nil {
 		return nil, err
 	}
 	content := &Canvas{ElementProperties: ElementProperties{Part: page.Part, Opacity: 1, Clip: renderBoxGeometry(layout.PageClip), RenderTransform: &layout.Transform}, Elements: elements}
 	if device != nil {
-		settings.printPlan = map[*Canvas]*PrintColorPlan{content: colorPlan}
+		settings.printPlan = map[*Canvas]*PrintColorPlan{content: state.colorPlan}
 		settings.printOptions = configuration.Color
 	}
-	if negative {
+	if state.negative {
 		settings.negative = map[*Canvas]bool{content: true}
 	}
 	media := &Canvas{ElementProperties: ElementProperties{Part: page.Part, Opacity: 1, Clip: renderBoxGeometry(layout.MediaClip)}, Elements: []Element{content}}
@@ -1239,6 +1245,87 @@ func (r *printWatermarkRenderer) reserveGeometry(edges int) error {
 	return nil
 }
 
+// preparePrintPageState 拆解单页有效票据的水印、反相、输出色彩与色彩计划，按需剥离拼版Feature并计算正背面布局
+// 入参: ctx 取消Context, ticket 有效打印票据, config 票据解析配置, page 可选页面头, media 物理介质, opts 拆解与校验策略
+// 返回: preparedPrintPageState 单页打印准备状态, error 票据、特征、布局或取消错误
+func preparePrintPageState(ctx context.Context, ticket *PrintSettings, config printSettingsConfig, page *Page, media PrintMedia, opts printPageStateOptions) (preparedPrintPageState, error) {
+	var state preparedPrintPageState
+	if ticket == nil {
+		ticket = &PrintSettings{Version: 1}
+	}
+	model := ticket
+	if opts.stripPrivate {
+		model = printStripPrivateExtensions(model)
+	}
+	if opts.stripSignatures && !opts.stripPlanFeatures {
+		model = printSignatureLayoutSettings(model)
+	}
+	var err error
+	if opts.stripSinglePoster {
+		model, err = printSinglePosterSettings(model, config)
+		if err != nil {
+			return state, err
+		}
+	}
+	model, state.watermark, err = printWatermarkSettings(model, config)
+	if err != nil {
+		return state, err
+	}
+	model, state.negative, state.outputColor, err = printColorSettings(model, config)
+	if err != nil {
+		return state, err
+	}
+	cleaned, colorPlan, err := printColorPlanSettings(ctx, model, &config.PrintSettingsOptions)
+	if err != nil {
+		if !opts.ignoreColorPlanError || !errors.Is(err, ErrUnsupported) {
+			return state, err
+		}
+		model = printStripColorPlanFeatures(model)
+		state.colorPlan = nil
+	} else {
+		model = cleaned
+		state.colorPlan = colorPlan
+	}
+	if opts.stripPlanFeatures {
+		model, err = printPlanLayoutSettings(model, opts.stripSignatures, opts.ignoreUnsupported)
+		if err != nil {
+			return state, err
+		}
+	}
+	state.settings = model
+	if page != nil {
+		if err := state.computeLayout(ctx, config, page, media, opts.computeBackLayout); err != nil {
+			return state, err
+		}
+	}
+	return state, nil
+}
+
+// computeLayout 按已拆解的布局票据计算单页物理正面布局及可选的旋转背面布局
+// 入参: ctx 取消Context, config 票据解析配置, page 页面头, media 物理介质, computeBack 是否计算非对称背面布局
+// 返回: error 页面、介质或布局错误
+func (s *preparedPrintPageState) computeLayout(ctx context.Context, config printSettingsConfig, page *Page, media PrintMedia, computeBack bool) error {
+	layout, rotation, err := s.settings.layoutWithRotation(ctx, page, media, &config.PrintSettingsOptions)
+	if err != nil {
+		return err
+	}
+	s.layout = layout
+	s.rotation = rotation
+	if computeBack {
+		if backClip := printRotateBox180(layout.MediaClip, layout.Width, layout.Height); backClip != layout.MediaClip {
+			backMedia := media
+			backMedia.Width, backMedia.Height = layout.Width, layout.Height
+			backMedia.ImageableArea = &backClip
+			backLayout, _, err := s.settings.layoutWithRotation(ctx, page, backMedia, &config.PrintSettingsOptions)
+			if err != nil {
+				return err
+			}
+			s.backLayout = backLayout
+		}
+	}
+	return nil
+}
+
 // printStripColorPlanFeatures 从预览渲染票据视图中移除色彩计划相关的Feature与参数
 // 入参: settings 有效票据视图
 // 返回: *PrintSettings 过滤后的票据视图
@@ -1248,11 +1335,8 @@ func printStripColorPlanFeatures(settings *PrintSettings) *PrintSettings {
 	}
 	result := &PrintSettings{Version: settings.Version, Elements: make([]PrintSetting, 0, len(settings.Elements))}
 	for _, value := range settings.Elements {
-		if printPublicKeywordSpace(value.Name.Space) {
-			switch value.Name.Local {
-			case "PageColorManagement", "PageDeviceColorSpaceUsage", "PageBlendColorSpace", "PageSourceColorProfile", "PageDestinationColorProfile", "PageICMRenderingIntent", "PageDeviceColorSpaceProfileURI":
-				continue
-			}
+		if printColorPlanName(value.Name) && (value.Kind == PrintSettingFeature || value.Kind == PrintSettingParameterInit) {
+			continue
 		}
 		result.Elements = append(result.Elements, value)
 	}
@@ -1261,7 +1345,7 @@ func printStripColorPlanFeatures(settings *PrintSettings) *PrintSettings {
 
 // printResourceMedia 识别Microsoft两代票据及能力媒体类型，不接受参数或猜测自定义票据
 // 入参: media 不含参数的部件内容类型
-// 返回: known 是否为已知Microsoft格式, capabilities 是否为能力文档
+// 返回: bool 是否为已知Microsoft格式, bool 是否为能力文档
 func printResourceMedia(media string) (known bool, capabilities bool) {
 	switch strings.ToLower(media) {
 	case printTicketType, printTicket2Type:

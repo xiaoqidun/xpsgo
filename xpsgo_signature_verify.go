@@ -20,6 +20,7 @@ import (
 	"crypto"
 	"crypto/dsa"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/sha1"
@@ -27,6 +28,7 @@ import (
 	"crypto/sha512"
 	"crypto/subtle"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/binary"
 	"encoding/xml"
@@ -35,6 +37,7 @@ import (
 	"hash"
 	"math/big"
 	"mime"
+	"net"
 	"net/url"
 	"slices"
 	"strconv"
@@ -68,6 +71,9 @@ var ErrTrust = errors.New("signer certificate is not trusted")
 
 // ErrSignature 表示摘要或签名值不匹配，不用于表示证书信任或XPS签名覆盖状态
 var ErrSignature = errors.New("signature verification failed")
+
+// signatureParseCertificate 解析X509证书DER字节，供测试观测验签路径解析次数
+var signatureParseCertificate = x509.ParseCertificate
 
 // signatureVerifier 保存同一次签名读取及累计处理预算，读取与变换处理分别受包字节上限约束
 type signatureVerifier struct {
@@ -382,7 +388,7 @@ func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePar
 	}
 	if len(certificates) == 0 {
 		var keyCapErr error
-		triedKey := false
+		signatureMismatch := false
 		for _, key := range info.PublicKeys {
 			if err := ctx.Err(); err != nil {
 				return nil, nil, false, err
@@ -393,9 +399,9 @@ func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePar
 				}
 				continue
 			}
-			triedKey = true
 			if err := verifySignatureValueParams(ctx, info.Method, info.PSS, key, canonical, info.Value); err != nil {
 				if errors.Is(err, ErrSignature) {
+					signatureMismatch = true
 					continue
 				}
 				if errors.Is(err, ErrUnsupported) || errors.Is(err, ErrLimit) {
@@ -406,21 +412,24 @@ func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePar
 			}
 			return nil, nil, true, fmt.Errorf("%w: no document signer certificates", ErrTrust)
 		}
+		if signatureMismatch {
+			return nil, nil, false, fmt.Errorf("%w: no key value matches the signature value", ErrSignature)
+		}
 		if keyCapErr != nil {
 			return nil, nil, false, keyCapErr
 		}
-		if triedKey {
-			return nil, nil, false, fmt.Errorf("%w: no key value matches the signature value", ErrSignature)
-		}
 		return nil, nil, false, fmt.Errorf("%w: no document signer certificates", ErrTrust)
 	}
+	localCerts := make(map[*x509.Certificate]bool, len(certificates))
 	for _, certificate := range certificates {
+		localCerts[certificate] = true
 		options.Intermediates.AddCert(certificate)
 	}
 	var trustError error
 	var capabilityError error
 	var matchedCert *x509.Certificate
 	matched := false
+	signatureMismatch := false
 	for _, certificate := range certificates {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, false, err
@@ -434,6 +443,7 @@ func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePar
 		}
 		if err := verifySignatureValueParams(ctx, info.Method, info.PSS, certificate.PublicKey, canonical, info.Value); err != nil {
 			if errors.Is(err, ErrSignature) {
+				signatureMismatch = true
 				continue
 			}
 			if errors.Is(err, ErrUnsupported) || errors.Is(err, ErrLimit) {
@@ -458,22 +468,17 @@ func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePar
 		if err := ctx.Err(); err != nil {
 			return nil, nil, true, err
 		}
-		signer, err := cloneSignatureSigner(ctx, certificate, chains)
+		signer, err := buildSignatureSigner(ctx, certificate, chains, localCerts)
 		if err != nil {
 			return nil, nil, true, err
 		}
-		matchedCopy, err := cloneSignatureCertificate(certificate)
-		if err != nil {
-			return nil, nil, true, err
-		}
-		return signer, matchedCopy, true, nil
+		return signer, copySignatureCertificate(certificate), true, nil
 	}
 	if matched && trustError != nil {
-		matchedCopy, err := cloneSignatureCertificate(matchedCert)
-		if err != nil {
-			return nil, nil, true, err
-		}
-		return nil, matchedCopy, true, trustError
+		return nil, matchedCert, true, trustError
+	}
+	if signatureMismatch {
+		return nil, nil, false, fmt.Errorf("%w: no certificate matches the signature value", ErrSignature)
 	}
 	if capabilityError != nil {
 		return nil, nil, false, capabilityError
@@ -519,9 +524,15 @@ func loadSignatureCertificates(info *SignatureInfo, graph *signaturePartGraph) (
 		if seen[key] {
 			continue
 		}
-		certificate, err := x509.ParseCertificate(der)
-		if err != nil {
-			return nil, fmt.Errorf("%w: signer certificate DER: %w", ErrInvalid, err)
+		certificate := graph.certs[key]
+		if certificate != nil {
+			delete(graph.certs, key)
+		} else {
+			var err error
+			certificate, err = signatureParseCertificate(bytes.Clone(der))
+			if err != nil {
+				return nil, fmt.Errorf("%w: signer certificate DER: %w", ErrInvalid, err)
+			}
 		}
 		seen[key] = true
 		result = append(result, certificate)
@@ -541,42 +552,213 @@ func signatureCertificateUsage(certificate *x509.Certificate) error {
 	return nil
 }
 
-// cloneSignatureCertificate 重新解析返回独立证书副本，避免共享DER字节或池中可变对象
-// 入参: certificate 待复制证书
-// 返回: *x509.Certificate 独立证书副本, error 解析错误
-func cloneSignatureCertificate(certificate *x509.Certificate) (*x509.Certificate, error) {
-	copyCert, err := x509.ParseCertificate(bytes.Clone(certificate.Raw))
-	if err != nil {
-		return nil, fmt.Errorf("%w: verified signer certificate: %w", ErrInvalid, err)
-	}
-	return copyCert, nil
-}
-
-// cloneSignatureSigner 重新解析返回证书及链，避免返回调用方证书池中的对象或共享DER字节
-// 入参: ctx 取消Context, certificate 匹配签名的证书, chains 已验证的证书链
-// 返回: *SignatureSigner 独立结果, error 解析或取消错误
-func cloneSignatureSigner(ctx context.Context, certificate *x509.Certificate, chains [][]*x509.Certificate) (*SignatureSigner, error) {
-	copyCert, err := cloneSignatureCertificate(certificate)
-	if err != nil {
-		return nil, err
-	}
-	result := &SignatureSigner{Certificate: copyCert, Chains: make([][]*x509.Certificate, len(chains))}
+// buildSignatureSigner 复用已解析的本地证书并深拷贝共享节点，避免重复ASN.1解析与证书池别名
+// 入参: ctx 取消Context, certificate 匹配签名的本地独占证书, chains 已验证的证书链, localCerts 本次调用解析出的本地证书集合
+// 返回: *SignatureSigner 独立结果, error 取消错误
+func buildSignatureSigner(ctx context.Context, certificate *x509.Certificate, chains [][]*x509.Certificate, localCerts map[*x509.Certificate]bool) (*SignatureSigner, error) {
+	owned := make(map[*x509.Certificate]bool, len(localCerts))
+	owned[certificate] = true
+	result := &SignatureSigner{Certificate: certificate, Chains: make([][]*x509.Certificate, len(chains))}
 	for index, chain := range chains {
-		for _, certificate := range chain {
+		items := make([]*x509.Certificate, 0, len(chain))
+		for _, item := range chain {
 			if err := checkContext(ctx); err != nil {
 				return nil, err
 			}
-			copy, err := x509.ParseCertificate(bytes.Clone(certificate.Raw))
-			if err != nil {
-				return nil, fmt.Errorf("%w: verified signer chain: %w", ErrInvalid, err)
+			if localCerts[item] && !owned[item] {
+				owned[item] = true
+				items = append(items, item)
+			} else {
+				items = append(items, copySignatureCertificate(item))
 			}
-			result.Chains[index] = append(result.Chains[index], copy)
 		}
+		result.Chains[index] = items
 	}
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+// copySignatureCertificate 深拷贝X509证书的全部可变字段与DER切片，避免重复解析或与证书池共享内存
+// 入参: src 源证书
+// 返回: *x509.Certificate 独立深拷贝证书
+func copySignatureCertificate(src *x509.Certificate) *x509.Certificate {
+	if src == nil {
+		return nil
+	}
+	dst := *src
+	dst.Raw = bytes.Clone(src.Raw)
+	dst.RawTBSCertificate = bytes.Clone(src.RawTBSCertificate)
+	dst.RawSubjectPublicKeyInfo = bytes.Clone(src.RawSubjectPublicKeyInfo)
+	dst.RawSubject = bytes.Clone(src.RawSubject)
+	dst.RawIssuer = bytes.Clone(src.RawIssuer)
+	dst.Signature = bytes.Clone(src.Signature)
+	dst.PublicKey = copySignaturePublicKey(src.PublicKey)
+	dst.SerialNumber = copyBigInt(src.SerialNumber)
+	dst.Issuer = copyPKIXName(src.Issuer)
+	dst.Subject = copyPKIXName(src.Subject)
+	dst.Extensions = copyPKIXExtensions(src.Extensions)
+	dst.ExtraExtensions = copyPKIXExtensions(src.ExtraExtensions)
+	dst.UnhandledCriticalExtensions = copyASN1OIDs(src.UnhandledCriticalExtensions)
+	dst.ExtKeyUsage = slices.Clone(src.ExtKeyUsage)
+	dst.UnknownExtKeyUsage = copyASN1OIDs(src.UnknownExtKeyUsage)
+	dst.SubjectKeyId = bytes.Clone(src.SubjectKeyId)
+	dst.AuthorityKeyId = bytes.Clone(src.AuthorityKeyId)
+	dst.OCSPServer = slices.Clone(src.OCSPServer)
+	dst.IssuingCertificateURL = slices.Clone(src.IssuingCertificateURL)
+	dst.DNSNames = slices.Clone(src.DNSNames)
+	dst.EmailAddresses = slices.Clone(src.EmailAddresses)
+	if len(src.IPAddresses) != 0 {
+		dst.IPAddresses = make([]net.IP, len(src.IPAddresses))
+		for i, ip := range src.IPAddresses {
+			dst.IPAddresses[i] = bytes.Clone(ip)
+		}
+	}
+	if len(src.URIs) != 0 {
+		dst.URIs = make([]*url.URL, len(src.URIs))
+		for i, item := range src.URIs {
+			if item == nil {
+				continue
+			}
+			copied := *item
+			if item.User != nil {
+				user := *item.User
+				copied.User = &user
+			}
+			dst.URIs[i] = &copied
+		}
+	}
+	dst.PermittedDNSDomains = slices.Clone(src.PermittedDNSDomains)
+	dst.ExcludedDNSDomains = slices.Clone(src.ExcludedDNSDomains)
+	dst.PermittedIPRanges = copyIPNets(src.PermittedIPRanges)
+	dst.ExcludedIPRanges = copyIPNets(src.ExcludedIPRanges)
+	dst.PermittedEmailAddresses = slices.Clone(src.PermittedEmailAddresses)
+	dst.ExcludedEmailAddresses = slices.Clone(src.ExcludedEmailAddresses)
+	dst.PermittedURIDomains = slices.Clone(src.PermittedURIDomains)
+	dst.ExcludedURIDomains = slices.Clone(src.ExcludedURIDomains)
+	dst.CRLDistributionPoints = slices.Clone(src.CRLDistributionPoints)
+	dst.PolicyIdentifiers = copyASN1OIDs(src.PolicyIdentifiers)
+	dst.Policies = slices.Clone(src.Policies)
+	dst.PolicyMappings = slices.Clone(src.PolicyMappings)
+	return &dst
+}
+
+// copyBigInt 返回非空大整数的独立副本
+// 入参: value 源大整数
+// 返回: *big.Int 独立大整数副本
+func copyBigInt(value *big.Int) *big.Int {
+	if value == nil {
+		return nil
+	}
+	return new(big.Int).Set(value)
+}
+
+// copySignaturePublicKey 深拷贝证书中可能包含可变大整数或字节切片的公钥对象
+// 入参: key 源公钥
+// 返回: any 独立公钥副本
+func copySignaturePublicKey(key any) any {
+	switch pub := key.(type) {
+	case *rsa.PublicKey:
+		if pub == nil {
+			return nil
+		}
+		return &rsa.PublicKey{N: copyBigInt(pub.N), E: pub.E}
+	case *ecdsa.PublicKey:
+		if pub == nil {
+			return nil
+		}
+		return &ecdsa.PublicKey{Curve: pub.Curve, X: copyBigInt(pub.X), Y: copyBigInt(pub.Y)}
+	case *dsa.PublicKey:
+		if pub == nil {
+			return nil
+		}
+		return &dsa.PublicKey{Parameters: dsa.Parameters{P: copyBigInt(pub.P), Q: copyBigInt(pub.Q), G: copyBigInt(pub.G)}, Y: copyBigInt(pub.Y)}
+	case ed25519.PublicKey:
+		return ed25519.PublicKey(bytes.Clone(pub))
+	default:
+		return key
+	}
+}
+
+// copyPKIXName 深拷贝X509专有名称的全部字符串与属性切片
+// 入参: src 源专有名称
+// 返回: pkix.Name 独立专有名称副本
+func copyPKIXName(src pkix.Name) pkix.Name {
+	dst := src
+	dst.Country = slices.Clone(src.Country)
+	dst.Organization = slices.Clone(src.Organization)
+	dst.OrganizationalUnit = slices.Clone(src.OrganizationalUnit)
+	dst.Locality = slices.Clone(src.Locality)
+	dst.Province = slices.Clone(src.Province)
+	dst.StreetAddress = slices.Clone(src.StreetAddress)
+	dst.PostalCode = slices.Clone(src.PostalCode)
+	dst.Names = copyPKIXAttributes(src.Names)
+	dst.ExtraNames = copyPKIXAttributes(src.ExtraNames)
+	return dst
+}
+
+// copyPKIXAttributes 深拷贝PKIX属性列表及其OID和字节值
+// 入参: list 源属性列表
+// 返回: []pkix.AttributeTypeAndValue 独立属性列表副本
+func copyPKIXAttributes(list []pkix.AttributeTypeAndValue) []pkix.AttributeTypeAndValue {
+	if len(list) == 0 {
+		return nil
+	}
+	result := make([]pkix.AttributeTypeAndValue, len(list))
+	for i, item := range list {
+		value := item.Value
+		if raw, ok := value.([]byte); ok {
+			value = bytes.Clone(raw)
+		}
+		result[i] = pkix.AttributeTypeAndValue{Type: slices.Clone(item.Type), Value: value}
+	}
+	return result
+}
+
+// copyPKIXExtensions 深拷贝证书扩展切片及其OID与原始值
+// 入参: list 源扩展列表
+// 返回: []pkix.Extension 独立扩展列表副本
+func copyPKIXExtensions(list []pkix.Extension) []pkix.Extension {
+	if len(list) == 0 {
+		return nil
+	}
+	result := make([]pkix.Extension, len(list))
+	for i, item := range list {
+		result[i] = pkix.Extension{Id: slices.Clone(item.Id), Critical: item.Critical, Value: bytes.Clone(item.Value)}
+	}
+	return result
+}
+
+// copyASN1OIDs 深拷贝ASN.1对象标识符列表
+// 入参: list 源OID列表
+// 返回: []asn1.ObjectIdentifier 独立OID列表副本
+func copyASN1OIDs(list []asn1.ObjectIdentifier) []asn1.ObjectIdentifier {
+	if len(list) == 0 {
+		return nil
+	}
+	result := make([]asn1.ObjectIdentifier, len(list))
+	for i, item := range list {
+		result[i] = slices.Clone(item)
+	}
+	return result
+}
+
+// copyIPNets 深拷贝证书名称约束中的IP网段列表
+// 入参: list 源IP网段列表
+// 返回: []*net.IPNet 独立IP网段列表副本
+func copyIPNets(list []*net.IPNet) []*net.IPNet {
+	if len(list) == 0 {
+		return nil
+	}
+	result := make([]*net.IPNet, len(list))
+	for i, item := range list {
+		if item == nil {
+			continue
+		}
+		result[i] = &net.IPNet{IP: bytes.Clone(item.IP), Mask: bytes.Clone(item.Mask)}
+	}
+	return result
 }
 
 // signatureHash 按XML签名算法URI创建对应的标准摘要器
@@ -608,7 +790,7 @@ func signatureMethodHash(method string) (string, error) {
 	switch method {
 	case xmlSignatureNamespace + "rsa-sha1", xmlSignatureNamespace + "dsa-sha1":
 		return xmlSignatureNamespace + "sha1", nil
-	case "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256", signatureMethodECDSA256, signatureMethodPSS256, signatureMethodRSAPSS:
+	case "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256", signatureMethodDSA256, signatureMethodECDSA256, signatureMethodPSS256, signatureMethodRSAPSS:
 		return "http://www.w3.org/2001/04/xmlenc#sha256", nil
 	case "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384", signatureMethodECDSA384, signatureMethodPSS384:
 		return "http://www.w3.org/2001/04/xmldsig-more#sha384", nil
@@ -667,9 +849,18 @@ func signatureKey(method string, key crypto.PublicKey) error {
 	if _, err := signatureMethodHash(method); err != nil {
 		return err
 	}
-	if method == xmlSignatureNamespace+"dsa-sha1" {
+	if method == xmlSignatureNamespace+"dsa-sha1" || method == signatureMethodDSA256 {
 		public, ok := key.(*dsa.PublicKey)
-		if !ok || public == nil || public.P == nil || public.Q == nil || public.G == nil || public.Y == nil || public.P.Sign() <= 0 || public.Q.Sign() <= 0 || public.G.Cmp(big.NewInt(1)) <= 0 || public.Y.Cmp(big.NewInt(1)) <= 0 || public.Q.Cmp(public.P) >= 0 || public.G.Cmp(public.P) >= 0 || public.Y.Cmp(public.P) >= 0 {
+		if !ok || public == nil || public.Y == nil {
+			return fmt.Errorf("%w: DSA verification key", ErrInvalid)
+		}
+		if public.P == nil || public.Q == nil || public.G == nil {
+			if public.Y.Sign() > 0 && (public.P == nil) == (public.Q == nil) {
+				return fmt.Errorf("%w: implicit DSA domain parameters", ErrUnsupported)
+			}
+			return fmt.Errorf("%w: DSA verification key", ErrInvalid)
+		}
+		if public.P.Sign() <= 0 || public.Q.Sign() <= 0 || public.G.Cmp(big.NewInt(1)) <= 0 || public.Y.Cmp(big.NewInt(1)) <= 0 || public.Q.Cmp(public.P) >= 0 || public.G.Cmp(public.P) >= 0 || public.Y.Cmp(public.P) >= 0 {
 			return fmt.Errorf("%w: DSA verification key", ErrInvalid)
 		}
 		if public.P.BitLen() < signatureMinDSABits {
@@ -678,8 +869,11 @@ func signatureKey(method string, key crypto.PublicKey) error {
 		if public.P.BitLen() > signatureMaxKeyBits {
 			return fmt.Errorf("%w: DSA verification key size", ErrLimit)
 		}
-		if public.Q.BitLen() != 160 {
+		if method == xmlSignatureNamespace+"dsa-sha1" && public.Q.BitLen() != 160 {
 			return fmt.Errorf("%w: DSA-SHA1 subgroup size", ErrUnsupported)
+		}
+		if method == signatureMethodDSA256 && (public.P.BitLen() < 2048 || public.Q.BitLen() != 256) {
+			return fmt.Errorf("%w: DSA-SHA256 parameter size", ErrUnsupported)
 		}
 		return nil
 	}
@@ -736,6 +930,14 @@ func verifySignatureValueParams(ctx context.Context, method string, pss *Signatu
 		r, s := new(big.Int).SetBytes(value[:20]), new(big.Int).SetBytes(value[20:])
 		if !dsa.Verify(key.(*dsa.PublicKey), digest, r, s) {
 			return fmt.Errorf("%w: DSA signature value", ErrSignature)
+		}
+	case method == signatureMethodDSA256:
+		if len(value) != 64 {
+			return fmt.Errorf("%w: DSA-SHA256 signature size", ErrSignature)
+		}
+		r, s := new(big.Int).SetBytes(value[:32]), new(big.Int).SetBytes(value[32:])
+		if !dsa.Verify(key.(*dsa.PublicKey), digest, r, s) {
+			return fmt.Errorf("%w: DSA-SHA256 signature value", ErrSignature)
 		}
 	case signatureMethodECDSA(method):
 		public := key.(*ecdsa.PublicKey)
@@ -934,10 +1136,17 @@ func (p *signatureXML) retrievalCertificates(node *xmlElement) ([][]byte, bool, 
 			return nil, false, err
 		}
 		if !part.certificate {
-			if _, err := x509.ParseCertificate(data); err != nil {
+			parsed, err := signatureParseCertificate(bytes.Clone(data))
+			if err != nil {
 				return nil, false, fmt.Errorf("%w: retrieved certificate DER: %w", ErrInvalid, err)
 			}
 			part.certificate = true
+			if p.graph != nil {
+				if p.graph.certs == nil {
+					p.graph.certs = make(map[[32]byte]*x509.Certificate)
+				}
+				p.graph.certs[sha256.Sum256(data)] = parsed
+			}
 		}
 		return [][]byte{bytes.Clone(data)}, false, nil
 	}

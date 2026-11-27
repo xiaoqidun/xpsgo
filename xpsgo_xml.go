@@ -165,11 +165,14 @@ type compatibilitySelection struct {
 	preserved []*xmlElement
 }
 
-// canonicalXMLOptions 指定OPC签名使用的C14N1.0处理方式，selectElement仅选择一个完整子树
+// canonicalXMLOptions 指定C14N1.0、Exclusive C14N1.0或C14N1.1处理方式，selectElement仅选择一个完整子树
 type canonicalXMLOptions struct {
 	limits        Limits
 	maxBytes      int64
 	comments      bool
+	exclusive     bool
+	version11     bool
+	inclusive     map[string]bool
 	context       context.Context
 	selectElement func(*xmlElement, []xml.Name) bool
 }
@@ -2195,8 +2198,8 @@ func (p *compatibilityProcessor) orderedContents(node *xmlElement, scope compati
 	return result, nil
 }
 
-// canonicalXML 按C14N1.0生成文档或单个子树的UTF-8字节，遵循OPC输入限制并拒绝DTD与相对命名空间
-// 入参: data XML原始字节, options 输入、输出及取消选项
+// canonicalXML 按C14N1.0、Exclusive C14N1.0或C14N1.1生成文档或单个子树的UTF-8字节，遵循OPC输入限制并拒绝DTD与相对命名空间
+// 入参: data XML原始字节, options 输入、算法、输出及取消选项
 // 返回: []byte 独立规范化数据, error 解析、选择、命名空间或预算错误，失败无部分结果
 func canonicalXML(data []byte, options canonicalXMLOptions) ([]byte, error) {
 	options.limits = mergeLimits(DefaultLimits(), options.limits)
@@ -2230,7 +2233,7 @@ func canonicalXML(data []byte, options canonicalXMLOptions) ([]byte, error) {
 	return output.Bytes(), nil
 }
 
-// token 按已校验词元输出C14N1.0，不将显示层的属性默认值或MCE改写用于摘要
+// token 按已校验词元输出C14N1.0、Exclusive C14N1.0或C14N1.1，不将显示层的属性默认值或MCE改写用于摘要
 // 入参: token 保留原始前缀的词元, node 当前元素或词元所属元素
 // 返回: error 选择、命名空间、取消或输出错误
 func (w *canonicalWriter) token(token xml.Token, node *xmlElement) error {
@@ -2306,9 +2309,9 @@ func (w *canonicalWriter) token(token xml.Token, node *xmlElement) error {
 	return nil
 }
 
-// start 输出元素的原始QName、按前缀排序的命名空间及按展开名称排序的属性
+// start 按C14N1.0、Exclusive C14N1.0或C14N1.1规则输出起始标签、命名空间声明及排序属性
 // 入参: token 起始词元, node 当前元素, selected 是否为选定子树根
-// 返回: error 名称或输出错误
+// 返回: error 名称、URI合并或输出错误
 func (w *canonicalWriter) start(token xml.StartElement, node *xmlElement, selected bool) error {
 	if err := w.write("<" + canonicalQName(token.Name)); err != nil {
 		return err
@@ -2318,9 +2321,38 @@ func (w *canonicalWriter) start(token xml.StartElement, node *xmlElement, select
 		parent = w.rendered[len(w.rendered)-1]
 	}
 	var prefixes []string
-	for prefix, namespace := range node.Namespaces {
-		if prefix != "xml" && namespace != parent[prefix] {
-			prefixes = append(prefixes, prefix)
+	var nextRendered map[string]string
+	if w.options.exclusive {
+		visiblyUtilized := map[string]bool{token.Name.Space: true}
+		for _, attr := range token.Attr {
+			if attr.Name.Space != "" && attr.Name.Space != "xmlns" && attr.Name.Space != "xml" {
+				visiblyUtilized[attr.Name.Space] = true
+			}
+		}
+		nextRendered = make(map[string]string, len(parent)+len(node.Namespaces))
+		maps.Copy(nextRendered, parent)
+		if visiblyUtilized[""] || w.options.inclusive[""] {
+			defaultNS := node.Namespaces[""]
+			if defaultNS != parent[""] {
+				prefixes = append(prefixes, "")
+				nextRendered[""] = defaultNS
+			}
+		}
+		for prefix, namespace := range node.Namespaces {
+			if prefix == "" || prefix == "xml" {
+				continue
+			}
+			if (visiblyUtilized[prefix] || w.options.inclusive[prefix]) && namespace != parent[prefix] {
+				prefixes = append(prefixes, prefix)
+				nextRendered[prefix] = namespace
+			}
+		}
+	} else {
+		nextRendered = node.Namespaces
+		for prefix, namespace := range node.Namespaces {
+			if prefix != "xml" && namespace != parent[prefix] {
+				prefixes = append(prefixes, prefix)
+			}
 		}
 	}
 	slices.Sort(prefixes)
@@ -2329,17 +2361,33 @@ func (w *canonicalWriter) start(token xml.StartElement, node *xmlElement, select
 		if prefix != "" {
 			name = xml.Name{Space: "xmlns", Local: prefix}
 		}
-		if err := w.attribute(name, node.Namespaces[prefix]); err != nil {
+		if err := w.attribute(name, nextRendered[prefix]); err != nil {
 			return err
 		}
 	}
 	var attributes []canonicalAttribute
 	inherited := make(map[string]string)
-	if selected {
+	ancestorBase, hasBase := "", false
+	if selected && !w.options.exclusive {
 		for _, ancestor := range w.ancestors {
 			for _, attr := range ancestor.Attr {
-				if attr.Name.Space == xmlNamespace {
+				if attr.Name.Space != xmlNamespace {
+					continue
+				}
+				if !w.options.version11 {
 					inherited[attr.Name.Local] = attr.Value
+					continue
+				}
+				switch attr.Name.Local {
+				case "lang", "space":
+					inherited[attr.Name.Local] = attr.Value
+				case "base":
+					var err error
+					ancestorBase, err = c14n11JoinURI(ancestorBase, attr.Value)
+					if err != nil {
+						return err
+					}
+					hasBase = true
 				}
 			}
 		}
@@ -2352,10 +2400,24 @@ func (w *canonicalWriter) start(token xml.StartElement, node *xmlElement, select
 		if err != nil {
 			return err
 		}
-		attributes = append(attributes, canonicalAttribute{attr.Name, name, attr.Value})
+		value := attr.Value
+		if selected && !w.options.exclusive && w.options.version11 && name == (xml.Name{Space: xmlNamespace, Local: "base"}) && hasBase {
+			value, err = c14n11JoinURI(ancestorBase, value)
+			if err != nil {
+				return err
+			}
+			hasBase = false
+			if value == "" {
+				continue
+			}
+		}
+		attributes = append(attributes, canonicalAttribute{attr.Name, name, value})
 		if name.Space == xmlNamespace {
 			delete(inherited, name.Local)
 		}
+	}
+	if selected && !w.options.exclusive && w.options.version11 && hasBase && ancestorBase != "" {
+		attributes = append(attributes, canonicalAttribute{xml.Name{Space: "xml", Local: "base"}, xml.Name{Space: xmlNamespace, Local: "base"}, ancestorBase})
 	}
 	for local, value := range inherited {
 		attributes = append(attributes, canonicalAttribute{xml.Name{Space: "xml", Local: local}, xml.Name{Space: xmlNamespace, Local: local}, value})
@@ -2371,7 +2433,7 @@ func (w *canonicalWriter) start(token xml.StartElement, node *xmlElement, select
 			return err
 		}
 	}
-	w.rendered = append(w.rendered, node.Namespaces)
+	w.rendered = append(w.rendered, nextRendered)
 	return w.write(">")
 }
 
@@ -2398,7 +2460,7 @@ func (w *canonicalWriter) attribute(name xml.Name, value string) error {
 	return w.write("\"")
 }
 
-// escaped 按C14N1.0逐段转义，输出超限前不分配完整扩张字符串
+// escaped 按C14N规则逐段转义，输出超限前不分配完整扩张字符串
 // 入参: value XML解析后的内容, attribute 是否为属性值
 // 返回: error 输出或取消错误
 func (w *canonicalWriter) escaped(value string, attribute bool) error {

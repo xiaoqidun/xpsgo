@@ -178,7 +178,7 @@ type ImageOptions struct {
 	MaxPixels uint64
 }
 
-// ImageResource 保存原始图像部件、解码样本及未应用的内嵌ICC，不以显示转换替代源数据
+// ImageResource 保存原始图像部件、解码样本、生效内存预算及未应用的内嵌ICC，不以显示转换替代源数据
 // Data和Profile独立拥有字节；Profile为解压后的ICC，未内嵌时为空
 // Resolution单位为DPI，图像元数据未声明物理分辨率时缺省为96
 type ImageResource struct {
@@ -188,6 +188,51 @@ type ImageResource struct {
 	Data        []byte
 	Profile     []byte
 	source      *rasterImage
+	maxBytes    uint64
+}
+
+// pngHeaderState 保存PNG单遍头与辅助块解析状态，供ImageInfo、元数据校验与非隔行流式逐行解码共用
+type pngHeaderState struct {
+	width       int
+	height      int
+	rawBitDepth int
+	colorType   byte
+	interlace   byte
+	hasIHDR     bool
+	paletteSeen bool
+	imageSeen   bool
+	physSeen    bool
+	profileSeen bool
+	srgbSeen    bool
+	cicpSeen    bool
+	gamaSeen    bool
+	chrmSeen    bool
+	mdcvSeen    bool
+	clliSeen    bool
+	trnsSeen    bool
+	palette     []byte
+	trns        []byte
+	gammaChroma imageGammaChroma
+	mdcvMaxNits float64
+	clliMaxNits float64
+	metadata    rasterMetadata
+}
+
+// jpegHeaderState 保存JPEG单遍标记段解析状态，供ImageInfo与解码元数据提取共用
+type jpegHeaderState struct {
+	width        int
+	height       int
+	hasFrame     bool
+	exif         Point
+	hasExif      bool
+	exifAbsolute bool
+	jfifAbsolute bool
+	hasOrient    bool
+	profiles     [256][]byte
+	profileSeen  [256]bool
+	profileCount int
+	profileSize  int64
+	metadata     rasterMetadata
 }
 
 // rasterMetadata 保存图像分辨率、原生通道数、颜色空间、位深、透明度、方向及颜色提示元数据
@@ -492,7 +537,7 @@ func (r *Reader) ImageInfo(ctx context.Context, part string) (*ImageInfo, error)
 			return nil, &PartError{Part: canonical, Err: err}
 		}
 		defer stream.Close()
-		info, err := readJPEGImageInfo(ctx, stream, canonical, media)
+		info, err := readJPEGImageInfo(ctx, stream, canonical, media, r.limits.MaxPartBytes)
 		if err != nil {
 			return nil, &PartError{Part: canonical, Err: err}
 		}
@@ -522,9 +567,10 @@ func (r *Reader) ImageInfo(ctx context.Context, part string) (*ImageInfo, error)
 	}
 }
 
-// DecodeImageRows 按行流式解码并色彩管理导出包内图像为八位非预乘sRGB行字节，JPEG XR优先走条带级流式转换
+// DecodeImageRows 按行流式解码并色彩管理导出包内图像为八位非预乘sRGB行字节
+// 非隔行PNG、非分块非JPEG非转置TIFF与JPEG XR优先走真流式逐行转换，隔行PNG、分块TIFF与JPEG平滑回退整帧后逐行输出
 // 回调按y从0到Height-1递增接收Width*4字节行切片，缓冲在行间复用，调用方不得跨回调长期持有切片
-// 入参: ctx 取消Context，nil采用Background, part 图像部件包根URI, options 图像解码选项，nil采用默认值, convert 色彩转换选项，nil采用默认值, fn 逐行消费回调
+// 入参: ctx 取消Context，nil采用Background, part 图像部件包根URI, options 图像解码选项，nil继承阅读器字节上限与默认像素上限, convert 色彩转换选项，nil继承本次有效字节上限, fn 逐行消费回调
 // 返回: error 状态、参数、媒体类型、解码、色彩、回调或取消错误
 func (r *Reader) DecodeImageRows(ctx context.Context, part string, options *ImageOptions, convert *ImageConvertOptions, fn func(y int, nrgba []byte) error) error {
 	ctx = normalizeContext(ctx)
@@ -534,14 +580,13 @@ func (r *Reader) DecodeImageRows(ctx context.Context, part string, options *Imag
 	if fn == nil {
 		return fmt.Errorf("%w: nil image row consumer", ErrInvalid)
 	}
-	cfg, maxConvertBytes, err := validateImageConvertOptions(convert)
-	if err != nil {
-		return err
-	}
 	if err := r.readLock(); err != nil {
 		return err
 	}
 	imgCfg := DefaultImageOptions()
+	if r.limits.MaxPartBytes > 0 {
+		imgCfg.MaxBytes = r.limits.MaxPartBytes
+	}
 	if options != nil {
 		if options.MaxBytes != 0 {
 			imgCfg.MaxBytes = options.MaxBytes
@@ -553,6 +598,11 @@ func (r *Reader) DecodeImageRows(ctx context.Context, part string, options *Imag
 	if imgCfg.MaxBytes < 1 {
 		r.mu.RUnlock()
 		return fmt.Errorf("%w: image byte limit", ErrInvalid)
+	}
+	cfg, maxConvertBytes, err := validateImageConvertOptionsWithDefault(convert, uint64(imgCfg.MaxBytes))
+	if err != nil {
+		r.mu.RUnlock()
+		return err
 	}
 	canonical, err := opcPartName(part)
 	if err != nil {
@@ -573,16 +623,18 @@ func (r *Reader) DecodeImageRows(ctx context.Context, part string, options *Imag
 	if err != nil {
 		return &PartError{Part: canonical, Err: err}
 	}
-	if strings.EqualFold(media, "image/vnd.ms-photo") {
-		var callbackErr error
-		rowFn := func(y int, nrgba []byte) error {
-			if err := fn(y, nrgba); err != nil {
-				callbackErr = err
-				return err
-			}
-			return nil
+	var callbackErr error
+	rowFn := func(y int, nrgba []byte) error {
+		if err := fn(y, nrgba); err != nil {
+			callbackErr = err
+			return err
 		}
-		handled, jxrErr := decodeJXRImageRows(ctx, data, imgCfg.MaxPixels, min(uint64(imgCfg.MaxBytes), maxConvertBytes), cfg, rowFn)
+		return nil
+	}
+	rowBudget := min(uint64(imgCfg.MaxBytes), maxConvertBytes)
+	switch strings.ToLower(media) {
+	case "image/vnd.ms-photo":
+		handled, jxrErr := decodeJXRImageRows(ctx, data, imgCfg.MaxPixels, rowBudget, cfg, rowFn)
 		if callbackErr != nil {
 			return callbackErr
 		}
@@ -592,18 +644,40 @@ func (r *Reader) DecodeImageRows(ctx context.Context, part string, options *Imag
 			}
 			return nil
 		}
+	case "image/png":
+		handled, pngErr := decodePNGImageRows(ctx, data, imgCfg.MaxPixels, rowBudget, cfg, rowFn)
+		if callbackErr != nil {
+			return callbackErr
+		}
+		if handled || pngErr != nil {
+			if pngErr != nil {
+				return &PartError{Part: canonical, Err: pngErr}
+			}
+			return nil
+		}
+	case "image/tiff":
+		handled, tiffErr := decodeTIFFImageRows(ctx, data, imgCfg.MaxPixels, rowBudget, cfg, rowFn)
+		if callbackErr != nil {
+			return callbackErr
+		}
+		if handled || tiffErr != nil {
+			if tiffErr != nil {
+				return &PartError{Part: canonical, Err: tiffErr}
+			}
+			return nil
+		}
 	}
 	source, err := decodeRasterImageWithMemory(ctx, data, media, imgCfg.MaxPixels, uint64(imgCfg.MaxBytes))
 	if err != nil {
 		return &PartError{Part: canonical, Err: err}
 	}
-	res := &ImageResource{Part: canonical, ContentType: media, Resolution: source.dpi, Data: data, source: source}
+	res := &ImageResource{Part: canonical, ContentType: media, Resolution: source.dpi, Data: data, source: source, maxBytes: uint64(imgCfg.MaxBytes)}
 	return res.exportRowsNRGBA(ctx, cfg, maxConvertBytes, fn)
 }
 
 // Image 读取指定包内图像部件并保留源样本与内嵌ICC，不应用关联ICC颜色转换
 // 读取和解码边界检查ctx取消信号及options字节与像素容量上限
-// 入参: ctx 取消Context，nil采用Background, part 图像部件的包根URI, options 图像参数，nil采用默认值
+// 入参: ctx 取消Context，nil采用Background, part 图像部件的包根URI, options 图像参数，nil继承阅读器字节上限与默认像素上限
 // 返回: *ImageResource 独立图像数据, error 输入、解码、资源或取消错误
 func (r *Reader) Image(ctx context.Context, part string, options *ImageOptions) (*ImageResource, error) {
 	ctx = normalizeContext(ctx)
@@ -619,6 +693,9 @@ func (r *Reader) Image(ctx context.Context, part string, options *ImageOptions) 
 // 返回: *ImageResource 独立图像, error 引用、解码或资源错误
 func (r *Reader) readImage(ctx context.Context, part string, options *ImageOptions) (*ImageResource, error) {
 	configuration := DefaultImageOptions()
+	if r.limits.MaxPartBytes > 0 {
+		configuration.MaxBytes = r.limits.MaxPartBytes
+	}
 	if options != nil {
 		if options.MaxBytes != 0 {
 			configuration.MaxBytes = options.MaxBytes
@@ -664,7 +741,7 @@ func (r *Reader) readImage(ctx context.Context, part string, options *ImageOptio
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	return &ImageResource{Part: part, ContentType: media, Resolution: source.dpi, Data: data, Profile: profile, source: source}, nil
+	return &ImageResource{Part: part, ContentType: media, Resolution: source.dpi, Data: data, Profile: profile, source: source, maxBytes: uint64(configuration.MaxBytes)}, nil
 }
 
 // Bounds 返回解码图像的像素范围，空资源返回空范围
@@ -882,9 +959,10 @@ func (r *ImageResource) ToNRGBA(ctx context.Context, opts *ImageConvertOptions) 
 		return nil, err
 	}
 	var bgLinear [3]float64
+	bgAlpha := 0.0
 	hasBG := cfg.Background != nil
 	if hasBG {
-		bgLinear, _ = imageConvertBackground(cfg.Background)
+		bgLinear, bgAlpha, _ = imageConvertBackground(cfg.Background)
 	}
 	var jxrCache jxrRowCache
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
@@ -902,7 +980,7 @@ func (r *ImageResource) ToNRGBA(ctx context.Context, opts *ImageConvertOptions) 
 			if err != nil {
 				return nil, err
 			}
-			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode)
+			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode)
 			if err != nil {
 				return nil, err
 			}
@@ -945,9 +1023,10 @@ func (r *ImageResource) ToNRGBA64(ctx context.Context, opts *ImageConvertOptions
 		return nil, err
 	}
 	var bgLinear [3]float64
+	bgAlpha := 0.0
 	hasBG := cfg.Background != nil
 	if hasBG {
-		bgLinear, _ = imageConvertBackground(cfg.Background)
+		bgLinear, bgAlpha, _ = imageConvertBackground(cfg.Background)
 	}
 	var jxrCache jxrRowCache
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
@@ -965,7 +1044,7 @@ func (r *ImageResource) ToNRGBA64(ctx context.Context, opts *ImageConvertOptions
 			if err != nil {
 				return nil, err
 			}
-			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode)
+			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode)
 			if err != nil {
 				return nil, err
 			}
@@ -1038,9 +1117,10 @@ func (r *ImageResource) ToCMYK(ctx context.Context, opts *ImageConvertOptions) (
 		return nil, nil, err
 	}
 	var bgLinear [3]float64
+	bgAlpha := 0.0
 	hasBG := cfg.Background != nil
 	if hasBG {
-		bgLinear, _ = imageConvertBackground(cfg.Background)
+		bgLinear, bgAlpha, _ = imageConvertBackground(cfg.Background)
 	}
 	out := image.NewCMYK(bounds)
 	var jxrCache jxrRowCache
@@ -1059,7 +1139,7 @@ func (r *ImageResource) ToCMYK(ctx context.Context, opts *ImageConvertOptions) (
 			if err != nil {
 				return nil, nil, err
 			}
-			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode)
+			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1092,9 +1172,10 @@ func (r *ImageResource) ToGray(ctx context.Context, opts *ImageConvertOptions) (
 		return nil, err
 	}
 	var bgLinear [3]float64
+	bgAlpha := 0.0
 	hasBG := cfg.Background != nil
 	if hasBG {
-		bgLinear, _ = imageConvertBackground(cfg.Background)
+		bgLinear, bgAlpha, _ = imageConvertBackground(cfg.Background)
 	}
 	out := image.NewGray(bounds)
 	var jxrCache jxrRowCache
@@ -1113,7 +1194,7 @@ func (r *ImageResource) ToGray(ctx context.Context, opts *ImageConvertOptions) (
 			if err != nil {
 				return nil, err
 			}
-			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode)
+			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode)
 			if err != nil {
 				return nil, err
 			}
@@ -1202,10 +1283,10 @@ func (r *ImageResource) AlphaMask(ctx context.Context) (*image.Gray, error) {
 	return mask, checkContext(ctx)
 }
 
-// validateImageConvertOptions 规范化并校验色彩转换选项及预算上限
-// 入参: opts 可选转换选项
+// validateImageConvertOptionsWithDefault 规范化并校验色彩转换选项，未显式设置Limits时继承调用方生效字节上限
+// 入参: opts 可选转换选项, defaultMaxBytes 默认生效字节上限，零值回退DefaultLimits().MaxPartBytes
 // 返回: ImageConvertOptions 规范化选项, uint64 有效内存字节上限, error 选项或预算错误
-func validateImageConvertOptions(opts *ImageConvertOptions) (ImageConvertOptions, uint64, error) {
+func validateImageConvertOptionsWithDefault(opts *ImageConvertOptions, defaultMaxBytes uint64) (ImageConvertOptions, uint64, error) {
 	var cfg ImageConvertOptions
 	if opts != nil {
 		cfg = *opts
@@ -1216,11 +1297,14 @@ func validateImageConvertOptions(opts *ImageConvertOptions) (ImageConvertOptions
 	if cfg.Limits.MaxPartBytes < 0 || cfg.Limits.MaxPackageBytes < 0 || cfg.Limits.MaxMetadataBytes < 0 || cfg.Limits.MaxPartCount < 0 || cfg.Limits.MaxXMLDepth < 0 || cfg.Limits.MaxXMLNodes < 0 || cfg.Limits.MaxXMLBindings < 0 || cfg.Limits.MaxPageCount < 0 {
 		return ImageConvertOptions{}, 0, fmt.Errorf("%w: negative image convert limits", ErrInvalid)
 	}
-	maxBytes := uint64(DefaultLimits().MaxPartBytes)
+	maxBytes := defaultMaxBytes
+	if maxBytes == 0 {
+		maxBytes = uint64(DefaultLimits().MaxPartBytes)
+	}
 	if cfg.Limits.MaxPartBytes > 0 {
 		maxBytes = uint64(cfg.Limits.MaxPartBytes)
 	}
-	if cfg.Limits.MaxPackageBytes > 0 && uint64(cfg.Limits.MaxPackageBytes) < maxBytes {
+	if cfg.Limits.MaxPackageBytes > 0 && (cfg.Limits.MaxPartBytes == 0 || uint64(cfg.Limits.MaxPackageBytes) < maxBytes) {
 		maxBytes = uint64(cfg.Limits.MaxPackageBytes)
 	}
 	if uint64(len(cfg.Profile)) > maxBytes {
@@ -1239,7 +1323,7 @@ func imageConvertValidate(ctx context.Context, r *ImageResource, opts *ImageConv
 	if r == nil || r.source == nil || r.source.bounds().Empty() {
 		return ImageConvertOptions{}, image.Rectangle{}, 0, fmt.Errorf("%w: empty image resource", ErrInvalid)
 	}
-	cfg, maxBytes, err := validateImageConvertOptions(opts)
+	cfg, maxBytes, err := validateImageConvertOptionsWithDefault(opts, r.maxBytes)
 	if err != nil {
 		return ImageConvertOptions{}, image.Rectangle{}, 0, err
 	}
@@ -1255,48 +1339,51 @@ func imageConvertValidate(ctx context.Context, r *ImageResource, opts *ImageConv
 	return cfg, bounds, maxBytes, nil
 }
 
-// imageConvertBackground 将可选背景色换算为非预乘线性sRGB三分量与八位CMYK四分量
+// imageConvertBackground 将可选背景色按16位高精度换算为非预乘线性sRGB三分量、归一化背景Alpha与八位CMYK四分量
 // 入参: bg 背景色
-// 返回: [3]float64 线性sRGB背景色, [4]uint8 八位CMYK背景色
-func imageConvertBackground(bg color.Color) ([3]float64, [4]uint8) {
-	nrgba := color.NRGBAModel.Convert(bg).(color.NRGBA)
+// 返回: [3]float64 16位精度线性sRGB背景色, float64 归一化背景Alpha, [4]uint8 八位CMYK背景色
+func imageConvertBackground(bg color.Color) ([3]float64, float64, [4]uint8) {
+	n64 := color.NRGBA64Model.Convert(bg).(color.NRGBA64)
 	lin := [3]float64{
-		renderSRGBToLinear(float64(nrgba.R) / 255),
-		renderSRGBToLinear(float64(nrgba.G) / 255),
-		renderSRGBToLinear(float64(nrgba.B) / 255),
+		renderSRGBToLinear(float64(n64.R) / 65535),
+		renderSRGBToLinear(float64(n64.G) / 65535),
+		renderSRGBToLinear(float64(n64.B) / 65535),
 	}
+	alpha := float64(n64.A) / 65535
 	if cmyk, ok := bg.(color.CMYK); ok {
-		return lin, [4]uint8{cmyk.C, cmyk.M, cmyk.Y, cmyk.K}
+		return lin, 1, [4]uint8{cmyk.C, cmyk.M, cmyk.Y, cmyk.K}
 	}
-	c, m, y, k := color.RGBToCMYK(nrgba.R, nrgba.G, nrgba.B)
-	return lin, [4]uint8{c, m, y, k}
+	c, m, y, k := color.RGBToCMYK(colorQuantize8(float64(n64.R)/65535), colorQuantize8(float64(n64.G)/65535), colorQuantize8(float64(n64.B)/65535))
+	return lin, alpha, [4]uint8{c, m, y, k}
 }
 
-// imageConvertLinearPixelWithBG 对线性scRGB预乘像素执行色调映射、可选背景合成、反相与灰度黑白转换
-// 入参: c 线性scRGB预乘像素, toneMapPeak HDR色调映射峰值亮度, hasBG 是否启用背景合成, bgLinear 线性sRGB背景色, negative 是否反相, mode 打印输出色彩模式
+// imageConvertLinearPixelWithBG 对线性scRGB预乘像素执行色调映射、Porter-Duff背景Alpha合成、反相与灰度黑白转换
+// 入参: c 线性scRGB预乘像素, toneMapPeak HDR色调映射峰值亮度, hasBG 是否启用背景合成, bgLinear 线性sRGB背景色, bgAlpha 背景Alpha, negative 是否反相, mode 打印输出色彩模式
 // 返回: [3]float64 最终非预乘线性RGB分量, float64 最终归一化透明度, error 数值范围错误
-func imageConvertLinearPixelWithBG(c renderColor, toneMapPeak float64, hasBG bool, bgLinear [3]float64, negative bool, mode PrintColorMode) ([3]float64, float64, error) {
+func imageConvertLinearPixelWithBG(c renderColor, toneMapPeak float64, hasBG bool, bgLinear [3]float64, bgAlpha float64, negative bool, mode PrintColorMode) ([3]float64, float64, error) {
 	if c.a == 0 {
-		if !hasBG {
+		if !hasBG || bgAlpha <= 0 {
 			return [3]float64{}, 0, nil
 		}
 		lin, _, err := applyPrintLinearColor(bgLinear, negative, mode)
 		if err != nil {
 			return [3]float64{}, 0, err
 		}
-		return lin, 1, nil
+		return lin, colorClamp(bgAlpha), nil
 	}
 	lin := [3]float64{c.r / c.a, c.g / c.a, c.b / c.a}
 	if toneMapPeak > 0 {
 		lin = renderBT2446MethodA(lin, toneMapPeak)
 	}
 	alpha := colorClamp(c.a)
-	if hasBG {
-		inv := 1 - alpha
-		lin[0] = lin[0]*alpha + bgLinear[0]*inv
-		lin[1] = lin[1]*alpha + bgLinear[1]*inv
-		lin[2] = lin[2]*alpha + bgLinear[2]*inv
-		alpha = 1
+	if hasBG && bgAlpha > 0 {
+		ba := colorClamp(bgAlpha)
+		inv := ba * (1 - alpha)
+		outAlpha := alpha + inv
+		lin[0] = (lin[0]*alpha + bgLinear[0]*inv) / outAlpha
+		lin[1] = (lin[1]*alpha + bgLinear[1]*inv) / outAlpha
+		lin[2] = (lin[2]*alpha + bgLinear[2]*inv) / outAlpha
+		alpha = outAlpha
 	}
 	lin, _, err := applyPrintLinearColor(lin, negative, mode)
 	if err != nil {
@@ -1341,8 +1428,9 @@ func (r *ImageResource) convertJXRDisplayRows(ctx context.Context, bounds image.
 	toneMapPeak := jxrExtraToneMapPeak(jxr.info, cfg)
 	hasBG := cfg.Background != nil
 	var bgLinear [3]float64
+	bgAlpha := 0.0
 	if hasBG {
-		bgLinear, _ = imageConvertBackground(cfg.Background)
+		bgLinear, bgAlpha, _ = imageConvertBackground(cfg.Background)
 	}
 	fast := !hasBG && !cfg.Negative && cfg.ColorMode == PrintColorOriginal && toneMapPeak == 0
 	var linRow []float64
@@ -1375,9 +1463,9 @@ func (r *ImageResource) convertJXRDisplayRows(ctx context.Context, bounds image.
 				return true, jxrImageError(err)
 			}
 			if wide {
-				err = finishLinearRowToNRGBA64(linRow, width, toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode, dstRow)
+				err = finishLinearRowToNRGBA64(linRow, width, toneMapPeak, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode, dstRow)
 			} else {
-				err = finishLinearRowToNRGBA(linRow, width, toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode, dstRow)
+				err = finishLinearRowToNRGBA(linRow, width, toneMapPeak, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode, dstRow)
 			}
 			if err != nil {
 				return true, err
@@ -1392,30 +1480,32 @@ func (r *ImageResource) convertJXRDisplayRows(ctx context.Context, bounds image.
 	return true, checkContext(ctx)
 }
 
-// finishLinearPixel 对单像素非预乘线性RGBA执行有限性检查、色调映射、背景合成及打印色彩转换
-// 入参: r, g, b, a 非预乘线性RGBA分量, toneMapPeak 额外BT.2446峰值亮度，零禁用, hasBG 是否启用背景合成, bgLinear 线性背景色, negative 是否反相, mode 打印色彩模式
+// finishLinearPixel 对单像素非预乘线性RGBA执行有限性检查、色调映射、背景Alpha合成及打印色彩转换
+// 入参: r, g, b, a 非预乘线性RGBA分量, toneMapPeak 额外BT.2446峰值亮度，零禁用, hasBG 是否启用背景合成, bgLinear 线性背景色, bgAlpha 背景Alpha, negative 是否反相, mode 打印色彩模式
 // 返回: [3]float64 输出线性RGB分量, float64 输出归一化透明度, error 非有限像素或数值范围错误
-func finishLinearPixel(r, g, b, a, toneMapPeak float64, hasBG bool, bgLinear [3]float64, negative bool, mode PrintColorMode) ([3]float64, float64, error) {
+func finishLinearPixel(r, g, b, a, toneMapPeak float64, hasBG bool, bgLinear [3]float64, bgAlpha float64, negative bool, mode PrintColorMode) ([3]float64, float64, error) {
 	if !geometryFinite(r, g, b, a) {
 		return [3]float64{}, 0, fmt.Errorf("%w: non-finite linear image pixel", ErrUnsupported)
 	}
 	alpha := colorClamp(a)
 	lin := [3]float64{r, g, b}
 	if alpha == 0 {
-		if !hasBG {
+		if !hasBG || bgAlpha <= 0 {
 			return [3]float64{}, 0, nil
 		}
-		lin, alpha = bgLinear, 1
+		lin, alpha = bgLinear, colorClamp(bgAlpha)
 	} else {
 		if toneMapPeak > 0 {
 			lin = renderBT2446MethodA(lin, toneMapPeak)
 		}
-		if hasBG {
-			inv := 1 - alpha
-			lin[0] = lin[0]*alpha + bgLinear[0]*inv
-			lin[1] = lin[1]*alpha + bgLinear[1]*inv
-			lin[2] = lin[2]*alpha + bgLinear[2]*inv
-			alpha = 1
+		if hasBG && bgAlpha > 0 {
+			ba := colorClamp(bgAlpha)
+			inv := ba * (1 - alpha)
+			outAlpha := alpha + inv
+			lin[0] = (lin[0]*alpha + bgLinear[0]*inv) / outAlpha
+			lin[1] = (lin[1]*alpha + bgLinear[1]*inv) / outAlpha
+			lin[2] = (lin[2]*alpha + bgLinear[2]*inv) / outAlpha
+			alpha = outAlpha
 		}
 	}
 	outLin, _, err := applyPrintLinearColor(lin, negative, mode)
@@ -1425,13 +1515,13 @@ func finishLinearPixel(r, g, b, a, toneMapPeak float64, hasBG bool, bgLinear [3]
 	return outLin, alpha, nil
 }
 
-// finishLinearRowToNRGBA 将单行非预乘线性scRGB与Alpha执行可选色调映射、背景合成、反相与打印模式转换并写入八位NRGBA行
-// 入参: src 长度为4*width的线性RGBA浮点行, width 像素宽度, toneMapPeak 额外BT.2446峰值亮度，零禁用, hasBG 是否启用背景合成, bgLinear 线性背景色, negative 是否反相, mode 打印色彩模式, dst 目标八位NRGBA行
+// finishLinearRowToNRGBA 将单行非预乘线性scRGB与Alpha执行可选色调映射、背景Alpha合成、反相与打印模式转换并写入八位NRGBA行
+// 入参: src 长度为4*width的线性RGBA浮点行, width 像素宽度, toneMapPeak 额外BT.2446峰值亮度，零禁用, hasBG 是否启用背景合成, bgLinear 线性背景色, bgAlpha 背景Alpha, negative 是否反相, mode 打印色彩模式, dst 目标八位NRGBA行
 // 返回: error 数值范围错误
-func finishLinearRowToNRGBA(src []float64, width int, toneMapPeak float64, hasBG bool, bgLinear [3]float64, negative bool, mode PrintColorMode, dst []byte) error {
+func finishLinearRowToNRGBA(src []float64, width int, toneMapPeak float64, hasBG bool, bgLinear [3]float64, bgAlpha float64, negative bool, mode PrintColorMode, dst []byte) error {
 	for x := range width {
 		at := x * 4
-		outLin, alpha, err := finishLinearPixel(src[at], src[at+1], src[at+2], src[at+3], toneMapPeak, hasBG, bgLinear, negative, mode)
+		outLin, alpha, err := finishLinearPixel(src[at], src[at+1], src[at+2], src[at+3], toneMapPeak, hasBG, bgLinear, bgAlpha, negative, mode)
 		if err != nil {
 			return err
 		}
@@ -1448,14 +1538,14 @@ func finishLinearRowToNRGBA(src []float64, width int, toneMapPeak float64, hasBG
 	return nil
 }
 
-// finishLinearRowToNRGBA64 将单行非预乘线性scRGB与Alpha执行可选色调映射、背景合成、反相与打印模式转换并写入十六位大端NRGBA64行
-// 入参: src 长度为4*width的线性RGBA浮点行, width 像素宽度, toneMapPeak 额外BT.2446峰值亮度，零禁用, hasBG 是否启用背景合成, bgLinear 线性背景色, negative 是否反相, mode 打印色彩模式, dst 目标十六位NRGBA64行
+// finishLinearRowToNRGBA64 将单行非预乘线性scRGB与Alpha执行可选色调映射、背景Alpha合成、反相与打印模式转换并写入十六位大端NRGBA64行
+// 入参: src 长度为4*width的线性RGBA浮点行, width 像素宽度, toneMapPeak 额外BT.2446峰值亮度，零禁用, hasBG 是否启用背景合成, bgLinear 线性背景色, bgAlpha 背景Alpha, negative 是否反相, mode 打印色彩模式, dst 目标十六位NRGBA64行
 // 返回: error 数值范围错误
-func finishLinearRowToNRGBA64(src []float64, width int, toneMapPeak float64, hasBG bool, bgLinear [3]float64, negative bool, mode PrintColorMode, dst []byte) error {
+func finishLinearRowToNRGBA64(src []float64, width int, toneMapPeak float64, hasBG bool, bgLinear [3]float64, bgAlpha float64, negative bool, mode PrintColorMode, dst []byte) error {
 	for x := range width {
 		at := x * 4
 		outOff := x * 8
-		outLin, alpha, err := finishLinearPixel(src[at], src[at+1], src[at+2], src[at+3], toneMapPeak, hasBG, bgLinear, negative, mode)
+		outLin, alpha, err := finishLinearPixel(src[at], src[at+1], src[at+2], src[at+3], toneMapPeak, hasBG, bgLinear, bgAlpha, negative, mode)
 		if err != nil {
 			return err
 		}
@@ -1483,9 +1573,10 @@ func (r *ImageResource) exportRowsNRGBA(ctx context.Context, cfg ImageConvertOpt
 		return err
 	}
 	var bgLinear [3]float64
+	bgAlpha := 0.0
 	hasBG := cfg.Background != nil
 	if hasBG {
-		bgLinear, _ = imageConvertBackground(cfg.Background)
+		bgLinear, bgAlpha, _ = imageConvertBackground(cfg.Background)
 	}
 	sampler, err := prepareImageConvertSampler(r, cfg, maxBytes)
 	if err != nil {
@@ -1507,7 +1598,7 @@ func (r *ImageResource) exportRowsNRGBA(ctx context.Context, cfg ImageConvertOpt
 			if err != nil {
 				return err
 			}
-			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, cfg.Negative, cfg.ColorMode)
+			lin, alpha, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode)
 			if err != nil {
 				return err
 			}
@@ -1528,19 +1619,251 @@ func (r *ImageResource) exportRowsNRGBA(ctx context.Context, cfg ImageConvertOpt
 	return checkContext(ctx)
 }
 
-// readPNGImageInfo 仅流式读取PNG在首个IDAT之前的头部元数据块，不解压像素数据
+// newPNGHeaderState 初始化带默认96 DPI的PNG头与元数据解析状态
+// 返回: pngHeaderState 初始解析状态
+func newPNGHeaderState() pngHeaderState {
+	return pngHeaderState{metadata: rasterMetadata{dpi: Point{96, 96}, orientation: 1}}
+}
+
+// consumeChunk 统一校验并吸收PNG单个非像素元数据块，供ImageInfo、元数据解析及流式逐行解码共用
+// 入参: kind 四字节块类型, payload 块载荷字节（不含长度、类型与CRC）
+// 返回: error 块顺序、长度、数值范围或组合非法错误
+func (s *pngHeaderState) consumeChunk(kind string, payload []byte) error {
+	size := uint64(len(payload))
+	if !s.hasIHDR && kind != "IHDR" {
+		return fmt.Errorf("%w: PNG header placement", ErrInvalid)
+	}
+	switch kind {
+	case "IHDR":
+		if s.hasIHDR || size != 13 {
+			return fmt.Errorf("%w: PNG header placement", ErrInvalid)
+		}
+		w := binary.BigEndian.Uint32(payload[0:4])
+		h := binary.BigEndian.Uint32(payload[4:8])
+		if w == 0 || h == 0 {
+			return fmt.Errorf("%w: empty PNG image", ErrInvalid)
+		}
+		if w > rasterMaxDimension || h > rasterMaxDimension {
+			return fmt.Errorf("%w: PNG image dimensions", ErrLimit)
+		}
+		bitDepth := int(payload[8])
+		colorType := payload[9]
+		compression, filter, interlace := payload[10], payload[11], payload[12]
+		if compression != 0 || filter != 0 || interlace > 1 {
+			return fmt.Errorf("%w: PNG header method", ErrInvalid)
+		}
+		validDepth := false
+		switch colorType {
+		case 0:
+			validDepth = bitDepth == 1 || bitDepth == 2 || bitDepth == 4 || bitDepth == 8 || bitDepth == 16
+			s.metadata.channels = 1
+			s.metadata.colorSpace = ImageColorGray
+			s.metadata.bitDepth = bitDepth
+		case 2:
+			validDepth = bitDepth == 8 || bitDepth == 16
+			s.metadata.channels = 3
+			s.metadata.colorSpace = ImageColorRGB
+			s.metadata.bitDepth = bitDepth
+		case 3:
+			validDepth = bitDepth == 1 || bitDepth == 2 || bitDepth == 4 || bitDepth == 8
+			s.metadata.channels = 3
+			s.metadata.colorSpace = ImageColorRGB
+			s.metadata.bitDepth = 8
+		case 4:
+			validDepth = bitDepth == 8 || bitDepth == 16
+			s.metadata.channels = 1
+			s.metadata.colorSpace = ImageColorGray
+			s.metadata.bitDepth = bitDepth
+			s.metadata.hasAlpha = true
+		case 6:
+			validDepth = bitDepth == 8 || bitDepth == 16
+			s.metadata.channels = 3
+			s.metadata.colorSpace = ImageColorRGB
+			s.metadata.bitDepth = bitDepth
+			s.metadata.hasAlpha = true
+		default:
+			return fmt.Errorf("%w: PNG color type %d", ErrInvalid, colorType)
+		}
+		if !validDepth {
+			return fmt.Errorf("%w: PNG color type %d bit depth %d", ErrInvalid, colorType, bitDepth)
+		}
+		s.width, s.height = int(w), int(h)
+		s.rawBitDepth, s.colorType, s.interlace = bitDepth, colorType, interlace
+		s.hasIHDR = true
+	case "PLTE":
+		if s.paletteSeen || s.imageSeen || s.colorType == 0 || s.colorType == 4 || size == 0 || size%3 != 0 || size > 256*3 {
+			return fmt.Errorf("%w: PNG PLTE chunk", ErrInvalid)
+		}
+		if s.colorType == 3 && size/3 > uint64(1)<<s.rawBitDepth {
+			return fmt.Errorf("%w: PNG PLTE length", ErrInvalid)
+		}
+		s.paletteSeen = true
+		s.palette = payload
+	case "tRNS":
+		if s.trnsSeen || s.imageSeen {
+			return fmt.Errorf("%w: PNG tRNS placement", ErrInvalid)
+		}
+		switch s.colorType {
+		case 0:
+			if size != 2 {
+				return fmt.Errorf("%w: PNG tRNS length", ErrInvalid)
+			}
+		case 2:
+			if size != 6 {
+				return fmt.Errorf("%w: PNG tRNS length", ErrInvalid)
+			}
+		case 3:
+			if !s.paletteSeen || size == 0 || size > uint64(len(s.palette)/3) {
+				return fmt.Errorf("%w: PNG tRNS length", ErrInvalid)
+			}
+		default:
+			return fmt.Errorf("%w: PNG tRNS forbidden for color type %d", ErrInvalid, s.colorType)
+		}
+		s.trnsSeen = true
+		s.trns = payload
+		s.metadata.hasAlpha = true
+	case "IDAT":
+		if s.colorType == 3 && !s.paletteSeen {
+			return fmt.Errorf("%w: PNG missing PLTE", ErrInvalid)
+		}
+		s.imageSeen = true
+	case "cICP":
+		if s.cicpSeen || s.paletteSeen || s.imageSeen || size != 4 || payload[3] > 1 {
+			return fmt.Errorf("%w: PNG cICP chunk", ErrInvalid)
+		}
+		s.cicpSeen = true
+		s.metadata.cicp = &imageCICP{primaries: payload[0], transfer: payload[1], matrix: payload[2], fullRange: payload[3] == 1}
+	case "mDCV":
+		if s.mdcvSeen || s.paletteSeen || s.imageSeen || size != 24 {
+			return fmt.Errorf("%w: PNG mDCV chunk", ErrInvalid)
+		}
+		for i := range 4 {
+			cx := binary.BigEndian.Uint16(payload[i*4:])
+			cy := binary.BigEndian.Uint16(payload[2+i*4:])
+			if cx > 50000 || cy > 50000 || uint32(cx)+uint32(cy) > 50000 {
+				return fmt.Errorf("%w: PNG mDCV chromaticity", ErrInvalid)
+			}
+		}
+		maxLum := binary.BigEndian.Uint32(payload[16:])
+		minLum := binary.BigEndian.Uint32(payload[20:])
+		if minLum > maxLum || maxLum > 0 && minLum == maxLum {
+			return fmt.Errorf("%w: PNG mDCV luminance", ErrInvalid)
+		}
+		s.mdcvSeen = true
+		if maxLum > 0 {
+			s.mdcvMaxNits = float64(maxLum) / 10000
+		}
+	case "cLLI":
+		if s.clliSeen || s.paletteSeen || s.imageSeen || size != 8 {
+			return fmt.Errorf("%w: PNG cLLI chunk", ErrInvalid)
+		}
+		maxCLL := binary.BigEndian.Uint32(payload[0:])
+		maxFALL := binary.BigEndian.Uint32(payload[4:])
+		if maxCLL > 0 && maxFALL > maxCLL {
+			return fmt.Errorf("%w: PNG cLLI luminance", ErrInvalid)
+		}
+		s.clliSeen = true
+		if maxCLL > 0 {
+			s.clliMaxNits = float64(maxCLL) / 10000
+		}
+	case "pHYs":
+		if s.physSeen || s.imageSeen || size != 9 || payload[8] > 1 {
+			return fmt.Errorf("%w: PNG physical dimensions", ErrInvalid)
+		}
+		s.physSeen = true
+		x, y := binary.BigEndian.Uint32(payload[0:]), binary.BigEndian.Uint32(payload[4:])
+		if payload[8] == 1 {
+			if x == 0 || y == 0 {
+				return fmt.Errorf("%w: zero PNG resolution", ErrInvalid)
+			}
+			s.metadata.dpi = Point{float64(x) * 0.0254, float64(y) * 0.0254}
+		} else if x != 0 && y != 0 {
+			s.metadata.dpi = Point{96, 96 * (float64(y) / float64(x))}
+		}
+	case "iCCP":
+		if s.profileSeen || s.srgbSeen || s.paletteSeen || s.imageSeen {
+			return fmt.Errorf("%w: PNG profile placement", ErrInvalid)
+		}
+		s.profileSeen = true
+		profile, err := pngICCStream(payload)
+		if err != nil {
+			return err
+		}
+		s.metadata.profile = profile
+		s.metadata.profileCompressed = true
+	case "sRGB":
+		if s.profileSeen || s.srgbSeen || s.paletteSeen || s.imageSeen || size != 1 || payload[0] > 3 {
+			return fmt.Errorf("%w: PNG sRGB chunk", ErrInvalid)
+		}
+		s.srgbSeen = true
+		s.metadata.srgb = true
+	case "gAMA":
+		if s.gamaSeen || s.paletteSeen || s.imageSeen || size != 4 {
+			return fmt.Errorf("%w: PNG gAMA chunk", ErrInvalid)
+		}
+		raw := binary.BigEndian.Uint32(payload)
+		if raw == 0 {
+			return fmt.Errorf("%w: PNG gAMA zero value", ErrInvalid)
+		}
+		s.gamaSeen = true
+		s.gammaChroma.hasGamma = true
+		s.gammaChroma.gamma = float64(raw) / 100000
+	case "cHRM":
+		if s.chrmSeen || s.paletteSeen || s.imageSeen || size != 32 {
+			return fmt.Errorf("%w: PNG cHRM chunk", ErrInvalid)
+		}
+		wx := float64(binary.BigEndian.Uint32(payload[0:])) / 100000
+		wy := float64(binary.BigEndian.Uint32(payload[4:])) / 100000
+		rx := float64(binary.BigEndian.Uint32(payload[8:])) / 100000
+		ry := float64(binary.BigEndian.Uint32(payload[12:])) / 100000
+		gx := float64(binary.BigEndian.Uint32(payload[16:])) / 100000
+		gy := float64(binary.BigEndian.Uint32(payload[20:])) / 100000
+		bx := float64(binary.BigEndian.Uint32(payload[24:])) / 100000
+		by := float64(binary.BigEndian.Uint32(payload[28:])) / 100000
+		if !(wx > 0 && wy > 0 && wx+wy < 1 && rx >= 0 && ry > 0 && rx+ry <= 1 && gx >= 0 && gy > 0 && gx+gy <= 1 && bx >= 0 && by > 0 && bx+by <= 1) {
+			return fmt.Errorf("%w: PNG cHRM coordinates", ErrInvalid)
+		}
+		if math.Abs((rx-bx)*(gy-by)-(gx-bx)*(ry-by)) <= 1e-9 {
+			return fmt.Errorf("%w: PNG cHRM degenerate primaries", ErrInvalid)
+		}
+		_, kr, kb, ok := cicpChromaticityToSRGB([3][2]float64{{rx, ry}, {gx, gy}, {bx, by}}, [2]float64{wx, wy})
+		if !ok || kr <= 0 || kb <= 0 || 1-kr-kb <= 0 {
+			return fmt.Errorf("%w: PNG cHRM chromaticity", ErrInvalid)
+		}
+		s.chrmSeen = true
+		s.gammaChroma.hasChrm = true
+		s.gammaChroma.whiteX, s.gammaChroma.whiteY = wx, wy
+		s.gammaChroma.redX, s.gammaChroma.redY = rx, ry
+		s.gammaChroma.greenX, s.gammaChroma.greenY = gx, gy
+		s.gammaChroma.blueX, s.gammaChroma.blueY = bx, by
+	}
+	return nil
+}
+
+// finalize 汇总PNG颜色提示优先级与HDR峰值亮度并返回最终元数据
+// 返回: rasterMetadata 汇总后的PNG图像元数据
+func (s *pngHeaderState) finalize() rasterMetadata {
+	if s.clliMaxNits > 0 {
+		s.metadata.hdrPeakNits = s.clliMaxNits
+	} else if s.mdcvMaxNits > 0 {
+		s.metadata.hdrPeakNits = s.mdcvMaxNits
+	}
+	if !imageCICPUsable(s.metadata.cicp) && !s.profileSeen && !s.srgbSeen && (s.gamaSeen || s.chrmSeen) {
+		gc := s.gammaChroma
+		s.metadata.gammaChroma = &gc
+	}
+	return s.metadata
+}
+
+// readPNGImageInfo 仅流式读取PNG在首个IDAT之前的头部元数据块并校验每块CRC与字节预算，不解压像素数据
 // 入参: ctx 已规范化取消Context, stream 只读流, part 部件包根URI, media 内容类型, maxBytes 单块字节上限
 // 返回: *ImageInfo 轻量图像头元数据, error 签名、块结构、CRC、预算或取消错误
 func readPNGImageInfo(ctx context.Context, stream io.Reader, part, media string, maxBytes int64) (*ImageInfo, error) {
 	var sig [8]byte
-	if _, err := io.ReadFull(stream, sig[:]); err != nil {
+	if _, err := io.ReadFull(stream, sig[:]); err != nil || !bytes.Equal(sig[:], []byte("\x89PNG\r\n\x1a\n")) {
 		return nil, fmt.Errorf("%w: PNG signature", ErrInvalid)
 	}
-	if !bytes.Equal(sig[:], []byte("\x89PNG\r\n\x1a\n")) {
-		return nil, fmt.Errorf("%w: PNG signature", ErrInvalid)
-	}
-	info := &ImageInfo{Part: part, ContentType: media, DPIX: 96, DPIY: 96, Orientation: 1}
-	hasIHDR := false
+	state := newPNGHeaderState()
 	var header [8]byte
 	var crcBuf [4]byte
 	for {
@@ -1552,130 +1875,553 @@ func readPNGImageInfo(ctx context.Context, stream io.Reader, part, media string,
 		}
 		size := uint64(binary.BigEndian.Uint32(header[:4]))
 		kind := string(header[4:8])
-		if !hasIHDR && kind != "IHDR" {
-			return nil, fmt.Errorf("%w: PNG header placement", ErrInvalid)
+		if maxBytes > 0 && size > uint64(maxBytes) {
+			return nil, fmt.Errorf("%w: PNG chunk size", ErrLimit)
 		}
-		switch kind {
-		case "IHDR":
-			if hasIHDR || size != 13 {
-				return nil, fmt.Errorf("%w: PNG header placement", ErrInvalid)
+		if kind == "IDAT" {
+			if err := state.consumeChunk("IDAT", nil); err != nil {
+				return nil, err
 			}
-			var payload [13]byte
-			if _, err := io.ReadFull(stream, payload[:]); err != nil {
-				return nil, fmt.Errorf("%w: truncated PNG IHDR", ErrInvalid)
-			}
-			if _, err := io.ReadFull(stream, crcBuf[:]); err != nil {
-				return nil, fmt.Errorf("%w: truncated PNG CRC", ErrInvalid)
-			}
-			h := crc32.NewIEEE()
-			_, _ = h.Write(header[4:8])
-			_, _ = h.Write(payload[:])
-			if h.Sum32() != binary.BigEndian.Uint32(crcBuf[:]) {
-				return nil, fmt.Errorf("%w: PNG chunk checksum", ErrInvalid)
-			}
-			w := binary.BigEndian.Uint32(payload[0:4])
-			ht := binary.BigEndian.Uint32(payload[4:8])
-			if w == 0 || ht == 0 {
-				return nil, fmt.Errorf("%w: empty PNG image", ErrInvalid)
-			}
-			if w > rasterMaxDimension || ht > rasterMaxDimension {
-				return nil, fmt.Errorf("%w: PNG image dimensions", ErrLimit)
-			}
-			info.Width, info.Height = int(w), int(ht)
-			info.BitDepth = int(payload[8])
-			info.ColorSpace = ImageColorRGB
-			switch payload[9] {
-			case 0:
-				info.ColorSpace = ImageColorGray
-			case 2:
-				info.ColorSpace = ImageColorRGB
-			case 3:
-				info.ColorSpace = ImageColorRGB
-				info.BitDepth = 8
-			case 4:
-				info.ColorSpace = ImageColorGray
-				info.HasAlpha = true
-			case 6:
-				info.ColorSpace = ImageColorRGB
-				info.HasAlpha = true
-			default:
-				return nil, fmt.Errorf("%w: PNG color type %d", ErrInvalid, payload[9])
-			}
-			hasIHDR = true
-		case "pHYs":
-			if size != 9 {
-				return nil, fmt.Errorf("%w: PNG physical dimensions", ErrInvalid)
-			}
-			var payload [9]byte
-			if _, err := io.ReadFull(stream, payload[:]); err != nil {
-				return nil, fmt.Errorf("%w: truncated PNG pHYs", ErrInvalid)
-			}
-			if _, err := io.ReadFull(stream, crcBuf[:]); err != nil {
-				return nil, fmt.Errorf("%w: truncated PNG CRC", ErrInvalid)
-			}
-			h := crc32.NewIEEE()
-			_, _ = h.Write(header[4:8])
-			_, _ = h.Write(payload[:])
-			if h.Sum32() != binary.BigEndian.Uint32(crcBuf[:]) {
-				return nil, fmt.Errorf("%w: PNG chunk checksum", ErrInvalid)
-			}
-			if payload[8] > 1 {
-				return nil, fmt.Errorf("%w: PNG physical dimensions", ErrInvalid)
-			}
-			x, y := binary.BigEndian.Uint32(payload[0:4]), binary.BigEndian.Uint32(payload[4:8])
-			if payload[8] == 1 {
-				if x == 0 || y == 0 {
-					return nil, fmt.Errorf("%w: zero PNG resolution", ErrInvalid)
-				}
-				info.DPIX, info.DPIY = float64(x)*0.0254, float64(y)*0.0254
-			} else if x != 0 && y != 0 {
-				info.DPIX, info.DPIY = 96, 96*(float64(y)/float64(x))
-			}
-		case "tRNS":
-			info.HasAlpha = true
-			if _, err := io.CopyN(io.Discard, stream, int64(size)+4); err != nil {
-				return nil, fmt.Errorf("%w: truncated PNG tRNS", ErrInvalid)
-			}
-		case "iCCP":
-			info.HasICCProfile = true
-			if _, err := io.CopyN(io.Discard, stream, int64(size)+4); err != nil {
-				return nil, fmt.Errorf("%w: truncated PNG iCCP", ErrInvalid)
-			}
-		case "cICP":
-			if size != 4 {
-				return nil, fmt.Errorf("%w: PNG cICP chunk", ErrInvalid)
-			}
-			info.HasCICP = true
-			if _, err := io.CopyN(io.Discard, stream, int64(size)+4); err != nil {
-				return nil, fmt.Errorf("%w: truncated PNG cICP", ErrInvalid)
-			}
-		case "IDAT":
-			return info, checkContext(ctx)
-		case "IEND":
+			return &ImageInfo{
+				Part:          part,
+				ContentType:   media,
+				Width:         state.width,
+				Height:        state.height,
+				DPIX:          state.metadata.dpi.X,
+				DPIY:          state.metadata.dpi.Y,
+				ColorSpace:    state.metadata.colorSpace,
+				HasAlpha:      state.metadata.hasAlpha,
+				BitDepth:      state.metadata.bitDepth,
+				Orientation:   1,
+				HasICCProfile: state.profileSeen,
+				HasCICP:       state.cicpSeen,
+			}, checkContext(ctx)
+		}
+		if kind == "IEND" {
 			return nil, fmt.Errorf("%w: PNG missing IDAT", ErrInvalid)
-		default:
-			if maxBytes > 0 && size > uint64(maxBytes) {
+		}
+		hasher := crc32.NewIEEE()
+		_, _ = hasher.Write(header[4:8])
+		needPayload := kind == "IHDR" || kind == "PLTE" || kind == "tRNS" || kind == "cICP" || kind == "mDCV" || kind == "cLLI" || kind == "pHYs" || kind == "iCCP" || kind == "sRGB" || kind == "gAMA" || kind == "cHRM"
+		var payload []byte
+		if needPayload {
+			if size > uint64(^uint(0)>>1) {
 				return nil, fmt.Errorf("%w: PNG chunk size", ErrLimit)
 			}
-			if _, err := io.CopyN(io.Discard, stream, int64(size)+4); err != nil {
+			payload = make([]byte, int(size))
+			if _, err := io.ReadFull(stream, payload); err != nil {
+				return nil, fmt.Errorf("%w: truncated PNG %s", ErrInvalid, kind)
+			}
+			_, _ = hasher.Write(payload)
+		} else if size > 0 {
+			if _, err := io.CopyN(hasher, stream, int64(size)); err != nil {
 				return nil, fmt.Errorf("%w: truncated PNG chunk payload", ErrInvalid)
 			}
+		}
+		if _, err := io.ReadFull(stream, crcBuf[:]); err != nil {
+			return nil, fmt.Errorf("%w: truncated PNG CRC", ErrInvalid)
+		}
+		if hasher.Sum32() != binary.BigEndian.Uint32(crcBuf[:]) {
+			return nil, fmt.Errorf("%w: PNG chunk checksum", ErrInvalid)
+		}
+		if err := state.consumeChunk(kind, payload); err != nil {
+			return nil, err
 		}
 	}
 }
 
-// readJPEGImageInfo 仅流式扫描JPEG标记段至首个SOS或EOI即停止，不解码熵编码图像流
-// 入参: ctx 已规范化取消Context, stream 只读流, part 部件包根URI, media 内容类型
-// 返回: *ImageInfo 视觉方向规范化后的图像头元数据, error 标记、元数据或取消错误
-func readJPEGImageInfo(ctx context.Context, stream io.Reader, part, media string) (*ImageInfo, error) {
+// decodePNGImageRows 对非隔行PNG执行真O(width)流式zlib解压、行滤镜还原与色彩管理逐行回调，隔行PNG返回handled=false由上层回退
+// 入参: ctx 已规范化取消Context, data 完整PNG字节, maxPixels 像素容量上限, maxBytes 色彩配置与行工作内存上限, cfg 已校验色彩转换选项, fn 逐行消费回调
+// 返回: bool 是否已由流式逐行路径处理, error 解码、色彩、预算、回调或取消错误
+func decodePNGImageRows(ctx context.Context, data []byte, maxPixels, maxBytes uint64, cfg ImageConvertOptions, fn func(y int, nrgba []byte) error) (bool, error) {
+	if err := checkContext(ctx); err != nil {
+		return false, err
+	}
+	if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
+		return false, fmt.Errorf("%w: PNG signature", ErrInvalid)
+	}
+	state := newPNGHeaderState()
+	idatStart, idatEnd := 0, 0
+	idatClosed := false
+	iendSeen := false
+	for pos := uint64(8); pos < uint64(len(data)); {
+		if err := checkContext(ctx); err != nil {
+			return false, err
+		}
+		if uint64(len(data))-pos < 12 {
+			return false, fmt.Errorf("%w: truncated PNG chunk", ErrInvalid)
+		}
+		size := uint64(binary.BigEndian.Uint32(data[pos:]))
+		if size > uint64(len(data))-pos-12 {
+			return false, fmt.Errorf("%w: PNG chunk size", ErrInvalid)
+		}
+		chunk := data[pos+4 : pos+8+size]
+		if crc32.ChecksumIEEE(chunk) != binary.BigEndian.Uint32(data[pos+8+size:]) {
+			return false, fmt.Errorf("%w: PNG chunk checksum", ErrInvalid)
+		}
+		kind := string(chunk[:4])
+		payload := chunk[4:]
+		if kind == "IDAT" {
+			if idatClosed {
+				return false, fmt.Errorf("%w: non-contiguous PNG IDAT", ErrInvalid)
+			}
+			if idatStart == 0 {
+				if err := state.consumeChunk("IDAT", payload); err != nil {
+					return false, err
+				}
+				idatStart = int(pos)
+			}
+			idatEnd = int(pos + size + 12)
+		} else {
+			if idatStart != 0 {
+				idatClosed = true
+			}
+			if kind == "IEND" {
+				if size != 0 || pos+12 != uint64(len(data)) {
+					return false, fmt.Errorf("%w: PNG ending", ErrInvalid)
+				}
+				iendSeen = true
+				break
+			}
+			if err := state.consumeChunk(kind, payload); err != nil {
+				return false, err
+			}
+		}
+		pos += size + 12
+	}
+	if !state.hasIHDR || idatStart == 0 || !iendSeen {
+		return false, fmt.Errorf("%w: incomplete PNG stream", ErrInvalid)
+	}
+	if state.interlace != 0 {
+		return false, nil
+	}
+	w, h := state.width, state.height
+	pixels := uint64(w) * uint64(h)
+	if pixels > maxPixels || pixels > uint64(^uint(0)>>1)/8 {
+		return false, fmt.Errorf("%w: decoded image pixels", ErrLimit)
+	}
+	samples := 1
+	switch state.colorType {
+	case 2:
+		samples = 3
+	case 4:
+		samples = 2
+	case 6:
+		samples = 4
+	}
+	scanlineBytes := (uint64(w)*uint64(samples)*uint64(state.rawBitDepth) + 7) / 8
+	rowWork := scanlineBytes*2 + uint64(w)*12
+	if maxBytes > 0 && rowWork > maxBytes || scanlineBytes > uint64(^uint(0)>>1) {
+		return false, fmt.Errorf("%w: PNG row buffer memory budget", ErrLimit)
+	}
+	metadata := state.finalize()
+	rowOut := image.NewNRGBA64(image.Rect(0, 0, w, 1))
+	rowRaster := &rasterImage{
+		pixels:            rowOut,
+		dpi:               metadata.dpi,
+		channels:          metadata.channels,
+		profile:           metadata.profile,
+		profileCompressed: metadata.profileCompressed,
+		cicp:              metadata.cicp,
+		gammaChroma:       metadata.gammaChroma,
+		srgb:              metadata.srgb,
+		hdrPeakNits:       metadata.hdrPeakNits,
+		colorSpace:        metadata.colorSpace,
+		hasAlpha:          metadata.hasAlpha,
+		bitDepth:          metadata.bitDepth,
+		orientation:       1,
+	}
+	sampler, err := prepareImageConvertSampler(&ImageResource{source: rowRaster}, cfg, maxBytes)
+	if err != nil {
+		return false, err
+	}
+	var bgLinear [3]float64
+	bgAlpha := 0.0
+	hasBG := cfg.Background != nil
+	if hasBG {
+		bgLinear, bgAlpha, _ = imageConvertBackground(cfg.Background)
+	}
+	idat := &pngCompressedReader{data: data, next: idatStart, limit: idatEnd}
+	zr, err := zlib.NewReader(idat)
+	if err != nil {
+		return false, fmt.Errorf("%w: PNG zlib header: %w", ErrInvalid, err)
+	}
+	defer zr.Close()
+	bpp := max(1, (samples*state.rawBitDepth)/8)
+	prevRow := make([]byte, int(scanlineBytes))
+	curRow := make([]byte, int(scanlineBytes))
+	rowBuf := make([]byte, w*4)
+	var filterBuf [1]byte
+	var jxrCache jxrRowCache
+	for y := range h {
+		if err := checkContext(ctx); err != nil {
+			return true, err
+		}
+		if _, err := io.ReadFull(zr, filterBuf[:]); err != nil {
+			return true, fmt.Errorf("%w: truncated PNG scanline filter: %w", ErrInvalid, err)
+		}
+		if _, err := io.ReadFull(zr, curRow); err != nil {
+			return true, fmt.Errorf("%w: truncated PNG scanline data: %w", ErrInvalid, err)
+		}
+		if err := pngUnfilterRow(filterBuf[0], curRow, prevRow, bpp); err != nil {
+			return true, err
+		}
+		if err := pngUnpackRowToNRGBA64(curRow, rowOut, w, state.colorType, state.rawBitDepth, state.palette, state.trns); err != nil {
+			return true, err
+		}
+		clear(rowBuf)
+		for x := range w {
+			if x&1023 == 0 {
+				if err := checkContext(ctx); err != nil {
+					return true, err
+				}
+			}
+			c, err := sampler.pixelColorWithCache(x, 0, &jxrCache)
+			if err != nil {
+				return true, err
+			}
+			lin, alphaVal, err := imageConvertLinearPixelWithBG(c, sampler.toneMapPeak, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode)
+			if err != nil {
+				return true, err
+			}
+			a8 := colorQuantize8(alphaVal)
+			if a8 == 0 {
+				continue
+			}
+			off := x * 4
+			rowBuf[off] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[0])))
+			rowBuf[off+1] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[1])))
+			rowBuf[off+2] = colorQuantize8(renderLinearToSRGB(colorClamp(lin[2])))
+			rowBuf[off+3] = a8
+		}
+		if err := fn(y, rowBuf); err != nil {
+			return true, err
+		}
+		prevRow, curRow = curRow, prevRow
+	}
+	var extra [1]byte
+	if n, err := zr.Read(extra[:]); n != 0 || err != io.EOF {
+		return true, fmt.Errorf("%w: trailing PNG scanline data", ErrInvalid)
+	}
+	if err := zr.Close(); err != nil {
+		return true, fmt.Errorf("%w: PNG zlib checksum: %w", ErrInvalid, err)
+	}
+	return true, checkContext(ctx)
+}
+
+// pngUnfilterRow 按ISO/IEC 15948 §9标准算法原地还原单条PNG过滤扫描行
+// 入参: filter 滤镜类型0至4, cur 当前行缓冲, prev 上一行缓冲（首行全零）, bpp 像素字节步长
+// 返回: error 未知滤镜类型错误
+func pngUnfilterRow(filter byte, cur, prev []byte, bpp int) error {
+	switch filter {
+	case 0:
+		return nil
+	case 1:
+		for i := bpp; i < len(cur); i++ {
+			cur[i] += cur[i-bpp]
+		}
+	case 2:
+		for i := range cur {
+			cur[i] += prev[i]
+		}
+	case 3:
+		for i := range cur {
+			a := 0
+			if i >= bpp {
+				a = int(cur[i-bpp])
+			}
+			cur[i] += byte((a + int(prev[i])) >> 1)
+		}
+	case 4:
+		for i := range cur {
+			a, b, c := 0, int(prev[i]), 0
+			if i >= bpp {
+				a, c = int(cur[i-bpp]), int(prev[i-bpp])
+			}
+			cur[i] += byte(pngPaethPredictor(a, b, c))
+		}
+	default:
+		return fmt.Errorf("%w: PNG filter type %d", ErrInvalid, filter)
+	}
+	return nil
+}
+
+// pngPaethPredictor 按ISO/IEC 15948 §9.4计算Paeth滤镜预测值
+// 入参: a 左侧字节, b 上方字节, c 左上字节
+// 返回: int Paeth预测值
+func pngPaethPredictor(a, b, c int) int {
+	p := a + b - c
+	pa := p - a
+	if pa < 0 {
+		pa = -pa
+	}
+	pb := p - b
+	if pb < 0 {
+		pb = -pb
+	}
+	pc := p - c
+	if pc < 0 {
+		pc = -pc
+	}
+	if pa <= pb && pa <= pc {
+		return a
+	}
+	if pb <= pc {
+		return b
+	}
+	return c
+}
+
+// pngUnpackRowToNRGBA64 将已解滤的PNG单行原始样本精确解包写入1行16位NRGBA64缓冲，支持全部标准色彩类型、位深、调色板与tRNS透明色键
+// 入参: raw 已解滤扫描行, dst 高度为1的目标NRGBA64图像, width 像素宽度, colorType PNG色型, bitDepth 原始位深, palette 可选PLTE字节, trns 可选tRNS字节
+// 返回: error 调色板索引越界错误
+func pngUnpackRowToNRGBA64(raw []byte, dst *image.NRGBA64, width int, colorType byte, bitDepth int, palette, trns []byte) error {
+	pix := dst.Pix
+	switch colorType {
+	case 0:
+		hasTRNS := len(trns) == 2
+		trnsKey := uint16(0)
+		if hasTRNS {
+			trnsKey = binary.BigEndian.Uint16(trns)
+		}
+		if bitDepth == 16 {
+			for x := range width {
+				v := binary.BigEndian.Uint16(raw[x*2:])
+				a := uint16(65535)
+				if hasTRNS && v == trnsKey {
+					a = 0
+				}
+				off := x * 8
+				binary.BigEndian.PutUint16(pix[off:], v)
+				binary.BigEndian.PutUint16(pix[off+2:], v)
+				binary.BigEndian.PutUint16(pix[off+4:], v)
+				binary.BigEndian.PutUint16(pix[off+6:], a)
+			}
+			return nil
+		}
+		mask := byte((1 << bitDepth) - 1)
+		scale := uint16(65535 / ((1 << bitDepth) - 1))
+		perByte := 8 / bitDepth
+		for x := range width {
+			shift := uint(8 - bitDepth*(x%perByte+1))
+			v := uint16((raw[x/perByte] >> shift) & mask)
+			a := uint16(65535)
+			if hasTRNS && v == trnsKey {
+				a = 0
+			}
+			v16 := v * scale
+			off := x * 8
+			binary.BigEndian.PutUint16(pix[off:], v16)
+			binary.BigEndian.PutUint16(pix[off+2:], v16)
+			binary.BigEndian.PutUint16(pix[off+4:], v16)
+			binary.BigEndian.PutUint16(pix[off+6:], a)
+		}
+	case 2:
+		hasTRNS := len(trns) == 6
+		var tr, tg, tb uint16
+		if hasTRNS {
+			tr, tg, tb = binary.BigEndian.Uint16(trns[0:]), binary.BigEndian.Uint16(trns[2:]), binary.BigEndian.Uint16(trns[4:])
+		}
+		if bitDepth == 16 {
+			for x := range width {
+				r := binary.BigEndian.Uint16(raw[x*6:])
+				g := binary.BigEndian.Uint16(raw[x*6+2:])
+				b := binary.BigEndian.Uint16(raw[x*6+4:])
+				a := uint16(65535)
+				if hasTRNS && r == tr && g == tg && b == tb {
+					a = 0
+				}
+				off := x * 8
+				binary.BigEndian.PutUint16(pix[off:], r)
+				binary.BigEndian.PutUint16(pix[off+2:], g)
+				binary.BigEndian.PutUint16(pix[off+4:], b)
+				binary.BigEndian.PutUint16(pix[off+6:], a)
+			}
+			return nil
+		}
+		for x := range width {
+			r, g, b := uint16(raw[x*3]), uint16(raw[x*3+1]), uint16(raw[x*3+2])
+			a := uint16(65535)
+			if hasTRNS && r == tr && g == tg && b == tb {
+				a = 0
+			}
+			off := x * 8
+			binary.BigEndian.PutUint16(pix[off:], r*0x0101)
+			binary.BigEndian.PutUint16(pix[off+2:], g*0x0101)
+			binary.BigEndian.PutUint16(pix[off+4:], b*0x0101)
+			binary.BigEndian.PutUint16(pix[off+6:], a)
+		}
+	case 3:
+		palCount := len(palette) / 3
+		mask := byte((1 << bitDepth) - 1)
+		perByte := 8 / bitDepth
+		for x := range width {
+			shift := uint(8 - bitDepth*(x%perByte+1))
+			idx := int((raw[x/perByte] >> shift) & mask)
+			if idx >= palCount {
+				return fmt.Errorf("%w: PNG palette index out of range", ErrInvalid)
+			}
+			a := uint16(65535)
+			if idx < len(trns) {
+				a = uint16(trns[idx]) * 0x0101
+			}
+			off := x * 8
+			binary.BigEndian.PutUint16(pix[off:], uint16(palette[idx*3])*0x0101)
+			binary.BigEndian.PutUint16(pix[off+2:], uint16(palette[idx*3+1])*0x0101)
+			binary.BigEndian.PutUint16(pix[off+4:], uint16(palette[idx*3+2])*0x0101)
+			binary.BigEndian.PutUint16(pix[off+6:], a)
+		}
+	case 4:
+		if bitDepth == 16 {
+			for x := range width {
+				v := binary.BigEndian.Uint16(raw[x*4:])
+				a := binary.BigEndian.Uint16(raw[x*4+2:])
+				off := x * 8
+				binary.BigEndian.PutUint16(pix[off:], v)
+				binary.BigEndian.PutUint16(pix[off+2:], v)
+				binary.BigEndian.PutUint16(pix[off+4:], v)
+				binary.BigEndian.PutUint16(pix[off+6:], a)
+			}
+			return nil
+		}
+		for x := range width {
+			v := uint16(raw[x*2]) * 0x0101
+			a := uint16(raw[x*2+1]) * 0x0101
+			off := x * 8
+			binary.BigEndian.PutUint16(pix[off:], v)
+			binary.BigEndian.PutUint16(pix[off+2:], v)
+			binary.BigEndian.PutUint16(pix[off+4:], v)
+			binary.BigEndian.PutUint16(pix[off+6:], a)
+		}
+	case 6:
+		if bitDepth == 16 {
+			copy(pix[:width*8], raw[:width*8])
+			return nil
+		}
+		for x := range width {
+			off := x * 8
+			binary.BigEndian.PutUint16(pix[off:], uint16(raw[x*4])*0x0101)
+			binary.BigEndian.PutUint16(pix[off+2:], uint16(raw[x*4+1])*0x0101)
+			binary.BigEndian.PutUint16(pix[off+4:], uint16(raw[x*4+2])*0x0101)
+			binary.BigEndian.PutUint16(pix[off+6:], uint16(raw[x*4+3])*0x0101)
+		}
+	}
+	return nil
+}
+
+// newJPEGHeaderState 初始化带默认96 DPI与方向1的JPEG标记段解析状态
+// 返回: jpegHeaderState 初始解析状态
+func newJPEGHeaderState() jpegHeaderState {
+	return jpegHeaderState{metadata: rasterMetadata{dpi: Point{96, 96}, orientation: 1}}
+}
+
+// consumeSegment 统一校验并吸收JPEG帧头、JFIF、Adobe、EXIF及APP2 ICC分片标记段，供ImageInfo与解码路径共用
+// 入参: marker 标记字节, payload 段载荷, maxProfileBytes ICC配置字节预算上限, storeICC 是否保留ICC分片切片
+// 返回: error 帧结构、分辨率、方向、ICC分片序数或预算错误
+func (s *jpegHeaderState) consumeSegment(marker byte, payload []byte, maxProfileBytes int64, storeICC bool) error {
+	switch {
+	case marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc:
+		if len(payload) < 6 || s.hasFrame {
+			return fmt.Errorf("%w: JPEG frame metadata", ErrInvalid)
+		}
+		nf := int(payload[5])
+		if nf == 0 || len(payload) != 6+3*nf || payload[0] == 0 {
+			return fmt.Errorf("%w: JPEG frame component layout", ErrInvalid)
+		}
+		h := int(binary.BigEndian.Uint16(payload[1:3]))
+		w := int(binary.BigEndian.Uint16(payload[3:5]))
+		if w == 0 || h == 0 {
+			return fmt.Errorf("%w: empty JPEG image", ErrInvalid)
+		}
+		if w > rasterMaxDimension || h > rasterMaxDimension {
+			return fmt.Errorf("%w: JPEG image dimensions", ErrLimit)
+		}
+		s.width, s.height = w, h
+		s.metadata.bitDepth = int(payload[0])
+		s.metadata.channels = nf
+		s.metadata.jpegProcess = marker
+		switch nf {
+		case 1:
+			s.metadata.colorSpace = ImageColorGray
+		case 3:
+			s.metadata.colorSpace = ImageColorRGB
+		case 4:
+			s.metadata.colorSpace = ImageColorCMYK
+		default:
+			s.metadata.colorSpace = ImageColorMultiChannel
+		}
+		s.hasFrame = true
+	case marker == 0xe0 && bytes.HasPrefix(payload, []byte("JFIF\x00")):
+		if len(payload) < 14 {
+			return fmt.Errorf("%w: truncated JFIF", ErrInvalid)
+		}
+		s.metadata.jpegJFIF = true
+		unit, x, y := payload[7], binary.BigEndian.Uint16(payload[8:]), binary.BigEndian.Uint16(payload[10:])
+		if unit > 2 || x == 0 || y == 0 {
+			return fmt.Errorf("%w: JFIF density", ErrInvalid)
+		}
+		if unit == 0 {
+			s.metadata.dpi = Point{96, 96 * (float64(y) / float64(x))}
+			s.jfifAbsolute = false
+		} else {
+			factor := 1.0
+			if unit == 2 {
+				factor = 2.54
+			}
+			s.metadata.dpi = Point{float64(x) * factor, float64(y) * factor}
+			s.jfifAbsolute = true
+		}
+	case marker == 0xee && len(payload) >= 12 && bytes.HasPrefix(payload, []byte("Adobe")):
+		s.metadata.jpegAdobe = true
+		s.metadata.jpegAdobeTransform = payload[11]
+	case marker == 0xe1 && bytes.HasPrefix(payload, []byte("Exif\x00\x00")):
+		value, present, absolute, orientation, hasOrientation, err := exifImageMetadata(payload[6:])
+		if err != nil {
+			return err
+		}
+		if present {
+			if s.hasExif && (s.exif != value || s.exifAbsolute != absolute) {
+				return fmt.Errorf("%w: conflicting EXIF resolution", ErrInvalid)
+			}
+			s.exif, s.hasExif, s.exifAbsolute = value, true, absolute
+		}
+		if hasOrientation {
+			if s.hasOrient && s.metadata.orientation != orientation {
+				return fmt.Errorf("%w: conflicting EXIF orientation", ErrInvalid)
+			}
+			s.metadata.orientation, s.hasOrient = orientation, true
+		}
+	case marker == 0xe2 && bytes.HasPrefix(payload, []byte("ICC_PROFILE\x00")):
+		if len(payload) <= 14 {
+			return fmt.Errorf("%w: JPEG ICC fragment header", ErrInvalid)
+		}
+		index, count := int(payload[12]), int(payload[13])
+		if index == 0 || count == 0 || index > count || s.profileSeen[index] || s.profileCount != 0 && s.profileCount != count {
+			return fmt.Errorf("%w: JPEG ICC fragment sequence", ErrInvalid)
+		}
+		s.profileCount = count
+		s.profileSeen[index] = true
+		fragSize := int64(len(payload) - 14)
+		if maxProfileBytes >= 0 && fragSize > maxProfileBytes-s.profileSize {
+			return fmt.Errorf("%w: JPEG ICC byte budget", ErrLimit)
+		}
+		s.profileSize += fragSize
+		if storeICC {
+			s.profiles[index] = payload[14:]
+		}
+	}
+	return nil
+}
+
+// readJPEGImageInfo 仅流式扫描JPEG标记段至首个SOS或EOI即停止，严格校验SOF长度与APP2 ICC分片序数且不解码熵编码流
+// 入参: ctx 已规范化取消Context, stream 只读流, part 部件包根URI, media 内容类型, maxProfileBytes ICC配置字节预算上限
+// 返回: *ImageInfo 视觉方向规范化后的图像头元数据, error 标记、元数据、预算或取消错误
+func readJPEGImageInfo(ctx context.Context, stream io.Reader, part, media string, maxProfileBytes int64) (*ImageInfo, error) {
 	var soi [2]byte
 	if _, err := io.ReadFull(stream, soi[:]); err != nil || soi[0] != 0xff || soi[1] != 0xd8 {
 		return nil, fmt.Errorf("%w: JPEG signature", ErrInvalid)
 	}
-	info := &ImageInfo{Part: part, ContentType: media, DPIX: 96, DPIY: 96, Orientation: 1}
-	hasFrame := false
-	var exifDPI Point
-	hasExif, exifAbsolute, jfifAbsolute, hasOrient := false, false, false, false
+	state := newJPEGHeaderState()
 	var single [1]byte
 	var lengthBuf [2]byte
 	for {
@@ -1708,7 +2454,7 @@ func readJPEGImageInfo(ctx context.Context, stream io.Reader, part, media string
 			return nil, fmt.Errorf("%w: JPEG marker length", ErrInvalid)
 		}
 		payloadLen := size - 2
-		needPayload := marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc || marker == 0xe0 || marker == 0xe1 || marker == 0xe2
+		needPayload := marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc || marker == 0xe0 || marker == 0xe1 || marker == 0xe2 || marker == 0xee
 		if !needPayload {
 			if _, err := io.CopyN(io.Discard, stream, int64(payloadLen)); err != nil {
 				return nil, fmt.Errorf("%w: truncated JPEG segment", ErrInvalid)
@@ -1719,88 +2465,34 @@ func readJPEGImageInfo(ctx context.Context, stream io.Reader, part, media string
 		if _, err := io.ReadFull(stream, payload); err != nil {
 			return nil, fmt.Errorf("%w: truncated JPEG segment", ErrInvalid)
 		}
-		switch {
-		case marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc:
-			if len(payload) < 6 || hasFrame {
-				return nil, fmt.Errorf("%w: JPEG frame metadata", ErrInvalid)
-			}
-			h := int(binary.BigEndian.Uint16(payload[1:3]))
-			w := int(binary.BigEndian.Uint16(payload[3:5]))
-			if w == 0 || h == 0 {
-				return nil, fmt.Errorf("%w: empty JPEG image", ErrInvalid)
-			}
-			if w > rasterMaxDimension || h > rasterMaxDimension {
-				return nil, fmt.Errorf("%w: JPEG image dimensions", ErrLimit)
-			}
-			info.Width, info.Height = w, h
-			info.BitDepth = int(payload[0])
-			switch payload[5] {
-			case 0:
-				return nil, fmt.Errorf("%w: JPEG frame component count", ErrInvalid)
-			case 1:
-				info.ColorSpace = ImageColorGray
-			case 3:
-				info.ColorSpace = ImageColorRGB
-			case 4:
-				info.ColorSpace = ImageColorCMYK
-			default:
-				info.ColorSpace = ImageColorMultiChannel
-			}
-			hasFrame = true
-		case marker == 0xe0 && bytes.HasPrefix(payload, []byte("JFIF\x00")):
-			if len(payload) < 14 {
-				return nil, fmt.Errorf("%w: truncated JFIF", ErrInvalid)
-			}
-			unit, x, y := payload[7], binary.BigEndian.Uint16(payload[8:]), binary.BigEndian.Uint16(payload[10:])
-			if unit > 2 || x == 0 || y == 0 {
-				return nil, fmt.Errorf("%w: JFIF density", ErrInvalid)
-			}
-			if unit == 0 {
-				info.DPIX, info.DPIY = 96, 96*(float64(y)/float64(x))
-				jfifAbsolute = false
-			} else {
-				factor := 1.0
-				if unit == 2 {
-					factor = 2.54
-				}
-				info.DPIX, info.DPIY = float64(x)*factor, float64(y)*factor
-				jfifAbsolute = true
-			}
-		case marker == 0xe1 && bytes.HasPrefix(payload, []byte("Exif\x00\x00")):
-			value, present, absolute, orientation, hasOrientation, err := exifImageMetadata(payload[6:])
-			if err != nil {
-				return nil, err
-			}
-			if present {
-				if hasExif && (exifDPI != value || exifAbsolute != absolute) {
-					return nil, fmt.Errorf("%w: conflicting EXIF resolution", ErrInvalid)
-				}
-				exifDPI, hasExif, exifAbsolute = value, true, absolute
-			}
-			if hasOrientation {
-				if hasOrient && info.Orientation != orientation {
-					return nil, fmt.Errorf("%w: conflicting EXIF orientation", ErrInvalid)
-				}
-				info.Orientation, hasOrient = orientation, true
-			}
-		case marker == 0xe2 && bytes.HasPrefix(payload, []byte("ICC_PROFILE\x00")):
-			if len(payload) <= 14 {
-				return nil, fmt.Errorf("%w: JPEG ICC fragment header", ErrInvalid)
-			}
-			info.HasICCProfile = true
+		if err := state.consumeSegment(marker, payload, maxProfileBytes, false); err != nil {
+			return nil, err
 		}
 	}
-	if !hasFrame {
+	if !state.hasFrame {
 		return nil, fmt.Errorf("%w: missing JPEG frame header", ErrInvalid)
 	}
-	if hasExif && (exifAbsolute || !jfifAbsolute) {
-		info.DPIX, info.DPIY = exifDPI.X, exifDPI.Y
+	if state.hasExif && (state.exifAbsolute || !state.jfifAbsolute) {
+		state.metadata.dpi = state.exif
 	}
-	if info.Orientation >= 5 && info.Orientation <= 8 {
-		info.Width, info.Height = info.Height, info.Width
-		info.DPIX, info.DPIY = info.DPIY, info.DPIX
+	w, h := state.width, state.height
+	dpiX, dpiY := state.metadata.dpi.X, state.metadata.dpi.Y
+	if state.metadata.orientation >= 5 && state.metadata.orientation <= 8 {
+		w, h = h, w
+		dpiX, dpiY = dpiY, dpiX
 	}
-	return info, checkContext(ctx)
+	return &ImageInfo{
+		Part:          part,
+		ContentType:   media,
+		Width:         w,
+		Height:        h,
+		DPIX:          dpiX,
+		DPIY:          dpiY,
+		ColorSpace:    state.metadata.colorSpace,
+		BitDepth:      state.metadata.bitDepth,
+		Orientation:   state.metadata.orientation,
+		HasICCProfile: state.profileCount > 0,
+	}, checkContext(ctx)
 }
 
 // imageEmbeddedProfileBytes 在预算内提取源图像内嵌ICC的未压缩字节视图，不修改源图像状态
@@ -1811,7 +2503,7 @@ func imageEmbeddedProfileBytes(source *rasterImage, maxBytes uint64) ([]byte, er
 		return nil, nil
 	}
 	if source.profileCompressed {
-		limit := int64(min(maxBytes, uint64(DefaultLimits().MaxPartBytes)))
+		limit := int64(min(maxBytes, uint64(math.MaxInt64)))
 		return inflatePNGProfile(source.profile, limit)
 	}
 	if uint64(len(source.profile)) > maxBytes {
@@ -1895,8 +2587,9 @@ func exportDirectCMYK(ctx context.Context, source *rasterImage, bounds image.Rec
 	width := bounds.Dx()
 	hasBG := background != nil
 	var bgCMYK [4]uint8
+	bgAlpha := 0.0
 	if hasBG {
-		_, bgCMYK = imageConvertBackground(background)
+		_, bgAlpha, bgCMYK = imageConvertBackground(background)
 	}
 	blendCMYK := func(dst []byte, c, m, y, k, alpha uint8) {
 		if alpha == 255 {
@@ -1904,23 +2597,24 @@ func exportDirectCMYK(ctx context.Context, source *rasterImage, bounds image.Rec
 			return
 		}
 		if alpha == 0 {
-			if hasBG {
+			if hasBG && bgAlpha > 0 {
 				dst[0], dst[1], dst[2], dst[3] = bgCMYK[0], bgCMYK[1], bgCMYK[2], bgCMYK[3]
 			} else {
 				dst[0], dst[1], dst[2], dst[3] = 0, 0, 0, 0
 			}
 			return
 		}
-		if !hasBG {
+		if !hasBG || bgAlpha <= 0 {
 			dst[0], dst[1], dst[2], dst[3] = c, m, y, k
 			return
 		}
 		a := float64(alpha) / 255
-		inv := 1 - a
-		dst[0] = colorQuantize8((float64(c)*a + float64(bgCMYK[0])*inv) / 255)
-		dst[1] = colorQuantize8((float64(m)*a + float64(bgCMYK[1])*inv) / 255)
-		dst[2] = colorQuantize8((float64(y)*a + float64(bgCMYK[2])*inv) / 255)
-		dst[3] = colorQuantize8((float64(k)*a + float64(bgCMYK[3])*inv) / 255)
+		inv := colorClamp(bgAlpha) * (1 - a)
+		outAlpha := a + inv
+		dst[0] = colorQuantize8((float64(c)*a + float64(bgCMYK[0])*inv) / (255 * outAlpha))
+		dst[1] = colorQuantize8((float64(m)*a + float64(bgCMYK[1])*inv) / (255 * outAlpha))
+		dst[2] = colorQuantize8((float64(y)*a + float64(bgCMYK[2])*inv) / (255 * outAlpha))
+		dst[3] = colorQuantize8((float64(k)*a + float64(bgCMYK[3])*inv) / (255 * outAlpha))
 	}
 	if src, ok := source.pixels.(*image.CMYK); ok {
 		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
@@ -2129,14 +2823,10 @@ func (r *ImageResource) Sample(x, y int, components []float64) (float64, error) 
 // 入参: data 完整PNG数据
 // 返回: rasterMetadata 图像元数据, error 数据或资源错误
 func pngImageMetadata(data []byte) (rasterMetadata, error) {
-	metadata := rasterMetadata{dpi: Point{96, 96}, orientation: 1}
 	if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
 		return rasterMetadata{}, fmt.Errorf("%w: PNG signature", ErrInvalid)
 	}
-	seen := false
-	profileSeen, srgbSeen, cicpSeen, gamaSeen, chrmSeen, mdcvSeen, clliSeen, paletteSeen, imageSeen := false, false, false, false, false, false, false, false, false
-	var gammaChroma imageGammaChroma
-	var mdcvMaxNits, clliMaxNits float64
+	state := newPNGHeaderState()
 	for pos := uint64(8); pos < uint64(len(data)); {
 		if uint64(len(data))-pos < 12 {
 			return rasterMetadata{}, fmt.Errorf("%w: truncated PNG chunk", ErrInvalid)
@@ -2149,157 +2839,15 @@ func pngImageMetadata(data []byte) (rasterMetadata, error) {
 		if crc32.ChecksumIEEE(chunk) != binary.BigEndian.Uint32(data[pos+8+size:]) {
 			return rasterMetadata{}, fmt.Errorf("%w: PNG chunk checksum", ErrInvalid)
 		}
-		switch string(chunk[:4]) {
-		case "IHDR":
-			if pos != 8 || size != 13 {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG header placement", ErrInvalid)
-			}
-			bitDepth := int(chunk[12])
-			metadata.channels = 3
-			metadata.colorSpace = ImageColorRGB
-			metadata.bitDepth = bitDepth
-			switch chunk[13] {
-			case 0:
-				metadata.channels = 1
-				metadata.colorSpace = ImageColorGray
-			case 3:
-				metadata.bitDepth = 8
-			case 4:
-				metadata.channels = 1
-				metadata.colorSpace = ImageColorGray
-				metadata.hasAlpha = true
-			case 6:
-				metadata.hasAlpha = true
-			}
-		case "PLTE":
-			paletteSeen = true
-		case "tRNS":
-			metadata.hasAlpha = true
-		case "IDAT":
-			imageSeen = true
-		case "cICP":
-			if cicpSeen || paletteSeen || imageSeen || size != 4 || chunk[7] > 1 {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG cICP chunk", ErrInvalid)
-			}
-			cicpSeen = true
-			metadata.cicp = &imageCICP{primaries: chunk[4], transfer: chunk[5], matrix: chunk[6], fullRange: chunk[7] == 1}
-		case "mDCV":
-			if mdcvSeen || paletteSeen || imageSeen || size != 24 {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG mDCV chunk", ErrInvalid)
-			}
-			for i := range 4 {
-				cx := binary.BigEndian.Uint16(chunk[4+i*4:])
-				cy := binary.BigEndian.Uint16(chunk[6+i*4:])
-				if cx > 50000 || cy > 50000 || uint32(cx)+uint32(cy) > 50000 {
-					return rasterMetadata{}, fmt.Errorf("%w: PNG mDCV chromaticity", ErrInvalid)
-				}
-			}
-			maxLum := binary.BigEndian.Uint32(chunk[20:])
-			minLum := binary.BigEndian.Uint32(chunk[24:])
-			if minLum > maxLum || maxLum > 0 && minLum == maxLum {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG mDCV luminance", ErrInvalid)
-			}
-			mdcvSeen = true
-			if maxLum > 0 {
-				mdcvMaxNits = float64(maxLum) / 10000
-			}
-		case "cLLI":
-			if clliSeen || paletteSeen || imageSeen || size != 8 {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG cLLI chunk", ErrInvalid)
-			}
-			maxCLL := binary.BigEndian.Uint32(chunk[4:])
-			maxFALL := binary.BigEndian.Uint32(chunk[8:])
-			if maxCLL > 0 && maxFALL > maxCLL {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG cLLI luminance", ErrInvalid)
-			}
-			clliSeen = true
-			if maxCLL > 0 {
-				clliMaxNits = float64(maxCLL) / 10000
-			}
-		case "pHYs":
-			if seen || imageSeen || size != 9 || chunk[12] > 1 {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG physical dimensions", ErrInvalid)
-			}
-			seen = true
-			x, y := binary.BigEndian.Uint32(chunk[4:]), binary.BigEndian.Uint32(chunk[8:])
-			if chunk[12] == 1 {
-				if x == 0 || y == 0 {
-					return rasterMetadata{}, fmt.Errorf("%w: zero PNG resolution", ErrInvalid)
-				}
-				metadata.dpi = Point{float64(x) * 0.0254, float64(y) * 0.0254}
-			} else if x != 0 && y != 0 {
-				metadata.dpi = Point{96, 96 * (float64(y) / float64(x))}
-			}
-		case "iCCP":
-			if profileSeen || srgbSeen || paletteSeen || imageSeen {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG profile placement", ErrInvalid)
-			}
-			profileSeen = true
-			profile, err := pngICCStream(chunk[4:])
-			if err != nil {
-				return rasterMetadata{}, err
-			}
-			metadata.profile = profile
-			metadata.profileCompressed = true
-		case "sRGB":
-			if profileSeen || srgbSeen || paletteSeen || imageSeen || size != 1 || chunk[4] > 3 {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG sRGB chunk", ErrInvalid)
-			}
-			srgbSeen = true
-			metadata.srgb = true
-		case "gAMA":
-			if gamaSeen || paletteSeen || imageSeen || size != 4 {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG gAMA chunk", ErrInvalid)
-			}
-			raw := binary.BigEndian.Uint32(chunk[4:])
-			if raw == 0 {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG gAMA zero value", ErrInvalid)
-			}
-			gamaSeen = true
-			gammaChroma.hasGamma = true
-			gammaChroma.gamma = float64(raw) / 100000
-		case "cHRM":
-			if chrmSeen || paletteSeen || imageSeen || size != 32 {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG cHRM chunk", ErrInvalid)
-			}
-			wx := float64(binary.BigEndian.Uint32(chunk[4:])) / 100000
-			wy := float64(binary.BigEndian.Uint32(chunk[8:])) / 100000
-			rx := float64(binary.BigEndian.Uint32(chunk[12:])) / 100000
-			ry := float64(binary.BigEndian.Uint32(chunk[16:])) / 100000
-			gx := float64(binary.BigEndian.Uint32(chunk[20:])) / 100000
-			gy := float64(binary.BigEndian.Uint32(chunk[24:])) / 100000
-			bx := float64(binary.BigEndian.Uint32(chunk[28:])) / 100000
-			by := float64(binary.BigEndian.Uint32(chunk[32:])) / 100000
-			if !(wx > 0 && wy > 0 && wx+wy < 1 && rx >= 0 && ry > 0 && rx+ry <= 1 && gx >= 0 && gy > 0 && gx+gy <= 1 && bx >= 0 && by > 0 && bx+by <= 1) {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG cHRM coordinates", ErrInvalid)
-			}
-			if math.Abs((rx-bx)*(gy-by)-(gx-bx)*(ry-by)) <= 1e-9 {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG cHRM degenerate primaries", ErrInvalid)
-			}
-			_, kr, kb, ok := cicpChromaticityToSRGB([3][2]float64{{rx, ry}, {gx, gy}, {bx, by}}, [2]float64{wx, wy})
-			if !ok || kr <= 0 || kb <= 0 || 1-kr-kb <= 0 {
-				return rasterMetadata{}, fmt.Errorf("%w: PNG cHRM chromaticity", ErrInvalid)
-			}
-			chrmSeen = true
-			gammaChroma.hasChrm = true
-			gammaChroma.whiteX, gammaChroma.whiteY = wx, wy
-			gammaChroma.redX, gammaChroma.redY = rx, ry
-			gammaChroma.greenX, gammaChroma.greenY = gx, gy
-			gammaChroma.blueX, gammaChroma.blueY = bx, by
-		case "IEND":
+		kind := string(chunk[:4])
+		if kind == "IEND" {
 			if size != 0 || pos+12 != uint64(len(data)) {
 				return rasterMetadata{}, fmt.Errorf("%w: PNG ending", ErrInvalid)
 			}
-			if clliMaxNits > 0 {
-				metadata.hdrPeakNits = clliMaxNits
-			} else if mdcvMaxNits > 0 {
-				metadata.hdrPeakNits = mdcvMaxNits
-			}
-			if !imageCICPUsable(metadata.cicp) && !profileSeen && !srgbSeen && (gamaSeen || chrmSeen) {
-				gc := gammaChroma
-				metadata.gammaChroma = &gc
-			}
-			return metadata, nil
+			return state.finalize(), nil
+		}
+		if err := state.consumeChunk(kind, chunk[4:]); err != nil {
+			return rasterMetadata{}, err
 		}
 		pos += size + 12
 	}
@@ -2313,11 +2861,7 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 	if !bytes.HasPrefix(data, []byte{0xff, 0xd8}) {
 		return rasterMetadata{}, fmt.Errorf("%w: JPEG signature", ErrInvalid)
 	}
-	metadata := rasterMetadata{dpi: Point{96, 96}, orientation: 1}
-	var exif Point
-	hasExif, exifAbsolute, jfifAbsolute, hasOrient := false, false, false, false
-	var profiles [256][]byte
-	profileCount, profileSize := 0, int64(0)
+	state := newJPEGHeaderState()
 	entropy := false
 	for pos := 2; pos < len(data); {
 		if data[pos] != 0xff {
@@ -2340,21 +2884,21 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 		}
 		entropy = false
 		if marker == 0xd9 {
-			if hasExif && (exifAbsolute || !jfifAbsolute) {
-				metadata.dpi = exif
+			if state.hasExif && (state.exifAbsolute || !state.jfifAbsolute) {
+				state.metadata.dpi = state.exif
 			}
-			if profileCount != 0 {
-				for i := 1; i <= profileCount; i++ {
-					if profiles[i] == nil {
+			if state.profileCount != 0 {
+				for i := 1; i <= state.profileCount; i++ {
+					if state.profiles[i] == nil {
 						return rasterMetadata{}, fmt.Errorf("%w: missing JPEG ICC fragment", ErrInvalid)
 					}
 				}
-				metadata.profile = make([]byte, 0, int(profileSize))
-				for i := 1; i <= profileCount; i++ {
-					metadata.profile = append(metadata.profile, profiles[i]...)
+				state.metadata.profile = make([]byte, 0, int(state.profileSize))
+				for i := 1; i <= state.profileCount; i++ {
+					state.metadata.profile = append(state.metadata.profile, state.profiles[i]...)
 				}
 			}
-			return metadata, nil
+			return state.metadata, nil
 		}
 		if marker == 1 {
 			continue
@@ -2368,76 +2912,8 @@ func jpegImageMetadata(data []byte, maxProfileBytes int64) (rasterMetadata, erro
 		}
 		payload := data[pos+2 : pos+size]
 		pos += size
-		switch {
-		case marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc:
-			if len(payload) < 6 || metadata.channels != 0 {
-				return rasterMetadata{}, fmt.Errorf("%w: JPEG frame metadata", ErrInvalid)
-			}
-			metadata.bitDepth = int(payload[0])
-			metadata.channels = int(payload[5])
-			metadata.jpegProcess = marker
-			switch metadata.channels {
-			case 1:
-				metadata.colorSpace = ImageColorGray
-			case 3:
-				metadata.colorSpace = ImageColorRGB
-			case 4:
-				metadata.colorSpace = ImageColorCMYK
-			}
-		case marker == 0xe0 && bytes.HasPrefix(payload, []byte("JFIF\x00")):
-			if len(payload) < 14 {
-				return rasterMetadata{}, fmt.Errorf("%w: truncated JFIF", ErrInvalid)
-			}
-			metadata.jpegJFIF = true
-			unit, x, y := payload[7], binary.BigEndian.Uint16(payload[8:]), binary.BigEndian.Uint16(payload[10:])
-			if unit > 2 || x == 0 || y == 0 {
-				return rasterMetadata{}, fmt.Errorf("%w: JFIF density", ErrInvalid)
-			}
-			if unit == 0 {
-				metadata.dpi = Point{96, 96 * (float64(y) / float64(x))}
-				jfifAbsolute = false
-			} else {
-				factor := 1.0
-				if unit == 2 {
-					factor = 2.54
-				}
-				metadata.dpi = Point{float64(x) * factor, float64(y) * factor}
-				jfifAbsolute = true
-			}
-		case marker == 0xee && len(payload) >= 12 && bytes.HasPrefix(payload, []byte("Adobe")):
-			metadata.jpegAdobe = true
-			metadata.jpegAdobeTransform = payload[11]
-		case marker == 0xe1 && bytes.HasPrefix(payload, []byte("Exif\x00\x00")):
-			value, present, absolute, orientation, hasOrientation, err := exifImageMetadata(payload[6:])
-			if err != nil {
-				return rasterMetadata{}, err
-			}
-			if present {
-				if hasExif && (exif != value || exifAbsolute != absolute) {
-					return rasterMetadata{}, fmt.Errorf("%w: conflicting EXIF resolution", ErrInvalid)
-				}
-				exif, hasExif, exifAbsolute = value, true, absolute
-			}
-			if hasOrientation {
-				if hasOrient && metadata.orientation != orientation {
-					return rasterMetadata{}, fmt.Errorf("%w: conflicting EXIF orientation", ErrInvalid)
-				}
-				metadata.orientation, hasOrient = orientation, true
-			}
-		case marker == 0xe2 && bytes.HasPrefix(payload, []byte("ICC_PROFILE\x00")):
-			if len(payload) <= 14 {
-				return rasterMetadata{}, fmt.Errorf("%w: JPEG ICC fragment header", ErrInvalid)
-			}
-			index, count := int(payload[12]), int(payload[13])
-			if index == 0 || count == 0 || index > count || profiles[index] != nil || profileCount != 0 && profileCount != count {
-				return rasterMetadata{}, fmt.Errorf("%w: JPEG ICC fragment sequence", ErrInvalid)
-			}
-			profileCount = count
-			if maxProfileBytes < 0 || int64(len(payload)-14) > maxProfileBytes-profileSize {
-				return rasterMetadata{}, fmt.Errorf("%w: JPEG ICC byte budget", ErrLimit)
-			}
-			profiles[index] = payload[14:]
-			profileSize += int64(len(payload) - 14)
+		if err := state.consumeSegment(marker, payload, maxProfileBytes, true); err != nil {
+			return rasterMetadata{}, err
 		}
 		entropy = marker == 0xda
 	}

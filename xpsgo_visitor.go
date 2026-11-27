@@ -1241,7 +1241,7 @@ func (w *sceneWalker) walkPath(ctx context.Context, path *Path, state WalkState,
 		return w.emitPathEvent(ctx, path, state, nil, path.Stroke, strokeNeeds, strokeReasons)
 	}
 	if path.Fill != nil && path.Fill.Kind == BrushVisual && path.Fill.TileMode == TileNone && w.config.expandVisualBrush {
-		expanded, extraReasons, err := w.expandVisualBrush(ctx, path, path.Fill, state, depth, brushDepth)
+		expanded, extraReasons, err := w.expandVisualBrush(ctx, path, path.Fill, state, depth, brushDepth, false)
 		if err != nil {
 			return err
 		}
@@ -1263,7 +1263,7 @@ func (w *sceneWalker) walkPath(ctx context.Context, path *Path, state WalkState,
 		return w.emitPathEvent(ctx, path, state, path.Fill, path.Stroke, true, reasons|extraReasons)
 	}
 	if path.Fill != nil && path.Fill.Kind == BrushVisual && path.Fill.TileMode != TileNone && w.config.expandTiledVisualBrush {
-		expanded, extraReasons, err := w.expandTiledVisualBrush(ctx, path, path.Fill, state, depth, brushDepth)
+		expanded, extraReasons, err := w.expandVisualBrush(ctx, path, path.Fill, state, depth, brushDepth, true)
 		if err != nil {
 			return err
 		}
@@ -1495,81 +1495,113 @@ func (w *sceneWalker) emitPathEvent(ctx context.Context, path *Path, state WalkS
 	return w.visitor.Path(ctx, event)
 }
 
-// expandVisualBrush 校验深度上限、环引用、平铺模式、蒙版及坐标映射，满足条件时展开非平铺VisualBrush内部矢量子树
-// 入参: ctx 取消Context, path 宿主路径, brush 视觉画刷, state 宿主状态, depth 元素深度, brushDepth 画刷深度
-// 返回: bool 是否成功完成矢量展开, FallbackReason 失败时的附加回退原因, error 取消、资源上限或回调错误
-func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *Brush, state WalkState, depth, brushDepth int) (bool, FallbackReason, error) {
+// expandVisualBrush 统一校验非平铺与平铺VisualBrush约束、剪枝零透明度并展开内部矢量子树
+// 入参: ctx 取消Context, path 宿主路径, brush 视觉画刷, state 宿主状态, depth 元素深度, brushDepth 画刷深度, tiled 是否按平铺单瓦片模式展开
+// 返回: bool 是否成功完成矢量展开或剪枝, FallbackReason 失败时的附加回退原因, error 取消、资源上限或回调错误
+func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *Brush, state WalkState, depth, brushDepth int, tiled bool) (bool, FallbackReason, error) {
+	baseReason := FallbackVisualBrush
+	if tiled {
+		baseReason = FallbackVisualBrushTile
+	}
 	if brush == nil || brush.Visual == nil {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Visual", Message: "visual brush has no visual content"})
-		return false, FallbackVisualBrush, nil
+		return false, baseReason, nil
 	}
-	if brush.TileMode > TileFlipXY {
-		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: "invalid visual brush tile mode"})
-		return false, FallbackVisualBrush, nil
+	if brush.TileMode > TileFlipXY || (tiled && brush.TileMode == TileNone) {
+		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "TileMode", Message: "invalid visual brush tile mode"})
+		return false, baseReason, nil
 	}
-	if brush.TileMode != TileNone {
+	if !tiled && brush.TileMode != TileNone {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "TileMode", Message: "tiled visual brush requires raster fallback"})
 		return false, FallbackVisualBrushTile, nil
 	}
 	if state.OpacityMask != nil {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "OpacityMask", Message: "visual brush host opacity mask requires raster fallback"})
-		return false, FallbackOpacityMask | FallbackVisualBrush, nil
+		return false, FallbackOpacityMask | baseReason, nil
 	}
 	if path.Stroke != nil && path.Opacity < 1 {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Opacity", Message: "translucent stroked visual brush host requires raster fallback"})
-		return false, FallbackTranslucentFillStroke | FallbackVisualBrush, nil
+		return false, FallbackTranslucentFillStroke | baseReason, nil
 	}
 	if brushDepth >= w.config.maxBrushDepth {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: fmt.Sprintf("visual brush recursion depth exceeds limit %d", w.config.maxBrushDepth)})
-		return false, FallbackVisualBrush, nil
+		return false, FallbackVisualBrush | baseReason, nil
 	}
 	if w.activeBrushes[brush] || w.activeElements[brush.Visual] {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: "cyclic visual brush reference detected"})
-		return false, FallbackVisualBrush, nil
+		return false, FallbackVisualBrush | baseReason, nil
 	}
 	brushMatrix := state.Matrix
 	if brush.Transform != nil {
 		if !geometryFillMatrixFinite(*brush.Transform) {
 			w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Transform", Message: "non-finite visual brush transform"})
-			return false, FallbackVisualBrush, nil
+			return false, baseReason, nil
 		}
 		brushMatrix = strokePathCompose(brushMatrix, *brush.Transform)
 	}
 	if !geometryFillMatrixFinite(brushMatrix) {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Transform", Message: "visual brush transform overflow"})
-		return false, FallbackVisualBrush, nil
+		return false, baseReason, nil
 	}
 	if geometryMatrixSingular(brushMatrix) {
+		if tiled {
+			w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Transform", Message: "singular tiled visual brush transform"})
+			return false, baseReason, nil
+		}
 		return true, FallbackNone, nil
 	}
 	if !geometryFinite(brush.Viewbox.X, brush.Viewbox.Y, brush.Viewbox.Width, brush.Viewbox.Height, brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height) || brush.Viewbox.Width <= 0 || brush.Viewbox.Height <= 0 || brush.Viewport.Width <= 0 || brush.Viewport.Height <= 0 {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Viewbox", Message: "degenerate visual brush viewbox or viewport"})
-		return false, FallbackVisualBrush, nil
+		return false, baseReason, nil
 	}
 	sx := brush.Viewport.Width / brush.Viewbox.Width
 	sy := brush.Viewport.Height / brush.Viewbox.Height
-	mapping := Matrix{A: sx, D: sy, E: brush.Viewport.X - brush.Viewbox.X*sx, F: brush.Viewport.Y - brush.Viewbox.Y*sy}
-	visualMatrix := strokePathCompose(brushMatrix, mapping)
-	if !geometryFillMatrixFinite(visualMatrix) || geometryMatrixSingular(visualMatrix) || !geometryFinite(brush.Opacity) || brush.Opacity < 0 || brush.Opacity > 1 {
+	var walkMatrix Matrix
+	if tiled {
+		walkMatrix = Matrix{A: sx, D: sy, E: -brush.Viewbox.X * sx, F: -brush.Viewbox.Y * sy}
+	} else {
+		mapping := Matrix{A: sx, D: sy, E: brush.Viewport.X - brush.Viewbox.X*sx, F: brush.Viewport.Y - brush.Viewbox.Y*sy}
+		walkMatrix = strokePathCompose(brushMatrix, mapping)
+	}
+	if !geometryFillMatrixFinite(walkMatrix) || geometryMatrixSingular(walkMatrix) || !geometryFinite(brush.Opacity) || brush.Opacity < 0 || brush.Opacity > 1 {
 		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: "visual brush mapping or opacity out of range"})
-		return false, FallbackVisualBrush, nil
+		return false, baseReason, nil
 	}
-	groupClips := slices.Clone(state.Clip)
+	effectiveOpacity := colorClamp(state.Opacity * brush.Opacity)
+	if effectiveOpacity == 0 {
+		return true, FallbackNone, nil
+	}
 	clipAliased := state.EdgeMode == EdgeModeAliased
+	groupClips := slices.Clone(state.Clip)
 	if path.Data != nil {
 		groupClips = append(groupClips, WalkClip{Geometry: path.Data, Matrix: state.Matrix, Aliased: clipAliased})
 	}
-	groupClips = append(groupClips, WalkClip{Geometry: renderBoxGeometry(brush.Viewport), Matrix: brushMatrix, Aliased: clipAliased})
 	groupState := state
-	groupState.Matrix = visualMatrix
 	groupState.Clip = groupClips
-	groupState.Opacity = colorClamp(state.Opacity * brush.Opacity)
+	groupState.Opacity = effectiveOpacity
 	groupState.OpacityMask = nil
 	groupState.NavigateURI = ""
 	groupState.Name = ""
+	kind := WalkGroupVisualBrush
+	var walkState WalkState
+	if tiled {
+		kind = WalkGroupVisualBrushTile
+		groupState.Matrix = brushMatrix
+		walkState = state
+		walkState.Matrix = walkMatrix
+		walkState.Clip = []WalkClip{{Geometry: renderBoxGeometry(Rect{Width: brush.Viewport.Width, Height: brush.Viewport.Height}), Matrix: IdentityMatrix(), Aliased: clipAliased}}
+		walkState.Opacity = 1
+		walkState.OpacityMask = nil
+		walkState.NavigateURI = ""
+		walkState.Name = ""
+	} else {
+		groupState.Clip = append(groupState.Clip, WalkClip{Geometry: renderBoxGeometry(brush.Viewport), Matrix: brushMatrix, Aliased: clipAliased})
+		groupState.Matrix = walkMatrix
+		walkState = groupState
+	}
 	groupEvent := WalkGroupEvent{
 		State:               groupState.clone(),
-		Kind:                WalkGroupVisualBrush,
+		Kind:                kind,
 		Brush:               brush,
 		HostData:            path.Data,
 		HostMatrix:          state.Matrix,
@@ -1589,107 +1621,7 @@ func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *
 			return false, FallbackNone, err
 		}
 	}
-	if err := w.walkElement(ctx, brush.Visual, groupState, depth+1, brushDepth+1); err != nil {
-		return false, FallbackNone, err
-	}
-	if w.visitor.LeaveGroup != nil {
-		groupEvent.State = groupState.clone()
-		if err := w.visitor.LeaveGroup(ctx, groupEvent); err != nil {
-			return false, FallbackNone, err
-		}
-	}
-	return true, FallbackNone, nil
-}
-
-// expandTiledVisualBrush 在无循环与深度预算内将平铺VisualBrush回调为单瓦片局部坐标系矢量子树，便于生成矢量图案底纹
-// 入参: ctx 取消Context, path 宿主路径, brush 平铺视觉画刷, state 宿主状态, depth 元素深度, brushDepth 画刷深度
-// 返回: bool 是否成功完成单瓦片矢量回调, FallbackReason 失败时的附加回退原因, error 取消、资源上限或回调错误
-func (w *sceneWalker) expandTiledVisualBrush(ctx context.Context, path *Path, brush *Brush, state WalkState, depth, brushDepth int) (bool, FallbackReason, error) {
-	if brush == nil || brush.Visual == nil || brush.TileMode == TileNone || brush.TileMode > TileFlipXY {
-		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "TileMode", Message: "invalid tiled visual brush"})
-		return false, FallbackVisualBrushTile, nil
-	}
-	if state.OpacityMask != nil {
-		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "OpacityMask", Message: "tiled visual brush host opacity mask requires raster fallback"})
-		return false, FallbackOpacityMask | FallbackVisualBrushTile, nil
-	}
-	if path.Stroke != nil && path.Opacity < 1 {
-		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Opacity", Message: "translucent stroked tiled visual brush host requires raster fallback"})
-		return false, FallbackTranslucentFillStroke | FallbackVisualBrushTile, nil
-	}
-	if brushDepth >= w.config.maxBrushDepth {
-		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: fmt.Sprintf("visual brush recursion depth exceeds limit %d", w.config.maxBrushDepth)})
-		return false, FallbackVisualBrush | FallbackVisualBrushTile, nil
-	}
-	if w.activeBrushes[brush] || w.activeElements[brush.Visual] {
-		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: "cyclic visual brush reference detected"})
-		return false, FallbackVisualBrush | FallbackVisualBrushTile, nil
-	}
-	brushMatrix := state.Matrix
-	if brush.Transform != nil {
-		if !geometryFillMatrixFinite(*brush.Transform) {
-			w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Transform", Message: "non-finite visual brush transform"})
-			return false, FallbackVisualBrushTile, nil
-		}
-		brushMatrix = strokePathCompose(brushMatrix, *brush.Transform)
-	}
-	if !geometryFillMatrixFinite(brushMatrix) || geometryMatrixSingular(brushMatrix) {
-		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Transform", Message: "singular or overflow tiled visual brush transform"})
-		return false, FallbackVisualBrushTile, nil
-	}
-	if !geometryFinite(brush.Viewbox.X, brush.Viewbox.Y, brush.Viewbox.Width, brush.Viewbox.Height, brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height) || brush.Viewbox.Width <= 0 || brush.Viewbox.Height <= 0 || brush.Viewport.Width <= 0 || brush.Viewport.Height <= 0 {
-		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Viewbox", Message: "degenerate visual brush viewbox or viewport"})
-		return false, FallbackVisualBrushTile, nil
-	}
-	sx := brush.Viewport.Width / brush.Viewbox.Width
-	sy := brush.Viewport.Height / brush.Viewbox.Height
-	tileMatrix := Matrix{A: sx, D: sy, E: -brush.Viewbox.X * sx, F: -brush.Viewbox.Y * sy}
-	if !geometryFillMatrixFinite(tileMatrix) || geometryMatrixSingular(tileMatrix) || !geometryFinite(brush.Opacity) || brush.Opacity < 0 || brush.Opacity > 1 {
-		w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Message: "tiled visual brush mapping or opacity out of range"})
-		return false, FallbackVisualBrushTile, nil
-	}
-	clipAliased := state.EdgeMode == EdgeModeAliased
-	groupClips := slices.Clone(state.Clip)
-	if path.Data != nil {
-		groupClips = append(groupClips, WalkClip{Geometry: path.Data, Matrix: state.Matrix, Aliased: clipAliased})
-	}
-	groupState := state
-	groupState.Matrix = brushMatrix
-	groupState.Clip = groupClips
-	groupState.Opacity = colorClamp(state.Opacity * brush.Opacity)
-	groupState.OpacityMask = nil
-	groupState.NavigateURI = ""
-	groupState.Name = ""
-	groupEvent := WalkGroupEvent{
-		State:               groupState.clone(),
-		Kind:                WalkGroupVisualBrushTile,
-		Brush:               brush,
-		HostData:            path.Data,
-		HostMatrix:          state.Matrix,
-		LocalOpacity:        colorClamp(path.Opacity * brush.Opacity),
-		EdgeMode:            state.EdgeMode,
-		NeedsRasterFallback: w.forceRasterFallback,
-		FallbackReasons:     w.inheritedReasons,
-		FallbackDPI:         w.config.fallbackDPI,
-	}
-	tileState := state
-	tileState.Matrix = tileMatrix
-	tileState.Clip = []WalkClip{{Geometry: renderBoxGeometry(Rect{Width: brush.Viewport.Width, Height: brush.Viewport.Height}), Matrix: IdentityMatrix(), Aliased: clipAliased}}
-	tileState.Opacity = 1
-	tileState.OpacityMask = nil
-	tileState.NavigateURI = ""
-	tileState.Name = ""
-	w.activeBrushes[brush] = true
-	defer delete(w.activeBrushes, brush)
-	if w.visitor.EnterGroup != nil {
-		if err := w.visitor.EnterGroup(ctx, groupEvent); err != nil {
-			if errors.Is(err, ErrSkipGroup) {
-				return true, FallbackNone, nil
-			}
-			return false, FallbackNone, err
-		}
-	}
-	if err := w.walkElement(ctx, brush.Visual, tileState, depth+1, brushDepth+1); err != nil {
+	if err := w.walkElement(ctx, brush.Visual, walkState, depth+1, brushDepth+1); err != nil {
 		return false, FallbackNone, err
 	}
 	if w.visitor.LeaveGroup != nil {
@@ -2171,58 +2103,8 @@ func (w *sceneWalker) walkBoldOutline(ctx context.Context, outline *Geometry, ra
 // 入参: edges 经反向抵消后的闭合有向边切片
 // 返回: Geometry 独立矢量几何
 func walkEdgesToGeometry(edges []geometryEdge) Geometry {
-	result := Geometry{FillRule: GeometryNonZero}
-	if len(edges) == 0 {
-		return result
-	}
-	outgoing := make(map[Point][]int, len(edges))
-	used := make([]bool, len(edges))
-	for i, edge := range edges {
-		if edge.start == edge.end {
-			used[i] = true
-			continue
-		}
-		outgoing[edge.start] = append(outgoing[edge.start], i)
-	}
-	for i, edge := range edges {
-		if used[i] {
-			continue
-		}
-		used[i] = true
-		start := edge.start
-		current := edge.end
-		segments := []GeometrySegment{{Kind: GeometryLine, Point: current, IsStroked: true}}
-		for current != start {
-			list := outgoing[current]
-			nextIdx := -1
-			for len(list) > 0 {
-				candidate := list[0]
-				list = list[1:]
-				if !used[candidate] {
-					nextIdx = candidate
-					break
-				}
-			}
-			outgoing[current] = list
-			if nextIdx < 0 {
-				break
-			}
-			used[nextIdx] = true
-			current = edges[nextIdx].end
-			if current != start {
-				segments = append(segments, GeometrySegment{Kind: GeometryLine, Point: current, IsStroked: true})
-			}
-		}
-		if len(segments) >= 2 {
-			result.Figures = append(result.Figures, GeometryFigure{
-				StartPoint: start,
-				IsFilled:   true,
-				IsClosed:   true,
-				Segments:   segments,
-			})
-		}
-	}
-	return result
+	geom, _ := edgesToClosedGeometryContext(nil, edges, false)
+	return *geom
 }
 
 // walkGeometryBounds 计算包含可选Geometry.Transform的路径轴对齐外包矩形
@@ -2232,37 +2114,15 @@ func walkGeometryBounds(g *Geometry) (Rect, error) {
 	if g == nil {
 		return Rect{}, nil
 	}
-	bounds, err := g.Bounds()
-	if err != nil || g.Transform == nil {
-		return bounds, err
-	}
-	if !geometryFillMatrixFinite(*g.Transform) {
-		return Rect{}, fmt.Errorf("%w: non-finite geometry transform", ErrInvalid)
-	}
-	corners := [4]Point{
-		{bounds.X, bounds.Y},
-		{bounds.X + bounds.Width, bounds.Y},
-		{bounds.X, bounds.Y + bounds.Height},
-		{bounds.X + bounds.Width, bounds.Y + bounds.Height},
-	}
-	first, err := geometryFillPoint(*g.Transform, corners[0])
-	if err != nil {
-		return Rect{}, err
-	}
-	minX, minY, maxX, maxY := first.X, first.Y, first.X, first.Y
-	for _, corner := range corners[1:] {
-		point, err := geometryFillPoint(*g.Transform, corner)
-		if err != nil {
-			return Rect{}, err
+	m := IdentityMatrix()
+	if g.Transform != nil {
+		if !geometryFillMatrixFinite(*g.Transform) {
+			return Rect{}, fmt.Errorf("%w: non-finite geometry transform", ErrInvalid)
 		}
-		minX, minY = min(minX, point.X), min(minY, point.Y)
-		maxX, maxY = max(maxX, point.X), max(maxY, point.Y)
+		m = *g.Transform
 	}
-	width, height := maxX-minX, maxY-minY
-	if !geometryFinite(width, height) {
-		return Rect{}, fmt.Errorf("%w: transformed geometry bounds overflow", ErrLimit)
-	}
-	return Rect{X: minX, Y: minY, Width: width, Height: height}, nil
+	bounds, _, err := transformedGeometryBounds(g, m)
+	return bounds, err
 }
 
 // cloneBoolPtr 复制可选布尔指针，避免事件修改影响源元素

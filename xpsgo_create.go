@@ -46,11 +46,12 @@ const (
 	createdNavigationPage
 )
 
-// PackageOptions 设置可编辑包的资源上限，零值字段采用默认值
-// MaxImagePixels按RGBA64等价存储容量计费，不只计算图像宽度与高度的乘积
+// PackageOptions 设置可编辑包的资源上限与紧凑编码选项，零值字段采用默认值
+// MaxImagePixels按RGBA64等价存储容量计费，不只计算图像宽度与高度的乘积；Compact启用后对新增或替换页面及资源字典启用紧凑属性编码
 type PackageOptions struct {
 	Limits         Limits
 	MaxImagePixels uint64
+	Compact        bool
 }
 
 // AddFontOptions 设置字体嵌入时的混淆策略、内容去重与TTC/OTC集合面索引
@@ -75,6 +76,7 @@ type Package struct {
 	relationSizes  map[string]int64
 	total          int64
 	maxImagePixels uint64
+	compact        bool
 	names          map[string]bool
 	layout         map[string]bool
 	parents        map[string]int
@@ -143,16 +145,18 @@ func NewPackage(format Format, options *PackageOptions) (*Package, error) {
 	defaults := DefaultPackageOptions()
 	limits := defaults.Limits
 	maxPixels := defaults.MaxImagePixels
+	compact := false
 	if options != nil {
 		limits = mergeLimits(limits, options.Limits)
 		if options.MaxImagePixels != 0 {
 			maxPixels = options.MaxImagePixels
 		}
+		compact = options.Compact
 	}
 	if err := validateLimits(limits); err != nil {
 		return nil, err
 	}
-	p := &Package{format: format, limits: limits, maxImagePixels: maxPixels, sequence: "/FixedDocSeq.fdseq", parts: make(map[string]packagePart), relations: make(map[string][]Relationship), relationSizes: make(map[string]int64), names: make(map[string]bool), layout: make(map[string]bool), parents: make(map[string]int), allocated: make(map[string]int), dirty: make(map[string]bool), dirtyRels: make(map[string]bool), protected: make(map[string]bool)}
+	p := &Package{format: format, limits: limits, maxImagePixels: maxPixels, compact: compact, sequence: "/FixedDocSeq.fdseq", parts: make(map[string]packagePart), relations: make(map[string][]Relationship), relationSizes: make(map[string]int64), names: make(map[string]bool), layout: make(map[string]bool), parents: make(map[string]int), allocated: make(map[string]int), dirty: make(map[string]bool), dirtyRels: make(map[string]bool), protected: make(map[string]bool)}
 	p.registerName(p.sequence)
 	p.layout[strings.ToLower(p.sequence)] = true
 	p.registerName("/_rels/.rels")
@@ -335,32 +339,20 @@ func (p *Package) addPageLocked(ctx context.Context, docIndex int, page *Page) (
 		return 0, err
 	}
 	value.Part = part
-	if p.hasDiscardControl() {
-		q := p.storyCopy()
-		targets, err := q.storePage(&value, docIndex, -1, ctx)
+	if err := p.mutateWithDiscardSync(func(target *Package) error {
+		targets, err := target.storePage(&value, docIndex, -1, ctx)
 		if err != nil {
-			return 0, err
+			return err
 		}
-		q.layout[strings.ToLower(part)] = true
-		q.documents[docIndex].Pages = append(q.documents[docIndex].Pages, PageReference{Part: part, Width: value.Width, Height: value.Height, LinkTargets: targets})
-		q.pageCount++
-		q.dirty[strings.ToLower(q.documents[docIndex].Part)] = true
-		q.commitName(pattern, part)
-		if err := q.syncDiscardControl(); err != nil {
-			return 0, err
-		}
-		p.commitStory(q)
-		return len(p.documents[docIndex].Pages) - 1, nil
-	}
-	targets, err := p.storePage(&value, docIndex, -1, ctx)
-	if err != nil {
+		target.layout[strings.ToLower(part)] = true
+		target.documents[docIndex].Pages = append(target.documents[docIndex].Pages, PageReference{Part: part, Width: value.Width, Height: value.Height, LinkTargets: targets})
+		target.pageCount++
+		target.dirty[strings.ToLower(target.documents[docIndex].Part)] = true
+		target.commitName(pattern, part)
+		return nil
+	}); err != nil {
 		return 0, err
 	}
-	p.layout[strings.ToLower(part)] = true
-	p.documents[docIndex].Pages = append(p.documents[docIndex].Pages, PageReference{Part: part, Width: value.Width, Height: value.Height, LinkTargets: targets})
-	p.pageCount++
-	p.dirty[strings.ToLower(p.documents[docIndex].Part)] = true
-	p.commitName(pattern, part)
 	return len(p.documents[docIndex].Pages) - 1, nil
 }
 
@@ -383,9 +375,6 @@ func (p *Package) AddFontWithOptions(ctx context.Context, data []byte, options *
 		return "", err
 	}
 	defer p.mu.Unlock()
-	if err := checkContext(ctx); err != nil {
-		return "", err
-	}
 	obfuscate := true
 	deduplicate := false
 	collectionIndex := 0
@@ -603,9 +592,6 @@ func (p *Package) AddImageWithOptions(ctx context.Context, data []byte, options 
 		return "", err
 	}
 	defer p.mu.Unlock()
-	if err := checkContext(ctx); err != nil {
-		return "", err
-	}
 	if len(data) == 0 {
 		return "", fmt.Errorf("%w: empty image data", ErrInvalid)
 	}
@@ -628,7 +614,7 @@ func (p *Package) AddGoImage(ctx context.Context, img image.Image, options *Imag
 		return "", err
 	}
 	defer p.mu.Unlock()
-	data, media, ext, err := encodeGoImage(ctx, img, options, p.limits.MaxPartBytes)
+	data, media, ext, err := encodeGoImageWithLimits(ctx, img, options, p.limits.MaxPartBytes, p.maxImagePixels)
 	if err != nil {
 		return "", err
 	}
@@ -650,6 +636,9 @@ func (p *Package) AddImageFromRows(ctx context.Context, info jxrgo.Info, read jx
 		return "", err
 	}
 	defer p.mu.Unlock()
+	if err := validateImageRowsInfoLimits(info, p.maxImagePixels); err != nil {
+		return "", err
+	}
 	var cfg jxrgo.EncodeOptions
 	if options != nil {
 		cfg = *options
@@ -657,12 +646,32 @@ func (p *Package) AddImageFromRows(ctx context.Context, info jxrgo.Info, read jx
 	if cfg.MaxOutputBytes == 0 || cfg.MaxOutputBytes > uint64(p.limits.MaxPartBytes) {
 		cfg.MaxOutputBytes = uint64(p.limits.MaxPartBytes)
 	}
+	if cfg.Limits.MaxPixels == 0 || cfg.Limits.MaxPixels > p.maxImagePixels {
+		cfg.Limits.MaxPixels = p.maxImagePixels
+	}
 	var buf bytes.Buffer
 	counted := packageOutput{writer: &buf, context: ctx, limit: p.limits.MaxPartBytes}
 	if err := jxrgo.EncodeRows(ctx, &counted, info, read, &cfg); err != nil {
 		return "", err
 	}
 	return p.storeAllocatedResourceLocked(ctx, "/Resources/Images/%d.jxr", "image/vnd.ms-photo", buf.Bytes())
+}
+
+// validateImageRowsInfoLimits 前置校验逐行流式编码图像头尺寸与像素预算上限
+// 入参: info JPEG XR图像头信息, maxPixels 像素总数上限
+// 返回: error 尺寸非法或像素超限错误
+func validateImageRowsInfoLimits(info jxrgo.Info, maxPixels uint64) error {
+	if info.Bounds.Empty() {
+		return fmt.Errorf("%w: empty image bounds", ErrInvalid)
+	}
+	if maxPixels == 0 {
+		maxPixels = DefaultImageOptions().MaxPixels
+	}
+	w, h := info.Bounds.Dx(), info.Bounds.Dy()
+	if w > rasterMaxDimension || h > rasterMaxDimension || uint64(w) > maxPixels/uint64(h) {
+		return fmt.Errorf("%w: image exceeds MaxImagePixels", ErrLimit)
+	}
+	return nil
 }
 
 // AddColorProfile 校验ICC颜色配置文件并分配唯一路径存入包中
@@ -684,9 +693,6 @@ func (p *Package) AddColorProfileWithOptions(ctx context.Context, data []byte, d
 		return "", err
 	}
 	defer p.mu.Unlock()
-	if err := checkContext(ctx); err != nil {
-		return "", err
-	}
 	if len(data) == 0 {
 		return "", fmt.Errorf("%w: empty color profile data", ErrInvalid)
 	}
@@ -731,14 +737,14 @@ func (p *Package) AddResourceDictionary(ctx context.Context, dict *ResourceDicti
 	if err != nil {
 		return "", err
 	}
-	var buf bytes.Buffer
-	if _, err := EncodeResourceDictionary(ctx, &buf, dict, &EncodeOptions{Format: p.format, Limits: p.limits, Part: part}); err != nil {
+	_, data, err := encodeResourceDictionaryTree(ctx, dict, &EncodeOptions{Format: p.format, Limits: p.limits, Part: part, Compact: p.compact})
+	if err != nil {
 		return "", err
 	}
 	if err := p.editable(part); err != nil {
 		return "", err
 	}
-	if err := p.storePart(part, resourceDictionaryContentType, buf.Bytes(), false); err != nil {
+	if err := p.storePart(part, resourceDictionaryContentType, data, false); err != nil {
 		return "", err
 	}
 	p.commitName(pattern, part)
@@ -898,7 +904,7 @@ func validPackageWriteOptions(options *WriteOptions) bool {
 	return options.Compression <= CompressionOptimize && options.MaxBytes >= 0 && options.InterleaveBytes >= 0 && options.InterleaveBytes <= compressionBufferLimit && (options.InterleaveBytes != 0 || len(options.PartOrder) == 0)
 }
 
-// writeReader 为包写出准备已校验只读快照，启用SubsetFonts时在独立副本上执行子集化
+// writeReader 为包写出准备已校验只读快照，启用SubsetFonts时在独立副本上执行子集化并直接复用已校验快照
 // 入参: ctx 取消Context, options 写出选项
 // 返回: *Reader 独立只读快照, error 校验、子集化或取消错误
 func (p *Package) writeReader(ctx context.Context, options *WriteOptions) (*Reader, error) {
@@ -913,14 +919,12 @@ func (p *Package) writeReader(ctx context.Context, options *WriteOptions) (*Read
 	}
 	clone := p.storyCopy()
 	p.mu.Unlock()
-	var subOpts *OptimizationOptions
-	if options.CompactFontGIDs {
-		subOpts = &OptimizationOptions{CompactGIDs: true}
-	}
-	if _, err := clone.SubsetFonts(ctx, subOpts); err != nil {
+	cfg := FontSubsetOptions{MaxBytes: clone.limits.MaxPartBytes, MaxWork: 1 << 20, CompactGIDs: options.CompactFontGIDs}
+	_, view, err := clone.subsetFontsWithReader(ctx, nil, cfg, true)
+	if err != nil {
 		return nil, err
 	}
-	return clone.reader(ctx)
+	return view, nil
 }
 
 // WriteTo 将当前模型写入输出流，不关闭调用方输出流
@@ -947,7 +951,7 @@ func (p *Package) lock() error {
 // snapshot 在调用方持有包锁时构造独立的浅拷贝快照，共享不可变部件字节
 // 返回: *Package 独立快照
 func (p *Package) snapshot() *Package {
-	snapshot := &Package{format: p.format, limits: p.limits, sequence: p.sequence, maxImagePixels: p.maxImagePixels, parts: maps.Clone(p.parts), relations: maps.Clone(p.relations), documents: slices.Clone(p.documents), original: p.original, originalRels: p.originalRels, comment: p.comment, dirty: maps.Clone(p.dirty), dirtyRels: maps.Clone(p.dirtyRels)}
+	snapshot := &Package{format: p.format, limits: p.limits, sequence: p.sequence, maxImagePixels: p.maxImagePixels, compact: p.compact, parts: maps.Clone(p.parts), relations: maps.Clone(p.relations), documents: slices.Clone(p.documents), original: p.original, originalRels: p.originalRels, comment: p.comment, dirty: maps.Clone(p.dirty), dirtyRels: maps.Clone(p.dirtyRels)}
 	for index := range snapshot.documents {
 		snapshot.documents[index].Pages = slices.Clone(snapshot.documents[index].Pages)
 	}
@@ -961,15 +965,11 @@ func (p *Package) managed(part string) bool {
 	return p.layout[strings.ToLower(part)]
 }
 
-// storePage 完成页面编码及显式链接目标校验后原子替换部件，编码失败不改变已有内容
+// storePage 完成页面编码及显式链接目标校验后原子替换部件，直接复用编码节点树消除写后二次解码
 // 入参: page 带有目标部件名的模型, docIndex 所属文档序号, replacePageIndex 替换页面序号，新增页传-1, ctx 取消Context
 // 返回: []string 经校验的显式页面链接目标, error 编码、链接目标或预算错误
 func (p *Package) storePage(page *Page, docIndex, replacePageIndex int, ctx context.Context) ([]string, error) {
-	var output bytes.Buffer
-	if _, err := EncodePage(ctx, &output, page, &EncodeOptions{Format: p.format, Limits: p.limits}); err != nil {
-		return nil, err
-	}
-	root, err := decodeXML(output.Bytes(), p.limits)
+	root, data, err := encodePageTree(ctx, page, &EncodeOptions{Format: p.format, Limits: p.limits, Compact: p.compact})
 	if err != nil {
 		return nil, err
 	}
@@ -977,10 +977,7 @@ func (p *Package) storePage(page *Page, docIndex, replacePageIndex int, ctx cont
 	if err != nil {
 		return nil, err
 	}
-	if err := checkContext(ctx); err != nil {
-		return nil, err
-	}
-	if err := p.storePart(page.Part, fixedContentType("fixedpage"), output.Bytes(), false); err != nil {
+	if err := p.storePart(page.Part, fixedContentType("fixedpage"), data, false); err != nil {
 		return nil, err
 	}
 	return targets, nil
@@ -1046,16 +1043,8 @@ func (p *Package) available(part string) error {
 // 入参: part 已规范化名称
 // 返回: error 名称冲突错误
 func (p *Package) availableName(part string) error {
-	key := strings.ToLower(part)
-	if p.names[key] || p.parents[key] != 0 {
-		return fmt.Errorf("%w: part name collision", ErrInvalid)
-	}
-	for slash := strings.LastIndexByte(key, '/'); slash > 0; slash = strings.LastIndexByte(key[:slash], '/') {
-		if p.names[key[:slash]] {
-			return fmt.Errorf("%w: derived part name", ErrInvalid)
-		}
-	}
-	return nil
+	registry := partNameRegistry{names: p.names, parents: p.parents}
+	return registry.available(part)
 }
 
 // store 校验资源类型和预算后提交独立字节，失败时保留之前的部件
@@ -1103,11 +1092,8 @@ func (p *Package) storePart(part, media string, data []byte, checkName bool) err
 // registerName 累计祖先名称的占用，部件派生冲突检查不反复扫描整个包
 // 入参: part 已规范化的新部件名称
 func (p *Package) registerName(part string) {
-	key := strings.ToLower(part)
-	p.names[key] = true
-	for slash := strings.LastIndexByte(key, '/'); slash > 0; slash = strings.LastIndexByte(key[:slash], '/') {
-		p.parents[key[:slash]]++
-	}
+	registry := partNameRegistry{names: p.names, parents: p.parents}
+	registry.register(part)
 }
 
 // createdPageTargets 枚举直接页面内容的命名目标，不把视觉画刷源或字典定义暴露为可点击位置
@@ -1574,15 +1560,24 @@ func (p *Package) commitName(pattern, part string) {
 	p.allocated[pattern] = index
 }
 
-// validateCreatedFonts 校验所有被引用字体面的封装、度量及嵌入许可规则
-// 入参: cache 本次快照的字体缓存, graph 完整页面资源图, format 文档方言, ctx 取消Context
-// 返回: []string 需要Restricted Font关系的字体部件, error 字体或嵌入规则错误
-func validateCreatedFonts(cache *fontCache, graph *resourceGraph, format Format, ctx context.Context) ([]string, error) {
+// validateCreatedFontsCollect 校验页面资源图中所有被引用字体面的封装、度量及嵌入许可，onErr非nil时按节点非短路收集诊断
+// 入参: cache 本次快照的字体缓存, graph 完整页面资源图, format 文档方言, ctx 取消Context, onErr 非短路错误收集回调，nil时遇错即返回
+// 返回: []string 需要Restricted Font关系的字体部件, error 字体、嵌入规则或取消错误
+func validateCreatedFontsCollect(cache *fontCache, graph *resourceGraph, format Format, ctx context.Context, onErr func(part, element, attr string, err error) error) ([]string, error) {
 	var restricted []string
 	seen := make(map[string]bool)
 	parser := newSceneParser(format, graph)
 	remaining := cache.pkg.limits.MaxXMLNodes
 	checkedGlyphs := make(map[fontCacheKey]map[uint16]bool)
+	report := func(part, element, attr string, err error) (bool, error) {
+		if onErr == nil {
+			return true, err
+		}
+		if cancelErr := onErr(part, element, attr, err); cancelErr != nil {
+			return true, cancelErr
+		}
+		return false, nil
+	}
 	for _, node := range graph.Nodes {
 		if node.Name.Local != "Glyphs" {
 			continue
@@ -1590,30 +1585,49 @@ func validateCreatedFonts(cache *fontCache, graph *resourceGraph, format Format,
 		if err := checkContext(ctx); err != nil {
 			return nil, err
 		}
+		nodePart := graph.Parts[node]
 		text, _ := node.attribute("FontUri")
 		uri, index, present, err := ParseFontURI(strings.Trim(text, " \t\r\n"))
 		if err != nil {
-			return nil, err
+			if stop, retErr := report(nodePart, "Glyphs", "FontUri", err); stop {
+				return nil, retErr
+			}
+			continue
 		}
-		part, err := resolvePart(graph.Parts[node], uri)
+		part, err := resolvePart(nodePart, uri)
 		if err != nil {
-			return nil, err
+			if stop, retErr := report(nodePart, "Glyphs", "FontUri", err); stop {
+				return nil, retErr
+			}
+			continue
 		}
 		source, err := cache.load(&Glyphs{FontPart: part, CollectionIndex: index, HasCollectionIndex: present})
 		if err != nil {
-			return nil, err
+			if stop, retErr := report(part, "Glyphs", "FontUri", err); stop {
+				return nil, retErr
+			}
+			continue
 		}
 		key := fontCacheKey{strings.ToLower(part), index}
 		if err := cache.validateCreated(key, source.face); err != nil {
-			return nil, &PartError{Part: part, Err: err}
+			if stop, retErr := report(part, "Glyphs", "FontUri", &PartError{Part: part, Err: err}); stop {
+				return nil, retErr
+			}
+			continue
 		}
-		glyphs, err := parser.glyphValue(node, ElementProperties{Part: graph.Parts[node], Opacity: 1})
+		glyphs, err := parser.glyphValue(node, ElementProperties{Part: nodePart, Opacity: 1})
 		if err != nil {
-			return nil, err
+			if stop, retErr := report(nodePart, "Glyphs", "FontUri", err); stop {
+				return nil, retErr
+			}
+			continue
 		}
 		run, err := resolveGlyphRunWithStep(glyphs, source.metrics, source.glyphIndex, source.glyphYMax, remaining, func() error { return checkContext(ctx) })
 		if err != nil {
-			return nil, &PartError{Part: graph.Parts[node], Element: "Glyphs", Err: err}
+			if stop, retErr := report(nodePart, "Glyphs", "Indices", &PartError{Part: nodePart, Element: "Glyphs", Err: err}); stop {
+				return nil, retErr
+			}
+			continue
 		}
 		remaining -= len(run.glyphs)
 		_, outlines := source.face.tables["glyf"]
@@ -1626,35 +1640,55 @@ func validateCreatedFonts(cache *fontCache, graph *resourceGraph, format Format,
 					return nil, err
 				}
 				if !checkedGlyphs[key][glyph.gid] {
-					if _, err := source.glyphOutline(glyph.gid); err != nil {
-						return nil, &PartError{Part: part, Err: err}
-					}
 					checkedGlyphs[key][glyph.gid] = true
+					if _, err := source.glyphOutline(glyph.gid); err != nil {
+						if stop, retErr := report(part, "Glyphs", "Indices", &PartError{Part: part, Err: err}); stop {
+							return nil, retErr
+						}
+					}
 				}
 			}
 		}
 		if source.metrics.os2 == nil {
-			return nil, &PartError{Part: part, Err: fmt.Errorf("%w: producer font needs OS/2", ErrInvalid)}
+			if stop, retErr := report(part, "Glyphs", "FontUri", &PartError{Part: part, Err: fmt.Errorf("%w: producer font needs OS/2", ErrInvalid)}); stop {
+				return nil, retErr
+			}
+			continue
 		}
 		rights, err := fontEmbeddingRights(source.metrics.os2)
 		if err != nil {
-			return nil, &PartError{Part: part, Err: err}
+			if stop, retErr := report(part, "Glyphs", "FontUri", &PartError{Part: part, Err: err}); stop {
+				return nil, retErr
+			}
+			continue
 		}
 		if rights&2 != 0 {
-			return nil, &PartError{Part: part, Err: fmt.Errorf("%w: font prohibits embedding", ErrInvalid)}
+			if stop, retErr := report(part, "Glyphs", "FontUri", &PartError{Part: part, Err: fmt.Errorf("%w: font prohibits embedding", ErrInvalid)}); stop {
+				return nil, retErr
+			}
+			continue
 		}
 		if rights&0x30c != 0 {
 			media, err := cache.pkg.contentType(part)
 			if err != nil {
-				return nil, &PartError{Part: part, Err: err}
+				if stop, retErr := report(part, "Glyphs", "FontUri", &PartError{Part: part, Err: err}); stop {
+					return nil, retErr
+				}
+				continue
 			}
 			if !strings.EqualFold(media, "application/vnd.ms-package.obfuscated-opentype") {
-				return nil, &PartError{Part: part, Err: fmt.Errorf("%w: font requires obfuscation", ErrInvalid)}
+				if stop, retErr := report(part, "Glyphs", "FontUri", &PartError{Part: part, Err: fmt.Errorf("%w: font requires obfuscation", ErrInvalid)}); stop {
+					return nil, retErr
+				}
+				continue
 			}
 		}
 		if rights&0x200 != 0 {
 			if _, outline := source.face.tables["glyf"]; outline || source.face.cff {
-				return nil, &PartError{Part: part, Err: fmt.Errorf("%w: bitmap-only embedding contains outlines", ErrInvalid)}
+				if stop, retErr := report(part, "Glyphs", "FontUri", &PartError{Part: part, Err: fmt.Errorf("%w: bitmap-only embedding contains outlines", ErrInvalid)}); stop {
+					return nil, retErr
+				}
+				continue
 			}
 			bitmap, err := parseFontBitmapsWithWork(source.face, uint32(source.metrics.numGlyphs), func(amount uint64) error {
 				if err := checkContext(ctx); err != nil {
@@ -1667,7 +1701,10 @@ func validateCreatedFonts(cache *fontCache, graph *resourceGraph, format Format,
 				return nil
 			})
 			if err != nil {
-				return nil, &PartError{Part: part, Err: err}
+				if stop, retErr := report(part, "Glyphs", "FontUri", &PartError{Part: part, Err: err}); stop {
+					return nil, retErr
+				}
+				continue
 			}
 			hasBitmap := false
 			if bitmap != nil {
@@ -1679,7 +1716,10 @@ func validateCreatedFonts(cache *fontCache, graph *resourceGraph, format Format,
 				}
 			}
 			if !hasBitmap {
-				return nil, &PartError{Part: part, Err: fmt.Errorf("%w: bitmap-only font has no embedded bitmap", ErrInvalid)}
+				if stop, retErr := report(part, "Glyphs", "FontUri", &PartError{Part: part, Err: fmt.Errorf("%w: bitmap-only font has no embedded bitmap", ErrInvalid)}); stop {
+					return nil, retErr
+				}
+				continue
 			}
 		}
 		if source.metrics.os2.fsType&4 != 0 && !seen[key.part] {
@@ -1690,14 +1730,10 @@ func validateCreatedFonts(cache *fontCache, graph *resourceGraph, format Format,
 	return restricted, nil
 }
 
-// validateCreatedResources 解码并校验页面引用的图像与ICC资源，单次快照内每个部件仅校验一次
-// 入参: pkg 部件快照, graph 完整页面资源图, checked 已检查部件, channels 配置文件的输入分量数, ctx 取消Context
+// validateCreatedResourcesWithDeps 复用已提取依赖列表校验页面引用的图像与ICC资源，单次快照内每个部件仅校验一次
+// 入参: pkg 部件快照, graph 完整页面资源图, resources 已收集页面依赖列表, checked 已检查部件, channels 配置文件的输入分量数, ctx 取消Context
 // 返回: error 资源、解码、预算或取消错误
-func (p *Package) validateCreatedResources(pkg *packageReader, graph *resourceGraph, checked map[string]bool, channels map[string]uint32, ctx context.Context) error {
-	resources, err := collectRequiredResources(graph, p.format)
-	if err != nil {
-		return err
-	}
+func (p *Package) validateCreatedResourcesWithDeps(pkg *packageReader, graph *resourceGraph, resources []requiredResource, checked map[string]bool, channels map[string]uint32, ctx context.Context) error {
 	for _, resource := range resources {
 		if resource.Kind != requiredImage && resource.Kind != requiredProfile {
 			continue
@@ -1749,40 +1785,66 @@ func (p *Package) validateCreatedResources(pkg *packageReader, graph *resourceGr
 		}
 		checked[key] = true
 	}
-	return validateCreatedContextColors(graph, channels, ctx)
+	return validateCreatedContextColorsCollect(graph, channels, nil, ctx, nil)
 }
 
-// validateCreatedContextColors 检查颜色分量与ICC输入是否匹配，命名色使用色调数量而非设备坐标数量
-// 入参: graph 包含远程字典的页面资源图, channels 已校验配置文件的输入分量数, ctx 取消Context
+// validateCreatedContextColorsCollect 检查颜色分量与ICC输入是否匹配，跳过已损坏ICC并支持非短路收集诊断
+// 入参: graph 包含远程字典的页面资源图, channels 已校验配置文件的输入分量数, failedProfiles 已损坏无法解析的ICC部件小写键集合, ctx 取消Context, onErr 非短路错误收集回调，nil时遇错即返回
 // 返回: error 颜色、引用、分量数量或取消错误
-func validateCreatedContextColors(graph *resourceGraph, channels map[string]uint32, ctx context.Context) error {
+func validateCreatedContextColorsCollect(graph *resourceGraph, channels map[string]uint32, failedProfiles map[string]bool, ctx context.Context, onErr func(part, element, attr string, err error) error) error {
+	report := func(part, element, attr string, err error) (bool, error) {
+		if onErr == nil {
+			return true, err
+		}
+		if cancelErr := onErr(part, element, attr, err); cancelErr != nil {
+			return true, cancelErr
+		}
+		return false, nil
+	}
 	for _, node := range graph.Nodes {
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
+		nodePart := graph.Parts[node]
 		for _, attribute := range node.Attr {
 			if attribute.Name.Space != "" || !requiredColorAttribute(node.Name.Local, attribute.Name.Local) || graph.Bindings[node][attribute.Name.Local] != nil {
 				continue
 			}
 			if _, reference, err := parseResourceReference(attribute.Value); err != nil {
-				return err
+				if stop, retErr := report(nodePart, node.Name.Local, attribute.Name.Local, err); stop {
+					return retErr
+				}
+				continue
 			} else if reference {
 				continue
 			}
 			value, err := parseBrushColor(attribute.Value, node.Name.Space)
 			if err != nil {
-				return err
+				if stop, retErr := report(nodePart, node.Name.Local, attribute.Name.Local, err); stop {
+					return retErr
+				}
+				continue
 			}
 			if value.Space != ColorContext {
 				continue
 			}
-			part, err := resolvePart(graph.Parts[node], value.ProfileURI)
+			part, err := resolvePart(nodePart, value.ProfileURI)
 			if err != nil {
-				return err
+				if stop, retErr := report(nodePart, node.Name.Local, attribute.Name.Local, err); stop {
+					return retErr
+				}
+				continue
 			}
-			count, present := channels[strings.ToLower(part)]
+			profileKey := strings.ToLower(part)
+			if failedProfiles[profileKey] {
+				continue
+			}
+			count, present := channels[profileKey]
 			if !present || count != uint32(len(value.Components)) {
-				return &PartError{Part: graph.Parts[node], Element: node.Name.Local, Err: fmt.Errorf("%w: %s color components do not match ICC profile %s", ErrInvalid, attribute.Name.Local, part)}
+				mismatchErr := &PartError{Part: nodePart, Element: node.Name.Local, Err: fmt.Errorf("%w: %s color components do not match ICC profile %s", ErrInvalid, attribute.Name.Local, part)}
+				if stop, retErr := report(nodePart, node.Name.Local, attribute.Name.Local, mismatchErr); stop {
+					return retErr
+				}
 			}
 		}
 	}
@@ -2081,6 +2143,88 @@ func (g *createdStoryGraph) pageNames(index int) (map[string]bool, error) {
 	return names, nil
 }
 
+// resolveLayoutPartName 在文档序列与全部固定文档及页面中按小写键查找原始大小写的规范部件名
+// 入参: sequence 文档序列部件名, documents 固定文档列表, key 小写部件键
+// 返回: string 原始大小写部件名，未匹配时为空
+func resolveLayoutPartName(sequence string, documents []Document, key string) string {
+	if strings.EqualFold(sequence, key) {
+		return sequence
+	}
+	for _, document := range documents {
+		if strings.EqualFold(document.Part, key) {
+			return document.Part
+		}
+		for _, page := range document.Pages {
+			if strings.EqualFold(page.Part, key) {
+				return page.Part
+			}
+		}
+	}
+	return ""
+}
+
+// buildFixedDocumentPageContentNode 构造单个FixedDocument的PageContent元素节点
+// 入参: format 文档方言, docPart 所属固定文档URI, page 页面引用信息
+// 返回: *xmlElement PageContent节点, error 相对路径错误
+func buildFixedDocumentPageContentNode(format Format, docPart string, page PageReference) (*xmlElement, error) {
+	ns := formatNamespace(format)
+	child := createdNode(ns, "PageContent")
+	pageSource, err := relativePart(docPart, page.Part)
+	if err != nil {
+		return nil, err
+	}
+	child.Attr = []xml.Attr{{Name: xml.Name{Local: "Source"}, Value: pageSource}}
+	if page.Width > 0 {
+		child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Local: "Width"}, Value: encodeNumber(page.Width)})
+	}
+	if page.Height > 0 {
+		child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Local: "Height"}, Value: encodeNumber(page.Height)})
+	}
+	if len(page.LinkTargets) != 0 {
+		container := createdNode(ns, "PageContent.LinkTargets")
+		for _, name := range page.LinkTargets {
+			target := createdNode(ns, "LinkTarget")
+			target.Attr = []xml.Attr{{Name: xml.Name{Local: "Name"}, Value: name}}
+			container.Children = append(container.Children, target)
+		}
+		child.Children = []*xmlElement{container}
+	}
+	return child, nil
+}
+
+// buildFixedDocumentNode 构造单个FixedDocument根节点及其全部PageContent子元素
+// 入参: format 文档方言, doc 固定文档索引
+// 返回: *xmlElement FixedDocument根节点, error 相对路径错误
+func buildFixedDocumentNode(format Format, doc Document) (*xmlElement, error) {
+	root := createdNode(formatNamespace(format), "FixedDocument")
+	for _, page := range doc.Pages {
+		child, err := buildFixedDocumentPageContentNode(format, doc.Part, page)
+		if err != nil {
+			return nil, err
+		}
+		root.Children = append(root.Children, child)
+	}
+	return root, nil
+}
+
+// buildFixedDocumentSequenceNode 构造FixedDocumentSequence根节点及其全部DocumentReference子元素
+// 入参: format 文档方言, sequence 文档序列URI, documents 固定文档列表
+// 返回: *xmlElement FixedDocumentSequence根节点, error 相对路径错误
+func buildFixedDocumentSequenceNode(format Format, sequence string, documents []Document) (*xmlElement, error) {
+	ns := formatNamespace(format)
+	root := createdNode(ns, "FixedDocumentSequence")
+	for _, document := range documents {
+		reference := createdNode(ns, "DocumentReference")
+		documentSource, err := relativePart(sequence, document.Part)
+		if err != nil {
+			return nil, err
+		}
+		reference.Attr = []xml.Attr{{Name: xml.Name{Local: "Source"}, Value: documentSource}}
+		root.Children = append(root.Children, reference)
+	}
+	return root, nil
+}
+
 // relationSourceName 还原关系源部件的原始大小写，依次查找当前快照、文档序列及包内部件
 // 入参: pkg 内存快照索引, source 小写关系键或包根
 // 返回: string 保留原始大小写的源部件名称
@@ -2091,26 +2235,87 @@ func (p *Package) relationSourceName(pkg *packageReader, source string) string {
 	if name := pkg.names[source]; name != "" {
 		return name
 	}
-	if strings.EqualFold(p.sequence, source) {
-		return p.sequence
-	}
 	if part, exists := p.parts[source]; exists && part.name != "" {
 		return part.name
 	}
-	for _, document := range p.documents {
-		if strings.EqualFold(document.Part, source) {
-			return document.Part
-		}
-		for _, page := range document.Pages {
-			if strings.EqualFold(page.Part, source) {
-				return page.Part
-			}
-		}
+	if name := resolveLayoutPartName(p.sequence, p.documents, source); name != "" {
+		return name
 	}
 	return source
 }
 
-// reader 构造独立部件索引，保留原标记并更新已修改的索引和关系，不创建中间ZIP
+// validateRequiredResourcesWithDeps 复用已收集依赖列表校验页面RequiredResource关系及媒体类型匹配
+// 入参: pagePart 规范页面部件URI, dependencies 已收集页面依赖列表
+// 返回: error 关系、目标或媒体类型错误
+func (r *Reader) validateRequiredResourcesWithDeps(pagePart string, dependencies []requiredResource) error {
+	relations, err := r.pkg.relationships(pagePart)
+	if err != nil {
+		return &PartError{Part: pagePart, Err: err}
+	}
+	typeURI := formatNamespace(r.format) + "/required-resource"
+	targets := make(map[string]string, len(relations))
+	for _, relation := range relations {
+		if relation.Type != typeURI {
+			continue
+		}
+		if relation.TargetMode != TargetModeInternal {
+			return &PartError{Part: pagePart, Err: fmt.Errorf("%w: external Required Resource relationship %q", ErrInvalid, relation.ID)}
+		}
+		target, err := resolvePart(pagePart, relation.Target)
+		if err != nil {
+			return &PartError{Part: pagePart, Err: err}
+		}
+		media, err := r.pkg.contentType(target)
+		if err != nil {
+			return &PartError{Part: pagePart, Err: fmt.Errorf("Required Resource relationship %q target %s: %w", relation.ID, target, err)}
+		}
+		targets[strings.ToLower(target)] = media
+	}
+	for _, dependency := range dependencies {
+		media, ok := targets[strings.ToLower(dependency.Part)]
+		if !ok {
+			return requiredResourceError(dependency, fmt.Errorf("%w: missing Required Resource relationship from page %s to %s", ErrInvalid, pagePart, dependency.Part))
+		}
+		if !requiredResourceMedia(dependency.Kind, media) {
+			return requiredResourceError(dependency, fmt.Errorf("%w: unexpected resource content type %q for %s", ErrInvalid, media, dependency.Part))
+		}
+	}
+	checked := make(map[string]bool, len(dependencies))
+	for _, dependency := range dependencies {
+		key := strings.ToLower(dependency.Part)
+		if checked[key] {
+			continue
+		}
+		checked[key] = true
+		depRels, err := r.pkg.relationships(dependency.Part)
+		if err != nil {
+			return &PartError{Part: dependency.Part, Err: err}
+		}
+		for _, relation := range depRels {
+			if relation.Type == typeURI {
+				return &PartError{Part: dependency.Part, Err: fmt.Errorf("%w: Required Resource relationship %q must originate from FixedPage, not a resource part", ErrInvalid, relation.ID)}
+			}
+		}
+	}
+	return nil
+}
+
+// changedResourcesWithDeps 复用已收集依赖列表判断页面或其任一依赖是否发生修改
+// 入参: pagePart 规范页面部件URI, dependencies 已收集页面依赖列表
+// 返回: bool 是否需要执行生产者资源校验
+func (p *Package) changedResourcesWithDeps(pagePart string, dependencies []requiredResource) bool {
+	if p.original == nil || p.dirty[strings.ToLower(pagePart)] {
+		return true
+	}
+	for _, resource := range dependencies {
+		if p.dirty[strings.ToLower(resource.Part)] {
+			return true
+		}
+	}
+	return false
+}
+
+// reader 构造独立部件索引，单遍完成全部页面解析、依赖关系合成与资源校验，不创建中间ZIP
 // 入参: ctx 取消Context
 // 返回: *Reader 已校验快照, error 结构、资源或取消错误
 func (p *Package) reader(ctx context.Context) (*Reader, error) {
@@ -2121,7 +2326,6 @@ func (p *Package) reader(ctx context.Context) (*Reader, error) {
 		return nil, fmt.Errorf("%w: package needs a document", ErrInvalid)
 	}
 	pkg := p.partReader()
-	sequence := createdNode(formatNamespace(p.format), "FixedDocumentSequence")
 	for _, document := range p.documents {
 		if err := checkContext(ctx); err != nil {
 			return nil, err
@@ -2129,40 +2333,12 @@ func (p *Package) reader(ctx context.Context) (*Reader, error) {
 		if len(document.Pages) == 0 {
 			return nil, fmt.Errorf("%w: document %s needs a page", ErrInvalid, document.Part)
 		}
-		reference := createdNode(formatNamespace(p.format), "DocumentReference")
-		documentSource, err := relativePart(p.sequence, document.Part)
-		if err != nil {
-			return nil, err
-		}
-		reference.Attr = []xml.Attr{{Name: xml.Name{Local: "Source"}, Value: documentSource}}
-		sequence.Children = append(sequence.Children, reference)
 		if _, present := p.original[strings.ToLower(document.Part)]; present && !p.dirty[strings.ToLower(document.Part)] {
 			continue
 		}
-		root := createdNode(formatNamespace(p.format), "FixedDocument")
-		for _, page := range document.Pages {
-			child := createdNode(formatNamespace(p.format), "PageContent")
-			pageSource, err := relativePart(document.Part, page.Part)
-			if err != nil {
-				return nil, err
-			}
-			child.Attr = []xml.Attr{{Name: xml.Name{Local: "Source"}, Value: pageSource}}
-			if page.Width > 0 {
-				child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Local: "Width"}, Value: encodeNumber(page.Width)})
-			}
-			if page.Height > 0 {
-				child.Attr = append(child.Attr, xml.Attr{Name: xml.Name{Local: "Height"}, Value: encodeNumber(page.Height)})
-			}
-			if len(page.LinkTargets) != 0 {
-				container := createdNode(formatNamespace(p.format), "PageContent.LinkTargets")
-				for _, name := range page.LinkTargets {
-					target := createdNode(formatNamespace(p.format), "LinkTarget")
-					target.Attr = []xml.Attr{{Name: xml.Name{Local: "Name"}, Value: name}}
-					container.Children = append(container.Children, target)
-				}
-				child.Children = []*xmlElement{container}
-			}
-			root.Children = append(root.Children, child)
+		root, err := buildFixedDocumentNode(p.format, document)
+		if err != nil {
+			return nil, err
 		}
 		data, err := createdMarkup(root, p.limits, ctx)
 		if err != nil {
@@ -2171,6 +2347,10 @@ func (p *Package) reader(ctx context.Context) (*Reader, error) {
 		createdPut(pkg, document.Part, fixedContentType("fixeddocument"), data)
 	}
 	if _, present := p.original[strings.ToLower(p.sequence)]; !present || p.dirty[strings.ToLower(p.sequence)] {
+		sequence, err := buildFixedDocumentSequenceNode(p.format, p.sequence, p.documents)
+		if err != nil {
+			return nil, err
+		}
 		data, err := createdMarkup(sequence, p.limits, ctx)
 		if err != nil {
 			return nil, err
@@ -2208,79 +2388,72 @@ func (p *Package) reader(ctx context.Context) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, page := range r.pages {
-		if err := checkContext(ctx); err != nil {
-			return nil, err
-		}
-		root, err := r.readFixedPart(page.Part, "fixedpage", "FixedPage")
-		if err != nil {
-			return nil, err
-		}
-		graph, err := parseResourceGraphContext(page.Part, root, r.format, r.limits, func(part string) (*xmlElement, error) { return r.readResourceDictionaryLoader(part, nil, ctx) }, ctx)
-		if err != nil {
-			return nil, err
-		}
-		if err := navigation.validate(page.Part, graph, ctx); err != nil {
-			return nil, err
-		}
-		dependencies, err := collectRequiredResources(graph, p.format)
-		if err != nil {
-			return nil, err
-		}
-		var relations []Relationship
-		seen := make(map[string]bool)
-		for _, dependency := range dependencies {
-			key := strings.ToLower(dependency.Part)
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			relations = append(relations, Relationship{Type: formatNamespace(p.format) + "/required-resource", Target: dependency.Part, TargetMode: TargetModeInternal})
-		}
-		if err := p.composeRelationships(pkg, page.Part, relations, ctx); err != nil {
-			return nil, err
-		}
-	}
 	fonts := fontCache{pkg: pkg, data: make(map[string][]byte), faces: make(map[fontCacheKey]*fontSource), remaining: p.limits.MaxPackageBytes, maxFaces: p.limits.MaxPartCount}
 	restricted := make(map[string][]Relationship)
 	checkedResources := make(map[string]bool)
 	profileChannels := make(map[string]uint32)
-	owners := make(map[string]string)
+	ns := formatNamespace(p.format)
+	loadDict := func(part string) (*xmlElement, error) { return r.readResourceDictionaryLoader(part, nil, ctx) }
 	for _, document := range r.documents {
+		docKey := strings.ToLower(document.Part)
 		for _, page := range document.Pages {
-			owners[strings.ToLower(page.Part)] = strings.ToLower(document.Part)
-		}
-	}
-	for index := range r.pages {
-		if err := checkContext(ctx); err != nil {
-			return nil, err
-		}
-		page, err := r.readPage(index)
-		if err != nil {
-			return nil, err
-		}
-		changed, err := p.changedResources(page.resources)
-		if err != nil {
-			return nil, err
-		}
-		var parts []string
-		if changed {
-			parts, err = validateCreatedFonts(&fonts, page.resources, p.format, ctx)
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+			root, err := r.readFixedPartLoader(page.Part, "fixedpage", "FixedPage", nil, ctx)
 			if err != nil {
 				return nil, err
 			}
-			if err := p.validateCreatedResources(pkg, page.resources, checkedResources, profileChannels, ctx); err != nil {
+			if _, err := parsePageHeader(root, page.Part, r.format); err != nil {
 				return nil, err
 			}
-		}
-		key := owners[strings.ToLower(page.Part)]
-		for _, part := range parts {
-			duplicate := false
-			for _, relation := range restricted[key] {
-				duplicate = duplicate || strings.EqualFold(relation.Target, part)
+			graph, err := parseResourceGraphContext(page.Part, root, r.format, r.limits, loadDict, ctx)
+			if err != nil {
+				return nil, err
 			}
-			if !duplicate {
-				restricted[key] = append(restricted[key], Relationship{Type: formatNamespace(p.format) + "/restricted-font", Target: part, TargetMode: TargetModeInternal})
+			if _, err := newSceneParser(r.format, graph).parse(root); err != nil {
+				return nil, err
+			}
+			if err := navigation.validate(page.Part, graph, ctx); err != nil {
+				return nil, err
+			}
+			dependencies, err := collectRequiredResources(graph, p.format)
+			if err != nil {
+				return nil, err
+			}
+			var relations []Relationship
+			seen := make(map[string]bool, len(dependencies))
+			for _, dependency := range dependencies {
+				depKey := strings.ToLower(dependency.Part)
+				if seen[depKey] {
+					continue
+				}
+				seen[depKey] = true
+				relations = append(relations, Relationship{Type: ns + "/required-resource", Target: dependency.Part, TargetMode: TargetModeInternal})
+			}
+			if err := p.composeRelationships(pkg, page.Part, relations, ctx); err != nil {
+				return nil, err
+			}
+			if err := r.validateRequiredResourcesWithDeps(page.Part, dependencies); err != nil {
+				return nil, err
+			}
+			if p.changedResourcesWithDeps(page.Part, dependencies) {
+				parts, err := validateCreatedFontsCollect(&fonts, graph, p.format, ctx, nil)
+				if err != nil {
+					return nil, err
+				}
+				if err := p.validateCreatedResourcesWithDeps(pkg, graph, dependencies, checkedResources, profileChannels, ctx); err != nil {
+					return nil, err
+				}
+				for _, part := range parts {
+					duplicate := false
+					for _, relation := range restricted[docKey] {
+						duplicate = duplicate || strings.EqualFold(relation.Target, part)
+					}
+					if !duplicate {
+						restricted[docKey] = append(restricted[docKey], Relationship{Type: ns + "/restricted-font", Target: part, TargetMode: TargetModeInternal})
+					}
+				}
 			}
 		}
 	}
@@ -2977,13 +3150,6 @@ func createdRelationshipIDs(relations []Relationship) func() string {
 			}
 		}
 	}
-}
-
-// validatePackageMedia 校验内容类型的基本形式和OPC自身媒体类型的参数限制
-// 入参: value 内容类型
-// 返回: error 非法内容类型错误
-func validatePackageMedia(value string) error {
-	return validatePackageMediaForFormat(FormatUnknown, value)
 }
 
 // validatePackageMediaForFormat 按OPC规则及当前方言[M12.8]标准表校验内容类型，禁止标准表内类型携带任何MIME参数

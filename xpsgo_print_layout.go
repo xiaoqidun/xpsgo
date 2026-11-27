@@ -250,6 +250,7 @@ type printMediaPlacement struct {
 	widthMicrons  int64
 	heightMicrons int64
 	hasMicrons    bool
+	rollNoLength  bool
 	mediaName     string
 }
 
@@ -387,7 +388,9 @@ func (s *printLayoutSettings) mediaSize(media *PrintMedia) (printMediaPlacement,
 		width, height = float64(dimensions[0]), float64(dimensions[1])
 		widthMicrons, heightMicrons = int64(dimensions[0]), int64(dimensions[1])
 		if height == 0 {
+			placement.widthMicrons = widthMicrons
 			if media.Width == 0 {
+				placement.rollNoLength = true
 				return placement, fmt.Errorf("%w: roll media requires an explicit length", ErrUnsupported)
 			}
 			rollWidth := width * printMicronUnit
@@ -398,9 +401,18 @@ func (s *printLayoutSettings) mediaSize(media *PrintMedia) (printMediaPlacement,
 				media.ImageableArea = nil
 				media.Width = rollWidth
 			}
-			placement.widthMicrons = widthMicrons
 			return placement, nil
 		}
+	} else if hasWidth && !hasHeight && predefined && dimensions[1] == 0 {
+		if width <= 0 {
+			return placement, fmt.Errorf("%w: print media dimensions", ErrInvalid)
+		}
+		placement.widthMicrons = widthMicrons
+		if media.Width > 0 && !printCoordinateEqual(media.Width, width*printMicronUnit) && !media.DefaultOnly {
+			return placement, fmt.Errorf("%w: physical roll width conflicts with print ticket", ErrInvalid)
+		}
+		placement.rollNoLength = true
+		return placement, fmt.Errorf("%w: roll media requires an explicit length", ErrUnsupported)
 	} else if !hasWidth && !hasHeight && !custom && media.Width > 0 {
 		return placement, nil
 	} else if !hasWidth || !hasHeight {
@@ -620,11 +632,7 @@ func (s *PrintSettings) layoutWithRotation(ctx context.Context, page *Page, medi
 	if s == nil {
 		s = &PrintSettings{Version: 1}
 	}
-	root, err := printSettingsRoot(s, configuration)
-	if err != nil {
-		return nil, Matrix{}, err
-	}
-	model, err := parsePrintSettings(root, configuration)
+	model, err := validatePrintSettingsModel(s, configuration, printDocumentTicket)
 	if err != nil {
 		return nil, Matrix{}, err
 	}

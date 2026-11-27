@@ -180,7 +180,6 @@ type sceneRenderer struct {
 	printContext     map[*Canvas]*printColorRuntime
 	printSideSpace   *printWorkingSpace
 	brushMeta        sceneBrushMeta
-	visualCount      int
 	hasFiltered      bool
 	maskOnly         bool
 	concurrent       bool
@@ -1237,7 +1236,9 @@ func (r *Reader) renderElementMapped(ctx context.Context, part string, element E
 	}
 	current := core
 	if state.EdgeMode == EdgeModeAliased {
-		current = &Canvas{ElementProperties: ElementProperties{Part: basePart, Opacity: 1}, EdgeMode: EdgeModeAliased, Elements: []Element{current}}
+		if canvas, ok := current.(*Canvas); !ok || canvas.EdgeMode != EdgeModeAliased {
+			current = &Canvas{ElementProperties: ElementProperties{Part: basePart, Opacity: 1}, EdgeMode: EdgeModeAliased, Elements: []Element{current}}
+		}
 	}
 	if state.Negative {
 		negCanvas := &Canvas{ElementProperties: ElementProperties{Part: basePart, Opacity: 1}, Elements: []Element{current}}
@@ -1341,13 +1342,27 @@ func (r *Reader) renderElementMapped(ctx context.Context, part string, element E
 	}, nil
 }
 
+// printColorPreviewMaxBytes 在防止64位乘法溢出的前提下计算打印色彩预览设备缓冲的字节上限
+// 入参: pixels 场景允许的最大像素数
+// 返回: int64 不小于64MiB且不溢出的最大字节数
+func printColorPreviewMaxBytes(pixels int) int64 {
+	const minBytes int64 = 64 << 20
+	if pixels <= 0 {
+		return minBytes
+	}
+	if uint64(pixels) > uint64(math.MaxInt64/8) {
+		return math.MaxInt64
+	}
+	return max(minBytes, int64(pixels)*8)
+}
+
 // attachPrintColorPlanPreview 为NRGBA隔离渲染配置基于标准sRGB目标的打印色彩管理执行上下文
 // 入参: ctx 取消Context, settings 待配置的内部场景参数, config 渲染配置, root 承载颜色计划的根画布, plan 打印色彩管理计划
 // 返回: error 目标初始化或参数错误
 func attachPrintColorPlanPreview(ctx context.Context, settings *sceneRenderOptions, config RenderOptions, root *Canvas, plan *PrintColorPlan) error {
 	deviceConfig := config
 	deviceConfig.ColorSpace = ColorScRGB
-	maxBytes := max(int64(64<<20), int64(settings.pixels)*8)
+	maxBytes := printColorPreviewMaxBytes(settings.pixels)
 	devState, err := newDeviceRenderStateMode(ctx, &DeviceColorTarget{Profile: renderStandardSRGBProfile, MaxBytes: maxBytes}, deviceConfig, true)
 	if err != nil {
 		return err
@@ -1403,7 +1418,6 @@ func (r *sceneRenderer) renderPreparedPrintColor(nodes []*sceneNode, bounds imag
 	if bounds.Empty() {
 		return image.NewNRGBA(image.Rectangle{}), nil
 	}
-	samples := r.options.samples
 	var background printNativeColor
 	if r.options.background.a != 0 {
 		space := ColorScRGB
@@ -1416,6 +1430,19 @@ func (r *sceneRenderer) renderPreparedPrintColor(nodes []*sceneNode, bounds imag
 			space: &printWorkingSpace{space: space, channels: 3},
 		}
 	}
+	if err := runPreparedTiles(r, nodes, bounds, 4, r.acquirePrintSurface, r.releasePrintSurface, func(surface *printSurfaceBuffer, tile image.Rectangle, worker *sceneWorkerState) error {
+		return r.printColorTile(nodes, surface, background, tile, worker)
+	}); err != nil {
+		return nil, err
+	}
+	return deviceImageToNRGBA(r.options.device.result), nil
+}
+
+// runPreparedTiles 按像素预算与工作Goroutine数调度已准备节点树的单线程或并发图块光栅化
+// 入参: r 场景渲染器, nodes 已准备场景节点树, bounds 目标设备整数像素范围, pixelScale 单像素工作缓冲放大系数, acquire 申请单图块表面回调, release 释放单图块表面回调, render 执行单图块渲染回调
+// 返回: error 表面申请、预算、渲染或取消错误
+func runPreparedTiles[S any](r *sceneRenderer, nodes []*sceneNode, bounds image.Rectangle, pixelScale uint64, acquire func(image.Rectangle) (S, error), release func(S), render func(S, image.Rectangle, *sceneWorkerState) error) error {
+	samples := r.options.samples
 	cols := (bounds.Dx() + sceneTileSize - 1) / sceneTileSize
 	rows := (bounds.Dy() + sceneTileSize - 1) / sceneTileSize
 	tileCount := cols * rows
@@ -1428,7 +1455,7 @@ func (r *sceneRenderer) renderPreparedPrintColor(nodes []*sceneNode, bounds imag
 	}
 	if workers > 1 {
 		available := uint64(max(0, r.options.pixels-r.live))
-		perWorker := uint64(tileW) * uint64(tileH) * 4 * uint64(1+sceneMaxIsolatedDepth(nodes))
+		perWorker := uint64(tileW) * uint64(tileH) * pixelScale * uint64(1+sceneMaxIsolatedDepth(nodes))
 		if r.hasFiltered {
 			if available <= perWorker*2 {
 				workers = 1
@@ -1440,45 +1467,43 @@ func (r *sceneRenderer) renderPreparedPrintColor(nodes []*sceneNode, bounds imag
 		}
 	}
 	if workers <= 1 {
-		storage, err := r.acquirePrintSurface(first)
+		surface, err := acquire(first)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		defer r.releasePrintSurface(storage)
+		defer release(surface)
 		worker := acquireSceneWorker()
 		defer releaseSceneWorker(worker)
 		for y := bounds.Min.Y; y < bounds.Max.Y; y += sceneTileSize {
 			for x := bounds.Min.X; x < bounds.Max.X; x += sceneTileSize {
-				tileOut := image.Rect(x, y, min(x+sceneTileSize, bounds.Max.X), min(y+sceneTileSize, bounds.Max.Y))
-				if err := r.printColorTile(nodes, storage, background, tileOut, worker); err != nil {
-					return nil, err
+				tile := image.Rect(x, y, min(x+sceneTileSize, bounds.Max.X), min(y+sceneTileSize, bounds.Max.Y))
+				if err := render(surface, tile, worker); err != nil {
+					return err
 				}
 			}
 		}
-		return deviceImageToNRGBA(r.options.device.result), nil
+		return nil
 	}
-	surfaces := make([]*printSurfaceBuffer, workers)
+	surfaces := make([]S, workers)
 	states := make([]*sceneWorkerState, workers)
+	acquired := 0
 	defer func() {
-		for i := range workers {
-			if states[i] != nil {
-				releaseSceneWorker(states[i])
-			}
-			if surfaces[i] != nil {
-				r.releasePrintSurface(surfaces[i])
-			}
+		for i := range acquired {
+			releaseSceneWorker(states[i])
+			release(surfaces[i])
 		}
 	}()
 	for i := range workers {
-		surface, err := r.acquirePrintSurface(first)
+		surface, err := acquire(first)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		surfaces[i] = surface
 		states[i] = acquireSceneWorker()
+		acquired++
 	}
 	r.concurrent = true
-	if err := runXPSWorkerSlots(r.options.context, workers, tileCount, func(runCtx context.Context, slot, task int) error {
+	return runXPSWorkerSlots(r.options.context, workers, tileCount, func(runCtx context.Context, slot, task int) error {
 		if err := runCtx.Err(); err != nil {
 			r.cancelled.Store(true)
 			return err
@@ -1487,16 +1512,13 @@ func (r *sceneRenderer) renderPreparedPrintColor(nodes []*sceneNode, bounds imag
 		ty := task / cols
 		x := bounds.Min.X + tx*sceneTileSize
 		y := bounds.Min.Y + ty*sceneTileSize
-		tileOut := image.Rect(x, y, min(x+sceneTileSize, bounds.Max.X), min(y+sceneTileSize, bounds.Max.Y))
-		if err := r.printColorTile(nodes, surfaces[slot], background, tileOut, states[slot]); err != nil {
+		tile := image.Rect(x, y, min(x+sceneTileSize, bounds.Max.X), min(y+sceneTileSize, bounds.Max.Y))
+		if err := render(surfaces[slot], tile, states[slot]); err != nil {
 			r.cancelled.Store(true)
 			return err
 		}
 		return nil
-	}); err != nil {
-		return nil, err
-	}
-	return deviceImageToNRGBA(r.options.device.result), nil
+	})
 }
 
 // deviceImageToNRGBA 将三通道十六位sRGB设备图像精确量化转换为八位非预乘NRGBA图像
@@ -1522,7 +1544,7 @@ func deviceImageToNRGBA(dev *DeviceImage) *image.NRGBA {
 	return out
 }
 
-// buildRenderStandardSRGBICCProfile 构造与IEC 61966-2-1一致的标准D50适配sRGB矩阵-TRC ICC配置文件
+// buildRenderStandardSRGBICCProfile 构造符合ICC.1 v4.2规范且与IEC 61966-2-1一致的标准D50适配sRGB矩阵-TRC ICC配置文件
 // 返回: []byte 完整只读sRGB ICC配置字节
 func buildRenderStandardSRGBICCProfile() []byte {
 	encodeXYZ := func(x, y, z float64) []byte {
@@ -1532,6 +1554,34 @@ func buildRenderStandardSRGBICCProfile() []byte {
 		binary.BigEndian.PutUint32(buf[12:16], uint32(int32(math.Round(y*65536))))
 		binary.BigEndian.PutUint32(buf[16:20], uint32(int32(math.Round(z*65536))))
 		return buf
+	}
+	encodeMLUC := func(text string) []byte {
+		buf := make([]byte, 28+len(text)*2)
+		copy(buf[0:4], "mluc")
+		binary.BigEndian.PutUint32(buf[8:12], 1)
+		binary.BigEndian.PutUint32(buf[12:16], 12)
+		copy(buf[16:20], "enUS")
+		binary.BigEndian.PutUint32(buf[20:24], uint32(len(text)*2))
+		binary.BigEndian.PutUint32(buf[24:28], 28)
+		for i := range len(text) {
+			binary.BigEndian.PutUint16(buf[28+i*2:], uint16(text[i]))
+		}
+		return buf
+	}
+	d65 := [3]float64{0.3127 / 0.3290, 1, (1 - 0.3127 - 0.3290) / 0.3290}
+	coneSrc, coneDst := iccMatrixColor(cicpBradford, d65), iccMatrixColor(cicpBradford, iccPCSWhite)
+	adapt := cicpBradford
+	for row := range 3 {
+		scale := coneDst[row] / coneSrc[row]
+		for col := range 3 {
+			adapt[row*3+col] *= scale
+		}
+	}
+	chadMatrix := cicpMulMatrix3(cicpBradfordInverse, adapt)
+	chad := make([]byte, 44)
+	copy(chad[0:4], "sf32")
+	for i, v := range chadMatrix {
+		binary.BigEndian.PutUint32(chad[8+i*4:], uint32(int32(math.Round(v*65536))))
 	}
 	trc := make([]byte, 32)
 	copy(trc[0:4], "para")
@@ -1546,6 +1596,9 @@ func buildRenderStandardSRGBICCProfile() []byte {
 	}{
 		{"bTRC", trc},
 		{"bXYZ", encodeXYZ(m[2], m[5], m[8])},
+		{"chad", chad},
+		{"cprt", encodeMLUC("Public Domain")},
+		{"desc", encodeMLUC("sRGB IEC61966-2.1")},
 		{"gTRC", trc},
 		{"gXYZ", encodeXYZ(m[1], m[4], m[7])},
 		{"rTRC", trc},
@@ -1583,6 +1636,9 @@ func buildRenderStandardSRGBICCProfile() []byte {
 		copy(dir[0:4], entry.name)
 		binary.BigEndian.PutUint32(dir[4:8], offset)
 		binary.BigEndian.PutUint32(dir[8:12], uint32(len(entry.data)))
+	}
+	for len(data)%4 != 0 {
+		data = append(data, 0)
 	}
 	binary.BigEndian.PutUint32(data[0:4], uint32(len(data)))
 	return data
@@ -1777,86 +1833,9 @@ func (r *sceneRenderer) renderPrepared(nodes []*sceneNode, bounds image.Rectangl
 	if bounds.Empty() {
 		return output, nil
 	}
-	samples := options.samples
-	cols := (bounds.Dx() + sceneTileSize - 1) / sceneTileSize
-	rows := (bounds.Dy() + sceneTileSize - 1) / sceneTileSize
-	tileCount := cols * rows
-	tileW := min(sceneTileSize, bounds.Dx()) * samples
-	tileH := min(sceneTileSize, bounds.Dy()) * samples
-	first := image.Rect(bounds.Min.X*samples, bounds.Min.Y*samples, bounds.Min.X*samples+tileW, bounds.Min.Y*samples+tileH)
-	workers := resolveXPSWorkers(options.workers, tileCount)
-	if options.workers == 0 && (tileCount < 4 || bounds.Dx()*bounds.Dy() < 4096) {
-		workers = 1
-	}
-	if workers > 1 {
-		available := uint64(max(0, r.options.pixels-r.live))
-		perWorker := uint64(tileW) * uint64(tileH) * uint64(1+sceneMaxIsolatedDepth(nodes))
-		if r.hasFiltered {
-			if available <= perWorker*2 {
-				workers = 1
-			} else {
-				workers = budgetXPSWorkers(workers, available/2, perWorker)
-			}
-		} else {
-			workers = budgetXPSWorkers(workers, available, perWorker)
-		}
-	}
-	if workers <= 1 {
-		surface, err := r.acquireSurface(first)
-		if err != nil {
-			return nil, err
-		}
-		defer r.releaseSurface(surface)
-		worker := acquireSceneWorker()
-		defer releaseSceneWorker(worker)
-		for y := bounds.Min.Y; y < bounds.Max.Y; y += sceneTileSize {
-			for x := bounds.Min.X; x < bounds.Max.X; x += sceneTileSize {
-				tile := image.Rect(x, y, min(x+sceneTileSize, bounds.Max.X), min(y+sceneTileSize, bounds.Max.Y))
-				if err := r.tile(nodes, surface, output, tile, worker); err != nil {
-					return nil, err
-				}
-			}
-		}
-		return output, nil
-	}
-	surfaces := make([]*renderSurface, workers)
-	states := make([]*sceneWorkerState, workers)
-	defer func() {
-		for i := range workers {
-			if states[i] != nil {
-				releaseSceneWorker(states[i])
-			}
-			if surfaces[i] != nil {
-				r.releaseSurface(surfaces[i])
-			}
-		}
-	}()
-	for i := range workers {
-		surface, err := r.acquireSurface(first)
-		if err != nil {
-			return nil, err
-		}
-		surfaces[i] = surface
-		states[i] = acquireSceneWorker()
-	}
-	r.concurrent = true
-	err := runXPSWorkerSlots(r.options.context, workers, tileCount, func(runCtx context.Context, slot, task int) error {
-		if err := runCtx.Err(); err != nil {
-			r.cancelled.Store(true)
-			return err
-		}
-		tx := task % cols
-		ty := task / cols
-		x := bounds.Min.X + tx*sceneTileSize
-		y := bounds.Min.Y + ty*sceneTileSize
-		tile := image.Rect(x, y, min(x+sceneTileSize, bounds.Max.X), min(y+sceneTileSize, bounds.Max.Y))
-		if err := r.tile(nodes, surfaces[slot], output, tile, states[slot]); err != nil {
-			r.cancelled.Store(true)
-			return err
-		}
-		return nil
-	})
-	if err != nil {
+	if err := runPreparedTiles(r, nodes, bounds, 1, r.acquireSurface, r.releaseSurface, func(surface *renderSurface, tile image.Rectangle, worker *sceneWorkerState) error {
+		return r.tile(nodes, surface, output, tile, worker)
+	}); err != nil {
 		return nil, err
 	}
 	return output, nil
@@ -2218,7 +2197,6 @@ func (r *sceneRenderer) brushMode(brush *Brush, transform Matrix, aliased bool, 
 		if brush != nil && brush.Kind == BrushVisual {
 			r.brushMeta = sceneBrushMeta{visual: true}
 			r.hasFiltered = true
-			r.visualCount++
 		}
 		return r.printRuntime.previewSample(native), nil
 	}
@@ -2300,7 +2278,6 @@ func (r *sceneRenderer) brushMode(brush *Brush, transform Matrix, aliased bool, 
 			return nil, err
 		}
 		cached := r.brushMeta.sampleCached
-		r.visualCount++
 		r.hasFiltered = true
 		r.brushMeta = sceneBrushMeta{visual: true, sampleCached: cached}
 		return sample, nil

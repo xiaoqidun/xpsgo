@@ -19,7 +19,6 @@ import (
 	"compress/zlib"
 	"context"
 	"encoding/binary"
-	"encoding/xml"
 	"fmt"
 	"hash/crc32"
 	"image"
@@ -32,7 +31,6 @@ import (
 	"net/url"
 	"slices"
 	"strings"
-	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/xiaoqidun/jxrgo"
@@ -45,24 +43,37 @@ const (
 	ImageFormatPNG
 	// ImageFormatJPEG 表示编码为标准JPEG图像
 	ImageFormatJPEG
-	// ImageFormatTIFF 表示编码为无压缩Baseline TIFF图像
+	// ImageFormatTIFF 表示编码为标准Baseline TIFF图像
 	ImageFormatTIFF
 	// ImageFormatJXR 表示编码为标准JPEG XR图像
 	ImageFormatJXR
 )
 
+const (
+	// TIFFCompressionNone 表示不压缩TIFF像素数据
+	TIFFCompressionNone TIFFCompression = iota
+	// TIFFCompressionPackBits 表示采用TIFF PackBits字节游程无损压缩
+	TIFFCompressionPackBits
+	// TIFFCompressionDeflate 表示采用Adobe Deflate无损压缩
+	TIFFCompressionDeflate
+)
+
 // ImageEncodeFormat 表示写侧嵌入Go图像时使用的编码格式
 type ImageEncodeFormat uint8
 
-// ImageEncodeOptions 设置Go图像编码的格式、质量、分辨率、ICC配置文件与内容去重选项
-// Quality在1至99时启用有损编码，0或100在JXR下采用无损编码，在JPEG下0采用默认质量90
+// TIFFCompression 表示写侧编码TIFF图像时使用的无损压缩方式
+type TIFFCompression uint8
+
+// ImageEncodeOptions 设置Go图像编码的格式、TIFF压缩方式、质量、分辨率、ICC配置文件与内容去重选项
+// Quality在1至99时启用有损编码，0或100在JXR下采用无损编码，在JPEG下0采用默认质量90；TIFFCompression仅在输出TIFF时生效
 type ImageEncodeOptions struct {
-	Format      ImageEncodeFormat
-	Quality     int
-	DPIX        float64
-	DPIY        float64
-	ICCProfile  []byte
-	Deduplicate bool
+	Format          ImageEncodeFormat
+	TIFFCompression TIFFCompression
+	Quality         int
+	DPIX            float64
+	DPIY            float64
+	ICCProfile      []byte
+	Deduplicate     bool
 }
 
 // AddImageOptions 设置原始图像字节嵌入时的去重等选项
@@ -84,7 +95,8 @@ type ResourceDictionary struct {
 	Entries []ResourceEntry
 }
 
-// GlyphsBuildOptions 设置GlyphsBuilder构建字形元素时的双向级别、竖排、模拟样式、画刷与附加属性
+// GlyphsBuildOptions 设置GlyphsBuilder构建字形元素时的双向级别、竖排、模拟样式、画刷、步进省略与缺字策略
+// OmitDefaultAdvanceWidth启用且Tracking为零时省略与字体默认步进等价的AdvanceWidth；RejectMissingGlyphs启用时遇到缺字返回ErrInvalid
 type GlyphsBuildOptions struct {
 	BidiLevel               int
 	IsSideways              bool
@@ -101,6 +113,8 @@ type GlyphsBuildOptions struct {
 	Clip                    *Geometry
 	OpacityMask             *Brush
 	Tracking                float64
+	OmitDefaultAdvanceWidth bool
+	RejectMissingGlyphs     bool
 }
 
 // GlyphBuildItem 表示复合簇构建器中的单个显式字形条目，AdvanceWidth、UOffset与VOffset采用1/100 em单位
@@ -160,6 +174,49 @@ func (f ImageEncodeFormat) String() string {
 	}
 }
 
+// String 返回TIFF压缩方式的可读名称
+// 返回: string 压缩方式名称
+func (c TIFFCompression) String() string {
+	switch c {
+	case TIFFCompressionNone:
+		return "none"
+	case TIFFCompressionPackBits:
+		return "packbits"
+	case TIFFCompressionDeflate:
+		return "deflate"
+	default:
+		return fmt.Sprintf("TIFFCompression(%d)", c)
+	}
+}
+
+// EncodeCaretStops 将逻辑光标停靠标志切片编码为符合ECMA-388规范的十六进制CaretStops属性字符串
+// 每四位大端打包为一个大写十六进制字符，不足四位时末位低比特补零，与ParseCaretStops严格互逆
+// 入参: stops 逻辑光标停靠标志切片，长度须为对应UTF-16码元数加一且至少为1
+// 返回: string 规范化十六进制CaretStops字符串, error 空切片等参数错误
+func EncodeCaretStops(stops []bool) (string, error) {
+	if len(stops) == 0 {
+		return "", fmt.Errorf("%w: CaretStops requires at least one position", ErrInvalid)
+	}
+	const hexDigits = "0123456789ABCDEF"
+	digits := len(stops) / 4
+	if len(stops)%4 != 0 {
+		digits++
+	}
+	out := make([]byte, digits)
+	for i := range digits {
+		var nibble byte
+		base := i * 4
+		for bit := range 4 {
+			idx := base + bit
+			if idx < len(stops) && stops[idx] {
+				nibble |= 8 >> uint(bit)
+			}
+		}
+		out[i] = hexDigits[nibble]
+	}
+	return string(out), nil
+}
+
 // ParseFontResource 从原始单面SFNT或TTC/OTC字体字节解析只读FontResource，供写侧GlyphsBuilder等直接复用
 // 入参: ctx 取消Context，nil采用Background, data 原始字体字节, collectionIndex 零基字体面索引
 // 返回: *FontResource 已解析字体资源, error 字体封装、度量或取消错误
@@ -216,16 +273,25 @@ func (b *GlyphsBuilder) BuildText(ctx context.Context, text string, origin Point
 		return nil, err
 	}
 	glyphs.Text = text
+	if glyphs.CaretStops != "" {
+		if _, err := ParseCaretStops(glyphs.CaretStops, EscapeUnicodeString(glyphs.Text)); err != nil {
+			return nil, err
+		}
+	}
 	boldExtra := 0.0
 	if opts.StyleSimulations == StyleSimulationBold || opts.StyleSimulations == StyleSimulationBoldItalic {
 		boldExtra = 2
 	}
+	omitDefaultAdv := opts.OmitDefaultAdvanceWidth && opts.Tracking == 0
 	clusters := make([]GlyphCluster, 0, len(text))
 	for _, r := range text {
 		if err := checkContext(ctx); err != nil {
 			return nil, err
 		}
-		gid, _ := b.font.RuneGlyph(r)
+		gid, ok := b.font.RuneGlyph(r)
+		if !ok && opts.RejectMissingGlyphs {
+			return nil, fmt.Errorf("%w: missing glyph for rune %U", ErrInvalid, r)
+		}
 		var advanceEm float64
 		if opts.IsSideways {
 			advanceEm, err = b.font.GlyphVerticalAdvance(gid)
@@ -239,7 +305,11 @@ func (b *GlyphsBuilder) BuildText(ctx context.Context, text string, origin Point
 		if !geometryFinite(adv100) || adv100 < 0 {
 			return nil, fmt.Errorf("%w: invalid computed glyph advance", ErrInvalid)
 		}
-		entry := GlyphIndex{Index: gid, HasIndex: true, AdvanceWidth: adv100, HasAdvanceWidth: true}
+		entry := GlyphIndex{Index: gid, HasIndex: true}
+		if !omitDefaultAdv {
+			entry.AdvanceWidth = adv100
+			entry.HasAdvanceWidth = true
+		}
 		codeUnits := 1
 		hasMapping := false
 		if r > 0xffff {
@@ -264,7 +334,7 @@ func (b *GlyphsBuilder) BuildClusters(ctx context.Context, clusters []GlyphBuild
 	if b == nil || len(clusters) == 0 {
 		return nil, fmt.Errorf("%w: glyphs builder requires non-empty clusters", ErrInvalid)
 	}
-	glyphs, _, err := b.initGlyphs(origin, options)
+	glyphs, opts, err := b.initGlyphs(origin, options)
 	if err != nil {
 		return nil, err
 	}
@@ -280,6 +350,16 @@ func (b *GlyphsBuilder) BuildClusters(ctx context.Context, clusters []GlyphBuild
 		}
 	}
 	glyphs.Text = textBuilder.String()
+	if glyphs.CaretStops != "" {
+		if _, err := ParseCaretStops(glyphs.CaretStops, EscapeUnicodeString(glyphs.Text)); err != nil {
+			return nil, err
+		}
+	}
+	boldExtra := 0.0
+	if opts.StyleSimulations == StyleSimulationBold || opts.StyleSimulations == StyleSimulationBoldItalic {
+		boldExtra = 2
+	}
+	omitDefaultAdv := opts.OmitDefaultAdvanceWidth && opts.Tracking == 0 && b.font != nil
 	indices := make([]GlyphCluster, 0, len(clusters))
 	for _, cluster := range clusters {
 		if err := checkContext(ctx); err != nil {
@@ -292,30 +372,62 @@ func (b *GlyphsBuilder) BuildClusters(ctx context.Context, clusters []GlyphBuild
 			return nil, fmt.Errorf("%w: mixed empty and non-empty cluster text", ErrInvalid)
 		}
 		codeUnits := 1
-		hasSupplementary := false
 		scalarCount := 0
+		var singleRune rune
 		if hasAnyText {
-			codeUnits = len(utf16.Encode([]rune(cluster.Text)))
+			codeUnits = 0
 			for _, r := range cluster.Text {
+				if scalarCount == 0 {
+					singleRune = r
+				}
 				scalarCount++
+				codeUnits++
 				if r > 0xffff {
-					hasSupplementary = true
+					codeUnits++
 				}
 			}
 		}
 		entries := make([]GlyphIndex, 0, len(cluster.Glyphs))
 		for _, item := range cluster.Glyphs {
 			hasIndex := !item.OmitGlyphID
+			var resolvedGID uint16
+			hasResolvedGID := false
 			if !hasIndex {
 				if !hasAnyText || len(cluster.Glyphs) != 1 || scalarCount != 1 {
 					return nil, fmt.Errorf("%w: omitted glyph ID requires single Unicode scalar cluster", ErrInvalid)
 				}
-			} else if b.font != nil && int(item.GlyphID) >= b.font.GlyphCount {
-				return nil, fmt.Errorf("%w: glyph index %d exceeds font glyph count", ErrInvalid, item.GlyphID)
+				if b.font != nil {
+					gid, ok := b.font.RuneGlyph(singleRune)
+					if !ok && opts.RejectMissingGlyphs {
+						return nil, fmt.Errorf("%w: missing glyph for rune %U", ErrInvalid, singleRune)
+					}
+					resolvedGID, hasResolvedGID = gid, true
+				}
+			} else {
+				if opts.RejectMissingGlyphs && item.GlyphID == 0 {
+					return nil, fmt.Errorf("%w: missing glyph index 0 rejected", ErrInvalid)
+				}
+				if b.font != nil && int(item.GlyphID) >= b.font.GlyphCount {
+					return nil, fmt.Errorf("%w: glyph index %d exceeds font glyph count", ErrInvalid, item.GlyphID)
+				}
+				resolvedGID, hasResolvedGID = item.GlyphID, b.font != nil
 			}
 			hasAdv := item.HasAdvanceWidth || item.AdvanceWidth != 0
-			if hasAdv && (!geometryFinite(item.AdvanceWidth) || item.AdvanceWidth < 0) {
+			advVal := item.AdvanceWidth
+			if hasAdv && (!geometryFinite(advVal) || advVal < 0) {
 				return nil, fmt.Errorf("%w: invalid cluster glyph advance", ErrInvalid)
+			}
+			if hasAdv && omitDefaultAdv && hasResolvedGID {
+				var defaultAdvEm float64
+				if opts.IsSideways {
+					defaultAdvEm, err = b.font.GlyphVerticalAdvance(resolvedGID)
+				} else {
+					defaultAdvEm, err = b.font.GlyphAdvance(resolvedGID)
+				}
+				if err == nil && math.Abs(advVal-(defaultAdvEm*100+boldExtra)) <= 1e-9 {
+					hasAdv = false
+					advVal = 0
+				}
 			}
 			hasU := item.HasUOffset || item.UOffset != 0
 			if hasU && !geometryFinite(item.UOffset) {
@@ -328,7 +440,7 @@ func (b *GlyphsBuilder) BuildClusters(ctx context.Context, clusters []GlyphBuild
 			entries = append(entries, GlyphIndex{
 				Index:           item.GlyphID,
 				HasIndex:        hasIndex,
-				AdvanceWidth:    item.AdvanceWidth,
+				AdvanceWidth:    advVal,
 				HasAdvanceWidth: hasAdv,
 				UOffset:         item.UOffset,
 				HasUOffset:      hasU,
@@ -343,7 +455,7 @@ func (b *GlyphsBuilder) BuildClusters(ctx context.Context, clusters []GlyphBuild
 			continue
 		}
 		hasGlyphCount := len(entries) > 1
-		hasMapping := hasGlyphCount || codeUnits > 1 || hasSupplementary
+		hasMapping := hasGlyphCount || codeUnits > 1
 		indices = append(indices, GlyphCluster{
 			CodeUnitCount: codeUnits,
 			HasMapping:    hasMapping,
@@ -719,67 +831,16 @@ func EncodeResourceDictionary(ctx context.Context, output io.Writer, dict *Resou
 	if output == nil || dict == nil {
 		return 0, fmt.Errorf("%w: missing resource dictionary or output", ErrInvalid)
 	}
-	if dict.Source != "" {
-		return 0, fmt.Errorf("%w: remote resource dictionary cannot specify Source", ErrInvalid)
-	}
-	configuration := DefaultEncodeOptions()
-	if options != nil {
-		if options.Format != FormatUnknown {
-			configuration.Format = options.Format
-		}
-		configuration.Limits = mergeLimits(configuration.Limits, options.Limits)
-		configuration.Part = options.Part
-		configuration.Compact = options.Compact
-	}
-	if err := validateLimits(configuration.Limits); err != nil {
-		return 0, err
-	}
-	if formatNamespace(configuration.Format) == "" {
-		return 0, fmt.Errorf("%w: invalid resource dictionary format", ErrInvalid)
-	}
-	part := configuration.Part
-	var err error
-	if part == "" {
-		part = "/Resources/Dictionary.dict"
-	} else if part, err = opcPartName(part); err != nil {
-		return 0, err
-	}
-	p := pageEncoder{format: configuration.Format, ns: formatNamespace(configuration.Format), part: part, limits: configuration.Limits, compact: configuration.Compact, ctx: ctx, active: make(map[any]bool), elemCount: make(map[Element]int), mainElemCount: make(map[Element]int), emittedName: make(map[Element]bool)}
-	p.scope = map[string]string{"": p.ns, "xml": xmlNamespace, "r": p.ns + "/resourcedictionary-key"}
-	if err := p.prescanDictionary(dict, 1); err != nil {
-		return 0, err
-	}
-	root, err := p.resourceDictionary(dict, 1, true)
+	root, limits, err := encodeResourceDictionaryRoot(ctx, dict, options)
 	if err != nil {
 		return 0, err
 	}
-	if err := validateFixedNames(root, p.format); err != nil {
-		return 0, err
-	}
-	checker := &resourceParser{
-		format: p.format, limits: p.limits, context: ctx,
-		graph:  &resourceGraph{PagePart: part, Bindings: make(map[*xmlElement]map[string]*resourceDefinition), Parts: make(map[*xmlElement]string)},
-		remote: make(map[string]*resourceScope),
-	}
-	if _, err := checker.dictionary(root, part, nil, true, 1); err != nil {
-		return 0, err
-	}
-	if err := checkContext(ctx); err != nil {
-		return 0, err
-	}
-	counted := packageOutput{writer: output, context: ctx, limit: p.limits.MaxPartBytes}
-	encoder := xml.NewEncoder(&counted)
-	if err := encodePageNode(encoder, root, ctx); err != nil {
-		return counted.count, err
-	}
-	if err := encoder.Flush(); err != nil {
-		return counted.count, err
-	}
-	return counted.count, checkContext(ctx)
+	return writeEncodedXMLNode(ctx, output, root, limits.MaxPartBytes)
 }
 
 // InternalNavigateURI 构造符合ECMA-388与XPS 1.0导航约束的相对内部导航URI
-// 按[M9.4]与[M9.8]拒绝指向FixedPage的命名或页码片段以及指向FixedDocument的页码片段
+// 按[M9.4]与[M9.8]依据标准扩展名(.fpage与.fdoc)启发式拦截指向FixedPage的命名或页码片段以及指向FixedDocument的页码片段
+// 若目标部件采用非标准自定义扩展名，本函数仅执行词法与相对路径校验，完整部件角色合规性在包写出或读取校验阶段确认
 // 入参: sourcePart 来源部件URI, targetPart 目标部件URI, targetName 可选目标链接名称或页码片段
 // 返回: string 规范化相对导航URI, error 部件名、锚点或导航规则错误
 func InternalNavigateURI(sourcePart, targetPart, targetName string) (string, error) {
@@ -818,10 +879,10 @@ func InternalNavigateURI(sourcePart, targetPart, targetName string) (string, err
 	return rel + u.String(), nil
 }
 
-// encodeGoImage 将标准Go图像按指定格式、质量、分辨率与ICC配置编码为XPS支持的图像字节
-// 入参: ctx 取消Context, img 源Go图像, options 编码选项，nil采用默认值, maxBytes 输出字节上限
+// encodeGoImageWithLimits 将标准Go图像按指定格式、压缩方式、质量、分辨率、ICC配置与像素上限编码为XPS支持的图像字节
+// 入参: ctx 取消Context, img 源Go图像, options 编码选项，nil采用默认值, maxBytes 输出字节上限, maxPixels 像素总数上限，0采用默认上限
 // 返回: []byte 编码后图像字节, string 媒体类型, string 扩展名, error 编码、配置、预算或取消错误
-func encodeGoImage(ctx context.Context, img image.Image, options *ImageEncodeOptions, maxBytes int64) ([]byte, string, string, error) {
+func encodeGoImageWithLimits(ctx context.Context, img image.Image, options *ImageEncodeOptions, maxBytes int64, maxPixels uint64) ([]byte, string, string, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, "", "", err
 	}
@@ -832,12 +893,19 @@ func encodeGoImage(ctx context.Context, img image.Image, options *ImageEncodeOpt
 	if bounds.Empty() {
 		return nil, "", "", fmt.Errorf("%w: empty image bounds", ErrInvalid)
 	}
+	if maxPixels == 0 {
+		maxPixels = DefaultImageOptions().MaxPixels
+	}
+	w, h := bounds.Dx(), bounds.Dy()
+	if w > rasterMaxDimension || h > rasterMaxDimension || uint64(w) > maxPixels/uint64(h) {
+		return nil, "", "", fmt.Errorf("%w: image exceeds MaxImagePixels", ErrLimit)
+	}
 	cfg := ImageEncodeOptions{Format: ImageFormatAuto}
 	if options != nil {
 		cfg = *options
 	}
-	if cfg.Format > ImageFormatJXR || cfg.Quality < 0 || cfg.Quality > 100 {
-		return nil, "", "", fmt.Errorf("%w: invalid image encode format or quality", ErrInvalid)
+	if cfg.Format > ImageFormatJXR || cfg.TIFFCompression > TIFFCompressionDeflate || cfg.Quality < 0 || cfg.Quality > 100 {
+		return nil, "", "", fmt.Errorf("%w: invalid image encode format, TIFF compression or quality", ErrInvalid)
 	}
 	if cfg.DPIX < 0 || cfg.DPIY < 0 || math.IsNaN(cfg.DPIX) || math.IsInf(cfg.DPIX, 0) || math.IsNaN(cfg.DPIY) || math.IsInf(cfg.DPIY, 0) {
 		return nil, "", "", fmt.Errorf("%w: invalid image DPI", ErrInvalid)
@@ -871,10 +939,10 @@ func encodeGoImage(ctx context.Context, img image.Image, options *ImageEncodeOpt
 		data, err := encodeGoImageJPEG(ctx, img, cfg.Quality, cfg.DPIX, cfg.DPIY, cfg.ICCProfile, maxBytes)
 		return data, "image/jpeg", "jpg", err
 	case ImageFormatTIFF:
-		data, err := encodeGoImageTIFF(ctx, img, cfg.DPIX, cfg.DPIY, cfg.ICCProfile, maxBytes)
+		data, err := encodeGoImageTIFF(ctx, img, cfg.TIFFCompression, cfg.DPIX, cfg.DPIY, cfg.ICCProfile, maxBytes, maxPixels)
 		return data, "image/tiff", "tif", err
 	case ImageFormatJXR:
-		data, err := encodeGoImageJXR(ctx, img, cfg, maxBytes)
+		data, err := encodeGoImageJXR(ctx, img, cfg, maxBytes, maxPixels)
 		return data, "image/vnd.ms-photo", "jxr", err
 	default:
 		return nil, "", "", fmt.Errorf("%w: unsupported image encode format", ErrUnsupported)
@@ -1061,6 +1129,18 @@ func encodeGoImageJPEG(ctx context.Context, img image.Image, quality int, dpix, 
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
+	var dx, dy uint16
+	if dpix > 0 && dpiy > 0 {
+		var err error
+		dx, err = encodeJPEGDPI(dpix)
+		if err != nil {
+			return nil, err
+		}
+		dy, err = encodeJPEGDPI(dpiy)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if quality == 0 {
 		quality = 90
 	}
@@ -1103,8 +1183,6 @@ func encodeGoImageJPEG(ctx context.Context, img image.Image, quality int, dpix, 
 		}
 	}
 	if dpix > 0 && dpiy > 0 {
-		dx := clampUint16DPI(dpix)
-		dy := clampUint16DPI(dpiy)
 		jfif := []byte{0xff, 0xe0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00, 0x01, 0x01, 0x01, byte(dx >> 8), byte(dx), byte(dy >> 8), byte(dy), 0x00, 0x00}
 		if _, err := outCounted.Write(jfif); err != nil {
 			return nil, err
@@ -1141,24 +1219,24 @@ func encodeGoImageJPEG(ctx context.Context, img image.Image, quality int, dpix, 
 	return out.Bytes(), nil
 }
 
-// clampUint16DPI 将浮点DPI四舍五入并限制在合法16位无符号整数范围
+// encodeJPEGDPI 校验并将浮点DPI转换为JFIF 16位无符号整数分辨率，超出65535返回ErrInvalid
 // 入参: value 浮点分辨率
-// 返回: uint16 规范化DPI值
-func clampUint16DPI(value float64) uint16 {
+// 返回: uint16 JFIF分辨率值, error 越界错误
+func encodeJPEGDPI(value float64) (uint16, error) {
 	rounded := math.Round(value)
+	if !(rounded <= 65535) {
+		return 0, fmt.Errorf("%w: JPEG DPI exceeds JFIF uint16 limit", ErrInvalid)
+	}
 	if rounded < 1 {
-		return 1
+		return 1, nil
 	}
-	if rounded > 65535 {
-		return 65535
-	}
-	return uint16(rounded)
+	return uint16(rounded), nil
 }
 
-// encodeGoImageTIFF 编码标准无压缩Little-Endian Baseline TIFF，支持灰度、RGB、RGBA、16位与CMYK以及DPI和ICC标签
-// 入参: ctx 取消Context, img 源Go图像, dpix 水平DPI, dpiy 垂直DPI, icc 可选ICC配置字节, maxBytes 字节上限
+// encodeGoImageTIFF 编码标准Little-Endian Baseline TIFF，支持无压缩、PackBits与Adobe Deflate无损压缩以及灰度、RGB、RGBA、16位、CMYK、DPI和ICC标签
+// 入参: ctx 取消Context, img 源Go图像, compression 无损压缩方式, dpix 水平DPI, dpiy 垂直DPI, icc 可选ICC配置字节, maxBytes 字节上限, maxPixels 像素总数上限
 // 返回: []byte TIFF字节, error 编码、预算或取消错误
-func encodeGoImageTIFF(ctx context.Context, img image.Image, dpix, dpiy float64, icc []byte, maxBytes int64) ([]byte, error) {
+func encodeGoImageTIFF(ctx context.Context, img image.Image, compression TIFFCompression, dpix, dpiy float64, icc []byte, maxBytes int64, maxPixels uint64) ([]byte, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
@@ -1185,6 +1263,13 @@ func encodeGoImageTIFF(ctx context.Context, img image.Image, dpix, dpiy float64,
 	var hasExtra bool
 	var pixels []byte
 	pixelBudget := min(maxBytes, int64(math.MaxUint32))
+	if compression != TIFFCompressionNone {
+		maxRaw := uint64(math.MaxUint32)
+		if maxPixels > 0 && maxPixels < maxRaw/8 {
+			maxRaw = maxPixels * 8
+		}
+		pixelBudget = min(int64(maxRaw), int64(^uint(0)>>1))
+	}
 	checkPixelBudget := func(bytesPerPixel int64) error {
 		if int64(w) <= 0 || int64(h) <= 0 || int64(w) > math.MaxUint32 || int64(h) > math.MaxUint32 || int64(w) > pixelBudget/bytesPerPixel || int64(h) > pixelBudget/(int64(w)*bytesPerPixel) {
 			return fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
@@ -1306,6 +1391,26 @@ func encodeGoImageTIFF(ctx context.Context, img image.Image, dpix, dpiy float64,
 			}
 		}
 	}
+	rowBytes := w * int(spp) * int(bps/8)
+	var compressionTag uint32
+	var stripData []byte
+	var err error
+	switch compression {
+	case TIFFCompressionNone:
+		compressionTag = 1
+		stripData = pixels
+	case TIFFCompressionPackBits:
+		compressionTag = 32773
+		stripData, err = encodeTIFFPackBits(ctx, pixels, rowBytes, maxBytes)
+	case TIFFCompressionDeflate:
+		compressionTag = 8
+		stripData, err = encodeTIFFDeflate(ctx, pixels, maxBytes)
+	default:
+		return nil, fmt.Errorf("%w: unsupported TIFF compression %d", ErrInvalid, compression)
+	}
+	if err != nil {
+		return nil, err
+	}
 	type tiffEntry struct {
 		tag   uint16
 		kind  uint16
@@ -1334,12 +1439,12 @@ func encodeGoImageTIFF(ctx context.Context, img image.Image, dpix, dpiy float64,
 	binary.LittleEndian.PutUint32(yRat[0:4], uint32(yNum))
 	binary.LittleEndian.PutUint32(yRat[4:8], 1000)
 	entries = append(entries,
-		tiffEntry{tag: 259, kind: 3, count: 1, value: 1},
+		tiffEntry{tag: 259, kind: 3, count: 1, value: compressionTag},
 		tiffEntry{tag: 262, kind: 3, count: 1, value: uint32(photometric)},
 		tiffEntry{tag: 273, kind: 4, count: 1, value: 8},
 		tiffEntry{tag: 277, kind: 3, count: 1, value: uint32(spp)},
 		tiffEntry{tag: 278, kind: 4, count: 1, value: uint32(h)},
-		tiffEntry{tag: 279, kind: 4, count: 1, value: uint32(len(pixels))},
+		tiffEntry{tag: 279, kind: 4, count: 1, value: uint32(len(stripData))},
 		tiffEntry{tag: 282, kind: 5, count: 1, extra: xRat},
 		tiffEntry{tag: 283, kind: 5, count: 1, extra: yRat},
 		tiffEntry{tag: 296, kind: 3, count: 1, value: 2},
@@ -1354,7 +1459,7 @@ func encodeGoImageTIFF(ctx context.Context, img image.Image, dpix, dpiy float64,
 		entries = append(entries, tiffEntry{tag: 34675, kind: 7, count: uint32(len(icc)), extra: icc})
 	}
 	slices.SortFunc(entries, func(a, b tiffEntry) int { return int(a.tag) - int(b.tag) })
-	pixelEnd := int64(8) + int64(len(pixels))
+	pixelEnd := int64(8) + int64(len(stripData))
 	pad := pixelEnd & 1
 	ifdOffset := pixelEnd + pad
 	ifdSize := int64(2 + len(entries)*12 + 4)
@@ -1372,7 +1477,7 @@ func encodeGoImageTIFF(ctx context.Context, img image.Image, dpix, dpiy float64,
 	copy(out[0:2], "II")
 	binary.LittleEndian.PutUint16(out[2:4], 42)
 	binary.LittleEndian.PutUint32(out[4:8], uint32(ifdOffset))
-	copy(out[8:], pixels)
+	copy(out[8:], stripData)
 	binary.LittleEndian.PutUint16(out[int(ifdOffset):], uint16(len(entries)))
 	cursor := int(extraOffset)
 	for i, entry := range entries {
@@ -1393,14 +1498,101 @@ func encodeGoImageTIFF(ctx context.Context, img image.Image, dpix, dpiy float64,
 	return out, nil
 }
 
-// encodeGoImageJXR 调用jxrgo编码标准JPEG XR图像并传递分辨率、质量与ICC配置参数
-// 入参: ctx 取消Context, img 源Go图像, cfg 编码配置, maxBytes 字节上限
+// encodeTIFFPackBits 按TIFF 6.0规范逐行执行PackBits无损字节游程编码，严格保证游程不跨越行边界
+// 入参: ctx 取消Context, pixels 原始交织像素字节, rowBytes 单扫描行字节长度, maxBytes 输出字节上限
+// 返回: []byte PackBits压缩条带字节, error 预算或取消错误
+func encodeTIFFPackBits(ctx context.Context, pixels []byte, rowBytes int, maxBytes int64) ([]byte, error) {
+	if rowBytes <= 0 || len(pixels)%rowBytes != 0 {
+		return nil, fmt.Errorf("%w: invalid TIFF PackBits row length", ErrInvalid)
+	}
+	limit := min(maxBytes, int64(math.MaxUint32))
+	out := make([]byte, 0, min(int64(len(pixels)), limit))
+	for rowStart := 0; rowStart < len(pixels); rowStart += rowBytes {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		row := pixels[rowStart : rowStart+rowBytes]
+		for pos := 0; pos < len(row); {
+			run := 1
+			for pos+run < len(row) && run < 128 && row[pos+run] == row[pos] {
+				run++
+			}
+			if run >= 3 {
+				if int64(len(out))+2 > limit {
+					return nil, fmt.Errorf("%w: encoded TIFF PackBits exceeds byte budget", ErrLimit)
+				}
+				out = append(out, byte(int8(1-run)), row[pos])
+				pos += run
+				continue
+			}
+			litStart := pos
+			pos += run
+			for pos < len(row) && pos-litStart < 128 {
+				nextRun := 1
+				for pos+nextRun < len(row) && nextRun < 3 && row[pos+nextRun] == row[pos] {
+					nextRun++
+				}
+				if nextRun >= 3 {
+					break
+				}
+				pos++
+			}
+			litLen := pos - litStart
+			if int64(len(out))+1+int64(litLen) > limit {
+				return nil, fmt.Errorf("%w: encoded TIFF PackBits exceeds byte budget", ErrLimit)
+			}
+			out = append(out, byte(litLen-1))
+			out = append(out, row[litStart:pos]...)
+		}
+	}
+	return out, nil
+}
+
+// encodeTIFFDeflate 按Adobe TIFF Technical Note 3将条带像素编码为标准zlib无损压缩流
+// 入参: ctx 取消Context, pixels 原始交织像素字节, maxBytes 输出字节上限
+// 返回: []byte zlib压缩条带字节, error 压缩、预算或取消错误
+func encodeTIFFDeflate(ctx context.Context, pixels []byte, maxBytes int64) ([]byte, error) {
+	limit := min(maxBytes, int64(math.MaxUint32))
+	var buf bytes.Buffer
+	counted := packageOutput{writer: &buf, context: ctx, limit: limit}
+	zw := zlib.NewWriter(&counted)
+	const chunkSize = 32 << 10
+	for start := 0; start < len(pixels); start += chunkSize {
+		if err := checkContext(ctx); err != nil {
+			_ = zw.Close()
+			return nil, err
+		}
+		end := min(start+chunkSize, len(pixels))
+		if _, err := zw.Write(pixels[start:end]); err != nil {
+			_ = zw.Close()
+			return nil, err
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// encodeGoImageJXR 调用jxrgo编码标准JPEG XR图像并透传像素预算、字节预算、分辨率、质量与ICC配置参数
+// 入参: ctx 取消Context, img 源Go图像, cfg 编码配置, maxBytes 字节上限, maxPixels 像素总数上限
 // 返回: []byte JPEG XR字节, error 编码、预算或取消错误
-func encodeGoImageJXR(ctx context.Context, img image.Image, cfg ImageEncodeOptions, maxBytes int64) ([]byte, error) {
+func encodeGoImageJXR(ctx context.Context, img image.Image, cfg ImageEncodeOptions, maxBytes int64, maxPixels uint64) ([]byte, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	opts := &jxrgo.EncodeOptions{MaxOutputBytes: uint64(maxBytes)}
+	if maxPixels == 0 {
+		maxPixels = DefaultImageOptions().MaxPixels
+	}
+	bounds := img.Bounds()
+	if bounds.Empty() {
+		return nil, fmt.Errorf("%w: empty image bounds", ErrInvalid)
+	}
+	w, h := bounds.Dx(), bounds.Dy()
+	if w > rasterMaxDimension || h > rasterMaxDimension || uint64(w) > maxPixels/uint64(h) {
+		return nil, fmt.Errorf("%w: image exceeds MaxImagePixels", ErrLimit)
+	}
+	opts := &jxrgo.EncodeOptions{MaxOutputBytes: uint64(maxBytes), Limits: jxrgo.Limits{MaxPixels: maxPixels}}
 	if cfg.Quality > 0 && cfg.Quality < 100 {
 		opts.Lossy = true
 		opts.Quality = cfg.Quality
