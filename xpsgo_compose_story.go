@@ -105,13 +105,13 @@ type compositionSignatures struct {
 	budget *compositionBudget
 }
 
-// compositionSignatureMarkupOptions 提供签署标识与可选页面位置的改写回调，空回调保留原值
+// compositionSignatureMarkupOptions 提供签署标识与可选页面位置及仿射变换改写回调，非空变换同步改写StartX/StartY坐标，空回调保留原值
 type compositionSignatureMarkupOptions struct {
-	format Format
-	part   string
-	budget *compositionBudget
-	id     func(string) (string, error)
-	spot   func(string) (string, bool, error)
+	format        Format
+	part          string
+	budget        *compositionBudget
+	id            func(string) (string, error)
+	spotTransform func(string) (string, *Matrix, bool, error)
 }
 
 // newCompositionStories 投影作者声明的故事与片段，不分配部件URI或修改快照和规划
@@ -1133,7 +1133,7 @@ func (s *compositionSignatures) target(source int, part, id string) (string, err
 	return value, nil
 }
 
-// rewriteCompositionSignatureMarkup 定点改写签署请求标识与页面位置，保留兼容分支、原编码及其他字节
+// rewriteCompositionSignatureMarkup 定点改写签署请求标识与页面位置，并在提供页面仿射变换时同步改写StartX/StartY坐标，保留兼容分支、原编码及其他字节
 // 入参: value 原请求部件, options 输出位置、共享预算及改写回调
 // 返回: []byte 独立的原编码结果，失败为nil, error 模式、扩展、回调、预算或取消错误
 func rewriteCompositionSignatureMarkup(value packagePart, options compositionSignatureMarkupOptions) ([]byte, error) {
@@ -1211,13 +1211,19 @@ func rewriteCompositionSignatureMarkup(value packagePart, options compositionSig
 			return nil
 		}
 		attribute := "SpotID"
+		var startX, startY float64
+		var rawX, rawY string
 		if node.Name.Local == "SpotLocation" {
 			attribute = "PageURI"
-			for _, coordinate := range []string{"StartX", "StartY"} {
-				value, _ := node.attribute(coordinate)
-				if _, err := signatureDefinitionDouble(value); err != nil {
-					return err
-				}
+			rawX, _ = node.attribute("StartX")
+			startX, err = signatureDefinitionDouble(rawX)
+			if err != nil {
+				return err
+			}
+			rawY, _ = node.attribute("StartY")
+			startY, err = signatureDefinitionDouble(rawY)
+			if err != nil {
+				return err
 			}
 		}
 		raw, present := node.attribute(attribute)
@@ -1226,6 +1232,7 @@ func rewriteCompositionSignatureMarkup(value packagePart, options compositionSig
 		}
 		normalized := structureURI(raw)
 		target := normalized
+		var spotMatrix *Matrix
 		if attribute == "SpotID" {
 			if !xmlNCName(normalized) {
 				return fmt.Errorf("%w: composition signature source ID", ErrInvalid)
@@ -1236,9 +1243,9 @@ func rewriteCompositionSignatureMarkup(value packagePart, options compositionSig
 					return err
 				}
 			}
-		} else if options.spot != nil {
+		} else if options.spotTransform != nil {
 			var keep bool
-			target, keep, err = options.spot(normalized)
+			target, spotMatrix, keep, err = options.spotTransform(normalized)
 			if err != nil {
 				return err
 			}
@@ -1264,22 +1271,49 @@ func rewriteCompositionSignatureMarkup(value packagePart, options compositionSig
 		if !xmlTextValid(target) {
 			return fmt.Errorf("%w: composition signature replacement text", ErrInvalid)
 		}
-		if target == normalized {
-			return nil
+		var newX, newY string
+		var replaceX, replaceY bool
+		if spotMatrix != nil {
+			if !geometryFinite(startX, startY) {
+				return fmt.Errorf("%w: non-finite composition signature coordinates", ErrInvalid)
+			}
+			tx := spotMatrix.A*startX + spotMatrix.C*startY + spotMatrix.E
+			ty := spotMatrix.B*startX + spotMatrix.D*startY + spotMatrix.F
+			if !geometryFinite(tx, ty) {
+				return fmt.Errorf("%w: non-finite transformed composition signature coordinates", ErrInvalid)
+			}
+			newX = encodeSignatureDefinitionDouble(tx)
+			newY = encodeSignatureDefinitionDouble(ty)
+			replaceX = newX != rawX
+			replaceY = newY != rawY
 		}
-		if int64(len(target)) > intermediateLimit-replacementBytes {
-			return fmt.Errorf("%w: composition signature replacement bytes", ErrLimit)
+		replaceMain := target != normalized
+		if !replaceMain && !replaceX && !replaceY {
+			return nil
 		}
 		ranges, err := xmlStartAttributeRanges(input[start:end])
 		if err != nil || len(ranges) != len(node.Attr) {
 			return fmt.Errorf("%w: composition signature attribute ranges", ErrInvalid)
 		}
 		for index, attr := range node.Attr {
-			if attr.Name != (xml.Name{Local: attribute}) {
+			var replacement string
+			var match bool
+			switch {
+			case replaceMain && attr.Name == (xml.Name{Local: attribute}):
+				replacement, match = target, true
+			case replaceX && attr.Name == (xml.Name{Local: "StartX"}):
+				replacement, match = newX, true
+			case replaceY && attr.Name == (xml.Name{Local: "StartY"}):
+				replacement, match = newY, true
+			}
+			if !match {
 				continue
 			}
+			if int64(len(replacement)) > intermediateLimit-replacementBytes {
+				return fmt.Errorf("%w: composition signature replacement bytes", ErrLimit)
+			}
 			escaped := xmlRewriteBuffer{maximum: intermediateLimit - replacementBytes, context: b.context}
-			if err := xml.EscapeText(&escaped, []byte(target)); err != nil {
+			if err := xml.EscapeText(&escaped, []byte(replacement)); err != nil {
 				return err
 			}
 			span := ranges[index]
@@ -1309,12 +1343,6 @@ func rewriteCompositionSignatureMarkup(value packagePart, options compositionSig
 	}
 	output, err := applyCompositionXMLSpans(value.data, input, changes, maximum, intermediateLimit, false, b)
 	if err != nil {
-		return nil, err
-	}
-	if err := b.step(nodes); err != nil {
-		return nil, err
-	}
-	if _, err := readSignatureDefinitions(output, namespace, b.limits, b.context); err != nil {
 		return nil, err
 	}
 	return output, nil

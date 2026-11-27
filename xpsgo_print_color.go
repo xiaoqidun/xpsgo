@@ -1010,8 +1010,12 @@ func (r *Reader) PrintColorPlan(ctx context.Context, pageIndex int, defaults *Pr
 	if err != nil {
 		return nil, err
 	}
-	_, result, err := printColorPlanSettings(ctx, settings, options)
-	return result, err
+	configuration, err := printSettingsOptions(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	plan, _, err := newPrintLayoutSettings(settings, configuration).extractColorPlan()
+	return plan, err
 }
 
 // printColorPlanSettings 提取标准颜色语义，只有完整验证的设置才从内部执行视图移除
@@ -1052,7 +1056,7 @@ func (s *printLayoutSettings) extractColorPlan() (*PrintColorPlan, bool, error) 
 		output  *string
 		allowed []string
 	}{
-		{"PageColorManagement", &p.Management, []string{PrintColorManagementNone, PrintColorManagementDevice, PrintColorManagementDriver, PrintColorManagementSystem}},
+		{"PageColorManagement", &p.Management, printAllowedColorManagements},
 		{"PageDeviceColorSpaceUsage", &p.DeviceUsage, []string{PrintColorDeviceUsageMatchToDefault, PrintColorDeviceUsageOverrideDeviceDefault}},
 		{"PageBlendColorSpace", &p.BlendSpace, []string{PrintColorBlendSpaceSRGB, PrintColorBlendSpaceScRGB, PrintColorBlendSpaceICCProfile}},
 		{"PageSourceColorProfile", &p.SourceSpace, []string{PrintColorSourceSpaceNone, PrintColorSourceSpaceRGB, PrintColorSourceSpaceCMYK}},

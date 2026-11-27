@@ -396,6 +396,7 @@ func (p *Package) removePart(part string) {
 	delete(p.parts, relationKey)
 	p.unregisterName(name)
 	p.dirty[key], p.dirtyRels[key] = true, true
+	p.invalidatePartHashIndexLocked()
 }
 
 // editable 检查导入文档中受字体嵌入许可保护的部件，不把签名变化等同于禁止编辑
@@ -548,20 +549,7 @@ func (p *Package) SetPrintTicketSettings(ctx context.Context, targetPart string,
 // 入参: source 已规范化源部件
 // 返回: PrintScope 关联层级，非模型部件返回Unknown
 func (p *Package) printTicketScope(source string) PrintScope {
-	if strings.EqualFold(source, p.sequence) {
-		return PrintScopeJob
-	}
-	for _, document := range p.documents {
-		if strings.EqualFold(source, document.Part) {
-			return PrintScopeDocument
-		}
-		for _, page := range document.Pages {
-			if strings.EqualFold(source, page.Part) {
-				return PrintScopePage
-			}
-		}
-	}
-	return PrintScopeUnknown
+	return layoutPartScope(p.sequence, p.documents, source)
 }
 
 // SetSignatureDefinitions 替换固定文档的签名定义关联，保留其他关系及可复用关系ID，空列表仅移除关联
@@ -1528,8 +1516,14 @@ func (p *Package) protectImported(r *Reader, ctx context.Context) error {
 				if err != nil {
 					return err
 				}
-				if font.metrics.os2 != nil && font.metrics.os2.fsType&4 != 0 && !restricted[strings.ToLower(part)] {
-					return &PartError{Part: document.Part, Err: fmt.Errorf("%w: preview and print font lacks restricted font relationship", ErrInvalid)}
+				if font.metrics.os2 != nil {
+					rights, err := fontEmbeddingRights(font.metrics.os2)
+					if err != nil {
+						return &PartError{Part: part, Err: err}
+					}
+					if rights&4 != 0 && !restricted[strings.ToLower(part)] {
+						return &PartError{Part: document.Part, Err: fmt.Errorf("%w: preview and print font lacks restricted font relationship", ErrInvalid)}
+					}
 				}
 			}
 		}

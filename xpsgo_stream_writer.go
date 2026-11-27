@@ -19,7 +19,6 @@ import (
 	"bytes"
 	"compress/flate"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/xml"
@@ -54,6 +53,9 @@ const (
 	// StreamColorBilevel 表示1位MSB优先打包黑白二值位图（每行ceil(Width/8)字节，0为白1为黑，仅TIFF支持）
 	StreamColorBilevel
 )
+
+// streamEarlyAutoPieceBytes 定义EarlyContentTypes且未显式分片的Deflate流式图像自动分片字节数以消除尾条挂起
+const streamEarlyAutoPieceBytes = 64 << 10
 
 // StreamImageColorModel 表示逐行流式图像写入时的像素色彩模型
 type StreamImageColorModel uint8
@@ -176,6 +178,56 @@ type streamOpenPart struct {
 	closed   bool
 }
 
+// StreamJXRImageWriter 提供面向StreamWriter的推式JPEG XR逐行图像写入句柄，使用完毕须调用Close提交至底层流
+type StreamJXRImageWriter struct {
+	writer  *StreamWriter
+	part    string
+	pattern string
+	media   string
+	sink    *streamPieceSink
+	enc     *jxrgo.RowEncoder
+	closed  bool
+}
+
+// StreamPNGImageWriter 提供面向StreamWriter的推式PNG逐行图像写入句柄，使用完毕须调用Close提交至底层流
+type StreamPNGImageWriter struct {
+	writer   *StreamWriter
+	part     string
+	pattern  string
+	media    string
+	rowBytes int
+	sink     *streamPieceSink
+	enc      *pngRowEncoder
+	closed   bool
+}
+
+// streamDeferredFont 保存已预登记待后置非紧凑子集化落盘的延迟字体原始字节、字形缓存及累计用字集合
+type streamDeferredFont struct {
+	part        string
+	media       string
+	obfuscate   bool
+	data        []byte
+	usedGlyphs  map[uint32]map[uint16]bool
+	faceMetrics map[uint32]*fontMetrics
+	faceCmaps   map[uint32]*fontCmap
+	subsettable map[uint32]bool
+	flushed     bool
+}
+
+// streamPreparedFont 保存字体许可校验、可选单面提取、去重检查与部件分配后的共享准备结果
+type streamPreparedFont struct {
+	data            []byte
+	media           string
+	pattern         string
+	part            string
+	uri             string
+	digest          [32]byte
+	restrictedFaces []uint32
+	obfuscate       bool
+	isCollection    bool
+	deduplicated    bool
+}
+
 // StreamWriter 提供真前向低内存流式XPS/OpenXPS写出器，资源与页面提交即落盘ZIP流，关闭时补齐索引与元数据
 type StreamWriter struct {
 	mu                 sync.Mutex
@@ -218,6 +270,9 @@ type StreamWriter struct {
 	lateDictSources    map[string]bool
 	pendingDicts       map[string]bool
 	openPageRels       map[string]string
+	deferredFonts      map[string]*streamDeferredFont
+	signatureSpotIDs   map[string]bool
+	activeStreamPart   string
 	discardPart        string
 	partBytes          int64
 	entryCount         int
@@ -342,6 +397,8 @@ func NewStreamWriter(ctx context.Context, w io.Writer, format Format, options *S
 		lateDictSources:    make(map[string]bool),
 		pendingDicts:       make(map[string]bool),
 		openPageRels:       make(map[string]string),
+		deferredFonts:      make(map[string]*streamDeferredFont),
+		signatureSpotIDs:   make(map[string]bool),
 		copyBuf:            make([]byte, 32<<10),
 	}
 	if cfg.Compression == CompressionOptimize {
@@ -538,6 +595,9 @@ func (w *StreamWriter) EndDocument(ctx context.Context) error {
 	if len(doc.Pages) == 0 {
 		return fmt.Errorf("%w: stream document %s requires at least one page", ErrInvalid, doc.Part)
 	}
+	if err := w.flushDeferredFontsLocked(ctx, true); err != nil {
+		return w.failLocked(err)
+	}
 	if w.earlyContentTypes {
 		if err := w.flushResolvedLateSourcesLocked(ctx); err != nil {
 			return w.failLocked(err)
@@ -568,9 +628,9 @@ func (w *StreamWriter) AddFont(ctx context.Context, data []byte) (string, error)
 	return w.AddFontWithOptions(ctx, data, nil)
 }
 
-// AddFontWithOptions 按指定选项校验许可、可选去重与混淆嵌入字体并立即落盘，对TTC/OTC返回带#index的FontUri
+// AddFontWithOptions 按指定选项校验许可、可选单面提取、去重与混淆嵌入字体并立即落盘，整份TTC/OTC集合返回带#index的FontUri
 // 入参: ctx 取消Context，nil采用Background, data 原始字体字节, options 嵌入选项，nil默认混淆
-// 返回: string 字体部件URI，集合字体附加#index片段, error 格式、许可、索引、取消或写出错误
+// 返回: string 字体部件URI，保留集合封装时附加#index片段, error 格式、许可、索引、取消或写出错误
 func (w *StreamWriter) AddFontWithOptions(ctx context.Context, data []byte, options *AddFontOptions) (string, error) {
 	ctx = normalizeContext(ctx)
 	if err := checkContext(ctx); err != nil {
@@ -580,71 +640,334 @@ func (w *StreamWriter) AddFontWithOptions(ctx context.Context, data []byte, opti
 		return "", err
 	}
 	defer w.mu.Unlock()
-	obfuscate := true
-	deduplicate := false
-	collectionIndex := 0
-	if options != nil {
-		if options.Obfuscate != nil {
-			obfuscate = *options.Obfuscate
-		}
-		deduplicate = options.Deduplicate
-		collectionIndex = options.CollectionIndex
-	}
-	isCollection, isCFF, err := validateEmbeddedFontData(ctx, data, w.limits.MaxPartBytes, obfuscate, collectionIndex)
+	prep, err := w.prepareEmbeddedFontLocked(ctx, data, options, true)
 	if err != nil {
 		return "", err
 	}
-	restrictedFaces, err := collectRestrictedFontFaces(data)
-	if err != nil {
-		return "", err
+	if prep.deduplicated {
+		return prep.uri, nil
 	}
-	media := "application/vnd.ms-package.obfuscated-opentype"
-	if !obfuscate {
-		media = "application/vnd.ms-opentype"
-	}
-	digest := sha256.Sum256(data)
-	if deduplicate {
-		if existing, found := w.findHashLocked(digest, media, len(data)); found {
-			if isCollection {
-				return fmt.Sprintf("%s#%d", existing, collectionIndex), nil
-			}
-			return existing, nil
-		}
-	}
-	var part string
-	pattern := ""
-	if obfuscate {
-		part, err = w.newFontPartLocked()
-	} else {
-		ext := "ttf"
-		if isCollection {
-			ext = "ttc"
-		} else if isCFF {
-			ext = "otf"
-		}
-		pattern = "/Resources/Fonts/%d." + ext
-		part, err = w.newNameLocked(pattern, ctx)
-	}
-	if err != nil {
-		return "", err
-	}
-	payload := data
-	if obfuscate {
-		payload, err = ObfuscateFont(part, data)
+	payload := prep.data
+	if prep.obfuscate {
+		payload, err = ObfuscateFont(prep.part, prep.data)
 		if err != nil {
 			return "", err
 		}
 	}
-	if err := w.writePartLocked(ctx, part, media, payload, true); err != nil {
+	if err := w.writePartLocked(ctx, prep.part, prep.media, payload, true); err != nil {
 		return "", err
 	}
-	w.commitNameLocked(pattern, part)
-	w.recordHashLocked(digest, part, media, len(data))
-	w.recordRestrictedFaceIndicesLocked(part, restrictedFaces)
-	if isCollection {
-		return fmt.Sprintf("%s#%d", part, collectionIndex), nil
+	w.commitNameLocked(prep.pattern, prep.part)
+	w.recordHashLocked(prep.digest, prep.part, prep.media, len(prep.data))
+	w.recordRestrictedFaceIndicesLocked(prep.part, prep.restrictedFaces)
+	return prep.uri, nil
+}
+
+// RegisterDeferredFont 预登记字体以延迟至ReleaseResource后的EndDocument或Close阶段执行非紧凑子集化落盘，保持已写入页面的GID索引不变
+// 禁止嵌入、需混淆未混淆或含矢量轮廓的纯位图限制字体会立即返回ErrRestricted；带NoSubsetting标志或非子集化格式会在落盘时保留原字体字节
+// 入参: ctx 取消Context，nil采用Background, data 原始OpenType/TrueType或TTC/OTC字体字节, options 嵌入与单面提取选项，nil默认混淆
+// 返回: string 预分配的字体部件URI，保留集合封装时附加#index片段, error 格式、许可、索引、取消或资源错误
+func (w *StreamWriter) RegisterDeferredFont(ctx context.Context, data []byte, options *AddFontOptions) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
 	}
-	return part, nil
+	if err := w.lock(ctx); err != nil {
+		return "", err
+	}
+	defer w.mu.Unlock()
+	prep, err := w.prepareEmbeddedFontLocked(ctx, data, options, false)
+	if err != nil {
+		return "", err
+	}
+	if err := validatePackageMediaForFormat(w.format, prep.media); err != nil {
+		return "", err
+	}
+	if err := w.validateEarlyContentTypeLocked(prep.part, prep.media); err != nil {
+		return "", err
+	}
+	if w.registry.count() >= w.limits.MaxPartCount {
+		return "", fmt.Errorf("%w: stream package part count", ErrLimit)
+	}
+	owned := bytes.Clone(prep.data)
+	df, err := buildStreamDeferredFont(owned, prep.part, prep.media, prep.obfuscate, prep.isCollection)
+	if err != nil {
+		return "", err
+	}
+	w.registry.register(prep.part)
+	w.commitNameLocked(prep.pattern, prep.part)
+	w.recordRestrictedFaceIndicesLocked(prep.part, prep.restrictedFaces)
+	w.deferredFonts[strings.ToLower(prep.part)] = df
+	return prep.uri, nil
+}
+
+// prepareEmbeddedFontLocked 在持有互斥锁时完成字体选项解析、许可校验、可选单面提取、可选哈希去重与部件URI分配
+// 入参: ctx 已规范化取消Context, data 原始字体字节, options 嵌入选项, allowDeduplicate 是否计算内容哈希并按选项尝试去重
+// 返回: streamPreparedFont 共享字体准备结果, error 格式、许可、索引、取消或名称分配错误
+func (w *StreamWriter) prepareEmbeddedFontLocked(ctx context.Context, data []byte, options *AddFontOptions, allowDeduplicate bool) (streamPreparedFont, error) {
+	obfuscate := true
+	deduplicate := false
+	collectionIndex := 0
+	extractFace := false
+	if options != nil {
+		if options.Obfuscate != nil {
+			obfuscate = *options.Obfuscate
+		}
+		deduplicate = allowDeduplicate && options.Deduplicate
+		collectionIndex = options.CollectionIndex
+		extractFace = options.ExtractCollectionFace
+	}
+	isCollection, isCFF, err := validateEmbeddedFontDataWithPolicy(ctx, data, w.limits.MaxPartBytes, obfuscate, collectionIndex, extractFace)
+	if err != nil {
+		return streamPreparedFont{}, err
+	}
+	if isCollection && extractFace {
+		extracted, faceCFF, extractErr := extractCollectionFaceSFNT(ctx, data, uint32(collectionIndex), w.limits.MaxPartBytes)
+		if extractErr != nil {
+			return streamPreparedFont{}, extractErr
+		}
+		data = extracted
+		isCollection = false
+		isCFF = faceCFF
+	}
+	restrictedFaces, err := collectRestrictedFontFaces(data)
+	if err != nil {
+		return streamPreparedFont{}, err
+	}
+	media, pattern := embeddedFontMediaAndPattern(obfuscate, isCollection, isCFF)
+	formatURI := func(part string) string {
+		if isCollection {
+			return fmt.Sprintf("%s#%d", part, collectionIndex)
+		}
+		return part
+	}
+	var digest [32]byte
+	if allowDeduplicate {
+		digest = sha256.Sum256(data)
+		if deduplicate {
+			if existing, found := w.findHashLocked(digest, media, len(data)); found {
+				return streamPreparedFont{uri: formatURI(existing), deduplicated: true}, nil
+			}
+		}
+	}
+	var part string
+	if obfuscate {
+		part, err = w.newFontPartLocked()
+	} else {
+		part, err = w.newNameLocked(pattern, ctx)
+	}
+	if err != nil {
+		return streamPreparedFont{}, err
+	}
+	return streamPreparedFont{
+		data:            data,
+		media:           media,
+		pattern:         pattern,
+		part:            part,
+		uri:             formatURI(part),
+		digest:          digest,
+		restrictedFaces: restrictedFaces,
+		obfuscate:       obfuscate,
+		isCollection:    isCollection,
+	}, nil
+}
+
+// buildStreamDeferredFont 预解析延迟字体的各面度量、cmap与子集化资格，供AddPage增量收集引用GID
+// 入参: data 独立原始字体字节, part 预分配部件URI, media 内容类型, obfuscate 是否混淆, isCollection 是否为集合
+// 返回: *streamDeferredFont 延迟字体状态, error 字体解析错误
+func buildStreamDeferredFont(data []byte, part, media string, obfuscate, isCollection bool) (*streamDeferredFont, error) {
+	count := uint32(1)
+	if isCollection {
+		count = binary.BigEndian.Uint32(data[8:12])
+	}
+	df := &streamDeferredFont{
+		part:        part,
+		media:       media,
+		obfuscate:   obfuscate,
+		data:        data,
+		usedGlyphs:  make(map[uint32]map[uint16]bool, count),
+		faceMetrics: make(map[uint32]*fontMetrics, count),
+		faceCmaps:   make(map[uint32]*fontCmap, count),
+		subsettable: make(map[uint32]bool, count),
+	}
+	for index := uint32(0); index < count; index++ {
+		face, err := parseFontFace(data, index)
+		if err != nil {
+			return nil, err
+		}
+		metrics, err := parseFontMetrics(face)
+		if err != nil {
+			return nil, err
+		}
+		df.faceMetrics[index] = metrics
+		if cmapRaw, err := face.table("cmap"); err == nil {
+			if parsed, cmapErr := parseFontCmap(cmapRaw, uint32(metrics.numGlyphs)); cmapErr == nil {
+				df.faceCmaps[index] = parsed
+			}
+		}
+		canSubset := !isCollection && !fontIsBitmapOnly(face)
+		if canSubset && metrics.os2 != nil {
+			if rights, rErr := fontEmbeddingRights(metrics.os2); rErr != nil || rights&0x302 != 0 {
+				canSubset = false
+			}
+		}
+		if canSubset {
+			for _, unsupported := range []string{"CFF2", "fvar", "gvar", "COLR", "CPAL", "SVG "} {
+				if _, has := face.tables[unsupported]; has {
+					canSubset = false
+					break
+				}
+			}
+		}
+		df.subsettable[index] = canSubset
+	}
+	return df, nil
+}
+
+// recordDeferredFontGlyphsLocked 扫描页面或远程资源字典XML中的Glyphs元素，增量记录其对已注册延迟字体的GID使用集合
+// 入参: sourcePart 所属页面或远程字典部件URI, root XML根节点
+func (w *StreamWriter) recordDeferredFontGlyphsLocked(sourcePart string, root *xmlElement) {
+	if len(w.deferredFonts) == 0 || root == nil {
+		return
+	}
+	var walk func(*xmlElement)
+	walk = func(node *xmlElement) {
+		if node == nil {
+			return
+		}
+		if node.Name.Local == "Glyphs" && (node.Name.Space == xpsNamespace || node.Name.Space == openXPSNamespace) {
+			if rawURI, ok := node.attribute("FontUri"); ok {
+				uri, faceIdx, _, err := ParseFontURI(strings.Trim(rawURI, " \t\r\n"))
+				if err == nil {
+					if fontPart, rErr := resolvePart(sourcePart, uri); rErr == nil {
+						if df := w.deferredFonts[strings.ToLower(fontPart)]; df != nil && !df.flushed {
+							collectDeferredGlyphsFromNode(df, faceIdx, node)
+						}
+					}
+				}
+			}
+		}
+		for _, child := range node.Children {
+			walk(child)
+		}
+	}
+	walk(root)
+}
+
+// collectDeferredGlyphsFromNode 从单个Glyphs节点解析显式Indices或经UnicodeString查cmap收集目标字体面的引用GID
+// 入参: df 延迟字体状态, faceIdx 字体面索引, node Glyphs元素节点
+func collectDeferredGlyphsFromNode(df *streamDeferredFont, faceIdx uint32, node *xmlElement) {
+	metrics := df.faceMetrics[faceIdx]
+	if metrics == nil {
+		return
+	}
+	used := df.usedGlyphs[faceIdx]
+	if used == nil {
+		used = map[uint16]bool{0: true}
+		df.usedGlyphs[faceIdx] = used
+	}
+	text, _ := node.attribute("UnicodeString")
+	if strings.HasPrefix(text, "{}") {
+		text = text[2:]
+	}
+	var indices []GlyphCluster
+	if rawIndices, has := node.attribute("Indices"); has && strings.TrimSpace(rawIndices) != "" {
+		if parsed, err := ParseGlyphIndices(rawIndices); err == nil {
+			indices = parsed
+		}
+	}
+	g := &Glyphs{Text: text, Indices: indices, FontRenderingEmSize: 1}
+	cmap := df.faceCmaps[faceIdx]
+	var lookup func(rune) (uint16, error)
+	if cmap != nil {
+		lookup = cmap.unicodeGlyph
+	}
+	if _, err := glyphRunCount(g, 1<<20); err == nil {
+		_ = walkGlyphRun(g, func(entry GlyphIndex, r rune, _, _, _ int) error {
+			gid, gErr := glyphRunIndex(entry, r, metrics.numGlyphs, lookup)
+			if gErr == nil {
+				used[gid] = true
+			}
+			return nil
+		})
+		return
+	}
+	for _, cluster := range indices {
+		for _, entry := range cluster.Glyphs {
+			if entry.HasIndex && entry.Index < metrics.numGlyphs {
+				used[entry.Index] = true
+			}
+		}
+	}
+	if cmap != nil {
+		for _, r := range text {
+			if gid, err := cmap.unicodeGlyph(r); err == nil && gid < metrics.numGlyphs {
+				used[gid] = true
+			}
+		}
+	}
+}
+
+// flushDeferredFontsLocked 将符合条件的延迟字体执行非紧凑子集化并落盘写入底层ZIP，随后立即释放原始字体内存
+// 入参: ctx 已规范化取消Context, releasedOnly 为true时仅落盘已显式ReleaseResource释放的延迟字体
+// 返回: error 子集化、混淆、预算、取消或写出错误
+func (w *StreamWriter) flushDeferredFontsLocked(ctx context.Context, releasedOnly bool) error {
+	if len(w.deferredFonts) == 0 {
+		return nil
+	}
+	for _, key := range slices.Sorted(maps.Keys(w.deferredFonts)) {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		df := w.deferredFonts[key]
+		if df == nil || df.flushed {
+			continue
+		}
+		if releasedOnly {
+			if _, released := w.releasedAfter[key]; !released {
+				continue
+			}
+		}
+		outBytes := df.data
+		if df.subsettable[0] {
+			glyphSet := df.usedGlyphs[0]
+			glyphs := make([]uint16, 0, max(1, len(glyphSet)))
+			if len(glyphSet) == 0 {
+				glyphs = append(glyphs, 0)
+			} else {
+				for _, gid := range slices.Sorted(maps.Keys(glyphSet)) {
+					glyphs = append(glyphs, gid)
+				}
+			}
+			subset, subErr := SubsetFont(ctx, df.data, glyphs, &FontSubsetOptions{
+				MaxBytes:         w.limits.MaxPartBytes,
+				AllowMissingCmap: true,
+				CompactGIDs:      false,
+			})
+			if subErr == nil && len(subset) > 0 && len(subset) <= len(outBytes) {
+				outBytes = subset
+			} else if subErr != nil && ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
+		payload := outBytes
+		if df.obfuscate {
+			obf, err := ObfuscateFont(df.part, outBytes)
+			if err != nil {
+				return err
+			}
+			payload = obf
+		}
+		if err := w.writePartLocked(ctx, df.part, df.media, payload, true); err != nil {
+			return err
+		}
+		df.flushed = true
+		df.data = nil
+		df.faceMetrics = nil
+		df.faceCmaps = nil
+		df.usedGlyphs = nil
+	}
+	return nil
 }
 
 // recordRestrictedFaceIndicesLocked 按预扫描结果登记OS/2带有预览与打印限制标志的面索引
@@ -669,7 +992,7 @@ func (w *StreamWriter) recordFontFaceGuardsLocked(part string, needObf, prohibit
 }
 
 // validateStreamAddedFontPart 校验经AddPart直接写入的字体封装、全部面OS/2表及嵌入许可
-// 单面字体严格复用validateEmbeddedFontData立即拦截禁止嵌入与未混淆限制，多面TTC逐面核验结构并放行至少含一合法可用面的集合
+// 单面字体严格复用validateEmbeddedFontDataWithPolicy立即拦截禁止嵌入与未混淆限制，多面TTC逐面核验结构并放行至少含一合法可用面的集合
 // 入参: ctx 已规范化取消Context, data 原始未混淆字体字节, maxBytes 字节上限, obfuscated 是否以混淆媒体类型写入
 // 返回: []uint32 需标RestrictedFont的面索引, []uint32 未混淆时需混淆的面索引, []uint32 禁止嵌入的面索引, error 封装、许可、预算或取消错误
 func validateStreamAddedFontPart(ctx context.Context, data []byte, maxBytes int64, obfuscated bool) ([]uint32, []uint32, []uint32, error) {
@@ -687,7 +1010,7 @@ func validateStreamAddedFontPart(ctx context.Context, data []byte, maxBytes int6
 		return nil, nil, nil, err
 	}
 	if !firstFace.collection {
-		if _, _, err := validateEmbeddedFontData(ctx, data, maxBytes, obfuscated, 0); err != nil {
+		if _, _, err := validateEmbeddedFontDataWithPolicy(ctx, data, maxBytes, obfuscated, 0, false); err != nil {
 			return nil, nil, nil, err
 		}
 		restricted, err := collectRestrictedFontFaces(data)
@@ -723,7 +1046,7 @@ func validateStreamAddedFontPart(ctx context.Context, data []byte, maxBytes int6
 		if rights&4 != 0 {
 			restricted = append(restricted, index)
 		}
-		if rights&2 != 0 {
+		if rights&2 != 0 || rights&0x200 != 0 && fontFaceHasVectorOutline(face) {
 			prohibited = append(prohibited, index)
 			continue
 		}
@@ -906,35 +1229,7 @@ func (w *StreamWriter) AddPNGFromRows(ctx context.Context, options StreamImageRo
 		return "", err
 	}
 	sink := &streamPieceSink{writer: w, ctx: ctx, part: part, maxBytes: maxPart}
-	enc, err := newPNGRowEncoder(ctx, sink, options.Width, options.Height, uint8(bitDepth), colorType, dpix, dpiy, options.ICCProfile)
-	if err != nil {
-		if sink.touched {
-			w.failed = err
-		}
-		return "", err
-	}
-	rowBuf := make([]byte, rowBytes)
-	for y := range options.Height {
-		if err := checkContext(ctx); err != nil {
-			if sink.touched {
-				w.failed = err
-			}
-			return "", err
-		}
-		if err := readRow(y, rowBuf); err != nil {
-			if sink.touched {
-				w.failed = err
-			}
-			return "", err
-		}
-		if err := enc.writeRow(ctx, rowBuf); err != nil {
-			if sink.touched {
-				w.failed = err
-			}
-			return "", err
-		}
-	}
-	if err := enc.close(ctx); err != nil {
+	if err := encodePNGFromValidatedRowsTo(ctx, sink, options, dpix, dpiy, bitDepth, colorType, rowBytes, readRow); err != nil {
 		if sink.touched {
 			w.failed = err
 		}
@@ -952,7 +1247,7 @@ func (w *StreamWriter) AddPNGFromRows(ctx context.Context, options StreamImageRo
 }
 
 // AddTIFFFromRows 通过逐行扫描回调将图像按多Strip编码为Little-Endian Baseline TIFF并写入底层ZIP流
-// 无压缩模式采用恒定单条带内存直接前向流式落盘，压缩模式逐条带压缩并严格受MaxPartBytes与MaxPackageBytes约束，落盘前失败不毒化写出器
+// 无压缩模式采用恒定单条带内存直接前向流式落盘，压缩模式逐条带压缩并直写流式通道，落盘前失败不毒化写出器
 // 入参: ctx 取消Context，nil采用Background, options 图像尺寸、位深、色彩模型、压缩方式、分辨率与ICC配置, readRow 按零基行号填充单行原始像素的回调，16位样本按大端字节序
 // 返回: string 图像部件URI, error 参数、回调、编码、预算、取消或写出错误
 func (w *StreamWriter) AddTIFFFromRows(ctx context.Context, options StreamImageRowOptions, readRow func(y int, dst []byte) error) (string, error) {
@@ -977,174 +1272,8 @@ func (w *StreamWriter) AddTIFFFromRows(ctx context.Context, options StreamImageR
 	if err != nil {
 		return "", err
 	}
-	rowsPerStrip, err := tiffRowsPerStrip(rowBytes, spec.height, maxPart)
-	if err != nil {
-		return "", err
-	}
-	spec.rowsPerStrip = rowsPerStrip
-	stripCount := (spec.height + rowsPerStrip - 1) / rowsPerStrip
-	rawBuf := make([]byte, rowsPerStrip*rowBytes)
-	fillStrip := func(startY, rows int) ([]byte, error) {
-		chunk := rawBuf[:rows*rowBytes]
-		for row := range rows {
-			if err := checkContext(ctx); err != nil {
-				return nil, err
-			}
-			dst := chunk[row*rowBytes : (row+1)*rowBytes]
-			if err := readRow(startY+row, dst); err != nil {
-				return nil, err
-			}
-			if spec.bps == 16 {
-				swapUint16Bytes(dst)
-			}
-		}
-		return chunk, nil
-	}
 	sink := &streamPieceSink{writer: w, ctx: ctx, part: part, maxBytes: maxPart}
-	if spec.compression == TIFFCompressionNone {
-		if int64(spec.height) > maxPart/int64(rowBytes) {
-			return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
-		}
-		offsets := make([]uint32, stripCount)
-		counts := make([]uint32, stripCount)
-		cursor := int64(8)
-		for i := range stripCount {
-			rows := min(rowsPerStrip, spec.height-i*rowsPerStrip)
-			n := int64(rows * rowBytes)
-			if cursor+n > maxPart || cursor+n > math.MaxUint32 {
-				return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
-			}
-			offsets[i] = uint32(cursor)
-			counts[i] = uint32(n)
-			cursor += n
-		}
-		pad := cursor & 1
-		ifdOffset := cursor + pad
-		if ifdOffset > math.MaxUint32 {
-			return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
-		}
-		ifdBytes, err := encodeTIFFIFD(spec, offsets, counts, uint32(ifdOffset))
-		if err != nil {
-			return "", err
-		}
-		if ifdOffset+int64(len(ifdBytes)) > maxPart || ifdOffset+int64(len(ifdBytes)) > math.MaxUint32 {
-			return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
-		}
-		var header [8]byte
-		copy(header[0:2], "II")
-		binary.LittleEndian.PutUint16(header[2:4], 42)
-		binary.LittleEndian.PutUint32(header[4:8], uint32(ifdOffset))
-		if _, err := sink.Write(header[:]); err != nil {
-			if sink.touched {
-				w.failed = err
-			}
-			return "", err
-		}
-		for i := range stripCount {
-			rows := min(rowsPerStrip, spec.height-i*rowsPerStrip)
-			chunk, err := fillStrip(i*rowsPerStrip, rows)
-			if err != nil {
-				if sink.touched {
-					w.failed = err
-				}
-				return "", err
-			}
-			if _, err := sink.Write(chunk); err != nil {
-				if sink.touched {
-					w.failed = err
-				}
-				return "", err
-			}
-		}
-		if pad != 0 {
-			if _, err := sink.Write([]byte{0}); err != nil {
-				if sink.touched {
-					w.failed = err
-				}
-				return "", err
-			}
-		}
-		if _, err := sink.Write(ifdBytes); err != nil {
-			if sink.touched {
-				w.failed = err
-			}
-			return "", err
-		}
-		if err := sink.finish(); err != nil {
-			if sink.touched {
-				w.failed = err
-			}
-			return "", err
-		}
-		w.registerPartMetaLocked(part, media, sink.written)
-		w.commitNameLocked(pattern, part)
-		return part, nil
-	}
-	strips := make([][]byte, 0, stripCount)
-	offsets := make([]uint32, stripCount)
-	counts := make([]uint32, stripCount)
-	cursor := int64(8)
-	for i := range stripCount {
-		rows := min(rowsPerStrip, spec.height-i*rowsPerStrip)
-		chunk, err := fillStrip(i*rowsPerStrip, rows)
-		if err != nil {
-			return "", err
-		}
-		remaining := maxPart - cursor
-		if remaining <= 0 {
-			return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
-		}
-		encoded, err := encodeTIFFStripData(ctx, chunk, spec.width, rows, rowBytes, spec.compression, remaining)
-		if err != nil {
-			return "", err
-		}
-		if int64(len(encoded)) > math.MaxUint32 || cursor+int64(len(encoded)) > maxPart || cursor+int64(len(encoded)) > math.MaxUint32 {
-			return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
-		}
-		offsets[i] = uint32(cursor)
-		counts[i] = uint32(len(encoded))
-		cursor += int64(len(encoded))
-		strips = append(strips, encoded)
-	}
-	pad := cursor & 1
-	ifdOffset := cursor + pad
-	if ifdOffset > math.MaxUint32 {
-		return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
-	}
-	ifdBytes, err := encodeTIFFIFD(spec, offsets, counts, uint32(ifdOffset))
-	if err != nil {
-		return "", err
-	}
-	if ifdOffset+int64(len(ifdBytes)) > maxPart || ifdOffset+int64(len(ifdBytes)) > math.MaxUint32 {
-		return "", fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
-	}
-	var header [8]byte
-	copy(header[0:2], "II")
-	binary.LittleEndian.PutUint16(header[2:4], 42)
-	binary.LittleEndian.PutUint32(header[4:8], uint32(ifdOffset))
-	if _, err := sink.Write(header[:]); err != nil {
-		if sink.touched {
-			w.failed = err
-		}
-		return "", err
-	}
-	for _, strip := range strips {
-		if _, err := sink.Write(strip); err != nil {
-			if sink.touched {
-				w.failed = err
-			}
-			return "", err
-		}
-	}
-	if pad != 0 {
-		if _, err := sink.Write([]byte{0}); err != nil {
-			if sink.touched {
-				w.failed = err
-			}
-			return "", err
-		}
-	}
-	if _, err := sink.Write(ifdBytes); err != nil {
+	if err := encodeTIFFFromValidatedRowsTo(ctx, sink, spec, rowBytes, maxPart, readRow); err != nil {
 		if sink.touched {
 			w.failed = err
 		}
@@ -1159,6 +1288,538 @@ func (w *StreamWriter) AddTIFFFromRows(ctx context.Context, options StreamImageR
 	w.registerPartMetaLocked(part, media, sink.written)
 	w.commitNameLocked(pattern, part)
 	return part, nil
+}
+
+// BeginJXRImage 打开一个推式JPEG XR逐行图像写入句柄并直接对接jxrgo.NewRowEncoder写入底层ZIP流
+// 句柄打开期间不得交错调用宿主StreamWriter的其他写方法，全部像素行写入后须调用Close提交部件元数据
+// 入参: ctx 取消Context，nil采用Background, info JPEG XR图像头信息, options JPEG XR编码选项，nil采用默认值
+// 返回: *StreamJXRImageWriter 推式行流图像写入句柄, error 参数、预算、取消或初始化错误
+func (w *StreamWriter) BeginJXRImage(ctx context.Context, info jxrgo.Info, options *jxrgo.EncodeOptions) (*StreamJXRImageWriter, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := w.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer w.mu.Unlock()
+	if err := validateImageRowsInfoLimits(info, w.maxImagePixels); err != nil {
+		return nil, err
+	}
+	const pattern = "/Resources/Images/%d.jxr"
+	const media = "image/vnd.ms-photo"
+	part, maxPart, err := w.prepareStreamImagePartLocked(ctx, pattern, media)
+	if err != nil {
+		return nil, err
+	}
+	var cfg jxrgo.EncodeOptions
+	if options != nil {
+		cfg = *options
+	}
+	if cfg.MaxOutputBytes == 0 || cfg.MaxOutputBytes > uint64(maxPart) {
+		cfg.MaxOutputBytes = uint64(maxPart)
+	}
+	if cfg.Limits.MaxPixels == 0 || cfg.Limits.MaxPixels > w.maxImagePixels {
+		cfg.Limits.MaxPixels = w.maxImagePixels
+	}
+	sink := &streamPieceSink{writer: w, ctx: ctx, part: part, maxBytes: maxPart}
+	enc, err := jxrgo.NewRowEncoder(ctx, sink, info, &cfg)
+	if err != nil {
+		if sink.touched {
+			w.failed = err
+		}
+		return nil, err
+	}
+	sink.ctx = nil
+	w.activeStreamPart = part
+	return &StreamJXRImageWriter{writer: w, part: part, pattern: pattern, media: media, sink: sink, enc: enc}, nil
+}
+
+// Part 返回推式JPEG XR图像写入句柄对应的规范部件URI
+// 返回: string 图像部件URI
+func (h *StreamJXRImageWriter) Part() string {
+	if h == nil {
+		return ""
+	}
+	return h.part
+}
+
+// Info 返回底层JPEG XR行编码器的目标图像头信息
+// 返回: jxrgo.Info 图像头信息
+func (h *StreamJXRImageWriter) Info() jxrgo.Info {
+	if h == nil || h.enc == nil {
+		return jxrgo.Info{}
+	}
+	return h.enc.Info()
+}
+
+// RowStep 返回每次行写入推进的像素行数
+// 返回: int 单步推进像素行数
+func (h *StreamJXRImageWriter) RowStep() int {
+	if h == nil || h.enc == nil {
+		return 0
+	}
+	return h.enc.RowStep()
+}
+
+// WrittenRows 返回已提交给底层JPEG XR编码器的累计像素行数
+// 返回: int 已写入像素行数
+func (h *StreamJXRImageWriter) WrittenRows() int {
+	if h == nil || h.enc == nil {
+		return 0
+	}
+	return h.enc.WrittenRows()
+}
+
+// runWrite 在互斥锁保护下为推式JPEG XR句柄绑定本次调用Context并执行编码写入操作
+// 入参: ctx 取消Context，nil采用Background, fn 实际调用RowEncoder的闭包
+// 返回: error 状态、编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) runWrite(ctx context.Context, fn func(context.Context) error) error {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if h == nil || h.writer == nil || h.enc == nil {
+		return fmt.Errorf("%w: nil stream JXR image writer", ErrInvalid)
+	}
+	h.writer.mu.Lock()
+	defer h.writer.mu.Unlock()
+	if h.closed || h.writer.closed {
+		return ErrClosed
+	}
+	if h.writer.failed != nil {
+		return h.writer.failed
+	}
+	h.sink.ctx = ctx
+	h.writer.counted.context = ctx
+	h.writer.archive.context = ctx
+	defer func() {
+		h.sink.ctx = nil
+	}()
+	if err := fn(ctx); err != nil {
+		if h.sink.touched {
+			h.writer.failed = err
+		}
+		return err
+	}
+	return nil
+}
+
+// WriteRow 向推式JPEG XR图像句柄写入一行或一个步长的通用栅格像素
+// 入参: ctx 取消Context，nil采用Background, src 源栅格行缓冲
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) WriteRow(ctx context.Context, src *jxrgo.Raster) error {
+	return h.runWrite(ctx, func(c context.Context) error { return h.enc.WriteRow(c, src) })
+}
+
+// WriteRowNRGBA 向推式JPEG XR图像句柄写入一行8位非预乘RGBA像素
+// 入参: ctx 取消Context，nil采用Background, src 行像素字节切片
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) WriteRowNRGBA(ctx context.Context, src []byte) error {
+	return h.runWrite(ctx, func(c context.Context) error { return h.enc.WriteRowNRGBA(c, src) })
+}
+
+// WriteRowNRGBA64 向推式JPEG XR图像句柄写入一行16位大端非预乘RGBA像素
+// 入参: ctx 取消Context，nil采用Background, src 行像素字节切片
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) WriteRowNRGBA64(ctx context.Context, src []byte) error {
+	return h.runWrite(ctx, func(c context.Context) error { return h.enc.WriteRowNRGBA64(c, src) })
+}
+
+// WriteRowGray 向推式JPEG XR图像句柄写入一行8位灰度像素
+// 入参: ctx 取消Context，nil采用Background, src 行像素字节切片
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) WriteRowGray(ctx context.Context, src []byte) error {
+	return h.runWrite(ctx, func(c context.Context) error { return h.enc.WriteRowGray(c, src) })
+}
+
+// WriteRowGray16 向推式JPEG XR图像句柄写入一行16位大端灰度像素
+// 入参: ctx 取消Context，nil采用Background, src 行像素字节切片
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) WriteRowGray16(ctx context.Context, src []byte) error {
+	return h.runWrite(ctx, func(c context.Context) error { return h.enc.WriteRowGray16(c, src) })
+}
+
+// WriteRowCMYK 向推式JPEG XR图像句柄写入一行8位CMYK像素
+// 入参: ctx 取消Context，nil采用Background, src 行像素字节切片
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) WriteRowCMYK(ctx context.Context, src []byte) error {
+	return h.runWrite(ctx, func(c context.Context) error { return h.enc.WriteRowCMYK(c, src) })
+}
+
+// WriteRowCMYKAlpha 向推式JPEG XR图像句柄写入一行8位CMYK加分离Alpha像素
+// 入参: ctx 取消Context，nil采用Background, cmyk 行CMYK字节切片, alpha 行Alpha字节切片
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) WriteRowCMYKAlpha(ctx context.Context, cmyk, alpha []byte) error {
+	return h.runWrite(ctx, func(c context.Context) error { return h.enc.WriteRowCMYKAlpha(c, cmyk, alpha) })
+}
+
+// WriteRowRGB 向推式JPEG XR图像句柄写入一行24位紧凑RGB像素
+// 入参: ctx 取消Context，nil采用Background, src 行像素字节切片
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) WriteRowRGB(ctx context.Context, src []byte) error {
+	return h.runWrite(ctx, func(c context.Context) error { return h.enc.WriteRowRGB(c, src) })
+}
+
+// WriteRowRGBA 向推式JPEG XR图像句柄写入一行8位预乘RGBA像素
+// 入参: ctx 取消Context，nil采用Background, src 行像素字节切片
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) WriteRowRGBA(ctx context.Context, src []byte) error {
+	return h.runWrite(ctx, func(c context.Context) error { return h.enc.WriteRowRGBA(c, src) })
+}
+
+// WriteRowRGBA64 向推式JPEG XR图像句柄写入一行16位大端预乘RGBA像素
+// 入参: ctx 取消Context，nil采用Background, src 行像素字节切片
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) WriteRowRGBA64(ctx context.Context, src []byte) error {
+	return h.runWrite(ctx, func(c context.Context) error { return h.enc.WriteRowRGBA64(c, src) })
+}
+
+// WriteRowBlackWhite 向推式JPEG XR图像句柄写入一行1位MSB优先黑白像素
+// 入参: ctx 取消Context，nil采用Background, src 打包位图行字节切片
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) WriteRowBlackWhite(ctx context.Context, src []byte) error {
+	return h.runWrite(ctx, func(c context.Context) error { return h.enc.WriteRowBlackWhite(c, src) })
+}
+
+// WriteRowCMYK16 向推式JPEG XR图像句柄写入一行16位大端CMYK像素
+// 入参: ctx 取消Context，nil采用Background, src 行像素字节切片
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) WriteRowCMYK16(ctx context.Context, src []byte) error {
+	return h.runWrite(ctx, func(c context.Context) error { return h.enc.WriteRowCMYK16(c, src) })
+}
+
+// WriteRowCMYK16Alpha 向推式JPEG XR图像句柄写入一行16位大端CMYK加分离16位Alpha像素
+// 入参: ctx 取消Context，nil采用Background, cmyk 行CMYK字节切片, alpha 行Alpha字节切片
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) WriteRowCMYK16Alpha(ctx context.Context, cmyk, alpha []byte) error {
+	return h.runWrite(ctx, func(c context.Context) error { return h.enc.WriteRowCMYK16Alpha(c, cmyk, alpha) })
+}
+
+// Close 幂等完成JPEG XR推式编码器刷写、闭合ZIP分片通道并向宿主StreamWriter提交部件元数据
+// 入参: ctx 取消Context，nil采用Background
+// 返回: error 编码、预算、取消或写出错误
+func (h *StreamJXRImageWriter) Close(ctx context.Context) error {
+	ctx = normalizeContext(ctx)
+	if h == nil || h.writer == nil {
+		return fmt.Errorf("%w: nil stream JXR image writer", ErrInvalid)
+	}
+	h.writer.mu.Lock()
+	defer h.writer.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closed = true
+	if h.writer.activeStreamPart == h.part {
+		h.writer.activeStreamPart = ""
+	}
+	if h.writer.closed {
+		return ErrClosed
+	}
+	if h.writer.failed != nil {
+		return h.writer.failed
+	}
+	h.sink.ctx = ctx
+	h.writer.counted.context = ctx
+	h.writer.archive.context = ctx
+	defer func() {
+		h.sink.ctx = nil
+	}()
+	if err := h.enc.CloseContext(ctx); err != nil {
+		h.enc = nil
+		if h.sink.touched {
+			h.writer.failed = err
+		}
+		return err
+	}
+	h.enc = nil
+	if err := h.sink.finish(); err != nil {
+		if h.sink.touched {
+			h.writer.failed = err
+		}
+		return err
+	}
+	h.writer.registerPartMetaLocked(h.part, h.media, h.sink.written)
+	h.writer.commitNameLocked(h.pattern, h.part)
+	return nil
+}
+
+// Abort 幂等中止推式JPEG XR图像写入句柄并释放活跃锁；未触碰底层ZIP流时不毒化宿主StreamWriter，已落盘部分数据时标记宿主失败
+// 返回: error 恒返回nil
+func (h *StreamJXRImageWriter) Abort() error {
+	if h == nil || h.writer == nil {
+		return nil
+	}
+	h.writer.mu.Lock()
+	defer h.writer.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closed = true
+	if h.writer.activeStreamPart == h.part {
+		h.writer.activeStreamPart = ""
+	}
+	h.enc = nil
+	if h.sink != nil {
+		h.sink.buf.Reset()
+		h.sink.finalized = true
+		if h.sink.touched {
+			h.writer.failLocked(fmt.Errorf("%w: streaming JXR image %s aborted after partial write", ErrInvalid, h.part))
+		}
+	}
+	return nil
+}
+
+// BeginPNGImage 打开一个推式PNG逐行图像写入句柄并直接流式写入底层ZIP流
+// 句柄打开期间不得交错调用宿主StreamWriter的其他写方法，全部像素行写入后须调用Close提交部件元数据
+// 入参: ctx 取消Context，nil采用Background, options PNG尺寸、位深、色彩模型、分辨率与ICC配置
+// 返回: *StreamPNGImageWriter 推式PNG图像写入句柄, error 参数、预算、取消或初始化错误
+func (w *StreamWriter) BeginPNGImage(ctx context.Context, options StreamImageRowOptions) (*StreamPNGImageWriter, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := w.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer w.mu.Unlock()
+	dpix, dpiy, bitDepth, colorType, rowBytes, err := validateStreamPNGRowOptions(ctx, options, w.maxImagePixels)
+	if err != nil {
+		return nil, err
+	}
+	const pattern = "/Resources/Images/%d.png"
+	const media = "image/png"
+	part, maxPart, err := w.prepareStreamImagePartLocked(ctx, pattern, media)
+	if err != nil {
+		return nil, err
+	}
+	sink := &streamPieceSink{writer: w, ctx: ctx, part: part, maxBytes: maxPart}
+	enc, err := newPNGRowEncoder(ctx, sink, options.Width, options.Height, uint8(bitDepth), colorType, dpix, dpiy, options.ICCProfile)
+	if err != nil {
+		if sink.touched {
+			w.failed = err
+		}
+		return nil, err
+	}
+	sink.ctx = nil
+	w.activeStreamPart = part
+	return &StreamPNGImageWriter{writer: w, part: part, pattern: pattern, media: media, rowBytes: rowBytes, sink: sink, enc: enc}, nil
+}
+
+// Part 返回推式PNG图像写入句柄对应的规范部件URI
+// 返回: string 图像部件URI
+func (h *StreamPNGImageWriter) Part() string {
+	if h == nil {
+		return ""
+	}
+	return h.part
+}
+
+// RowBytes 返回单扫描行期望的原始像素字节长度
+// 返回: int 单行字节长度
+func (h *StreamPNGImageWriter) RowBytes() int {
+	if h == nil {
+		return 0
+	}
+	return h.rowBytes
+}
+
+// WrittenRows 返回已写入的累计像素行数
+// 返回: int 已写入像素行数
+func (h *StreamPNGImageWriter) WrittenRows() int {
+	if h == nil || h.enc == nil {
+		return 0
+	}
+	return h.enc.rows
+}
+
+// WriteRow 向推式PNG图像句柄写入单行原始像素数据，16位样本须按大端字节序排列
+// 入参: ctx 取消Context，nil采用Background, row 单行原始像素字节切片
+// 返回: error 行长、状态、预算、取消或写出错误
+func (h *StreamPNGImageWriter) WriteRow(ctx context.Context, row []byte) error {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if h == nil || h.writer == nil || h.enc == nil {
+		return fmt.Errorf("%w: nil stream PNG image writer", ErrInvalid)
+	}
+	h.writer.mu.Lock()
+	defer h.writer.mu.Unlock()
+	if h.closed || h.writer.closed {
+		return ErrClosed
+	}
+	if h.writer.failed != nil {
+		return h.writer.failed
+	}
+	h.sink.ctx = ctx
+	h.writer.counted.context = ctx
+	h.writer.archive.context = ctx
+	defer func() {
+		h.sink.ctx = nil
+	}()
+	if err := h.enc.writeRow(ctx, row); err != nil {
+		if h.sink.touched {
+			h.writer.failed = err
+		}
+		return err
+	}
+	return nil
+}
+
+// Close 幂等完成PNG推式编码器刷写、闭合ZIP分片通道并向宿主StreamWriter提交部件元数据
+// 入参: ctx 取消Context，nil采用Background
+// 返回: error 行数不足、预算、取消或写出错误
+func (h *StreamPNGImageWriter) Close(ctx context.Context) error {
+	ctx = normalizeContext(ctx)
+	if h == nil || h.writer == nil {
+		return fmt.Errorf("%w: nil stream PNG image writer", ErrInvalid)
+	}
+	h.writer.mu.Lock()
+	defer h.writer.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closed = true
+	if h.writer.activeStreamPart == h.part {
+		h.writer.activeStreamPart = ""
+	}
+	if h.writer.closed {
+		return ErrClosed
+	}
+	if h.writer.failed != nil {
+		return h.writer.failed
+	}
+	h.sink.ctx = ctx
+	h.writer.counted.context = ctx
+	h.writer.archive.context = ctx
+	defer func() {
+		h.sink.ctx = nil
+	}()
+	if err := h.enc.close(ctx); err != nil {
+		h.enc = nil
+		if h.sink.touched {
+			h.writer.failed = err
+		}
+		return err
+	}
+	h.enc = nil
+	if err := h.sink.finish(); err != nil {
+		if h.sink.touched {
+			h.writer.failed = err
+		}
+		return err
+	}
+	h.writer.registerPartMetaLocked(h.part, h.media, h.sink.written)
+	h.writer.commitNameLocked(h.pattern, h.part)
+	return nil
+}
+
+// Abort 幂等中止推式PNG图像写入句柄并释放活跃锁；未触碰底层ZIP流时不毒化宿主StreamWriter，已落盘部分数据时标记宿主失败
+// 返回: error 恒返回nil
+func (h *StreamPNGImageWriter) Abort() error {
+	if h == nil || h.writer == nil {
+		return nil
+	}
+	h.writer.mu.Lock()
+	defer h.writer.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closed = true
+	if h.writer.activeStreamPart == h.part {
+		h.writer.activeStreamPart = ""
+	}
+	if h.enc != nil {
+		h.enc.closed = true
+		h.enc = nil
+	}
+	if h.sink != nil {
+		h.sink.buf.Reset()
+		h.sink.finalized = true
+		if h.sink.touched {
+			h.writer.failLocked(fmt.Errorf("%w: streaming PNG image %s aborted after partial write", ErrInvalid, h.part))
+		}
+	}
+	return nil
+}
+
+// AddImageFromReader 读取头部魔数识别图像格式后以恒定内存直通流式拷贝至底层ZIP，不整图缓存
+// 入参: ctx 取消Context，nil采用Background, r 原始图像字节流
+// 返回: string 图像部件URI, error 格式、读取、预算、取消或写出错误
+func (w *StreamWriter) AddImageFromReader(ctx context.Context, r io.Reader) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	if r == nil {
+		return "", fmt.Errorf("%w: nil image reader", ErrInvalid)
+	}
+	if err := w.lock(ctx); err != nil {
+		return "", err
+	}
+	defer w.mu.Unlock()
+	var head [8]byte
+	n, err := io.ReadFull(r, head[:])
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return "", err
+	}
+	if n == 0 {
+		return "", fmt.Errorf("%w: empty image data", ErrInvalid)
+	}
+	media, ext, err := detectImageFormat(head[:n])
+	if err != nil {
+		return "", err
+	}
+	pattern := "/Resources/Images/%d." + ext
+	part, maxPart, err := w.prepareStreamImagePartLocked(ctx, pattern, media)
+	if err != nil {
+		return "", err
+	}
+	sink := &streamPieceSink{writer: w, ctx: ctx, part: part, maxBytes: maxPart}
+	if err := w.copyStreamToSinkLocked(ctx, sink, head[:n], r); err != nil {
+		if sink.touched {
+			w.failed = err
+		}
+		return "", err
+	}
+	if err := sink.finish(); err != nil {
+		if sink.touched {
+			w.failed = err
+		}
+		return "", err
+	}
+	w.registerPartMetaLocked(part, media, sink.written)
+	w.commitNameLocked(pattern, part)
+	return part, nil
+}
+
+// copyStreamToSinkLocked 以固定缓冲先写前缀再循环读取输入流拷贝至streamPieceSink，严格执行取消与预算检查
+// 入参: ctx 已规范化取消Context, sink 流式分片输出通道, prefix 已预读前缀字节, r 剩余输入流
+// 返回: error 读取、预算、取消或写出错误
+func (w *StreamWriter) copyStreamToSinkLocked(ctx context.Context, sink *streamPieceSink, prefix []byte, r io.Reader) error {
+	if len(prefix) != 0 {
+		if _, err := sink.Write(prefix); err != nil {
+			return err
+		}
+	}
+	for {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		n, readErr := r.Read(w.copyBuf)
+		if n > 0 {
+			if _, err := sink.Write(w.copyBuf[:n]); err != nil {
+				return err
+			}
+		}
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
 }
 
 // prepareStreamImagePartLocked 为流式图像写入预检名称、前置内容类型表、逻辑部件数与剩余字节预算
@@ -1404,6 +2065,13 @@ func (w *StreamWriter) writeDeduplicatedResourceLocked(ctx context.Context, patt
 // 入参: ctx 取消Context，nil采用Background, dict 资源字典模型，Source必须为空
 // 返回: string 资源字典部件URI, error 模型、编码、预算、取消或写出错误
 func (w *StreamWriter) AddResourceDictionary(ctx context.Context, dict *ResourceDictionary) (string, error) {
+	return w.AddResourceDictionaryWithOptions(ctx, dict, false)
+}
+
+// AddResourceDictionaryWithOptions 编码共享远程资源字典并支持按内容摘要去重，复用编码树记录依赖、导航引用与延迟字体用字
+// 入参: ctx 取消Context，nil采用Background, dict 资源字典模型，Source必须为空, deduplicate 是否按内容摘要复用已落盘的相同字典
+// 返回: string 资源字典部件URI, error 模型、编码、预算、取消或写出错误
+func (w *StreamWriter) AddResourceDictionaryWithOptions(ctx context.Context, dict *ResourceDictionary, deduplicate bool) (string, error) {
 	ctx = normalizeContext(ctx)
 	if err := checkContext(ctx); err != nil {
 		return "", err
@@ -1416,11 +2084,18 @@ func (w *StreamWriter) AddResourceDictionary(ctx context.Context, dict *Resource
 	}
 	defer w.mu.Unlock()
 	const pattern = "/Resources/Dictionaries/%d.dict"
-	part, err := w.newNameLocked(pattern, ctx)
+	const probePart = "/Resources/Dictionaries/0.dict"
+	root, data, err := encodeResourceDictionaryTree(ctx, dict, &EncodeOptions{Format: w.format, Limits: w.limits, Part: probePart, Compact: w.compact})
 	if err != nil {
 		return "", err
 	}
-	root, data, err := encodeResourceDictionaryTree(ctx, dict, &EncodeOptions{Format: w.format, Limits: w.limits, Part: part, Compact: w.compact})
+	digest := sha256.Sum256(data)
+	if deduplicate {
+		if existing, found := w.findHashLocked(digest, resourceDictionaryContentType, len(data)); found {
+			return existing, nil
+		}
+	}
+	part, err := w.newNameLocked(pattern, ctx)
 	if err != nil {
 		return "", err
 	}
@@ -1433,6 +2108,8 @@ func (w *StreamWriter) AddResourceDictionary(ctx context.Context, dict *Resource
 		return "", err
 	}
 	w.commitNameLocked(pattern, part)
+	w.recordHashLocked(digest, part, resourceDictionaryContentType, len(data))
+	w.recordDeferredFontGlyphsLocked(part, root)
 	dictKey := strings.ToLower(part)
 	w.dictDeps[dictKey] = deps
 	if len(navRefs) != 0 {
@@ -1454,22 +2131,113 @@ func (w *StreamWriter) AddPart(ctx context.Context, part, media string, data []b
 		return err
 	}
 	defer w.mu.Unlock()
-	canonical, err := opcPartName(part)
+	return w.addPartLocked(ctx, part, media, data)
+}
+
+// AddPartFromReader 按OPC规则与媒体类型校验后将自定义或扩展部件流式写入底层ZIP，普通二进制载荷采用恒定内存直通拷贝
+// 远程资源字典与字体部件受限于MaxPartBytes有界读入以执行完整结构与嵌入许可校验，不绕过安全约束
+// 入参: ctx 取消Context，nil采用Background, part 部件URI, media 内容类型, r 部件数据流
+// 返回: error 名称冲突、媒体类型、字典结构、字体许可、读取、预算、取消或写出错误
+func (w *StreamWriter) AddPartFromReader(ctx context.Context, part, media string, r io.Reader) error {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if r == nil {
+		return fmt.Errorf("%w: nil part reader", ErrInvalid)
+	}
+	if err := w.lock(ctx); err != nil {
+		return err
+	}
+	defer w.mu.Unlock()
+	canonical, err := w.validateAddPartHeaderLocked(part, media)
 	if err != nil {
 		return err
 	}
+	if requiredResourceMedia(requiredDictionary, media) || requiredResourceMedia(requiredFont, media) {
+		maxBytes := min(w.limits.MaxPartBytes, w.limits.MaxPackageBytes-w.partBytes)
+		if maxBytes < 0 {
+			return fmt.Errorf("%w: stream package exceeds MaxPackageBytes", ErrLimit)
+		}
+		var buf bytes.Buffer
+		var total int64
+		for {
+			if err := checkContext(ctx); err != nil {
+				return err
+			}
+			n, readErr := r.Read(w.copyBuf)
+			if n > 0 {
+				if int64(n) > maxBytes-total {
+					return fmt.Errorf("%w: stream part exceeds MaxPartBytes", ErrLimit)
+				}
+				buf.Write(w.copyBuf[:n])
+				total += int64(n)
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				return readErr
+			}
+		}
+		return w.addPartLocked(ctx, canonical, media, buf.Bytes())
+	}
+	if !w.registry.has(canonical) && w.registry.count() >= w.limits.MaxPartCount {
+		return fmt.Errorf("%w: stream package part count", ErrLimit)
+	}
+	maxPart := min(w.limits.MaxPartBytes, w.limits.MaxPackageBytes-w.partBytes)
+	if maxPart < 0 {
+		return fmt.Errorf("%w: stream package exceeds MaxPackageBytes", ErrLimit)
+	}
+	sink := &streamPieceSink{writer: w, ctx: ctx, part: canonical, maxBytes: maxPart}
+	if err := w.copyStreamToSinkLocked(ctx, sink, nil, r); err != nil {
+		if sink.touched {
+			w.failed = err
+		}
+		return err
+	}
+	if err := sink.finish(); err != nil {
+		if sink.touched {
+			w.failed = err
+		}
+		return err
+	}
+	w.registerPartMetaLocked(canonical, media, sink.written)
+	return nil
+}
+
+// validateAddPartHeaderLocked 在持有互斥锁时校验自定义部件名称规范、保留路径冲突、重复占用、格式媒体类型及前置内容类型
+// 入参: part 部件URI, media 内容类型
+// 返回: string 规范化部件URI, error 名称冲突、保留部件或媒体类型错误
+func (w *StreamWriter) validateAddPartHeaderLocked(part, media string) (string, error) {
+	canonical, err := opcPartName(part)
+	if err != nil {
+		return "", err
+	}
 	if opcRelationshipName(canonical) || strings.EqualFold(canonical, opcTypesName) || strings.EqualFold(canonical, w.sequence) {
-		return fmt.Errorf("%w: managed stream part name", ErrInvalid)
+		return "", fmt.Errorf("%w: managed stream part name", ErrInvalid)
 	}
 	if err := w.availableLocked(canonical); err != nil {
-		return err
+		return "", err
 	}
 	if err := validatePackageMediaForFormat(w.format, media); err != nil {
-		return err
+		return "", err
 	}
 	if err := w.validateEarlyContentTypeLocked(canonical, media); err != nil {
+		return "", err
+	}
+	return canonical, nil
+}
+
+// addPartLocked 在持有互斥锁时完成AddPart的完整校验、落盘及远程字典与字体登记
+// 入参: ctx 已规范化取消Context, part 部件URI, media 内容类型, data 部件原始字节
+// 返回: error 名称冲突、媒体类型、字典结构、字体许可、预算、取消或写出错误
+func (w *StreamWriter) addPartLocked(ctx context.Context, part, media string, data []byte) error {
+	canonical, err := w.validateAddPartHeaderLocked(part, media)
+	if err != nil {
 		return err
 	}
+	var parsedDictRoot *xmlElement
 	var parsedDictDeps []streamResourceRef
 	var parsedDictNavs []string
 	isDict := requiredResourceMedia(requiredDictionary, media)
@@ -1505,6 +2273,7 @@ func (w *StreamWriter) AddPart(ctx context.Context, part, media string, data []b
 			return err
 		}
 		parsedDictNavs = collectStreamNodeNavigateURIs(root)
+		parsedDictRoot = root
 	}
 	var restrictedFaces []uint32
 	var needObfFaces []uint32
@@ -1529,6 +2298,7 @@ func (w *StreamWriter) AddPart(ctx context.Context, part, media string, data []b
 		return err
 	}
 	if isDict {
+		w.recordDeferredFontGlyphsLocked(canonical, parsedDictRoot)
 		dictKey := strings.ToLower(canonical)
 		w.dictDeps[dictKey] = parsedDictDeps
 		if len(parsedDictNavs) != 0 {
@@ -1723,6 +2493,7 @@ func (w *StreamWriter) AddPage(ctx context.Context, page *Page) (string, error) 
 		return "", err
 	}
 	w.commitNameLocked(pattern, part)
+	w.recordDeferredFontGlyphsLocked(part, root)
 	pageIndex := len(w.allPages)
 	w.allPages = append(w.allPages, part)
 	w.documents[docIdx].Pages = append(w.documents[docIdx].Pages, ref)
@@ -1750,7 +2521,9 @@ func (w *StreamWriter) AddPage(ctx context.Context, page *Page) (string, error) 
 				hasPendingDict = true
 				w.pendingDicts[depKey] = true
 			} else if dep.kind == requiredFont {
-				hasPendingFont = true
+				if _, isDeferred := w.deferredFonts[depKey]; !isDeferred {
+					hasPendingFont = true
+				}
 			}
 		}
 		if dep.hasFace && w.restrictedFaces[fontCacheKey{part: depKey, index: dep.faceIndex}] {
@@ -1797,7 +2570,9 @@ func (w *StreamWriter) ReleaseResource(part string) error {
 	}
 	key := strings.ToLower(canonical)
 	if _, exists := w.parts[key]; !exists {
-		return fmt.Errorf("%w: released resource %s does not exist", ErrInvalid, canonical)
+		if _, deferred := w.deferredFonts[key]; !deferred {
+			return fmt.Errorf("%w: released resource %s does not exist", ErrInvalid, canonical)
+		}
 	}
 	w.releasedAfter[key] = len(w.allPages) - 1
 	return nil
@@ -2217,6 +2992,80 @@ func (w *StreamWriter) SetStoryFragments(ctx context.Context, docIndex, pageInde
 	return nil
 }
 
+// SetSignatureDefinitions 编码指定固定文档的签署请求定义、校验全局SpotID唯一、立即落盘并绑定signature-definitions关系
+// 入参: ctx 取消Context，nil采用Background, docIndex 零基固定文档序号, definitions 非空签署请求列表
+// 返回: string 写入的签名定义部件URI, error 序号、重复SpotID、编码、预算、取消或写出错误
+func (w *StreamWriter) SetSignatureDefinitions(ctx context.Context, docIndex int, definitions []SignatureDefinition) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	if err := w.lock(ctx); err != nil {
+		return "", err
+	}
+	defer w.mu.Unlock()
+	if docIndex < 0 || docIndex >= len(w.documents) || len(definitions) == 0 {
+		return "", fmt.Errorf("%w: signature definition document index or empty requests", ErrInvalid)
+	}
+	source := w.documents[docIndex].Part
+	if err := w.canReserveRelationPartLocked(source); err != nil {
+		return "", err
+	}
+	var encoded bytes.Buffer
+	if _, err := EncodeSignatureDefinitions(ctx, &encoded, definitions, &EncodeOptions{Format: w.format, Limits: w.limits}); err != nil {
+		return "", err
+	}
+	batchIDs := make(map[string]bool, len(definitions))
+	for _, def := range definitions {
+		id := strings.Trim(def.ID, " \t\r\n")
+		if id == "" || w.signatureSpotIDs[id] || batchIDs[id] {
+			return "", fmt.Errorf("%w: duplicate or empty global signature spot ID %q", ErrInvalid, id)
+		}
+		batchIDs[id] = true
+	}
+	data := encoded.Bytes()
+	if int64(len(data)) > min(w.limits.MaxPartBytes, w.limits.MaxMetadataBytes) {
+		return "", fmt.Errorf("%w: signature definitions byte budget", ErrLimit)
+	}
+	media := fixedContentType("signaturedefinitions")
+	ext := "xml"
+	if w.earlyContentTypes {
+		ext = "psigdef"
+		if expected, ok := w.earlyDefaults[ext]; !ok || !matchEarlyDefaultContentType(w.format, media, expected) {
+			for _, candidateExt := range slices.Sorted(maps.Keys(w.earlyDefaults)) {
+				if matchEarlyDefaultContentType(w.format, media, w.earlyDefaults[candidateExt]) {
+					ext = candidateExt
+					break
+				}
+			}
+		}
+	}
+	pattern := "/Metadata/SignatureDefinitions%d." + ext
+	part, err := w.newNameLocked(pattern, ctx)
+	if err != nil {
+		return "", err
+	}
+	if err := w.canWritePartWithRelLocked(part, source, media, int64(len(data))); err != nil {
+		return "", err
+	}
+	if err := w.writePartLocked(ctx, part, media, data, true); err != nil {
+		return "", err
+	}
+	w.commitNameLocked(pattern, part)
+	for id := range batchIDs {
+		w.signatureSpotIDs[id] = true
+	}
+	if err := w.appendRelationLocked(source, formatNamespace(w.format)+"/signature-definitions", part, false); err != nil {
+		return "", w.failLocked(err)
+	}
+	if w.earlyContentTypes {
+		if err := w.flushStreamRelationsLocked(ctx, source); err != nil {
+			return "", w.failLocked(err)
+		}
+	}
+	return part, nil
+}
+
 // Close 幂等完成流式包收尾：终检依赖、导航目标与故事结构，补齐或闭合固定布局、释放提示、全部.rels与[Content_Types].xml并关闭ZIP容器
 // 入参: ctx 取消Context，nil采用Background
 // 返回: error 结构、依赖、导航、故事、编码、预算、取消或ZIP关闭错误
@@ -2241,6 +3090,10 @@ func (w *StreamWriter) Close(ctx context.Context) error {
 		w.closeErr = w.failed
 		return w.closeErr
 	}
+	if w.activeStreamPart != "" {
+		w.closeErr = fmt.Errorf("%w: unclosed streaming image writer %s", ErrInvalid, w.activeStreamPart)
+		return w.closeErr
+	}
 	if err := checkContext(ctx); err != nil {
 		w.closeErr = err
 		return err
@@ -2251,7 +3104,7 @@ func (w *StreamWriter) Close(ctx context.Context) error {
 	return w.closeErr
 }
 
-// finalizeLocked 在Close期间执行终检、展开后置字典依赖、写出或闭合剩余索引、释放提示、关系与内容类型表并关闭ZIP
+// finalizeLocked 在Close期间执行终检、延迟字体子集落盘、展开后置字典依赖、写出或闭合剩余索引、释放提示、关系与内容类型表并关闭ZIP
 // 入参: ctx 已规范化取消Context
 // 返回: error 结构、依赖、导航、故事、编码或写出错误
 func (w *StreamWriter) finalizeLocked(ctx context.Context) error {
@@ -2266,6 +3119,9 @@ func (w *StreamWriter) finalizeLocked(ctx context.Context) error {
 		if len(doc.Pages) == 0 {
 			return fmt.Errorf("%w: stream document %s requires at least one page", ErrInvalid, doc.Part)
 		}
+	}
+	if err := w.flushDeferredFontsLocked(ctx, false); err != nil {
+		return err
 	}
 	reqType := ns + "/required-resource"
 	resType := ns + "/restricted-font"
@@ -2449,6 +3305,23 @@ func (w *StreamWriter) finalizeEarlyLocked(ctx context.Context) error {
 	return w.archive.Close()
 }
 
+// visitProtectedRelationsLocked 遍历源部件下应受生命周期保护的内部关系目标，排除discard-control及可选restricted-font关系
+// 入参: source 源部件URI或/, skipRestricted 是否跳过restricted-font关系, visit 接收目标URI的回调
+func (w *StreamWriter) visitProtectedRelationsLocked(source string, skipRestricted bool, visit func(target string)) {
+	ns := formatNamespace(w.format)
+	restrictedRel := ns + "/restricted-font"
+	discardRel := ns + "/discard-control"
+	for _, rel := range w.relations[strings.ToLower(source)] {
+		if rel.TargetMode != "" && rel.TargetMode != TargetModeInternal {
+			continue
+		}
+		if rel.Type == discardRel || skipRestricted && rel.Type == restrictedRel {
+			continue
+		}
+		visit(rel.Target)
+	}
+}
+
 // buildDiscardHintsLocked 按AutoDiscard与显式ReleaseResource记录生成严格合法的释放提示列表
 // 返回: []DiscardHint 按目标路径排序的合规释放提示
 func (w *StreamWriter) buildDiscardHintsLocked() []DiscardHint {
@@ -2475,19 +3348,10 @@ func (w *StreamWriter) buildDiscardHintsLocked() []DiscardHint {
 			bump(dep.part, idx, seen)
 		}
 	}
-	ns := formatNamespace(w.format)
-	restrictedRel := ns + "/restricted-font"
-	discardRel := ns + "/discard-control"
 	bumpRelations := func(source string, idx int, skipRestricted bool) {
-		for _, rel := range w.relations[strings.ToLower(source)] {
-			if rel.TargetMode != "" && rel.TargetMode != TargetModeInternal {
-				continue
-			}
-			if rel.Type == discardRel || skipRestricted && rel.Type == restrictedRel {
-				continue
-			}
-			bump(rel.Target, idx, make(map[string]bool))
-		}
+		w.visitProtectedRelationsLocked(source, skipRestricted, func(target string) {
+			bump(target, idx, make(map[string]bool))
+		})
 	}
 	bump(w.sequence, lastPageIdx, make(map[string]bool))
 	bumpRelations("/", lastPageIdx, false)
@@ -2563,6 +3427,11 @@ func (w *StreamWriter) lock(ctx context.Context) error {
 		w.mu.Unlock()
 		return err
 	}
+	if w.activeStreamPart != "" {
+		part := w.activeStreamPart
+		w.mu.Unlock()
+		return fmt.Errorf("%w: active streaming image writer %s must be closed first", ErrInvalid, part)
+	}
 	w.counted.context = ctx
 	w.archive.context = ctx
 	return nil
@@ -2618,10 +3487,13 @@ func (w *StreamWriter) registerPartMetaLocked(part, media string, size int64) {
 // 返回: error 压缩、预算、取消或写出错误
 func (w *StreamWriter) writeRawEntryLocked(ctx context.Context, part string, data []byte, allowInterleave bool) error {
 	baseName := strings.TrimPrefix(part, "/")
-	if !allowInterleave || w.interleaveBytes == 0 {
+	pieceSize := int(w.interleaveBytes)
+	if allowInterleave && pieceSize == 0 && w.earlyContentTypes && w.compression == CompressionDeflate && len(data) > compressionBufferLimit {
+		pieceSize = streamEarlyAutoPieceBytes
+	}
+	if !allowInterleave || pieceSize == 0 {
 		return w.writeZIPPayloadLocked(ctx, baseName, data)
 	}
-	pieceSize := int(w.interleaveBytes)
 	if len(data) == 0 {
 		return w.writeZIPPayloadLocked(ctx, baseName+"/[0].last.piece", data)
 	}
@@ -2711,6 +3583,18 @@ func (w *StreamWriter) writeZIPPayloadLocked(ctx context.Context, entryName stri
 	return writeZIPBufferEntry(ctx, w.archive, header, data, w.compression, w.optimizer, &w.candidate, w.copyBuf)
 }
 
+// pieceSize 返回流式输出通道使用的物理分片字节数，EarlyContentTypes下无显式分片的Deflate自动启用受控分片以消除尾条挂起
+// 返回: int64 物理分片字节上限，0表示不分片
+func (s *streamPieceSink) pieceSize() int64 {
+	if s.writer.interleaveBytes > 0 {
+		return s.writer.interleaveBytes
+	}
+	if s.writer.earlyContentTypes && s.writer.compression == CompressionDeflate {
+		return streamEarlyAutoPieceBytes
+	}
+	return 0
+}
+
 // Write 接收流式编码器输出的字节块，无分片Deflate直写、无分片Store/Optimize受控缓冲走CreateRaw、分片模式滞后冲刷上一满片消除0字节尾片
 // 入参: p 待写字节切片
 // 返回: int 已接收字节数, error 预算、取消或ZIP写出错误
@@ -2721,7 +3605,8 @@ func (s *streamPieceSink) Write(p []byte) (int, error) {
 	if int64(len(p)) > s.maxBytes-s.written {
 		return 0, fmt.Errorf("%w: streaming image exceeds byte budget", ErrLimit)
 	}
-	if s.writer.interleaveBytes == 0 && s.writer.compression == CompressionDeflate {
+	pieceLimit := s.pieceSize()
+	if pieceLimit == 0 && s.writer.compression == CompressionDeflate {
 		if s.direct == nil {
 			if s.writer.entryCount >= streamMaxPhysicalEntries(s.writer.limits.MaxPartCount) {
 				return 0, fmt.Errorf("%w: stream ZIP entry count", ErrLimit)
@@ -2740,12 +3625,12 @@ func (s *streamPieceSink) Write(p []byte) (int, error) {
 		s.written += int64(n)
 		return n, err
 	}
-	if s.writer.interleaveBytes == 0 {
+	if pieceLimit == 0 {
 		n, err := s.buf.Write(p)
 		s.written += int64(n)
 		return n, err
 	}
-	limit := int(s.writer.interleaveBytes)
+	limit := int(pieceLimit)
 	total := 0
 	for len(p) > 0 {
 		space := limit - s.buf.Len()
@@ -2775,14 +3660,15 @@ func (s *streamPieceSink) finish() error {
 		return nil
 	}
 	s.finalized = true
-	if s.writer.interleaveBytes == 0 && s.writer.compression == CompressionDeflate {
+	pieceLimit := s.pieceSize()
+	if pieceLimit == 0 && s.writer.compression == CompressionDeflate {
 		if s.direct == nil {
 			s.touched = true
 			return s.writer.writeZIPPayloadLocked(s.ctx, strings.TrimPrefix(s.part, "/"), nil)
 		}
 		return nil
 	}
-	if s.writer.interleaveBytes == 0 {
+	if pieceLimit == 0 {
 		data := s.buf.Bytes()
 		s.touched = true
 		err := s.writer.writeZIPPayloadLocked(s.ctx, strings.TrimPrefix(s.part, "/"), data)
@@ -2957,31 +3843,34 @@ func (w *StreamWriter) expandDependenciesRecursiveLocked(direct []streamResource
 // 返回: map[string]string 小写扩展名到合法内容类型的映射, error 扩展名或内容类型非法错误
 func earlyStreamDefaultTypes(format Format, excludePrintTicket bool, custom map[string]string) (map[string]string, error) {
 	defaults := map[string]string{
-		"rels":    opcRelsType,
-		"fdseq":   fixedContentType("fixeddocumentsequence"),
-		"fdoc":    fixedContentType("fixeddocument"),
-		"fpage":   fixedContentType("fixedpage"),
-		"dict":    resourceDictionaryContentType,
-		"struct":  fixedContentType("documentstructure"),
-		"frag":    fixedContentType("storyfragments"),
-		"discard": fixedContentType("discard-control"),
-		"xml":     printTicketType,
-		"psmdcp":  opcCoreType,
-		"png":     "image/png",
-		"jpg":     "image/jpeg",
-		"jpeg":    "image/jpeg",
-		"tif":     "image/tiff",
-		"tiff":    "image/tiff",
-		"wdp":     "image/vnd.ms-photo",
-		"jxr":     "image/vnd.ms-photo",
-		"hdp":     "image/vnd.ms-photo",
-		"ttf":     "application/vnd.ms-opentype",
-		"otf":     "application/vnd.ms-opentype",
-		"ttc":     "application/vnd.ms-opentype",
-		"odttf":   "application/vnd.ms-package.obfuscated-opentype",
-		"odttc":   "application/vnd.ms-package.obfuscated-opentype",
-		"icc":     "application/vnd.ms-color.iccprofile",
-		"icm":     "application/vnd.ms-color.iccprofile",
+		"rels":     opcRelsType,
+		"fdseq":    fixedContentType("fixeddocumentsequence"),
+		"fdoc":     fixedContentType("fixeddocument"),
+		"fpage":    fixedContentType("fixedpage"),
+		"dict":     resourceDictionaryContentType,
+		"struct":   fixedContentType("documentstructure"),
+		"frag":     fixedContentType("storyfragments"),
+		"discard":  fixedContentType("discard-control"),
+		"psigdef":  fixedContentType("signaturedefinitions"),
+		"psigdefs": fixedContentType("signaturedefinitions"),
+		"xml":      printTicketType,
+		"psmdcp":   opcCoreType,
+		"png":      "image/png",
+		"jpg":      "image/jpeg",
+		"jpeg":     "image/jpeg",
+		"tif":      "image/tiff",
+		"tiff":     "image/tiff",
+		"wdp":      "image/vnd.ms-photo",
+		"jxr":      "image/vnd.ms-photo",
+		"hdp":      "image/vnd.ms-photo",
+		"ttf":      "application/vnd.ms-opentype",
+		"otf":      "application/vnd.ms-opentype",
+		"ttc":      "application/vnd.ms-opentype",
+		"otc":      "application/vnd.ms-opentype",
+		"odttf":    "application/vnd.ms-package.obfuscated-opentype",
+		"odttc":    "application/vnd.ms-package.obfuscated-opentype",
+		"icc":      "application/vnd.ms-color.iccprofile",
+		"icm":      "application/vnd.ms-color.iccprofile",
 	}
 	if format != FormatXPS {
 		defaults["x3d"] = "model/x3d+xml"
@@ -3142,19 +4031,10 @@ func (w *StreamWriter) flushEarlyDiscardsForNextPageLocked(ctx context.Context, 
 		nextUsed[depKey] = true
 	}
 	protected := make(map[string]bool)
-	ns := formatNamespace(w.format)
-	restrictedRel := ns + "/restricted-font"
-	discardRel := ns + "/discard-control"
 	markProtected := func(source string, skipRestricted bool) {
-		for _, rel := range w.relations[strings.ToLower(source)] {
-			if rel.TargetMode != "" && rel.TargetMode != TargetModeInternal {
-				continue
-			}
-			if rel.Type == discardRel || skipRestricted && rel.Type == restrictedRel {
-				continue
-			}
-			protected[strings.ToLower(rel.Target)] = true
-		}
+		w.visitProtectedRelationsLocked(source, skipRestricted, func(target string) {
+			protected[strings.ToLower(target)] = true
+		})
 	}
 	protected[strings.ToLower(w.sequence)] = true
 	if w.discardPart != "" {
@@ -3428,10 +4308,6 @@ func (w *StreamWriter) validateStreamNavigationAndStoriesLocked(ctx context.Cont
 			pageKey := strings.ToLower(page.Part)
 			navParts[pageKey] = createdNavigationPage
 			for _, name := range page.LinkTargets {
-				targets[name] = true
-				allTargets[name] = true
-			}
-			for name := range w.pageNames[pageKey] {
 				targets[name] = true
 				allTargets[name] = true
 			}
@@ -3836,28 +4712,22 @@ func (w *StreamWriter) resolveSourceCaseLocked(sourceKey string) string {
 // 入参: source 规范化部件URI
 // 返回: PrintScope 所属固定布局层级
 func (w *StreamWriter) partScopeLocked(source string) PrintScope {
-	if strings.EqualFold(source, w.sequence) {
-		return PrintScopeJob
-	}
-	for _, doc := range w.documents {
-		if strings.EqualFold(source, doc.Part) {
-			return PrintScopeDocument
-		}
-		for _, page := range doc.Pages {
-			if strings.EqualFold(source, page.Part) {
-				return PrintScopePage
-			}
-		}
-	}
-	return PrintScopeUnknown
+	return layoutPartScope(w.sequence, w.documents, source)
 }
 
-// findHashLocked 在已落盘资源哈希索引中查找媒体类型与字节长度均一致的复用部件
+// findHashLocked 在已落盘资源哈希索引中查找未释放且媒体类型与字节长度均一致的复用部件
 // 入参: digest 内容SHA-256摘要, media 内容类型, size 原始字节长度
 // 返回: string 已有部件URI, bool 是否命中复用
 func (w *StreamWriter) findHashLocked(digest [32]byte, media string, size int) (string, bool) {
 	for _, entry := range w.hashes[digest] {
 		if entry.size == size && strings.EqualFold(entry.media, media) {
+			key := strings.ToLower(entry.name)
+			if _, discarded := w.emittedDiscardPage[key]; discarded {
+				continue
+			}
+			if _, released := w.releasedAfter[key]; released {
+				continue
+			}
 			return entry.name, true
 		}
 	}
@@ -3883,19 +4753,7 @@ func (w *StreamWriter) availableLocked(part string) error {
 // newFontPartLocked 生成不冲突的UUIDv4混淆字体部件路径
 // 返回: string 字体部件URI, error 随机数或冲突错误
 func (w *StreamWriter) newFontPartLocked() (string, error) {
-	var raw [16]byte
-	for range 1024 {
-		if _, err := rand.Read(raw[:]); err != nil {
-			return "", err
-		}
-		raw[6] = raw[6]&0x0f | 0x40
-		raw[8] = raw[8]&0x3f | 0x80
-		part := fmt.Sprintf("/Resources/Fonts/%X-%X-%X-%X-%X.odttf", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16])
-		if w.availableLocked(part) == nil {
-			return part, nil
-		}
-	}
-	return "", fmt.Errorf("%w: unable to allocate unique stream font part", ErrLimit)
+	return allocateObfuscatedFontPart(w.availableLocked)
 }
 
 // newNameLocked 按含%d占位符的路径模板顺序分配不冲突的规范部件URI
@@ -3929,16 +4787,7 @@ func (w *StreamWriter) newNameLocked(pattern string, ctx context.Context) (strin
 // commitNameLocked 提交最近一次模板分配的编号以加速后续分配
 // 入参: pattern 路径模板，空串忽略, part 实际采用的部件URI
 func (w *StreamWriter) commitNameLocked(pattern, part string) {
-	if pattern == "" {
-		return
+	if index, ok := extractAllocatedPatternIndex(pattern, part); ok {
+		w.allocated[pattern] = index
 	}
-	prefix, suffix, err := packageNamePattern(pattern, nil)
-	if err != nil || len(part) <= len(prefix)+len(suffix) || !strings.HasPrefix(part, prefix) || !strings.HasSuffix(part, suffix) {
-		return
-	}
-	index, err := strconv.Atoi(part[len(prefix) : len(part)-len(suffix)])
-	if err != nil {
-		return
-	}
-	w.allocated[pattern] = index
 }

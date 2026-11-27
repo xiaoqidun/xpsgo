@@ -959,6 +959,7 @@ type fontCmap struct {
 	encoding    uint16
 	format      uint16
 	data        []byte
+	uvsData     []byte
 	numGlyphs   uint32
 	count       uint32
 	arrayOffset uint32
@@ -998,6 +999,7 @@ func parseFontCmap(data []byte, numGlyphs uint32) (*fontCmap, error) {
 	seen := make(map[[3]uint32]bool)
 	best := 12
 	var chosen *fontCmap
+	var uvsData []byte
 	for i := uint64(4); i < end; i += 8 {
 		platform := binary.BigEndian.Uint16(data[i:])
 		encoding := binary.BigEndian.Uint16(data[i+2:])
@@ -1025,6 +1027,7 @@ func parseFontCmap(data []byte, numGlyphs uint32) (*fontCmap, error) {
 				if err := validateFontCmap14(sub, numGlyphs); err != nil {
 					return nil, err
 				}
+				uvsData = sub
 			}
 		}
 		rank := fontCmapPriority(platform, encoding)
@@ -1036,6 +1039,7 @@ func parseFontCmap(data []byte, numGlyphs uint32) (*fontCmap, error) {
 	if chosen == nil {
 		return nil, fmt.Errorf("%w: no XPS-compatible cmap encoding", ErrUnsupported)
 	}
+	chosen.uvsData = uvsData
 	if err := chosen.validate(); err != nil {
 		return nil, err
 	}
@@ -1169,18 +1173,11 @@ func (c *fontCmap) validate() error {
 	default:
 		return fmt.Errorf("%w: cmap format %d", ErrUnsupported, c.format)
 	}
-	if c.format == 2 || c.format == 4 {
-		for code := uint32(0); code <= 0xffff; code++ {
-			if uint32(c.lookup(code)) >= c.numGlyphs {
-				return fmt.Errorf("%w: cmap glyph outside maxp at code %X", ErrInvalid, code)
-			}
-		}
-	}
 	return nil
 }
 
-// validate2 校验混合单字节和双字节映射的相对偏移及子头范围
-// 返回: error 格式2结构错误
+// validate2 校验混合单字节和双字节映射的相对偏移、子头范围与可达字形编号
+// 返回: error 格式2结构或字形越界错误
 func (c *fontCmap) validate2() error {
 	d := c.data
 	if len(d) < 526 || len(d)%2 != 0 {
@@ -1209,11 +1206,44 @@ func (c *fontCmap) validate2() error {
 			return fmt.Errorf("%w: cmap subheader glyph array offset", ErrInvalid)
 		}
 	}
+	first0 := uint32(binary.BigEndian.Uint16(d[518:]))
+	count0 := uint32(binary.BigEndian.Uint16(d[520:]))
+	delta0 := binary.BigEndian.Uint16(d[522:])
+	offset0 := uint32(binary.BigEndian.Uint16(d[524:]))
+	for i := uint32(0); i < count0; i++ {
+		low := first0 + i
+		if binary.BigEndian.Uint16(d[6+2*low:]) != 0 {
+			continue
+		}
+		glyph := binary.BigEndian.Uint16(d[524+offset0+2*i:])
+		if glyph != 0 && uint32(glyph+delta0) >= c.numGlyphs {
+			return fmt.Errorf("%w: cmap glyph outside maxp at code %X", ErrInvalid, low)
+		}
+	}
+	checked := make(map[uint32]bool)
+	for hi := uint32(1); hi < 256; hi++ {
+		key := uint32(binary.BigEndian.Uint16(d[6+2*hi:]))
+		if key == 0 || checked[key] {
+			continue
+		}
+		checked[key] = true
+		pos := 518 + key
+		first := uint32(binary.BigEndian.Uint16(d[pos:]))
+		count := uint32(binary.BigEndian.Uint16(d[pos+2:]))
+		delta := binary.BigEndian.Uint16(d[pos+4:])
+		offset := uint32(binary.BigEndian.Uint16(d[pos+6:]))
+		for i := uint32(0); i < count; i++ {
+			glyph := binary.BigEndian.Uint16(d[pos+6+offset+2*i:])
+			if glyph != 0 && uint32(glyph+delta) >= c.numGlyphs {
+				return fmt.Errorf("%w: cmap glyph outside maxp at code %X", ErrInvalid, (hi<<8)|(first+i))
+			}
+		}
+	}
 	return nil
 }
 
-// validate4 校验格式4有序分段、搜索参数及相对偏移字形数组
-// 返回: error 格式4结构错误
+// validate4 校验格式4有序分段、搜索参数、相对偏移字形数组与全部可达字形编号
+// 返回: error 格式4结构或字形越界错误
 func (c *fontCmap) validate4() error {
 	d := c.data
 	if len(d) < 16 || len(d)%2 != 0 {
@@ -1234,13 +1264,28 @@ func (c *fontCmap) validate4() error {
 	for i := uint32(0); i < n; i++ {
 		end := uint32(binary.BigEndian.Uint16(d[14+2*i:]))
 		start := uint32(binary.BigEndian.Uint16(d[16+2*n+2*i:]))
+		delta := binary.BigEndian.Uint16(d[16+4*n+2*i:])
 		word := 16 + 6*n + 2*i
 		offset := uint32(binary.BigEndian.Uint16(d[word:]))
 		if start > end || i != 0 && start <= previous || offset%2 != 0 {
 			return fmt.Errorf("%w: cmap segment ordering or alignment", ErrInvalid)
 		}
-		if offset != 0 && (word+offset < c.arrayOffset || uint64(word+offset)+2*uint64(end-start+1) > uint64(len(d))) {
-			return fmt.Errorf("%w: cmap segment glyph array offset", ErrInvalid)
+		if offset != 0 {
+			if word+offset < c.arrayOffset || uint64(word+offset)+2*uint64(end-start+1) > uint64(len(d)) {
+				return fmt.Errorf("%w: cmap segment glyph array offset", ErrInvalid)
+			}
+			base := word + offset
+			for k := uint32(0); k <= end-start; k++ {
+				glyph := binary.BigEndian.Uint16(d[base+2*k:])
+				if glyph != 0 && uint32(glyph+delta) >= c.numGlyphs {
+					return fmt.Errorf("%w: cmap glyph outside maxp at code %X", ErrInvalid, start+k)
+				}
+			}
+		} else {
+			firstGlyph := uint32(uint16(start) + delta)
+			if firstGlyph+(end-start) >= c.numGlyphs {
+				return fmt.Errorf("%w: cmap glyph outside maxp at code %X", ErrInvalid, start)
+			}
 		}
 		previous = end
 	}
@@ -1493,6 +1538,95 @@ func (c *fontCmap) unicodeGlyph(r rune) (uint16, error) {
 	default:
 		return 0, fmt.Errorf("%w: Unicode conversion for cmap platform %d encoding %d", ErrUnsupported, c.platform, c.encoding)
 	}
+}
+
+// unicodeVariationGlyph 按Format 14变体序列子表查询Unicode码点与变体选择符对应的字形编号，支持默认与非默认UVS
+// 入参: r 基础Unicode标量, selector 变体选择符Unicode标量
+// 返回: uint16 命中的字形编号, bool 是否命中Format 14 UVS记录, error 非法标量、未初始化映射或默认回落查表错误
+func (c *fontCmap) unicodeVariationGlyph(r, selector rune) (uint16, bool, error) {
+	if !utf8.ValidRune(r) || !utf8.ValidRune(selector) {
+		return 0, false, fmt.Errorf("%w: invalid Unicode variation sequence (%U, %U)", ErrInvalid, r, selector)
+	}
+	if c == nil || len(c.data) < 2 || c.numGlyphs == 0 {
+		return 0, false, fmt.Errorf("%w: uninitialized cmap", ErrInvalid)
+	}
+	uvs := c.uvsData
+	if len(uvs) < 10 {
+		return 0, false, nil
+	}
+	count := uint64(binary.BigEndian.Uint32(uvs[6:]))
+	targetSel := uint32(selector)
+	lo, hi := uint64(0), count
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		pos := 10 + 11*mid
+		val := uint32(uvs[pos])<<16 | uint32(uvs[pos+1])<<8 | uint32(uvs[pos+2])
+		if val < targetSel {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == count {
+		return 0, false, nil
+	}
+	recPos := 10 + 11*lo
+	if uint32(uvs[recPos])<<16|uint32(uvs[recPos+1])<<8|uint32(uvs[recPos+2]) != targetSel {
+		return 0, false, nil
+	}
+	defOff := binary.BigEndian.Uint32(uvs[recPos+3:])
+	nonDefOff := binary.BigEndian.Uint32(uvs[recPos+7:])
+	targetRune := uint32(r)
+	if nonDefOff != 0 {
+		sub := uvs[nonDefOff:]
+		nCount := uint64(binary.BigEndian.Uint32(sub))
+		nLo, nHi := uint64(0), nCount
+		for nLo < nHi {
+			mid := nLo + (nHi-nLo)/2
+			pos := 4 + 5*mid
+			scalar := uint32(sub[pos])<<16 | uint32(sub[pos+1])<<8 | uint32(sub[pos+2])
+			if scalar < targetRune {
+				nLo = mid + 1
+			} else {
+				nHi = mid
+			}
+		}
+		if nLo < nCount {
+			pos := 4 + 5*nLo
+			if uint32(sub[pos])<<16|uint32(sub[pos+1])<<8|uint32(sub[pos+2]) == targetRune {
+				return binary.BigEndian.Uint16(sub[pos+3:]), true, nil
+			}
+		}
+	}
+	if defOff != 0 {
+		sub := uvs[defOff:]
+		dCount := uint64(binary.BigEndian.Uint32(sub))
+		dLo, dHi := uint64(0), dCount
+		for dLo < dHi {
+			mid := dLo + (dHi-dLo)/2
+			pos := 4 + 4*mid
+			start := uint32(sub[pos])<<16 | uint32(sub[pos+1])<<8 | uint32(sub[pos+2])
+			end := start + uint32(sub[pos+3])
+			if end < targetRune {
+				dLo = mid + 1
+			} else {
+				dHi = mid
+			}
+		}
+		if dLo < dCount {
+			pos := 4 + 4*dLo
+			start := uint32(sub[pos])<<16 | uint32(sub[pos+1])<<8 | uint32(sub[pos+2])
+			end := start + uint32(sub[pos+3])
+			if targetRune >= start && targetRune <= end {
+				gid, err := c.unicodeGlyph(r)
+				if err != nil {
+					return 0, false, err
+				}
+				return gid, true, nil
+			}
+		}
+	}
+	return 0, false, nil
 }
 
 // lookup 在已完成结构校验的子表内查找编码，不分配内存

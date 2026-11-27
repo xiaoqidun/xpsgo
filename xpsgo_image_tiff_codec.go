@@ -613,12 +613,9 @@ func decodeTIFFDeflate(dst, src []byte) error {
 	return nil
 }
 
-// jpegColor 校验TIFF的YCbCr解释，非默认颜色参数留给专用颜色转换路径
+// jpegColor 校验TIFF的YCbCr解释，缺失ReferenceBlackWhite时按TIFF 6.0默认值处理并支持居中与共址色度定位
 // 返回: error 字段或颜色能力错误
 func (d *tiffDirectory) jpegColor() error {
-	if d.entry[532] == nil {
-		return fmt.Errorf("%w: missing TIFF YCbCr ReferenceBlackWhite", ErrInvalid)
-	}
 	if err := d.rationalDefaults(529, [][2]uint32{{299, 1000}, {587, 1000}, {114, 1000}}); err != nil {
 		return err
 	}
@@ -629,7 +626,7 @@ func (d *tiffDirectory) jpegColor() error {
 	if err != nil {
 		return err
 	}
-	if position != 1 {
+	if position != 1 && position != 2 {
 		return fmt.Errorf("%w: TIFF YCbCr positioning", ErrUnsupported)
 	}
 	return nil

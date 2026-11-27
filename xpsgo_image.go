@@ -279,6 +279,15 @@ type pngCompressedReader struct {
 	limit int
 }
 
+// partPrefixReaderAt 按需从OPC顺序流增量缓冲前缀并实现io.ReaderAt，避免仅读图像头时整图读入内存
+type partPrefixReaderAt struct {
+	rc    io.ReadCloser
+	buf   []byte
+	limit int64
+	eof   bool
+	err   error
+}
+
 // losslessHuffman 保存无损JPEG差值类别的规范码区间及符号视图
 type losslessHuffman struct {
 	first   [16]uint32
@@ -545,21 +554,27 @@ func (r *Reader) ImageInfo(ctx context.Context, part string) (*ImageInfo, error)
 		}
 		return info, nil
 	case "image/tiff":
-		data, err := r.pkg.readItemsContext(ctx, key, r.limits.MaxPartBytes)
-		if err != nil {
-			return nil, &PartError{Part: canonical, Err: err}
-		}
-		info, err := readTIFFImageInfo(data, canonical, media)
+		info, err := r.readImageInfoStream(ctx, key, canonical,
+			func(ra io.ReaderAt, size int64) (*ImageInfo, error) {
+				return readTIFFImageInfoAt(ctx, ra, size, canonical, media)
+			},
+			func(data []byte) (*ImageInfo, error) {
+				return readTIFFImageInfo(data, canonical, media)
+			},
+		)
 		if err != nil {
 			return nil, &PartError{Part: canonical, Err: err}
 		}
 		return info, nil
 	case "image/vnd.ms-photo":
-		data, err := r.pkg.readItemsContext(ctx, key, r.limits.MaxPartBytes)
-		if err != nil {
-			return nil, &PartError{Part: canonical, Err: err}
-		}
-		info, err := readJXRImageInfo(ctx, data, canonical, media, uint64(r.limits.MaxPartBytes))
+		info, err := r.readImageInfoStream(ctx, key, canonical,
+			func(ra io.ReaderAt, size int64) (*ImageInfo, error) {
+				return readJXRImageInfoAt(ctx, ra, size, canonical, media, uint64(r.limits.MaxPartBytes))
+			},
+			func(data []byte) (*ImageInfo, error) {
+				return readJXRImageInfo(ctx, data, canonical, media, uint64(r.limits.MaxPartBytes))
+			},
+		)
 		if err != nil {
 			return nil, &PartError{Part: canonical, Err: err}
 		}
@@ -569,8 +584,107 @@ func (r *Reader) ImageInfo(ctx context.Context, part string) (*ImageInfo, error)
 	}
 }
 
+// ReadAt 按需从底层顺序流增量读取到目标区间并拷贝，超过字节上限时返回ErrLimit
+// 入参: p 目标接收切片, off 逻辑起始偏移
+// 返回: int 实际读取字节数, error 越界、上限、底层读取或EOF错误
+func (r *partPrefixReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, fmt.Errorf("%w: negative read offset", ErrInvalid)
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	need := off + int64(len(p))
+	if need < off {
+		return 0, fmt.Errorf("%w: read offset overflow", ErrLimit)
+	}
+	for !r.eof && int64(len(r.buf)) < need {
+		if r.err != nil {
+			break
+		}
+		cur := int64(len(r.buf))
+		if cur >= r.limit {
+			var probe [1]byte
+			n, err := r.rc.Read(probe[:])
+			if n > 0 {
+				r.err = fmt.Errorf("%w: part exceeds byte limit", ErrLimit)
+				return 0, r.err
+			}
+			if err == io.EOF {
+				r.eof = true
+				break
+			}
+			if err != nil {
+				r.err = err
+				return 0, err
+			}
+			continue
+		}
+		want := min(max(need-cur, 4096), r.limit-cur)
+		if want > 64<<10 {
+			want = 64 << 10
+		}
+		start := len(r.buf)
+		if cap(r.buf)-start < int(want) {
+			nextCap := max(cap(r.buf)*2, start+int(want))
+			grown := make([]byte, start, nextCap)
+			copy(grown, r.buf)
+			r.buf = grown
+		}
+		r.buf = r.buf[:start+int(want)]
+		n, err := r.rc.Read(r.buf[start:])
+		r.buf = r.buf[:start+n]
+		if err == io.EOF {
+			r.eof = true
+			break
+		}
+		if err != nil {
+			r.err = err
+			break
+		}
+	}
+	if off >= int64(len(r.buf)) {
+		if r.err != nil {
+			return 0, r.err
+		}
+		return 0, io.EOF
+	}
+	copied := copy(p, r.buf[off:])
+	if copied < len(p) {
+		if r.err != nil {
+			return copied, r.err
+		}
+		return copied, io.EOF
+	}
+	return copied, nil
+}
+
+// readImageInfoStream 使用按需前缀流探测支持随机读取的图像容器头元数据，流尺寸未知时回退整部件读取
+// 入参: ctx 已规范化取消Context, key 规范化小写部件键, canonical 包根URI, readAt 按需随机读取探测回调, readData 整部件字节回退探测回调
+// 返回: *ImageInfo 轻量图像头元数据, error 预算、流读取或图像头错误
+func (r *Reader) readImageInfoStream(ctx context.Context, key, canonical string, readAt func(io.ReaderAt, int64) (*ImageInfo, error), readData func([]byte) (*ImageInfo, error)) (*ImageInfo, error) {
+	size, sizeErr := r.pkg.partSize(key)
+	if sizeErr == nil && size > uint64(r.limits.MaxPartBytes) {
+		return nil, fmt.Errorf("%w: part %q exceeds byte limit", ErrLimit, canonical)
+	}
+	if sizeErr == nil && size > 0 && size <= uint64(math.MaxInt64) {
+		stream, err := r.pkg.openPartStream(ctx, key, PartReadOptions{MaxBytes: r.limits.MaxPartBytes})
+		if err != nil {
+			return nil, err
+		}
+		defer stream.Close()
+		ra := &partPrefixReaderAt{rc: stream, limit: r.limits.MaxPartBytes}
+		return readAt(ra, int64(size))
+	}
+	data, err := r.pkg.readItemsContext(ctx, key, r.limits.MaxPartBytes)
+	if err != nil {
+		return nil, err
+	}
+	return readData(data)
+}
+
 // DecodeImageRows 按行流式解码并色彩管理导出包内图像为八位非预乘sRGB行字节
-// 非隔行PNG、非分块非JPEG非转置TIFF与JPEG XR优先走真流式逐行转换，隔行PNG、分块TIFF与JPEG平滑回退整帧后逐行输出
+// 非隔行PNG、非JPEG非转置条带与分块TIFF及JPEG XR优先走真流式逐行转换，隔行PNG、JPEG及需转置TIFF平滑回退整帧后逐行输出
 // 回调按y从0到Height-1递增接收Width*4字节行切片，缓冲在行间复用，调用方不得跨回调长期持有切片
 // 入参: ctx 取消Context，nil采用Background, part 图像部件包根URI, options 图像解码选项，nil继承阅读器字节上限与默认像素上限, convert 色彩转换选项，nil继承本次有效字节上限, fn 逐行消费回调
 // 返回: error 状态、参数、媒体类型、解码、色彩、回调或取消错误
@@ -675,10 +789,22 @@ func (r *Reader) DecodeImageRows(ctx context.Context, part string, options *Imag
 	}
 	source, err := decodeRasterImageWithMemory(ctx, data, media, imgCfg.MaxPixels, uint64(imgCfg.MaxBytes))
 	if err != nil {
-		return &PartError{Part: canonical, Err: err}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		return wrapPartError(canonical, "", err)
 	}
 	res := &ImageResource{Part: canonical, ContentType: media, Resolution: source.dpi, Data: data, source: source, maxBytes: uint64(imgCfg.MaxBytes)}
-	return res.exportRowsNRGBA(ctx, cfg, maxConvertBytes, fn)
+	if err := res.exportRowsNRGBA(ctx, cfg, maxConvertBytes, rowFn); err != nil {
+		if callbackErr != nil {
+			return callbackErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		return wrapPartError(canonical, "", err)
+	}
+	return nil
 }
 
 // Image 读取指定包内图像部件并保留源样本与内嵌ICC，不应用关联ICC颜色转换
@@ -737,7 +863,11 @@ func (r *Reader) readImage(ctx context.Context, part string, options *ImageOptio
 	}
 	profile := source.profile
 	if source.profileCompressed {
-		profile, err = inflatePNGProfile(profile, configuration.MaxBytes-int64(len(data)))
+		profileLimit := configuration.MaxBytes
+		if r.limits.MaxMetadataBytes > 0 {
+			profileLimit = min(profileLimit, r.limits.MaxMetadataBytes)
+		}
+		profile, err = inflatePNGProfile(profile, profileLimit)
 		if err != nil {
 			return nil, &PartError{Part: part, Err: err}
 		}
@@ -1845,7 +1975,7 @@ func (s *pngHeaderState) consumeChunk(kind string, payload []byte) error {
 			s.metadata.dpi = Point{96, 96 * (float64(y) / float64(x))}
 		}
 	case "iCCP":
-		if s.profileSeen || s.srgbSeen || s.paletteSeen || s.imageSeen {
+		if s.profileSeen || s.paletteSeen || s.imageSeen {
 			return fmt.Errorf("%w: PNG profile placement", ErrInvalid)
 		}
 		s.profileSeen = true
@@ -1855,12 +1985,15 @@ func (s *pngHeaderState) consumeChunk(kind string, payload []byte) error {
 		}
 		s.metadata.profile = profile
 		s.metadata.profileCompressed = true
+		s.metadata.srgb = false
 	case "sRGB":
-		if s.profileSeen || s.srgbSeen || s.paletteSeen || s.imageSeen || size != 1 || payload[0] > 3 {
+		if s.srgbSeen || s.paletteSeen || s.imageSeen || size != 1 || payload[0] > 3 {
 			return fmt.Errorf("%w: PNG sRGB chunk", ErrInvalid)
 		}
 		s.srgbSeen = true
-		s.metadata.srgb = true
+		if !s.profileSeen {
+			s.metadata.srgb = true
+		}
 	case "gAMA":
 		if s.gamaSeen || s.paletteSeen || s.imageSeen || size != 4 {
 			return fmt.Errorf("%w: PNG gAMA chunk", ErrInvalid)
@@ -3040,7 +3173,7 @@ func exifImageMetadata(data []byte) (Point, bool, bool, uint32, bool, error) {
 
 // exifImageColor 校验EXIF颜色空间声明，未校准颜色由ICC或像素格式解释
 // 入参: data TIFF数据, order 字节序, offset EXIF目录偏移
-// 返回: error 目录错误或颜色能力错误
+// 返回: error EXIF目录或颜色空间标签格式错误
 func exifImageColor(data []byte, order binary.ByteOrder, offset uint64) error {
 	if len(data) < 2 || offset < 8 || offset > uint64(len(data))-2 {
 		return fmt.Errorf("%w: EXIF color directory offset", ErrInvalid)
@@ -3059,9 +3192,6 @@ func exifImageColor(data []byte, order binary.ByteOrder, offset uint64) error {
 			return fmt.Errorf("%w: EXIF color space tag", ErrInvalid)
 		}
 		seen = true
-		if value := order.Uint16(entry[8:]); value != 1 && value != 0xffff {
-			return fmt.Errorf("%w: EXIF color space %d", ErrUnsupported, value)
-		}
 	}
 	return nil
 }

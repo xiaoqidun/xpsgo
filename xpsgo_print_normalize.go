@@ -25,17 +25,21 @@ import (
 	"unicode/utf8"
 )
 
-// PrintNormalizeOptions 设置PrintTicket规范化合并与设备能力补全的作用域及资源预算
+// PrintNormalizeOptions 设置PrintTicket规范化合并、设备能力补全的作用域、资源预算及私有命名空间白名单透传策略
+// PreserveNamespaces中的私有扩展命名空间URI允许其未在能力文档声明的Feature、ParameterInit与Property原样透传保留
 type PrintNormalizeOptions struct {
-	Settings PrintSettingsOptions
+	Settings           PrintSettingsOptions
+	PreserveNamespaces []string
 }
 
-// printNormalizer 在单次规范化调用中保存能力索引、参数域、请求来源、比较预算及诊断列表
+// printNormalizer 在单次规范化调用中保存能力索引、参数域、请求来源、白名单命名空间、比较预算及诊断列表
 type printNormalizer struct {
 	options     printSettingsConfig
 	domains     map[xml.Name]*printParameterDomain
 	deltaFeats  map[xml.Name]bool
+	deltaParams map[xml.Name]bool
 	reqFeats    map[xml.Name]bool
+	preserveNS  map[string]bool
 	diagnostics []Diagnostic
 	remaining   int
 }
@@ -51,7 +55,7 @@ func NormalizePrintTicket(ctx context.Context, capabilities *PrintCapabilities, 
 	if err != nil {
 		return nil, nil, err
 	}
-	return normalizePrintSettingsInternal(base, delta, &PrintSettings{Version: capabilities.Version, Elements: capabilities.Elements}, printDocumentCapabilities, configuration, false, true)
+	return normalizePrintSettingsInternal(base, delta, &PrintSettings{Version: capabilities.Version, Elements: capabilities.Elements}, printDocumentCapabilities, configuration, nil, false, true)
 }
 
 // NormalizePrintSettings 按Microsoft Print Schema规范对基础票据与增量票据执行合并、设备能力校验、约束消解、默认补全与参数量化
@@ -60,9 +64,15 @@ func NormalizePrintTicket(ctx context.Context, capabilities *PrintCapabilities, 
 // 返回: *PrintSettings 规范化后的独立打印设置, []Diagnostic 规范化过程产生的诊断记录, error 结构、能力、预算或取消错误
 func NormalizePrintSettings(ctx context.Context, base, delta, capabilities *PrintSettings, options *PrintNormalizeOptions) (*PrintSettings, []Diagnostic, error) {
 	var settingsOpts *PrintSettingsOptions
+	var preserveNS map[string]bool
 	if options != nil {
 		optsCopy := options.Settings
 		settingsOpts = &optsCopy
+		var err error
+		preserveNS, err = validatePrintPreserveNamespaces(options.PreserveNamespaces)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	configuration, err := printSettingsOptions(ctx, settingsOpts)
 	if err != nil {
@@ -71,7 +81,24 @@ func NormalizePrintSettings(ctx context.Context, base, delta, capabilities *Prin
 	if capabilities == nil {
 		return nil, nil, fmt.Errorf("%w: nil print capabilities", ErrInvalid)
 	}
-	return normalizePrintSettingsInternal(base, delta, capabilities, printCapabilitiesDocumentMode(capabilities), configuration, false, true)
+	return normalizePrintSettingsInternal(base, delta, capabilities, printCapabilitiesDocumentMode(capabilities), configuration, preserveNS, false, true)
+}
+
+// validatePrintPreserveNamespaces 校验规范化私有命名空间透传白名单，仅允许合法且非标准保留的私有命名空间URI
+// 入参: namespaces 私有命名空间URI列表
+// 返回: map[string]bool 去重后的白名单映射, error 非法或标准保留命名空间错误
+func validatePrintPreserveNamespaces(namespaces []string) (map[string]bool, error) {
+	if len(namespaces) == 0 {
+		return nil, nil
+	}
+	result := make(map[string]bool, len(namespaces))
+	for _, uri := range namespaces {
+		if uri == "" || !xmlTextValid(uri) || uri == xmlnsNamespace || uri == xmlNamespace || uri == xsiNamespace || uri == printValueNS || printFrameworkSpace(uri) || printPublicKeywordSpace(uri) {
+			return nil, fmt.Errorf("%w: invalid preserve print namespace %q", ErrInvalid, uri)
+		}
+		result[uri] = true
+	}
+	return result, nil
 }
 
 // printCapabilitiesDocumentMode 按文档结构特征区分V4 PrintDeviceCapabilities与PrintCapabilities，而非仅凭Version判断
@@ -92,10 +119,10 @@ func printCapabilitiesDocumentMode(capabilities *PrintSettings) printDocumentMod
 	return printDocumentCapabilities
 }
 
-// normalizePrintSettingsInternal 在纯内存中执行票据合并、能力校验、跨Feature冲突消解、约束回退与参数规范化
-// 入参: base 基础票据或nil, delta 增量票据或nil, capabilities 设备能力模型, capMode 能力文档模式, configuration 已校验配置, capValidated 能力模型是否已预校验, checkBudget 是否执行最终序列化字节预算检查
+// normalizePrintSettingsInternal 在纯内存中执行票据合并、能力校验、跨Feature冲突消解、约束回退、白名单私有透传与参数规范化
+// 入参: base 基础票据或nil, delta 增量票据或nil, capabilities 设备能力模型, capMode 能力文档模式, configuration 已校验配置, preserveNS 私有命名空间白名单, capValidated 能力模型是否已预校验, checkBudget 是否执行最终序列化字节预算检查
 // 返回: *PrintSettings 规范化后的独立打印设置, []Diagnostic 诊断列表, error 校验、预算或取消错误
-func normalizePrintSettingsInternal(base, delta, capabilities *PrintSettings, capMode printDocumentMode, configuration printSettingsConfig, capValidated, checkBudget bool) (*PrintSettings, []Diagnostic, error) {
+func normalizePrintSettingsInternal(base, delta, capabilities *PrintSettings, capMode printDocumentMode, configuration printSettingsConfig, preserveNS map[string]bool, capValidated, checkBudget bool) (*PrintSettings, []Diagnostic, error) {
 	capConfig := configuration
 	capConfig.Scope = PrintScopeUnknown
 	capModel := capabilities
@@ -107,6 +134,7 @@ func normalizePrintSettingsInternal(base, delta, capabilities *PrintSettings, ca
 		}
 	}
 	deltaFeats := make(map[xml.Name]bool)
+	deltaParams := make(map[xml.Name]bool)
 	reqFeats := make(map[xml.Name]bool)
 	var parsedBase, parsedDelta *PrintSettings
 	if base != nil {
@@ -126,20 +154,18 @@ func normalizePrintSettingsInternal(base, delta, capabilities *PrintSettings, ca
 			return nil, nil, err
 		}
 		for _, element := range parsedDelta.Elements {
+			key := printCanonicalKey(element.Name)
 			if element.Kind == PrintSettingFeature {
-				key := printCanonicalKey(element.Name)
 				deltaFeats[key] = true
 				reqFeats[key] = true
+			} else if element.Kind == PrintSettingParameterInit {
+				deltaParams[key] = true
 			}
 		}
 	}
 	var ticket *PrintSettings
 	if parsedBase != nil && parsedDelta != nil {
-		ticket, err = mergePrintSettingsValidated(parsedBase, parsedDelta, configuration)
-		if err != nil {
-			return nil, nil, err
-		}
-		ticket, err = validatePrintSettingsModel(ticket, configuration, printDocumentTicket)
+		ticket, err = mergePrintSettingsInternal(parsedBase, parsedDelta, configuration)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -151,11 +177,13 @@ func normalizePrintSettingsInternal(base, delta, capabilities *PrintSettings, ca
 		ticket = &PrintSettings{Version: capModel.Version}
 	}
 	normalizer := printNormalizer{
-		options:    configuration,
-		domains:    make(map[xml.Name]*printParameterDomain),
-		deltaFeats: deltaFeats,
-		reqFeats:   reqFeats,
-		remaining:  configuration.MaxOptionComparisons,
+		options:     configuration,
+		domains:     make(map[xml.Name]*printParameterDomain),
+		deltaFeats:  deltaFeats,
+		deltaParams: deltaParams,
+		reqFeats:    reqFeats,
+		preserveNS:  preserveNS,
+		remaining:   configuration.MaxOptionComparisons,
 	}
 	for _, element := range capModel.Elements {
 		if element.Kind != PrintSettingParameterDef {
@@ -173,6 +201,7 @@ func normalizePrintSettingsInternal(base, delta, capabilities *PrintSettings, ca
 	}
 	paramInits := make(map[xml.Name]PrintSetting)
 	paramValues := make(map[xml.Name]*PrintValue)
+	var preservedParams []PrintSetting
 	var rootProperties []PrintSetting
 	for _, element := range ticket.Elements {
 		if err := checkContext(configuration.context); err != nil {
@@ -182,6 +211,10 @@ func normalizePrintSettingsInternal(base, delta, capabilities *PrintSettings, ca
 		case PrintSettingParameterInit:
 			key := printCanonicalKey(element.Name)
 			if normalizer.domains[key] == nil {
+				if preserveNS[element.Name.Space] {
+					preservedParams = append(preservedParams, printCloneSetting(element))
+					continue
+				}
 				normalizer.addDiagnostic("ParameterInit", "name", fmt.Sprintf("unsupported print ParameterInit %s removed", element.Name.Local))
 				continue
 			}
@@ -219,6 +252,7 @@ func normalizePrintSettingsInternal(base, delta, capabilities *PrintSettings, ca
 	printCollectParameterRefs(normalizedFeatures, finalReferenced)
 	keptParams := make([]PrintSetting, 0, len(normalizedParams))
 	keptParamKeys := make(map[xml.Name]bool, len(normalizedParams))
+	keptParamFamilies := make(map[printPrefixKey]xml.Name)
 	for _, param := range normalizedParams {
 		key := printCanonicalKey(param.Name)
 		domain := normalizer.domains[key]
@@ -226,6 +260,9 @@ func normalizePrintSettingsInternal(base, delta, capabilities *PrintSettings, ca
 		if hadInit || finalReferenced[key] || domain != nil && domain.mandatory == "Unconditional" {
 			keptParams = append(keptParams, param)
 			keptParamKeys[key] = true
+			if familyKey, _, ok := printPrefixFamily(param); ok {
+				keptParamFamilies[familyKey] = key
+			}
 		}
 	}
 	for _, element := range capModel.Elements {
@@ -238,31 +275,58 @@ func normalizePrintSettingsInternal(base, delta, capabilities *PrintSettings, ca
 		}
 		if domain := normalizer.domains[key]; domain != nil {
 			defaultCopy := domain.defaultValue
-			keptParams = append(keptParams, PrintSetting{
+			candidateParam := PrintSetting{
 				Kind:     PrintSettingParameterInit,
 				Name:     element.Name,
 				Children: []PrintSetting{{Kind: PrintSettingValue, Value: &defaultCopy}},
-			})
+			}
+			if familyKey, _, ok := printPrefixFamily(candidateParam); ok {
+				if prev, exists := keptParamFamilies[familyKey]; exists && prev != key {
+					continue
+				}
+				keptParamFamilies[familyKey] = key
+			}
+			keptParams = append(keptParams, candidateParam)
 			keptParamKeys[key] = true
 		}
 	}
 	normalizedParams = keptParams
-	resultElements := make([]PrintSetting, 0, len(normalizedFeatures)+len(rootProperties)+len(normalizedParams))
-	usedKeys := make(map[xml.Name]bool, len(normalizedFeatures)+len(normalizedParams))
+	resultElements := make([]PrintSetting, 0, len(normalizedFeatures)+len(rootProperties)+len(normalizedParams)+len(preservedParams))
+	usedKeys := make(map[xml.Name]bool, len(normalizedFeatures)+len(normalizedParams)+len(preservedParams))
+	usedFamilies := make(map[printPrefixKey]xml.Name)
+	registerUsed := func(item PrintSetting) bool {
+		key := printCanonicalKey(item.Name)
+		if usedKeys[key] {
+			return false
+		}
+		if familyKey, _, ok := printPrefixFamily(item); ok {
+			if prev, exists := usedFamilies[familyKey]; exists && prev != key {
+				return false
+			}
+			usedFamilies[familyKey] = key
+		}
+		usedKeys[key] = true
+		return true
+	}
 	for _, feature := range normalizedFeatures {
-		resultElements = append(resultElements, feature)
-		usedKeys[printCanonicalKey(feature.Name)] = true
+		if registerUsed(feature) {
+			resultElements = append(resultElements, feature)
+		}
 	}
 	for _, param := range normalizedParams {
-		usedKeys[printCanonicalKey(param.Name)] = true
+		registerUsed(param)
 	}
 	for _, prop := range rootProperties {
-		if !usedKeys[printCanonicalKey(prop.Name)] {
-			resultElements = append(resultElements, prop)
-			usedKeys[printCanonicalKey(prop.Name)] = true
+		if registerUsed(prop) {
+			resultElements = append(resultElements, printCloneSetting(prop))
 		}
 	}
 	resultElements = append(resultElements, normalizedParams...)
+	for _, param := range preservedParams {
+		if registerUsed(param) {
+			resultElements = append(resultElements, param)
+		}
+	}
 	version := ticket.Version
 	if version == 0 {
 		version = 1
@@ -284,13 +348,14 @@ func normalizePrintSettingsInternal(base, delta, capabilities *PrintSettings, ca
 	return result, normalizer.diagnostics, nil
 }
 
-// resolveRootMutexGroups 在根级规范化前消解作业级与文档级互斥Feature对，避免同时产出冲突设置
+// resolveRootMutexGroups 在根级规范化前按完整异名互斥表与printPrefixFamily同族规则消解多作用域Feature冲突，避免同时产出互斥或前缀冲突设置
 // 入参: requestedElements 票据根元素, capElements 能力根元素, paramValues 票据参数初值映射
 // 返回: map[xml.Name]bool 需跳过规范化与默认补全的能力Feature规范键集合
 func (n *printNormalizer) resolveRootMutexGroups(requestedElements, capElements []PrintSetting, paramValues map[xml.Name]*PrintValue) map[xml.Name]bool {
 	skip := make(map[xml.Name]bool)
 	capOrder := make(map[xml.Name]int)
 	capFeats := make(map[xml.Name]PrintSetting)
+	var capKeys []xml.Name
 	for index, element := range capElements {
 		if element.Kind != PrintSettingFeature {
 			continue
@@ -304,6 +369,7 @@ func (n *printNormalizer) resolveRootMutexGroups(requestedElements, capElements 
 		key := printCanonicalKey(element.Name)
 		capOrder[key] = index
 		capFeats[key] = element
+		capKeys = append(capKeys, key)
 	}
 	reqFeats := make(map[xml.Name]PrintSetting)
 	for _, element := range requestedElements {
@@ -311,61 +377,146 @@ func (n *printNormalizer) resolveRootMutexGroups(requestedElements, capElements 
 			reqFeats[printCanonicalKey(element.Name)] = element
 		}
 	}
-	pairs := [][2]string{
-		{"JobBindAllDocuments", "DocumentBinding"},
-		{"JobDuplexAllDocumentsContiguously", "DocumentDuplex"},
-		{"JobNUpAllDocumentsContiguously", "DocumentNUp"},
-	}
-	for _, pair := range pairs {
-		jobKey := xml.Name{Space: printKeywordsNS, Local: pair[0]}
-		docKey := xml.Name{Space: printKeywordsNS, Local: pair[1]}
-		_, hasCapJob := capFeats[jobKey]
-		_, hasCapDoc := capFeats[docKey]
-		if !hasCapJob || !hasCapDoc {
-			continue
-		}
-		reqJob, hasReqJob := reqFeats[jobKey]
-		reqDoc, hasReqDoc := reqFeats[docKey]
-		if hasReqJob && !hasReqDoc {
-			skip[docKey] = true
-			continue
-		}
-		if !hasReqJob && hasReqDoc {
-			skip[jobKey] = true
-			continue
-		}
-		if hasReqJob && hasReqDoc {
-			dropJob := true
-			if n.deltaFeats[jobKey] && !n.deltaFeats[docKey] {
-				dropJob = false
-			} else if n.deltaFeats[docKey] && !n.deltaFeats[jobKey] {
-				dropJob = true
-			} else {
-				jobNoOp := printMutexFeatureNoOp(reqJob, paramValues)
-				docNoOp := printMutexFeatureNoOp(reqDoc, paramValues)
-				if !jobNoOp && docNoOp {
-					dropJob = false
+	groups := printBuildMutexKeyGroups(capKeys, capFeats, printMutexFeatureGroups)
+	for _, group := range groups {
+		var presentCaps []xml.Name
+		for _, key := range group {
+			if !skip[key] {
+				if _, ok := capFeats[key]; ok {
+					presentCaps = append(presentCaps, key)
 				}
 			}
-			if dropJob {
-				skip[jobKey] = true
-				n.addDiagnostic("Feature", "name", fmt.Sprintf("conflicting print Feature %s removed in favor of %s", pair[0], pair[1]))
-			} else {
-				skip[docKey] = true
-				n.addDiagnostic("Feature", "name", fmt.Sprintf("conflicting print Feature %s removed in favor of %s", pair[1], pair[0]))
-			}
+		}
+		if len(presentCaps) < 2 {
 			continue
 		}
-		if capOrder[jobKey] < capOrder[docKey] {
-			skip[docKey] = true
+		var presentReqs []xml.Name
+		for _, key := range presentCaps {
+			if _, ok := reqFeats[key]; ok {
+				presentReqs = append(presentReqs, key)
+			}
+		}
+		var winner xml.Name
+		if len(presentReqs) == 0 {
+			winner = presentCaps[0]
+			for _, key := range presentCaps[1:] {
+				if capOrder[key] < capOrder[winner] {
+					winner = key
+				}
+			}
+		} else if len(presentReqs) == 1 {
+			winner = presentReqs[0]
 		} else {
-			skip[jobKey] = true
+			winner = presentReqs[0]
+			for _, key := range presentReqs[1:] {
+				if n.preferMutexFeature(key, winner, reqFeats, paramValues, capOrder) {
+					winner = key
+				}
+			}
+			for _, key := range presentReqs {
+				if key != winner {
+					n.addDiagnostic("Feature", "name", fmt.Sprintf("conflicting print Feature %s removed in favor of %s", key.Local, winner.Local))
+				}
+			}
+		}
+		for _, key := range presentCaps {
+			if key != winner {
+				skip[key] = true
+			}
 		}
 	}
 	return skip
 }
 
-// printMutexFeatureNoOp 判断互斥装订、双面或拼版Feature在请求中是否为无效果恒等项
+// preferMutexFeature 比较两个同时请求的互斥Feature优先级，依次按增量来源、非恒等有效值、更具体作用域与能力声明顺序决出胜者
+// 入参: candidate 候选键, current 当前胜出键, reqFeats 请求Feature索引, paramValues 票据参数初值映射, capOrder 能力声明序号
+// 返回: bool 候选键是否优于当前胜出键
+func (n *printNormalizer) preferMutexFeature(candidate, current xml.Name, reqFeats map[xml.Name]PrintSetting, paramValues map[xml.Name]*PrintValue, capOrder map[xml.Name]int) bool {
+	candDelta, currDelta := n.deltaFeats[candidate], n.deltaFeats[current]
+	if candDelta != currDelta {
+		return candDelta
+	}
+	candNoOp := printMutexFeatureNoOp(reqFeats[candidate], paramValues)
+	currNoOp := printMutexFeatureNoOp(reqFeats[current], paramValues)
+	if candNoOp != currNoOp {
+		return !candNoOp
+	}
+	candScope, currScope := printKeywordScope(candidate), printKeywordScope(current)
+	if candScope != currScope {
+		return candScope > currScope
+	}
+	return capOrder[candidate] < capOrder[current]
+}
+
+// printBuildMutexKeyGroups 合并公共异名互斥表与printPrefixFamily同族规则，为同层级元素构造无重互斥键组列表
+// 入参: keys 按出现顺序排列的规范键列表, settings 键到元素映射, explicitGroups 显式公共异名互斥本地名组列表
+// 返回: [][]xml.Name 合并后的互斥键组列表
+func printBuildMutexKeyGroups(keys []xml.Name, settings map[xml.Name]PrintSetting, explicitGroups [][]string) [][]xml.Name {
+	parent := make(map[xml.Name]xml.Name, len(keys))
+	for _, key := range keys {
+		parent[key] = key
+	}
+	var find func(xml.Name) xml.Name
+	find = func(k xml.Name) xml.Name {
+		for parent[k] != k {
+			parent[k] = parent[parent[k]]
+			k = parent[k]
+		}
+		return k
+	}
+	unite := func(a, b xml.Name) {
+		ra, rb := find(a), find(b)
+		if ra != rb {
+			parent[rb] = ra
+		}
+	}
+	for _, names := range explicitGroups {
+		var matched []xml.Name
+		for _, key := range keys {
+			if !printPublicKeywordSpace(key.Space) {
+				continue
+			}
+			for _, local := range names {
+				if key.Local == local {
+					matched = append(matched, key)
+					break
+				}
+			}
+		}
+		for i := 1; i < len(matched); i++ {
+			unite(matched[0], matched[i])
+		}
+	}
+	byFamily := make(map[printPrefixKey][]xml.Name)
+	for _, key := range keys {
+		if familyKey, _, ok := printPrefixFamily(settings[key]); ok {
+			byFamily[familyKey] = append(byFamily[familyKey], key)
+		}
+	}
+	for _, members := range byFamily {
+		for i := 1; i < len(members); i++ {
+			unite(members[0], members[i])
+		}
+	}
+	grouped := make(map[xml.Name][]xml.Name)
+	var roots []xml.Name
+	for _, key := range keys {
+		root := find(key)
+		if _, exists := grouped[root]; !exists {
+			roots = append(roots, root)
+		}
+		grouped[root] = append(grouped[root], key)
+	}
+	var result [][]xml.Name
+	for _, root := range roots {
+		if len(grouped[root]) >= 2 {
+			result = append(result, grouped[root])
+		}
+	}
+	return result
+}
+
+// printMutexFeatureNoOp 判断互斥装订、双面、拼版、钉装或打孔Feature在请求中是否为无效果恒等项
 // 入参: feature 请求的Feature节点, paramValues 票据参数初值映射
 // 返回: bool 是否为无效果恒等项
 func printMutexFeatureNoOp(feature PrintSetting, paramValues map[xml.Name]*PrintValue) bool {
@@ -374,7 +525,7 @@ func printMutexFeatureNoOp(feature PrintSetting, paramValues map[xml.Name]*Print
 			continue
 		}
 		switch feature.Name.Local {
-		case "JobBindAllDocuments", "DocumentBinding":
+		case "JobBindAllDocuments", "DocumentBinding", "JobStapleAllDocuments", "DocumentStaple", "JobHolePunch", "DocumentHolePunch":
 			return printPublicKeywordSpace(child.Name.Space) && child.Name.Local == "None"
 		case "JobDuplexAllDocumentsContiguously", "DocumentDuplex":
 			return printPublicKeywordSpace(child.Name.Space) && child.Name.Local == "OneSided"
@@ -388,6 +539,8 @@ func printMutexFeatureNoOp(feature PrintSetting, paramValues map[xml.Name]*Print
 					return val != nil && strings.Trim(val.Text, " \t\r\n") == "1"
 				}
 			}
+			return false
+		default:
 			return false
 		}
 	}
@@ -622,29 +775,82 @@ func (n *printNormalizer) resolveCrossFeatureConflicts(features, capElements []P
 	return result
 }
 
-// normalizeFeatureList 在同一父级层级规范化Feature集合，移除未声明项、执行互斥跳过并对缺失项执行Defaulting
+// normalizeFeatureList 在同一父级层级规范化Feature集合，移除未声明项、透传白名单私有Feature、执行互斥跳过并对缺失项执行Defaulting
 // 入参: requestedElements 票据当前层级元素, capElements 能力当前层级元素, paramInits 票据参数初值节点映射, paramValues 票据参数初值映射, isRoot 是否位于文档根层级, skipCaps 需跳过的能力Feature规范键集合
 // 返回: []PrintSetting 规范化后的Feature列表, error 预算或取消错误
 func (n *printNormalizer) normalizeFeatureList(requestedElements, capElements []PrintSetting, paramInits map[xml.Name]PrintSetting, paramValues map[xml.Name]*PrintValue, isRoot bool, skipCaps map[xml.Name]bool) ([]PrintSetting, error) {
 	capByKey := make(map[xml.Name]PrintSetting)
-	for _, element := range capElements {
+	var capKeys []xml.Name
+	capOrder := make(map[xml.Name]int)
+	for index, element := range capElements {
 		if element.Kind == PrintSettingFeature {
-			capByKey[printCanonicalKey(element.Name)] = element
+			key := printCanonicalKey(element.Name)
+			capByKey[key] = element
+			capOrder[key] = index
+			capKeys = append(capKeys, key)
 		}
 	}
 	reqByKey := make(map[xml.Name]PrintSetting)
+	var preserved []PrintSetting
 	for _, element := range requestedElements {
 		if element.Kind != PrintSettingFeature {
 			continue
 		}
 		key := printCanonicalKey(element.Name)
 		if _, exists := capByKey[key]; !exists {
+			if n.preserveNS[element.Name.Space] {
+				preserved = append(preserved, printCloneSetting(element))
+				continue
+			}
 			n.addDiagnostic("Feature", "name", fmt.Sprintf("unsupported print Feature %s removed", element.Name.Local))
 			continue
 		}
 		reqByKey[key] = element
 	}
+	if !isRoot && len(capKeys) >= 2 {
+		subSkip := make(map[xml.Name]bool)
+		for _, group := range printBuildMutexKeyGroups(capKeys, capByKey, nil) {
+			var presentReqs []xml.Name
+			for _, key := range group {
+				if _, ok := reqByKey[key]; ok {
+					presentReqs = append(presentReqs, key)
+				}
+			}
+			winner := group[0]
+			if len(presentReqs) == 1 {
+				winner = presentReqs[0]
+			} else if len(presentReqs) > 1 {
+				winner = presentReqs[0]
+				for _, key := range presentReqs[1:] {
+					if printKeywordScope(key) > printKeywordScope(winner) || printKeywordScope(key) == printKeywordScope(winner) && capOrder[key] < capOrder[winner] {
+						winner = key
+					}
+				}
+				for _, key := range presentReqs {
+					if key != winner {
+						n.addDiagnostic("Feature", "name", fmt.Sprintf("conflicting print Feature %s removed in favor of %s", key.Local, winner.Local))
+					}
+				}
+			} else {
+				for _, key := range group[1:] {
+					if capOrder[key] < capOrder[winner] {
+						winner = key
+					}
+				}
+			}
+			for _, key := range group {
+				if key != winner {
+					subSkip[key] = true
+				}
+			}
+		}
+		if len(subSkip) > 0 {
+			skipCaps = subSkip
+		}
+	}
 	var result []PrintSetting
+	usedKeys := make(map[xml.Name]bool)
+	usedFamilies := make(map[printPrefixKey]xml.Name)
 	for _, capFeat := range capElements {
 		if capFeat.Kind != PrintSettingFeature {
 			continue
@@ -673,7 +879,26 @@ func (n *printNormalizer) normalizeFeatureList(requestedElements, capElements []
 		}
 		if ok {
 			result = append(result, normalized)
+			normKey := printCanonicalKey(normalized.Name)
+			usedKeys[normKey] = true
+			if familyKey, _, hasFamily := printPrefixFamily(normalized); hasFamily {
+				usedFamilies[familyKey] = normKey
+			}
 		}
+	}
+	for _, kept := range preserved {
+		key := printCanonicalKey(kept.Name)
+		if usedKeys[key] {
+			continue
+		}
+		if familyKey, _, hasFamily := printPrefixFamily(kept); hasFamily {
+			if prev, exists := usedFamilies[familyKey]; exists && prev != key {
+				continue
+			}
+			usedFamilies[familyKey] = key
+		}
+		usedKeys[key] = true
+		result = append(result, kept)
 	}
 	return result, nil
 }
@@ -955,7 +1180,7 @@ func (n *printNormalizer) normalizeFeature(requested *PrintSetting, capability P
 			children = append(children, printCloneSetting(prop))
 		}
 	}
-	return PrintSetting{Kind: PrintSettingFeature, Name: requested.Name, Children: children}, true, nil
+	return PrintSetting{Kind: PrintSettingFeature, Name: capability.Name, Children: children}, true, nil
 }
 
 // backfillParameterRefs 在被约束或不支持选项回退至含ParameterRef的能力选项时，将原目标ScoredProperty值回填进参数初值表
@@ -1000,12 +1225,12 @@ func (n *printNormalizer) backfillParameterRefs(sourceChildren, targetChildren [
 	}
 }
 
-// printCompleteOptionFromCapability 将匹配能力的请求Option转为合法票据Option并从能力Option补齐缺失ScoredProperty与ParameterRef
+// printCompleteOptionFromCapability 将匹配能力的请求Option转为合法票据Option，优先采用能力声明的规范Name并补齐缺失ScoredProperty与ParameterRef
 // 入参: reqOpt 请求Option节点, capOpt 匹配的能力Option节点
 // 返回: PrintSetting 补齐后的独立票据Option节点
 func printCompleteOptionFromCapability(reqOpt, capOpt PrintSetting) PrintSetting {
 	kept := printTicketOptionFromCapability(reqOpt)
-	if kept.Name == (xml.Name{}) && capOpt.Name != (xml.Name{}) {
+	if capOpt.Name != (xml.Name{}) {
 		kept.Name = capOpt.Name
 	}
 	kept.Children = printMergeMissingScored(kept.Children, capOpt.Children)
@@ -1063,7 +1288,7 @@ func (n *printNormalizer) normalizeParameterizedOption(reqOpt PrintSetting, cand
 			continue
 		}
 		cloned := printTicketOptionFromCapability(reqOpt)
-		if cloned.Name == (xml.Name{}) && cand.Name != (xml.Name{}) {
+		if cand.Name != (xml.Name{}) {
 			cloned.Name = cand.Name
 		}
 		clampedChildren, changed, ok, err := n.normalizeParameterizedScored(cloned.Children, cand.Children, sameName, paramValues, emitDiag)
@@ -1305,7 +1530,7 @@ func (n *printNormalizer) matchExactOption(reqOpt PrintSetting, candidates []Pri
 		if !sameName && printScoredCount(reqOpt.Children) == 0 {
 			continue
 		}
-		matched, err := n.matchScoredExact(reqOpt.Children, cand.Children, sameName, paramValues)
+		matched, err := printMatchScoredExact(reqOpt.Children, cand.Children, sameName, n.domains, paramValues, n.options, n.step, false)
 		if err != nil {
 			return -1, err
 		}
@@ -1314,70 +1539,6 @@ func (n *printNormalizer) matchExactOption(reqOpt PrintSetting, candidates []Pri
 		}
 	}
 	return -1, nil
-}
-
-// matchScoredExact 检查请求Option与候选Option的ScoredProperty是否精确匹配
-// 入参: requested 请求子元素, supported 候选子元素, subset 是否允许省略候选已知描述, paramValues 票据参数初值映射
-// 返回: bool 是否精确匹配, error 预算或取消错误
-func (n *printNormalizer) matchScoredExact(requested, supported []PrintSetting, subset bool, paramValues map[xml.Name]*PrintValue) (bool, error) {
-	if !subset && printScoredCount(requested) != printScoredCount(supported) {
-		return false, nil
-	}
-	index := make(map[xml.Name]PrintSetting)
-	for _, setting := range supported {
-		if setting.Kind == PrintSettingScoredProperty {
-			index[printCanonicalKey(setting.Name)] = setting
-		}
-	}
-	for _, setting := range requested {
-		if setting.Kind != PrintSettingScoredProperty {
-			continue
-		}
-		if err := n.step(); err != nil {
-			return false, err
-		}
-		cand, exists := index[printCanonicalKey(setting.Name)]
-		if !exists {
-			return false, nil
-		}
-		reqVal, reqRef := printScoredValue(setting.Children)
-		capVal, capRef := printScoredValue(cand.Children)
-		if capRef != (xml.Name{}) {
-			if reqRef != (xml.Name{}) {
-				if printCanonicalKey(reqRef) != printCanonicalKey(capRef) {
-					return false, nil
-				}
-			} else {
-				domain := n.domains[printCanonicalKey(capRef)]
-				if domain == nil {
-					return false, nil
-				}
-				if _, err := domain.value(reqVal, n.options); err != nil {
-					if errors.Is(err, ErrInvalid) {
-						return false, nil
-					}
-					return false, err
-				}
-			}
-		} else {
-			if reqRef != (xml.Name{}) {
-				reqVal = paramValues[printCanonicalKey(reqRef)]
-				if reqVal == nil {
-					if domain := n.domains[printCanonicalKey(reqRef)]; domain != nil {
-						reqVal = &domain.defaultValue
-					}
-				}
-			}
-			same, err := n.valuesEqual(reqVal, capVal)
-			if err != nil || !same {
-				return same, err
-			}
-		}
-		if same, err := n.matchScoredExact(setting.Children, cand.Children, subset, paramValues); err != nil || !same {
-			return same, err
-		}
-	}
-	return true, nil
 }
 
 // bestOption 按ScoredProperty匹配度评分查找最接近的未受约束候选下标，无匹配时返回负一
@@ -1484,7 +1645,7 @@ func (n *printNormalizer) valuesEqual(requested, supported *PrintValue) (bool, e
 	if err := n.step(); err != nil {
 		return false, err
 	}
-	return printValuesEqual(requested, supported, n.options, true)
+	return printValuesEqual(requested, supported, n.options)
 }
 
 // numericProximity 计算两个数值PrintValue的接近度加分，越接近分值越高
@@ -1525,10 +1686,11 @@ func (n *printNormalizer) numericProximity(requested, supported *PrintValue) (fl
 	return 50.0 / (1.0 + diff/scale), true, nil
 }
 
-// normalizeParameters 按设备ParameterDef校验、补全、裁剪与量化票据中的ParameterInit集合
+// normalizeParameters 按设备ParameterDef校验、多作用域互斥消解、补全、裁剪与量化票据中的ParameterInit集合
 // 入参: capElements 能力根元素列表, paramInits 票据已有ParameterInit索引, referenced 选定Option引用的参数集合
 // 返回: []PrintSetting 规范化后的ParameterInit列表, error 预算或取消错误
 func (n *printNormalizer) normalizeParameters(capElements []PrintSetting, paramInits map[xml.Name]PrintSetting, referenced map[xml.Name]bool) ([]PrintSetting, error) {
+	skipParams := n.resolveRootMutexParameters(capElements, paramInits, referenced)
 	var result []PrintSetting
 	for _, element := range capElements {
 		if element.Kind != PrintSettingParameterDef {
@@ -1544,6 +1706,9 @@ func (n *printNormalizer) normalizeParameters(capElements []PrintSetting, paramI
 			}
 		}
 		key := printCanonicalKey(element.Name)
+		if skipParams[key] {
+			continue
+		}
 		domain := n.domains[key]
 		if domain == nil {
 			continue
@@ -1561,7 +1726,7 @@ func (n *printNormalizer) normalizeParameters(capElements []PrintSetting, paramI
 			}
 			continue
 		}
-		normalized, err := n.normalizeParameterInit(existing, domain)
+		normalized, err := n.normalizeParameterInit(existing, element.Name, domain)
 		if err != nil {
 			return nil, err
 		}
@@ -1570,16 +1735,96 @@ func (n *printNormalizer) normalizeParameters(capElements []PrintSetting, paramI
 	return result, nil
 }
 
-// normalizeParameterInit 校验单个ParameterInit，对越界数值裁剪量化、对越界字符串截断或回退默认值
-// 入参: existing 票据已有ParameterInit, domain 对应参数域定义
+// resolveRootMutexParameters 按完整异名互斥表与printPrefixFamily同族规则消解多作用域ParameterDef与ParameterInit冲突
+// 入参: capElements 能力根元素列表, paramInits 票据已有ParameterInit索引, referenced 选定Option引用的参数集合
+// 返回: map[xml.Name]bool 需跳过规范化与默认补全的能力ParameterDef规范键集合
+func (n *printNormalizer) resolveRootMutexParameters(capElements []PrintSetting, paramInits map[xml.Name]PrintSetting, referenced map[xml.Name]bool) map[xml.Name]bool {
+	skip := make(map[xml.Name]bool)
+	capOrder := make(map[xml.Name]int)
+	capParams := make(map[xml.Name]PrintSetting)
+	var capKeys []xml.Name
+	for index, element := range capElements {
+		if element.Kind != PrintSettingParameterDef {
+			continue
+		}
+		if n.options.Scope != PrintScopeUnknown {
+			scope := printKeywordScope(element.Name)
+			if scope != PrintScopeUnknown && scope < n.options.Scope {
+				continue
+			}
+		}
+		key := printCanonicalKey(element.Name)
+		capOrder[key] = index
+		capParams[key] = element
+		capKeys = append(capKeys, key)
+	}
+	groups := printBuildMutexKeyGroups(capKeys, capParams, printMutexParameterGroups)
+	for _, group := range groups {
+		var active []xml.Name
+		for _, key := range group {
+			domain := n.domains[key]
+			if domain == nil {
+				continue
+			}
+			_, present := paramInits[key]
+			if present || referenced[key] || domain.mandatory == "Unconditional" {
+				active = append(active, key)
+			}
+		}
+		if len(active) < 2 {
+			continue
+		}
+		winner := active[0]
+		for _, key := range active[1:] {
+			if n.preferMutexParameter(key, winner, paramInits, referenced, capOrder) {
+				winner = key
+			}
+		}
+		for _, key := range group {
+			if key == winner {
+				continue
+			}
+			skip[key] = true
+			if _, present := paramInits[key]; present {
+				n.addDiagnostic("ParameterInit", "name", fmt.Sprintf("conflicting print ParameterInit %s removed in favor of %s", key.Local, winner.Local))
+			}
+		}
+	}
+	return skip
+}
+
+// preferMutexParameter 比较两个同时生效的互斥参数优先级，依次按被引用状态、增量来源、显式声明、更具体作用域与能力顺序决出胜者
+// 入参: candidate 候选键, current 当前胜出键, paramInits 票据显式参数映射, referenced 被引用参数集合, capOrder 能力声明序号
+// 返回: bool 候选键是否优于当前胜出键
+func (n *printNormalizer) preferMutexParameter(candidate, current xml.Name, paramInits map[xml.Name]PrintSetting, referenced map[xml.Name]bool, capOrder map[xml.Name]int) bool {
+	if referenced[candidate] != referenced[current] {
+		return referenced[candidate]
+	}
+	if n.deltaParams[candidate] != n.deltaParams[current] {
+		return n.deltaParams[candidate]
+	}
+	_, candPresent := paramInits[candidate]
+	_, currPresent := paramInits[current]
+	if candPresent != currPresent {
+		return candPresent
+	}
+	candScope, currScope := printKeywordScope(candidate), printKeywordScope(current)
+	if candScope != currScope {
+		return candScope > currScope
+	}
+	return capOrder[candidate] < capOrder[current]
+}
+
+// normalizeParameterInit 校验单个ParameterInit，采用能力文档声明的规范名称，对越界数值裁剪量化、对越界字符串截断或回退默认值
+// 入参: existing 票据已有ParameterInit, capName 能力文档声明的规范参数名称, domain 对应参数域定义
 // 返回: PrintSetting 规范化后的ParameterInit, error 算术预算或取消错误
-func (n *printNormalizer) normalizeParameterInit(existing PrintSetting, domain *printParameterDomain) (PrintSetting, error) {
+func (n *printNormalizer) normalizeParameterInit(existing PrintSetting, capName xml.Name, domain *printParameterDomain) (PrintSetting, error) {
 	fallback := func(reason string) PrintSetting {
 		defaultCopy := domain.defaultValue
-		n.addDiagnostic("ParameterInit", "name", fmt.Sprintf("print ParameterInit %s %s", existing.Name.Local, reason))
+		n.addDiagnostic("ParameterInit", "name", fmt.Sprintf("print ParameterInit %s %s", capName.Local, reason))
 		return PrintSetting{
 			Kind:     PrintSettingParameterInit,
-			Name:     existing.Name,
+			Name:     capName,
 			Children: []PrintSetting{{Kind: PrintSettingValue, Value: &defaultCopy}},
 		}
 	}
@@ -1595,12 +1840,12 @@ func (n *printNormalizer) normalizeParameterInit(existing PrintSetting, domain *
 	}
 	if adjusted {
 		if domain.kind.Local == "string" {
-			n.addDiagnostic("ParameterInit", "name", fmt.Sprintf("print ParameterInit %s truncated to MaxLength", existing.Name.Local))
+			n.addDiagnostic("ParameterInit", "name", fmt.Sprintf("print ParameterInit %s truncated to MaxLength", capName.Local))
 		} else {
-			n.addDiagnostic("ParameterInit", "name", fmt.Sprintf("print ParameterInit %s clamped or quantized to %s", existing.Name.Local, normalized.Text))
+			n.addDiagnostic("ParameterInit", "name", fmt.Sprintf("print ParameterInit %s clamped or quantized to %s", capName.Local, normalized.Text))
 		}
 	}
-	return PrintSetting{Kind: PrintSettingParameterInit, Name: existing.Name, Children: []PrintSetting{{Kind: PrintSettingValue, Value: &normalized}}}, nil
+	return PrintSetting{Kind: PrintSettingParameterInit, Name: capName, Children: []PrintSetting{{Kind: PrintSettingValue, Value: &normalized}}}, nil
 }
 
 // printFormatDecimalRat 将有限十进制有理数精确格式化为XML Schema十进制词法字符串

@@ -109,6 +109,59 @@ var printSettingNames = [...]string{"", "Feature", "Option", "ParameterInit", "P
 // printConstraintNames 保存约束枚举对应的关键字名称，Unknown表示未声明
 var printConstraintNames = [...]string{"", "None", "PrintTicketSettings", "AdminSettings", "DeviceSettings"}
 
+// printAllowedOrientations 等切片与映射集中声明Print Schema公共关键字权威白名单与多作用域互斥表
+var (
+	printAllowedOrientations           = []string{"Portrait", "Landscape", "ReversePortrait", "ReverseLandscape"}
+	printAllowedScalings               = []string{"None", "Custom", "CustomSquare", "FitApplicationMediaSizeToPageImageableSize", "FitApplicationContentSizeToPageImageableSize", "FitApplicationBleedSizeToPageImageableSize", "FitApplicationMediaSizeToPageMediaSize"}
+	printAllowedScaleOffsetAlignments  = []string{"Center", "TopLeft", "TopCenter", "TopRight", "LeftCenter", "RightCenter", "BottomLeft", "BottomCenter", "BottomRight"}
+	printAllowedMirrorImages           = []string{"None", "MirrorImageWidth", "MirrorImageHeight"}
+	printAllowedPageOrders             = []string{"Standard", "Reverse"}
+	printAllowedCollateModes           = []string{"Collated", "Uncollated"}
+	printAllowedPresentationDirections = []string{"RightBottom", "BottomRight", "LeftBottom", "BottomLeft", "RightTop", "TopRight", "LeftTop", "TopLeft"}
+	printAllowedDuplexOptions          = []string{"OneSided", "TwoSidedLongEdge", "TwoSidedShortEdge"}
+	printAllowedBorderlessOptions      = []string{"None", "Borderless"}
+	printAllowedOutputColors           = []string{"Color", "Grayscale", "Monochrome"}
+	printAllowedColorManagements       = []string{"None", "Device", "Driver", "System"}
+	printAllowedRenderingIntents       = []string{"AbsoluteColorimetric", "BusinessGraphics", "Photographs", "RelativeColorimetric"}
+	printAllowedOutputQualities        = []string{"Automatic", "Draft", "Fax", "High", "Normal", "Photographic", "Text"}
+	printAllowedPhotoPrintingIntents   = []string{"None", "PhotoBest", "PhotoDraft", "PhotoStandard"}
+	printAllowedBindingOptions         = []string{"None", "Bale", "BindBottom", "BindLeft", "BindRight", "BindTop", "Booklet", "EdgeStitchBottom", "EdgeStitchLeft", "EdgeStitchRight", "EdgeStitchTop", "Fold", "JogOffset", "Trim"}
+	printAllowedStapleOptions          = []string{"None", "SaddleStitch", "StapleBottomLeft", "StapleBottomRight", "StapleDualBottom", "StapleDualLeft", "StapleDualRight", "StapleDualTop", "StapleTopLeft", "StapleTopRight"}
+	printAllowedHolePunchOptions       = []string{"None", "BottomEdge", "LeftEdge", "RightEdge", "TopEdge"}
+	printAllowedWatermarkLayers        = []string{"Overlay", "Underlay"}
+	printMutexFeatureGroups            = [][]string{
+		{"JobBindAllDocuments", "DocumentBinding"},
+		{"JobDuplexAllDocumentsContiguously", "DocumentDuplex"},
+		{"JobNUpAllDocumentsContiguously", "DocumentNUp"},
+		{"JobCollateAllDocuments", "DocumentCollate"},
+		{"JobStapleAllDocuments", "DocumentStaple"},
+		{"JobHolePunch", "DocumentHolePunch"},
+		{"JobInputBin", "DocumentInputBin", "PageInputBin"},
+		{"JobOutputBin", "DocumentOutputBin", "PageOutputBin"},
+	}
+	printMutexParameterGroups = [][]string{
+		{"JobCopiesAllDocuments", "DocumentCopiesAllPages", "PageCopies"},
+	}
+	printDeviceControlFeatures = map[string]bool{
+		"PageMediaType":              true,
+		"PageOutputQuality":          true,
+		"PagePhotoPrintingIntent":    true,
+		"PageResolution":             true,
+		"JobInputBin":                true,
+		"DocumentInputBin":           true,
+		"PageInputBin":               true,
+		"JobOutputBin":               true,
+		"DocumentOutputBin":          true,
+		"PageOutputBin":              true,
+		"JobStapleAllDocuments":      true,
+		"DocumentStaple":             true,
+		"JobHolePunch":               true,
+		"DocumentHolePunch":          true,
+		"PageTrueTypeFontMode":       true,
+		"PageDeviceFontSubstitution": true,
+	}
+)
+
 // PrintSelection 表示Feature允许同时选择一个或多个Option
 type PrintSelection uint8
 
@@ -159,14 +212,16 @@ type PrintValue struct {
 	QName xml.Name
 }
 
-// PrintSettingsOptions 设置资源预算及票据关联层级，参数算术默认最多处理4096位数字
+// PrintSettingsOptions 设置资源预算、票据关联层级与向前兼容校验选项，参数算术默认最多处理4096位数字
 // Option匹配默认最多执行100000次比较，预算不足返回ErrLimit，不改为近似匹配
 // 非Unknown层级会在Framework校验前移除更宽作用域的根设置，不推断私有设备约束
+// IgnoreUndeclaredFeatures开启时，ValidatePrintSelection对已知命名空间中能力文档未声明的扩展Feature记录非致命诊断并忽略，仍严格拦截不支持的Option值
 type PrintSettingsOptions struct {
-	Limits               Limits
-	Scope                PrintScope
-	MaxNumericDigits     int
-	MaxOptionComparisons int
+	Limits                   Limits
+	Scope                    PrintScope
+	MaxNumericDigits         int
+	MaxOptionComparisons     int
+	IgnoreUndeclaredFeatures bool
 }
 
 // printSettingsConfig 保存已校验的打印设置预算、关联层级、忽略策略与取消Context
@@ -276,13 +331,10 @@ func printPublicKeywordSpace(space string) bool {
 	return space == printKeywordsNS || space == printKeywordsV11NS || space == printKeywordsV12NS || space == printKeywords2NS
 }
 
-// printCanonicalKey 将公共关键字与框架命名空间分别归并到规范命名空间用于合并与查重，私有命名空间保持原样
+// printCanonicalKey 将v1与v2框架命名空间归并到规范框架命名空间用于合并与查重，公共关键字各版本及私有命名空间均保留真实命名空间
 // 入参: name 展开关键字名称
 // 返回: xml.Name 规范化后的展开名称
 func printCanonicalKey(name xml.Name) xml.Name {
-	if printPublicKeywordSpace(name.Space) {
-		return xml.Name{Space: printKeywordsNS, Local: name.Local}
-	}
 	if printFrameworkSpace(name.Space) {
 		return xml.Name{Space: printFrameworkNS, Local: name.Local}
 	}
@@ -339,6 +391,152 @@ func (p PrintSetting) Identity() (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// Feature 按完整xml.Name只读检索根级Feature并返回独立深拷贝
+// 入参: name 目标Feature的展开名称
+// 返回: PrintSetting 独立Feature副本, bool 是否找到
+func (p *PrintSettings) Feature(name xml.Name) (PrintSetting, bool) {
+	if p == nil {
+		return PrintSetting{}, false
+	}
+	return printFindChildSetting(p.Elements, PrintSettingFeature, name)
+}
+
+// Option 按Feature的完整xml.Name只读检索其首个直接Option并返回独立深拷贝
+// 入参: feature 目标Feature的展开名称
+// 返回: PrintSetting 独立Option副本, bool 是否找到
+func (p *PrintSettings) Option(feature xml.Name) (PrintSetting, bool) {
+	found, ok := p.Feature(feature)
+	if !ok {
+		return PrintSetting{}, false
+	}
+	return found.Option()
+}
+
+// Options 按Feature的完整xml.Name只读检索其全部直接Option并返回独立深拷贝切片
+// 入参: feature 目标Feature的展开名称
+// 返回: []PrintSetting 独立Option列表，未找到时为nil
+func (p *PrintSettings) Options(feature xml.Name) []PrintSetting {
+	found, ok := p.Feature(feature)
+	if !ok {
+		return nil
+	}
+	return found.Options()
+}
+
+// ScoredProperty 按Feature与ScoredProperty的完整xml.Name只读检索首个Option下的ScoredProperty并返回独立深拷贝
+// 入参: feature 目标Feature的展开名称, property 目标ScoredProperty的展开名称
+// 返回: PrintSetting 独立ScoredProperty副本, bool 是否找到
+func (p *PrintSettings) ScoredProperty(feature, property xml.Name) (PrintSetting, bool) {
+	option, ok := p.Option(feature)
+	if !ok {
+		return PrintSetting{}, false
+	}
+	return option.ScoredProperty(property)
+}
+
+// Property 按完整xml.Name只读检索根级Property并返回独立深拷贝
+// 入参: name 目标Property的展开名称
+// 返回: PrintSetting 独立Property副本, bool 是否找到
+func (p *PrintSettings) Property(name xml.Name) (PrintSetting, bool) {
+	if p == nil {
+		return PrintSetting{}, false
+	}
+	return printFindChildSetting(p.Elements, PrintSettingProperty, name)
+}
+
+// ParameterInit 按完整xml.Name只读检索根级ParameterInit并返回独立深拷贝
+// 入参: name 目标ParameterInit的展开名称
+// 返回: PrintSetting 独立ParameterInit副本, bool 是否找到
+func (p *PrintSettings) ParameterInit(name xml.Name) (PrintSetting, bool) {
+	if p == nil {
+		return PrintSetting{}, false
+	}
+	return printFindChildSetting(p.Elements, PrintSettingParameterInit, name)
+}
+
+// ParameterDef 按完整xml.Name只读检索根级ParameterDef并返回独立深拷贝
+// 入参: name 目标ParameterDef的展开名称
+// 返回: PrintSetting 独立ParameterDef副本, bool 是否找到
+func (p *PrintSettings) ParameterDef(name xml.Name) (PrintSetting, bool) {
+	if p == nil {
+		return PrintSetting{}, false
+	}
+	return printFindChildSetting(p.Elements, PrintSettingParameterDef, name)
+}
+
+// Feature 按完整xml.Name只读检索当前节点的直接子Feature并返回独立深拷贝
+// 入参: name 目标子Feature的展开名称
+// 返回: PrintSetting 独立子Feature副本, bool 是否找到
+func (p PrintSetting) Feature(name xml.Name) (PrintSetting, bool) {
+	return printFindChildSetting(p.Children, PrintSettingFeature, name)
+}
+
+// Option 只读检索当前节点的首个直接子Option并返回独立深拷贝
+// 返回: PrintSetting 独立Option副本, bool 是否找到
+func (p PrintSetting) Option() (PrintSetting, bool) {
+	for _, child := range p.Children {
+		if child.Kind == PrintSettingOption {
+			return printCloneSetting(child), true
+		}
+	}
+	return PrintSetting{}, false
+}
+
+// Options 只读检索当前节点的全部直接子Option并返回独立深拷贝切片
+// 返回: []PrintSetting 独立Option列表，无直接Option时为nil
+func (p PrintSetting) Options() []PrintSetting {
+	var result []PrintSetting
+	for _, child := range p.Children {
+		if child.Kind == PrintSettingOption {
+			result = append(result, printCloneSetting(child))
+		}
+	}
+	return result
+}
+
+// ScoredProperty 按完整xml.Name只读检索当前节点的直接子ScoredProperty并返回独立深拷贝
+// 入参: name 目标ScoredProperty的展开名称
+// 返回: PrintSetting 独立ScoredProperty副本, bool 是否找到
+func (p PrintSetting) ScoredProperty(name xml.Name) (PrintSetting, bool) {
+	return printFindChildSetting(p.Children, PrintSettingScoredProperty, name)
+}
+
+// Property 按完整xml.Name只读检索当前节点的直接子Property并返回独立深拷贝
+// 入参: name 目标Property的展开名称
+// 返回: PrintSetting 独立Property副本, bool 是否找到
+func (p PrintSetting) Property(name xml.Name) (PrintSetting, bool) {
+	return printFindChildSetting(p.Children, PrintSettingProperty, name)
+}
+
+// ScalarValue 只读提取当前节点的直接标量Value并返回独立深拷贝
+// 返回: *PrintValue 独立值副本, bool 是否存在标量值
+func (p PrintSetting) ScalarValue() (*PrintValue, bool) {
+	if p.Kind == PrintSettingValue && p.Value != nil {
+		val := *p.Value
+		return &val, true
+	}
+	for _, child := range p.Children {
+		if child.Kind == PrintSettingValue && child.Value != nil {
+			val := *child.Value
+			return &val, true
+		}
+	}
+	return nil, false
+}
+
+// printFindChildSetting 在同级元素列表中按类型与规范化xml.Name查找首个匹配节点并返回独立深拷贝
+// 入参: elements 同级元素列表, kind 目标元素类型, name 目标展开名称
+// 返回: PrintSetting 独立深拷贝节点, bool 是否找到
+func printFindChildSetting(elements []PrintSetting, kind PrintSettingKind, name xml.Name) (PrintSetting, bool) {
+	target := printCanonicalKey(name)
+	for _, element := range elements {
+		if element.Kind == kind && printCanonicalKey(element.Name) == target {
+			return printCloneSetting(element), true
+		}
+	}
+	return PrintSetting{}, false
 }
 
 // printCommonValue 读取公共Property唯一的直接标量Value
@@ -859,24 +1057,18 @@ func parsePrintCapabilitiesChangeID(node *xmlElement) (string, error) {
 	if len(node.Children) != 0 {
 		return "", fmt.Errorf("%w: print device capabilities CapabilitiesChangeID children", ErrInvalid)
 	}
-	for _, attribute := range node.Attr {
-		if attribute.Name.Space == xmlnsNamespace || attribute.Name == (xml.Name{Local: "xmlns"}) {
-			continue
-		}
-		if handled, err := printSettingsXMLAttribute(attribute, false); handled {
-			if err != nil {
-				return "", err
-			}
-			continue
-		}
+	err := printSettingsWalkAttributes(node, false, func(attribute xml.Attr) (bool, error) {
 		if attribute.Name == (xml.Name{Space: xsiNamespace, Local: "type"}) {
 			typeName, err := printSettingsQName(node, attribute.Value)
 			if err != nil || typeName != (xml.Name{Space: printValueNS, Local: "string"}) {
-				return "", fmt.Errorf("%w: print device capabilities CapabilitiesChangeID type", ErrInvalid)
+				return true, fmt.Errorf("%w: print device capabilities CapabilitiesChangeID type", ErrInvalid)
 			}
-			continue
+			return true, nil
 		}
-		return "", fmt.Errorf("%w: print device capabilities CapabilitiesChangeID attribute {%s}%s", ErrInvalid, attribute.Name.Space, attribute.Name.Local)
+		return false, nil
+	})
+	if err != nil {
+		return "", err
 	}
 	if strings.TrimSpace(node.Text) == "" {
 		return "", fmt.Errorf("%w: empty print device capabilities CapabilitiesChangeID", ErrInvalid)
@@ -1146,47 +1338,63 @@ func printSettingsXMLAttribute(attribute xml.Attr, isRoot bool) (bool, error) {
 	return false, nil
 }
 
-// printSettingsPSF2Attributes 校验Print Schema v2直接元素的框架属性并提取约束、默认标记与选择类型
-// 入参: node XML元素, kind 已识别元素类型, capabilities 是否为能力文档, allowType 是否允许xsi:type, constraint 约束输出, hasDefault 默认声明标志输出, isDefault 默认选项值输出, selection 选择属性输出
-// 返回: error 属性或取值错误
-func printSettingsPSF2Attributes(node *xmlElement, kind PrintSettingKind, capabilities, allowType bool, constraint *PrintConstraint, hasDefault, isDefault *bool, selection **PrintSetting) error {
+// printSettingsWalkAttributes 统一遍历元素属性，跳过命名空间声明并校验XML全局属性，将剩余属性交给专用回调处理
+// 入参: node XML元素, isRoot 是否位于文档根元素, handle 专用属性处理回调
+// 返回: error 非法属性或取值错误
+func printSettingsWalkAttributes(node *xmlElement, isRoot bool, handle func(xml.Attr) (bool, error)) error {
 	for _, attribute := range node.Attr {
 		if attribute.Name.Space == xmlnsNamespace || attribute.Name == (xml.Name{Local: "xmlns"}) {
 			continue
 		}
-		if handled, err := printSettingsXMLAttribute(attribute, false); handled {
+		if handled, err := printSettingsXMLAttribute(attribute, isRoot); handled {
 			if err != nil {
 				return err
 			}
 			continue
 		}
+		handled, err := handle(attribute)
+		if err != nil {
+			return err
+		}
+		if !handled {
+			return fmt.Errorf("%w: print settings attribute {%s}%s", ErrInvalid, attribute.Name.Space, attribute.Name.Local)
+		}
+	}
+	return nil
+}
+
+// printSettingsPSF2Attributes 校验Print Schema v2直接元素的框架属性并提取约束、默认标记与选择类型
+// 入参: node XML元素, kind 已识别元素类型, capabilities 是否为能力文档, allowType 是否允许xsi:type, constraint 约束输出, hasDefault 默认声明标志输出, isDefault 默认选项值输出, selection 选择属性输出
+// 返回: error 属性或取值错误
+func printSettingsPSF2Attributes(node *xmlElement, kind PrintSettingKind, capabilities, allowType bool, constraint *PrintConstraint, hasDefault, isDefault *bool, selection **PrintSetting) error {
+	return printSettingsWalkAttributes(node, false, func(attribute xml.Attr) (bool, error) {
 		if attribute.Name == (xml.Name{Space: printFramework2NS, Local: "psftype"}) {
-			continue
+			return true, nil
 		}
 		if allowType && attribute.Name == (xml.Name{Space: xsiNamespace, Local: "type"}) {
-			continue
+			return true, nil
 		}
 		if capabilities && kind == PrintSettingOption && attribute.Name == (xml.Name{Space: printFramework2NS, Local: "default"}) {
 			value := strings.Trim(attribute.Value, " \t\r\n")
 			if value != "true" && value != "false" {
-				return fmt.Errorf("%w: print settings psf2:default value", ErrInvalid)
+				return true, fmt.Errorf("%w: print settings psf2:default value", ErrInvalid)
 			}
 			*hasDefault = true
 			*isDefault = value == "true"
-			continue
+			return true, nil
 		}
 		if capabilities && kind == PrintSettingOption && (attribute.Name == (xml.Name{Local: "constrained"}) || attribute.Name == (xml.Name{Space: printFramework2NS, Local: "constrained"})) {
 			parsed, err := printConstraint(node, attribute.Value)
 			if err != nil {
-				return err
+				return true, err
 			}
 			*constraint = parsed
-			continue
+			return true, nil
 		}
 		if capabilities && kind == PrintSettingFeature && attribute.Name == (xml.Name{Space: printFramework2NS, Local: "selectiontype"}) {
 			qname, err := printSettingsQName(node, attribute.Value)
 			if err != nil || !printPublicKeywordSpace(qname.Space) || (qname.Local != "PickOne" && qname.Local != "PickMany") {
-				return fmt.Errorf("%w: print settings psf2:selectiontype value", ErrInvalid)
+				return true, fmt.Errorf("%w: print settings psf2:selectiontype value", ErrInvalid)
 			}
 			prop := PrintSetting{
 				Kind: PrintSettingProperty,
@@ -1197,11 +1405,10 @@ func printSettingsPSF2Attributes(node *xmlElement, kind PrintSettingKind, capabi
 				}},
 			}
 			*selection = &prop
-			continue
+			return true, nil
 		}
-		return fmt.Errorf("%w: print settings attribute {%s}%s", ErrInvalid, attribute.Name.Space, attribute.Name.Local)
-	}
-	return nil
+		return false, nil
+	})
 }
 
 // printSettingsAttributes 检查允许的无命名空间属性、标准XML属性及Value的xsi:type，不接受私有XML属性
@@ -1215,29 +1422,17 @@ func printSettingsAttributes(node *xmlElement, allowed ...string) error {
 // 入参: node 元素, isRoot 是否为文档根元素, allowed 允许的无命名空间属性
 // 返回: error 非法属性错误
 func printSettingsElementAttributes(node *xmlElement, isRoot bool, allowed ...string) error {
-	for _, attribute := range node.Attr {
-		if attribute.Name.Space == xmlnsNamespace || attribute.Name == (xml.Name{Local: "xmlns"}) {
-			continue
-		}
-		if handled, err := printSettingsXMLAttribute(attribute, isRoot); handled {
-			if err != nil {
-				return err
-			}
-			continue
-		}
-		valid := false
+	return printSettingsWalkAttributes(node, isRoot, func(attribute xml.Attr) (bool, error) {
 		for _, name := range allowed {
-			valid = valid || name != "" && attribute.Name == (xml.Name{Local: name})
-		}
-		if valid {
-			continue
+			if name != "" && attribute.Name == (xml.Name{Local: name}) {
+				return true, nil
+			}
 		}
 		if !isRoot && node.Name.Local == "Value" && attribute.Name == (xml.Name{Space: xsiNamespace, Local: "type"}) {
-			continue
+			return true, nil
 		}
-		return fmt.Errorf("%w: print settings attribute {%s}%s", ErrInvalid, attribute.Name.Space, attribute.Name.Local)
-	}
-	return nil
+		return false, nil
+	})
 }
 
 // printSettingsName 读取关键字QName，Option允许完全省略名称但不允许显式空名称
@@ -1462,11 +1657,7 @@ func MergePrintSettings(ctx context.Context, baseline, delta *PrintSettings, opt
 	if err != nil {
 		return nil, err
 	}
-	merged, err := mergePrintSettingsValidated(base, change, configuration)
-	if err != nil {
-		return nil, err
-	}
-	result, err := validatePrintSettingsModel(merged, configuration, printDocumentTicket)
+	result, err := mergePrintSettingsInternal(base, change, configuration)
 	if err != nil {
 		return nil, err
 	}
@@ -1476,9 +1667,83 @@ func MergePrintSettings(ctx context.Context, baseline, delta *PrintSettings, opt
 	return result, nil
 }
 
-// mergePrintSettingsValidated 在纯内存中合并两份已校验且已按作用域过滤的打印票据模型
-// 入参: base 已校验基础票据副本, change 已校验增量票据副本, configuration 已校验配置
-// 返回: *PrintSettings 合并后的打印设置模型, error 取消错误
+// mergePrintSettingsInternal 在纯内存中合并两份已校验打印票据模型并执行轻量复杂度与冲突校验，不修改入参亦不触发整树重校验或模拟编码
+// 入参: base 已校验基础票据，nil视为版本1空票据, change 已校验增量票据，nil直接返回base, configuration 已校验配置
+// 返回: *PrintSettings 合并后的打印设置模型, error 嵌套、预算、前缀冲突或取消错误
+func mergePrintSettingsInternal(base, change *PrintSettings, configuration printSettingsConfig) (*PrintSettings, error) {
+	if err := checkContext(configuration.context); err != nil {
+		return nil, err
+	}
+	if base == nil {
+		base = &PrintSettings{Version: 1}
+	}
+	if change == nil || len(change.Elements) == 0 && change.Version <= base.Version {
+		return base, nil
+	}
+	merged, err := mergePrintSettingsValidated(base, change, configuration)
+	if err != nil {
+		return nil, err
+	}
+	if err := validatePrintSettingsMergedFast(merged, configuration); err != nil {
+		return nil, err
+	}
+	return merged, nil
+}
+
+// validatePrintSettingsMergedFast 对由已校验票据合并生成的模型执行零拷贝节点数、深度、Feature嵌套、下界字节与作用域前缀冲突复验
+// 入参: settings 合并后的票据模型, configuration 已校验配置
+// 返回: error 结构深度、冲突、预算或取消错误
+func validatePrintSettingsMergedFast(settings *PrintSettings, configuration printSettingsConfig) error {
+	limit := min(configuration.Limits.MaxMetadataBytes, configuration.Limits.MaxPartBytes, configuration.Limits.MaxPackageBytes)
+	nodes := 1
+	bytesCount := int64(32)
+	if bytesCount > limit || nodes > configuration.Limits.MaxXMLNodes || configuration.Limits.MaxXMLDepth < 1 {
+		return fmt.Errorf("%w: print settings budget", ErrLimit)
+	}
+	var walk func(items []PrintSetting, depth int, featureDepth int) error
+	walk = func(items []PrintSetting, depth int, featureDepth int) error {
+		if depth > configuration.Limits.MaxXMLDepth {
+			return fmt.Errorf("%w: print settings depth", ErrLimit)
+		}
+		for _, item := range items {
+			if err := checkContext(configuration.context); err != nil {
+				return err
+			}
+			nodes++
+			if nodes > configuration.Limits.MaxXMLNodes {
+				return fmt.Errorf("%w: print settings nodes", ErrLimit)
+			}
+			bytesCount += int64(len(item.Name.Local)) + 16
+			if item.Value != nil {
+				bytesCount += int64(len(item.Value.Text)) + int64(len(item.Value.QName.Local)) + 8
+			}
+			if bytesCount > limit {
+				return fmt.Errorf("%w: print settings byte budget", ErrLimit)
+			}
+			nextFeat := featureDepth
+			if item.Kind == PrintSettingFeature {
+				nextFeat++
+				if nextFeat > 10 {
+					return fmt.Errorf("%w: print settings element nesting", ErrInvalid)
+				}
+			}
+			if len(item.Children) > 0 {
+				if err := walk(item.Children, depth+1, nextFeat); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walk(settings.Elements, 2, 0); err != nil {
+		return err
+	}
+	return printSettingsPrefixConflicts(settings.Elements)
+}
+
+// mergePrintSettingsValidated 在纯内存中无副作用合并两份已校验且已按作用域过滤的打印票据模型
+// 入参: base 已校验基础票据, change 已校验增量票据, configuration 已校验配置
+// 返回: *PrintSettings 新建的合并打印设置模型, error 取消错误
 func mergePrintSettingsValidated(base, change *PrintSettings, configuration printSettingsConfig) (*PrintSettings, error) {
 	elements := make([]PrintSetting, len(base.Elements))
 	copy(elements, base.Elements)
@@ -1546,15 +1811,24 @@ func mergePrintSettingsValidated(base, change *PrintSettings, configuration prin
 			merged = append(merged, value)
 		}
 	}
-	base.Elements = merged
-	if change.Version > base.Version {
-		base.Version = change.Version
+	version := base.Version
+	if version == 0 {
+		version = 1
 	}
-	if base.Version > 1 && printSettingsHasAnonymousOption(base.Elements) {
-		base.Version = 1
-		printStripOptionDefaults(base.Elements)
+	if change.Version > version {
+		version = change.Version
 	}
-	return base, nil
+	result := &PrintSettings{Version: version, Elements: merged}
+	if result.Version > 1 && printSettingsHasAnonymousOption(result.Elements) {
+		result.Version = 1
+		cloned := make([]PrintSetting, len(result.Elements))
+		for index, element := range result.Elements {
+			cloned[index] = printCloneSetting(element)
+		}
+		printStripOptionDefaults(cloned)
+		result.Elements = cloned
+	}
+	return result, nil
 }
 
 // mergePrintFeature 递归合并同名Feature的直接子Feature、Option与Property，delta未提供直接Option时保留baseline的Option
@@ -1703,13 +1977,6 @@ func writeEncodedPrintSettings(output io.Writer, validated *PrintSettings, optio
 	counted := packageOutput{writer: output, context: options.context, limit: min(options.Limits.MaxMetadataBytes, options.Limits.MaxPartBytes, options.Limits.MaxPackageBytes)}
 	_, err := counted.Write(buffer.Bytes())
 	return counted.count, err
-}
-
-// printSettingsEncodedSize 在纯内存中按与流式编码完全一致的前缀表与转义规则计算精确XML输出字节数
-// 入参: settings 已校验打印设置模型, options 已校验资源预算配置, mode 文档类别模式
-// 返回: int64 精确输出字节数, error 命名空间URI非法、字节预算超限或取消错误
-func printSettingsEncodedSize(settings *PrintSettings, options printSettingsConfig, mode printDocumentMode) (int64, error) {
-	return encodePrintSettingsDocument(nil, settings, options, mode)
 }
 
 // encodePrintSettingsDocument 按两遍纯内存流式策略收集冻结根前缀表并直接写出或精确计费XML

@@ -56,6 +56,7 @@ type compositionExecution struct {
 	dedupResources    map[compositionResourceDigest]string
 	digestCache       map[compositionOrigin]compositionResourceDigest
 	pageTransformed   map[int]bool
+	pageGeometries    map[int]compositionPageGeometry
 }
 
 // compositionResourceDigest 以规范内容类型与内容SHA-256摘要唯一标识可跨源复用的静态二进制资源
@@ -190,6 +191,7 @@ func executeCompositionPlan(plan *compositionPlan, names *compositionNames, root
 		p.documents[docIdx] = doc
 	}
 	if len(x.pageTransformed) != 0 {
+		x.pageGeometries = make(map[int]compositionPageGeometry, len(x.pageTransformed))
 		for i := range plan.pages {
 			if !x.pageTransformed[i] {
 				continue
@@ -205,6 +207,7 @@ func executeCompositionPlan(plan *compositionPlan, names *compositionNames, root
 			if err != nil {
 				return nil, err
 			}
+			x.pageGeometries[i] = geom
 			p.documents[instance.document].Pages[instance.position].Width = geom.newWidth
 			p.documents[instance.document].Pages[instance.position].Height = geom.newHeight
 			x.navigation.output.source.documents[instance.document].Pages[instance.position].Width = geom.newWidth
@@ -898,17 +901,6 @@ func (x *compositionExecution) rootRelationships(source int) error {
 	return nil
 }
 
-// filterCompositionRootRelationships 移除原作业的签名和释放提示关联，发生编辑时输出有效分支
-// 入参: value 原包根关系, format 包格式, budget 共享预算
-// 返回: []byte 原编码结果，无修改时借用原字节, error XML、关系、预算或取消错误
-func filterCompositionRootRelationships(value packagePart, format Format, budget *compositionBudget) ([]byte, error) {
-	relations, edited, err := filterCompositionRootRelationshipsRecords(value, format, budget)
-	if err != nil {
-		return nil, err
-	}
-	return compositionRelationshipMarkup(value, relations, edited, budget)
-}
-
 // filterCompositionRootRelationshipsRecords 单遍解码并过滤包根关系中的签名与释放提示关联，返回有效关系切片与修改标记
 // 入参: value 原包根关系, format 包格式, budget 共享预算
 // 返回: []Relationship 过滤后的有效关系, bool 是否触发过滤编辑, error XML、关系、预算或取消错误
@@ -1086,7 +1078,7 @@ func (x *compositionExecution) signature(key compositionPartKey) error {
 	target := x.targets[x.instance(key)]
 	data, err := rewriteCompositionSignatureMarkup(value, compositionSignatureMarkupOptions{format: x.plan.sources[key.source].format, part: target, budget: x.plan.budget, id: func(id string) (string, error) {
 		return x.signatures.target(key.source, value.name, id)
-	}, spot: func(uri string) (string, bool, error) {
+	}, spotTransform: func(uri string) (string, *Matrix, bool, error) {
 		return x.signatureSpot(key, value.name, target, uri)
 	}})
 	if err != nil {
@@ -1098,41 +1090,46 @@ func (x *compositionExecution) signature(key compositionPartKey) error {
 	return x.put(value, target, data)
 }
 
-// signatureSpot 映射签署请求页面位置，按舍弃策略省略未选普通位置，受保护请求保留原文
+// signatureSpot 映射签署请求页面位置，按舍弃策略省略未选普通位置，受保护请求保留原文并透传单页仿射变换
 // 入参: key 请求身份, original 原部件URI, destination 输出部件URI, value 原PageURI
-// 返回: string 输出位置, bool 是否保留SpotLocation, error 未支持URI、预算或取消错误
-func (x *compositionExecution) signatureSpot(key compositionPartKey, original, destination, value string) (string, bool, error) {
+// 返回: string 输出位置, *Matrix 目标页仿射矩阵，未变换为nil, bool 是否保留SpotLocation, error 未支持URI、预算或取消错误
+func (x *compositionExecution) signatureSpot(key compositionPartKey, original, destination, value string) (string, *Matrix, bool, error) {
 	b := x.plan.budget
 	if err := b.step(1); err != nil {
-		return "", false, err
+		return "", nil, false, err
 	}
 	if err := b.scan(int64(len(value))); err != nil {
-		return "", false, err
+		return "", nil, false, err
 	}
 	normalized := structureURI(value)
 	if linkExternal(normalized) {
-		return value, true, nil
+		return value, nil, true, nil
 	}
 	uri, err := url.Parse(normalized)
 	if err != nil || uri.RawQuery != "" || uri.ForceQuery || uri.Fragment != "" || uri.RawFragment != "" {
-		return "", false, fmt.Errorf("%w: opaque composition signature location", ErrUnsupported)
+		return "", nil, false, fmt.Errorf("%w: opaque composition signature location", ErrUnsupported)
 	}
 	part := original
 	if uri.Path != "" {
 		part, err = resolvePart(original, uri.EscapedPath())
 		if err != nil {
-			return "", false, fmt.Errorf("%w: non-package composition signature location", ErrUnsupported)
+			return "", nil, false, fmt.Errorf("%w: non-package composition signature location", ErrUnsupported)
 		}
 	}
 	partKey := strings.ToLower(part)
 	target := ""
+	var matrix *Matrix
 	if page := x.originalPage(key.source, part); page >= 0 {
 		index, err := x.plan.target(key.source, page, -1)
 		if err != nil {
-			return "", false, err
+			return "", nil, false, err
 		}
 		if index >= 0 {
 			target = x.plan.pages[index].reference.Part
+			if geom, transformed := x.pageGeometries[index]; transformed {
+				m := geom.matrix
+				matrix = &m
+			}
 		}
 	}
 	if target == "" {
@@ -1143,24 +1140,24 @@ func (x *compositionExecution) signatureSpot(key compositionPartKey, original, d
 	if target == "" {
 		if x.protected[key.source][key.part] {
 			x.hints = append(x.hints, compositionSignatureHint{key.source, partKey})
-			return value, true, nil
+			return value, nil, true, nil
 		}
 		if !x.plan.discardSignatureLocations {
-			return "", false, fmt.Errorf("%w: composition omits a signature location", ErrUnsupported)
+			return "", nil, false, fmt.Errorf("%w: composition omits a signature location", ErrUnsupported)
 		}
-		return "", false, nil
+		return "", nil, false, nil
 	}
 	resolved, err := resolvePart(destination, uri.EscapedPath())
 	if uri.Path == "" {
 		resolved, err = destination, nil
 	}
 	if err == nil && strings.EqualFold(resolved, target) {
-		return value, true, nil
+		return value, matrix, true, nil
 	}
 	if err := b.scan(int64(len(target))); err != nil {
-		return "", false, err
+		return "", nil, false, err
 	}
-	return target, true, nil
+	return target, matrix, true, nil
 }
 
 // validateSignatureHints 防止保持原文的可选位置因另一个来源复用URI而意外指向其内容

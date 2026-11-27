@@ -101,8 +101,43 @@ type PrintCustomSelectionSpec struct {
 	SubFeatures []PrintCustomSelectionSpec
 }
 
+// PrintCustomParameterSpec 描述能力文档中自定义私有命名空间ParameterDef的数据类型、范围、步进与默认值
+// DataType支持integer、decimal、string与QName，空字符串默认按string处理；Mandatory支持Conditional、Optional与Unconditional，空默认为Conditional
+type PrintCustomParameterSpec struct {
+	Name         xml.Name
+	DataType     string
+	UnitType     string
+	Mandatory    string
+	MinValue     string
+	MaxValue     string
+	Multiple     string
+	DefaultValue string
+	DefaultQName xml.Name
+	DisplayName  string
+}
+
+// PrintCustomParameterInitSpec 描述打印票据中自定义私有命名空间ParameterInit的参数名称与初值
+type PrintCustomParameterInitSpec struct {
+	Name  xml.Name
+	Value PrintValue
+}
+
+// PrintCustomPropertySpec 描述能力文档或打印票据根级自定义私有命名空间Property的名称、标量值及可选嵌套子Property
+type PrintCustomPropertySpec struct {
+	Name     xml.Name
+	Value    *PrintValue
+	Children []PrintCustomPropertySpec
+}
+
+// PrintDeriveOptions 配置Windows V4 PDC派生的资源预算与可选自定义动态约束回调
+// CustomConstraints在标准派生约束标注与PageImageableSize重算完成后执行，可基于有效基准票据动态调整能力文档选项约束或根属性
+type PrintDeriveOptions struct {
+	Settings          PrintSettingsOptions
+	CustomConstraints func(context.Context, *PrintSettings, *PrintCapabilities) error
+}
+
 // PrintCapabilitiesSpec 描述声明式构建PrintDeviceCapabilities与PrintCapabilities的设备能力规格
-// 支持标准/自定义/卷纸纸型、分辨率、方向、缩放、镜像、页序、逐份、海报、多合一、双面、无边距、色彩管理与照片意图、进出纸盒、介质类型、装订/钉装/打孔/折叠、水印、副本及自定义私有Feature
+// 支持标准/自定义/卷纸纸型、分辨率、方向、缩放、镜像、页序、逐份、海报、多合一、双面、无边距、色彩管理与照片意图、进出纸盒、介质类型、装订/钉装/打孔、水印、副本及自定义私有Feature/ParameterDef/Property
 type PrintCapabilitiesSpec struct {
 	CapabilitiesChangeID       string
 	MediaSizes                 []PrintMediaSpec
@@ -165,9 +200,9 @@ type PrintCapabilitiesSpec struct {
 	DefaultStaple              string
 	HolePunches                []string
 	DefaultHolePunch           string
-	Folds                      []string
-	DefaultFold                string
 	CustomFeatures             []PrintCustomFeatureSpec
+	CustomParameters           []PrintCustomParameterSpec
+	CustomProperties           []PrintCustomPropertySpec
 }
 
 // PrintTicketSpec 描述声明式构建标准PrintTicket的高层打印参数规格
@@ -221,8 +256,9 @@ type PrintTicketSpec struct {
 	JobLevelFinishing     bool
 	Staple                string
 	HolePunch             string
-	Fold                  string
 	CustomFeatures        []PrintCustomSelectionSpec
+	CustomParameters      []PrintCustomParameterInitSpec
+	CustomProperties      []PrintCustomPropertySpec
 }
 
 // printDeriveState 保存V4 PDC派生阶段从有效票据提取的纸型、方向、无边距及冲突状态
@@ -243,6 +279,10 @@ type printDeriveState struct {
 	hasDocDuplex    bool
 	hasJobNUp       bool
 	hasDocNUp       bool
+	hasJobStaple    bool
+	hasDocStaple    bool
+	hasJobHolePunch bool
+	hasDocHolePunch bool
 }
 
 // BuildPrintDeviceCapabilities 按声明式能力规格构造合规的Windows V4 PSF2 PrintDeviceCapabilities文档
@@ -379,6 +419,15 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 			}
 			mediaOptions = append(mediaOptions, opt)
 		}
+		type printPendingRoll struct {
+			name        xml.Name
+			width       int64
+			margins     [4]int64
+			isDefault   bool
+			constrained PrintConstraint
+		}
+		pendingRolls := make([]printPendingRoll, 0, len(spec.RollMedia))
+		var minDynamicHeight int64
 		for _, item := range spec.RollMedia {
 			dims, ok := printMediaSizes[item.StandardName]
 			if !ok || dims[1] != 0 {
@@ -409,14 +458,6 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 			if item.Margins[0] < 0 || item.Margins[1] < 0 || item.Margins[2] < 0 || item.Margins[3] < 0 || item.Margins[0] >= w || item.Margins[2] >= w-item.Margins[0] || item.Margins[1] >= item.MinHeightMicrons || item.Margins[3] >= item.MinHeightMicrons-item.Margins[1] {
 				return nil, nil, fmt.Errorf("%w: invalid roll media margins for %s", ErrInvalid, item.StandardName)
 			}
-			rollChildren := []PrintSetting{
-				printBuildIntScored("MediaSizeWidth", w),
-				printBuildRefScored("MediaSizeHeight", xml.Name{Space: printKeywordsNS, Local: "PageMediaSizeMediaSizeHeight"}),
-			}
-			if isPDC {
-				rollChildren = append(rollChildren, printBuildPortraitImageableProperty(item.Margins[0], item.Margins[1], w-item.Margins[0]-item.Margins[2], defH-item.Margins[1]-item.Margins[3]))
-			}
-			opt := PrintSetting{Kind: PrintSettingOption, Name: optName, Children: rollChildren, Constraint: item.Constrained}
 			if item.Default {
 				if defaultIdx >= 0 {
 					return nil, nil, fmt.Errorf("%w: multiple default media options", ErrInvalid)
@@ -424,12 +465,11 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 				if item.Constrained != PrintConstraintUnknown && item.Constrained != PrintConstraintNone {
 					return nil, nil, fmt.Errorf("%w: constrained roll media option cannot be default", ErrInvalid)
 				}
-				defaultIdx = len(mediaOptions)
-				defaultW, defaultH, defaultMargins = w, defH, item.Margins
-			} else if defaultIdx < 0 && (item.Constrained == PrintConstraintUnknown || item.Constrained == PrintConstraintNone) && defaultW == 0 {
-				defaultW, defaultH, defaultMargins = w, defH, item.Margins
 			}
-			mediaOptions = append(mediaOptions, opt)
+			pendingRolls = append(pendingRolls, printPendingRoll{name: optName, width: w, margins: item.Margins, isDefault: item.Default, constrained: item.Constrained})
+			if need := item.Margins[1] + item.Margins[3] + 1; need > minDynamicHeight {
+				minDynamicHeight = need
+			}
 			if !hasHeightParam {
 				hasHeightParam = true
 				heightMin, heightMax, heightStep, heightDef = item.MinHeightMicrons, item.MaxHeightMicrons, step, defH
@@ -443,52 +483,41 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 				heightStep = 1
 			}
 		}
+		var customName xml.Name
+		var customDefW, customDefH, customStep int64
 		if spec.CustomMedia != nil {
-			customName := xml.Name{Space: printKeywordsNS, Local: "CustomMediaSize"}
+			customName = xml.Name{Space: printKeywordsNS, Local: "CustomMediaSize"}
 			if mediaSeen[printCanonicalKey(customName)] {
 				return nil, nil, fmt.Errorf("%w: duplicate media option CustomMediaSize", ErrInvalid)
 			}
 			mediaSeen[printCanonicalKey(customName)] = true
 			cm := spec.CustomMedia
-			step := cm.StepMicrons
-			if step == 0 {
-				step = 1
+			customStep = cm.StepMicrons
+			if customStep == 0 {
+				customStep = 1
 			}
-			defW, defH := cm.DefaultWidthMicrons, cm.DefaultHeightMicrons
-			if defW == 0 {
-				defW = cm.MinWidthMicrons
+			customDefW, customDefH = cm.DefaultWidthMicrons, cm.DefaultHeightMicrons
+			if customDefW == 0 {
+				customDefW = cm.MinWidthMicrons
 			}
-			if defH == 0 {
-				defH = cm.MinHeightMicrons
+			if customDefH == 0 {
+				customDefH = cm.MinHeightMicrons
 			}
-			if cm.MinWidthMicrons <= 0 || cm.MinWidthMicrons > cm.MaxWidthMicrons || cm.MinHeightMicrons <= 0 || cm.MinHeightMicrons > cm.MaxHeightMicrons || step <= 0 {
+			if cm.MinWidthMicrons <= 0 || cm.MinWidthMicrons > cm.MaxWidthMicrons || cm.MinHeightMicrons <= 0 || cm.MinHeightMicrons > cm.MaxHeightMicrons || customStep <= 0 {
 				return nil, nil, fmt.Errorf("%w: invalid PrintCustomMediaSpec range", ErrInvalid)
 			}
-			if defW < cm.MinWidthMicrons || defW > cm.MaxWidthMicrons || defH < cm.MinHeightMicrons || defH > cm.MaxHeightMicrons || (defW-cm.MinWidthMicrons)%step != 0 || (defH-cm.MinHeightMicrons)%step != 0 {
+			if customDefW < cm.MinWidthMicrons || customDefW > cm.MaxWidthMicrons || customDefH < cm.MinHeightMicrons || customDefH > cm.MaxHeightMicrons || (customDefW-cm.MinWidthMicrons)%customStep != 0 || (customDefH-cm.MinHeightMicrons)%customStep != 0 {
 				return nil, nil, fmt.Errorf("%w: invalid PrintCustomMediaSpec default dimensions", ErrInvalid)
 			}
 			if cm.Margins[0] < 0 || cm.Margins[1] < 0 || cm.Margins[2] < 0 || cm.Margins[3] < 0 || cm.Margins[0] >= cm.MinWidthMicrons || cm.Margins[2] >= cm.MinWidthMicrons-cm.Margins[0] || cm.Margins[1] >= cm.MinHeightMicrons || cm.Margins[3] >= cm.MinHeightMicrons-cm.Margins[1] {
 				return nil, nil, fmt.Errorf("%w: invalid custom media margins", ErrInvalid)
 			}
-			customChildren := []PrintSetting{
-				printBuildRefScored("MediaSizeWidth", xml.Name{Space: printKeywordsNS, Local: "PageMediaSizeMediaSizeWidth"}),
-				printBuildRefScored("MediaSizeHeight", xml.Name{Space: printKeywordsNS, Local: "PageMediaSizeMediaSizeHeight"}),
+			if need := cm.Margins[1] + cm.Margins[3] + 1; need > minDynamicHeight {
+				minDynamicHeight = need
 			}
-			if isPDC {
-				customChildren = append(customChildren, printBuildPortraitImageableProperty(cm.Margins[0], cm.Margins[1], defW-cm.Margins[0]-cm.Margins[2], defH-cm.Margins[1]-cm.Margins[3]))
-			}
-			mediaOptions = append(mediaOptions, PrintSetting{
-				Kind:     PrintSettingOption,
-				Name:     customName,
-				Children: customChildren,
-			})
-			if defaultW == 0 {
-				defaultW, defaultH, defaultMargins = defW, defH, cm.Margins
-			}
-			addParam(printBuildIntParameterDef(xml.Name{Space: printKeywordsNS, Local: "PageMediaSizeMediaSizeWidth"}, "microns", "Conditional", cm.MinWidthMicrons, cm.MaxWidthMicrons, step, defW))
 			if !hasHeightParam {
 				hasHeightParam = true
-				heightMin, heightMax, heightStep, heightDef = cm.MinHeightMicrons, cm.MaxHeightMicrons, step, defH
+				heightMin, heightMax, heightStep, heightDef = cm.MinHeightMicrons, cm.MaxHeightMicrons, customStep, customDefH
 			} else {
 				if cm.MinHeightMicrons < heightMin {
 					heightMin = cm.MinHeightMicrons
@@ -498,6 +527,59 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 				}
 				heightStep = 1
 			}
+		}
+		if hasHeightParam {
+			if heightDef < minDynamicHeight {
+				heightDef = minDynamicHeight
+			}
+			if heightDef > heightMax {
+				return nil, nil, fmt.Errorf("%w: incompatible dynamic media height margins", ErrInvalid)
+			}
+			if heightStep > 1 {
+				if rem := (heightDef - heightMin) % heightStep; rem != 0 {
+					aligned := heightDef + (heightStep - rem)
+					if aligned > heightMax {
+						return nil, nil, fmt.Errorf("%w: incompatible dynamic media height step", ErrInvalid)
+					}
+					heightDef = aligned
+				}
+			}
+		}
+		for _, roll := range pendingRolls {
+			rollChildren := []PrintSetting{
+				printBuildIntScored("MediaSizeWidth", roll.width),
+				printBuildRefScored("MediaSizeHeight", xml.Name{Space: printKeywordsNS, Local: "PageMediaSizeMediaSizeHeight"}),
+			}
+			if isPDC {
+				rollChildren = append(rollChildren, printBuildPortraitImageableProperty(roll.margins[0], roll.margins[1], roll.width-roll.margins[0]-roll.margins[2], heightDef-roll.margins[1]-roll.margins[3]))
+			}
+			opt := PrintSetting{Kind: PrintSettingOption, Name: roll.name, Children: rollChildren, Constraint: roll.constrained}
+			if roll.isDefault {
+				defaultIdx = len(mediaOptions)
+				defaultW, defaultH, defaultMargins = roll.width, heightDef, roll.margins
+			} else if defaultIdx < 0 && (roll.constrained == PrintConstraintUnknown || roll.constrained == PrintConstraintNone) && defaultW == 0 {
+				defaultW, defaultH, defaultMargins = roll.width, heightDef, roll.margins
+			}
+			mediaOptions = append(mediaOptions, opt)
+		}
+		if spec.CustomMedia != nil {
+			cm := spec.CustomMedia
+			customChildren := []PrintSetting{
+				printBuildRefScored("MediaSizeWidth", xml.Name{Space: printKeywordsNS, Local: "PageMediaSizeMediaSizeWidth"}),
+				printBuildRefScored("MediaSizeHeight", xml.Name{Space: printKeywordsNS, Local: "PageMediaSizeMediaSizeHeight"}),
+			}
+			if isPDC {
+				customChildren = append(customChildren, printBuildPortraitImageableProperty(cm.Margins[0], cm.Margins[1], customDefW-cm.Margins[0]-cm.Margins[2], heightDef-cm.Margins[1]-cm.Margins[3]))
+			}
+			mediaOptions = append(mediaOptions, PrintSetting{
+				Kind:     PrintSettingOption,
+				Name:     customName,
+				Children: customChildren,
+			})
+			if defaultW == 0 {
+				defaultW, defaultH, defaultMargins = customDefW, heightDef, cm.Margins
+			}
+			addParam(printBuildIntParameterDef(xml.Name{Space: printKeywordsNS, Local: "PageMediaSizeMediaSizeWidth"}, "microns", "Conditional", cm.MinWidthMicrons, cm.MaxWidthMicrons, customStep, customDefW))
 		}
 		if hasHeightParam {
 			addParam(printBuildIntParameterDef(xml.Name{Space: printKeywordsNS, Local: "PageMediaSizeMediaSizeHeight"}, "microns", "Conditional", heightMin, heightMax, heightStep, heightDef))
@@ -561,20 +643,19 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "PageResolution"}, resOptions, defaultIdx, isPDC, nil))
 	}
 	if len(spec.Orientations) > 0 {
-		orientOpts, defIdx, err := printBuildKeywordOptions(spec.Orientations, spec.DefaultOrientation, []string{"Portrait", "Landscape", "ReversePortrait", "ReverseLandscape"})
+		orientOpts, defIdx, err := printBuildKeywordOptions(spec.Orientations, spec.DefaultOrientation, printAllowedOrientations)
 		if err != nil {
 			return nil, nil, err
 		}
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "PageOrientation"}, orientOpts, defIdx, isPDC, nil))
 	}
 	if len(spec.Scalings) > 0 {
-		allowedScalings := []string{"None", "Custom", "CustomSquare", "FitApplicationMediaSizeToPageImageableSize", "FitApplicationContentSizeToPageImageableSize", "FitApplicationBleedSizeToPageImageableSize", "FitApplicationMediaSizeToPageMediaSize"}
 		scaleOpts := make([]PrintSetting, 0, len(spec.Scalings))
 		seen := make(map[string]bool)
 		defIdx := -1
 		needAlignment := false
 		for _, name := range spec.Scalings {
-			if !slices.Contains(allowedScalings, name) || seen[name] {
+			if !slices.Contains(printAllowedScalings, name) || seen[name] {
 				return nil, nil, fmt.Errorf("%w: invalid or duplicate scaling option %s", ErrInvalid, name)
 			}
 			seen[name] = true
@@ -614,35 +695,34 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 		}
 		var subFeatures []PrintSetting
 		if needAlignment {
-			alignNames := []string{"Center", "TopLeft", "TopCenter", "TopRight", "CenterLeft", "CenterRight", "BottomLeft", "BottomCenter", "BottomRight"}
-			alignOpts, alignDef, _ := printBuildKeywordOptions(alignNames, "Center", alignNames)
+			alignOpts, alignDef, _ := printBuildKeywordOptions(printAllowedScaleOffsetAlignments, "Center", printAllowedScaleOffsetAlignments)
 			subFeatures = append(subFeatures, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "ScaleOffsetAlignment"}, alignOpts, alignDef, isPDC, nil))
 		}
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "PageScaling"}, scaleOpts, defIdx, isPDC, subFeatures))
 	}
 	if len(spec.MirrorImages) > 0 {
-		mirrorOpts, defIdx, err := printBuildKeywordOptions(spec.MirrorImages, spec.DefaultMirrorImage, []string{"None", "MirrorImageWidth", "MirrorImageHeight"})
+		mirrorOpts, defIdx, err := printBuildKeywordOptions(spec.MirrorImages, spec.DefaultMirrorImage, printAllowedMirrorImages)
 		if err != nil {
 			return nil, nil, err
 		}
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "PageMirrorImage"}, mirrorOpts, defIdx, isPDC, nil))
 	}
 	if len(spec.PageOrders) > 0 {
-		orderOpts, defIdx, err := printBuildKeywordOptions(spec.PageOrders, spec.DefaultPageOrder, []string{"Standard", "Reverse"})
+		orderOpts, defIdx, err := printBuildKeywordOptions(spec.PageOrders, spec.DefaultPageOrder, printAllowedPageOrders)
 		if err != nil {
 			return nil, nil, err
 		}
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "JobPageOrder"}, orderOpts, defIdx, isPDC, nil))
 	}
 	if len(spec.CollateModes) > 0 {
-		collateOpts, defIdx, err := printBuildKeywordOptions(spec.CollateModes, spec.DefaultCollateMode, []string{"Collated", "Uncollated"})
+		collateOpts, defIdx, err := printBuildKeywordOptions(spec.CollateModes, spec.DefaultCollateMode, printAllowedCollateModes)
 		if err != nil {
 			return nil, nil, err
 		}
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "JobCollateAllDocuments"}, collateOpts, defIdx, isPDC, nil))
 	}
 	if len(spec.DocumentCollateModes) > 0 {
-		docCollateOpts, defIdx, err := printBuildKeywordOptions(spec.DocumentCollateModes, spec.DefaultDocumentCollateMode, []string{"Collated", "Uncollated"})
+		docCollateOpts, defIdx, err := printBuildKeywordOptions(spec.DocumentCollateModes, spec.DefaultDocumentCollateMode, printAllowedCollateModes)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -669,8 +749,7 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 		if spec.DefaultNUp > 0 && defIdx < 0 {
 			return nil, nil, fmt.Errorf("%w: default NUp %d not in NUpCounts", ErrInvalid, spec.DefaultNUp)
 		}
-		dirNames := []string{"RightBottom", "BottomRight", "LeftBottom", "BottomLeft", "RightTop", "TopRight", "LeftTop", "TopLeft"}
-		dirOpts, dirDef, _ := printBuildKeywordOptions(dirNames, "RightBottom", dirNames)
+		dirOpts, dirDef, _ := printBuildKeywordOptions(printAllowedPresentationDirections, "RightBottom", printAllowedPresentationDirections)
 		sub := []PrintSetting{printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "PresentationDirection"}, dirOpts, dirDef, isPDC, nil)}
 		nupFeat := "DocumentNUp"
 		if spec.JobLevelNUp {
@@ -719,7 +798,7 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 				return nil, nil, fmt.Errorf("%w: default duplex not in DuplexModes", ErrInvalid)
 			}
 		}
-		duplexOpts, defIdx, err := printBuildKeywordOptions(duplexNames, defaultDuplexName, []string{"OneSided", "TwoSidedLongEdge", "TwoSidedShortEdge"})
+		duplexOpts, defIdx, err := printBuildKeywordOptions(duplexNames, defaultDuplexName, printAllowedDuplexOptions)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -734,7 +813,7 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 		if spec.DefaultBorderless {
 			defName = "Borderless"
 		}
-		borderOpts, defIdx, _ := printBuildKeywordOptions([]string{"None", "Borderless"}, defName, []string{"None", "Borderless"})
+		borderOpts, defIdx, _ := printBuildKeywordOptions(printAllowedBorderlessOptions, defName, printAllowedBorderlessOptions)
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "PageBorderless"}, borderOpts, defIdx, isPDC, nil))
 	}
 	if len(spec.ColorModes) > 0 {
@@ -766,35 +845,35 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 				return nil, nil, err
 			}
 		}
-		colorOpts, defIdx, err := printBuildKeywordOptions(colorNames, defColor, []string{"Color", "Grayscale", "Monochrome"})
+		colorOpts, defIdx, err := printBuildKeywordOptions(colorNames, defColor, printAllowedOutputColors)
 		if err != nil {
 			return nil, nil, err
 		}
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "PageOutputColor"}, colorOpts, defIdx, isPDC, nil))
 	}
 	if len(spec.ColorManagements) > 0 {
-		cmOpts, defIdx, err := printBuildKeywordOptions(spec.ColorManagements, spec.DefaultColorManagement, []string{PrintColorManagementNone, PrintColorManagementDevice, PrintColorManagementDriver, PrintColorManagementSystem})
+		cmOpts, defIdx, err := printBuildKeywordOptions(spec.ColorManagements, spec.DefaultColorManagement, printAllowedColorManagements)
 		if err != nil {
 			return nil, nil, err
 		}
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "PageColorManagement"}, cmOpts, defIdx, isPDC, nil))
 	}
 	if len(spec.RenderingIntents) > 0 {
-		intentOpts, defIdx, err := printBuildKeywordOptions(spec.RenderingIntents, spec.DefaultRenderingIntent, []string{"Photographs", "RelativeColorimetric", "BusinessGraphics", "AbsoluteColorimetric"})
+		intentOpts, defIdx, err := printBuildKeywordOptions(spec.RenderingIntents, spec.DefaultRenderingIntent, printAllowedRenderingIntents)
 		if err != nil {
 			return nil, nil, err
 		}
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "PageICMRenderingIntent"}, intentOpts, defIdx, isPDC, nil))
 	}
 	if len(spec.OutputQualities) > 0 {
-		qualOpts, defIdx, err := printBuildKeywordOptions(spec.OutputQualities, spec.DefaultOutputQuality, []string{"Automatic", "Draft", "Fax", "High", "Normal", "Photographic", "Text"})
+		qualOpts, defIdx, err := printBuildKeywordOptions(spec.OutputQualities, spec.DefaultOutputQuality, printAllowedOutputQualities)
 		if err != nil {
 			return nil, nil, err
 		}
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "PageOutputQuality"}, qualOpts, defIdx, isPDC, nil))
 	}
 	if len(spec.PhotoPrintingIntents) > 0 {
-		photoOpts, defIdx, err := printBuildKeywordOptions(spec.PhotoPrintingIntents, spec.DefaultPhotoPrintingIntent, []string{"None", "PhotoBest", "PhotoDraft", "PhotoStandard"})
+		photoOpts, defIdx, err := printBuildKeywordOptions(spec.PhotoPrintingIntents, spec.DefaultPhotoPrintingIntent, printAllowedPhotoPrintingIntents)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -838,8 +917,7 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 				return nil, nil, fmt.Errorf("%w: default binding not in Bindings", ErrInvalid)
 			}
 		}
-		allowedBindings := []string{"None", "Bale", "BindBottom", "BindLeft", "BindRight", "BindTop", "Booklet", "EdgeStitchBottom", "EdgeStitchLeft", "EdgeStitchRight", "EdgeStitchTop", "Fold", "JogOffset", "Trim"}
-		bindOpts, defIdx, err := printBuildKeywordOptions(bindingNames, defBindName, allowedBindings)
+		bindOpts, defIdx, err := printBuildKeywordOptions(bindingNames, defBindName, printAllowedBindingOptions)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -850,8 +928,7 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: bindFeat}, bindOpts, defIdx, isPDC, nil))
 	}
 	if len(spec.Staples) > 0 {
-		allowedStaples := []string{"None", "SaddleStitch", "StapleBottomLeft", "StapleBottomRight", "StapleDualBottom", "StapleDualLeft", "StapleDualRight", "StapleDualTop", "StapleTopLeft", "StapleTopRight"}
-		stapleOpts, defIdx, err := printBuildKeywordOptions(spec.Staples, spec.DefaultStaple, allowedStaples)
+		stapleOpts, defIdx, err := printBuildKeywordOptions(spec.Staples, spec.DefaultStaple, printAllowedStapleOptions)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -862,8 +939,7 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: stapleFeat}, stapleOpts, defIdx, isPDC, nil))
 	}
 	if len(spec.HolePunches) > 0 {
-		allowedPunches := []string{"None", "BottomEdge", "LeftEdge", "RightEdge", "TopEdge"}
-		punchOpts, defIdx, err := printBuildKeywordOptions(spec.HolePunches, spec.DefaultHolePunch, allowedPunches)
+		punchOpts, defIdx, err := printBuildKeywordOptions(spec.HolePunches, spec.DefaultHolePunch, printAllowedHolePunchOptions)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -872,18 +948,6 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 			punchFeat = "JobHolePunch"
 		}
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: punchFeat}, punchOpts, defIdx, isPDC, nil))
-	}
-	if len(spec.Folds) > 0 {
-		allowedFolds := []string{"None", "HalfFold", "LetterFold", "ZFold", "GateFold", "AccordionFold", "DoubleGateFold", "EngineeringZFold"}
-		foldOpts, defIdx, err := printBuildKeywordOptions(spec.Folds, spec.DefaultFold, allowedFolds)
-		if err != nil {
-			return nil, nil, err
-		}
-		foldFeat := "DocumentFold"
-		if spec.JobLevelFinishing {
-			foldFeat = "JobFoldAllDocuments"
-		}
-		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: foldFeat}, foldOpts, defIdx, isPDC, nil))
 	}
 	if spec.Watermark {
 		wmOpts := []PrintSetting{
@@ -902,7 +966,7 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 				},
 			},
 		}
-		layerOpts, layerDef, _ := printBuildKeywordOptions([]string{"Overlay", "Underlay"}, "Overlay", []string{"Overlay", "Underlay"})
+		layerOpts, layerDef, _ := printBuildKeywordOptions(printAllowedWatermarkLayers, "Overlay", printAllowedWatermarkLayers)
 		sub := []PrintSetting{printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "Layering"}, layerOpts, layerDef, isPDC, nil)}
 		elements = append(elements, printBuildPickOneFeature(xml.Name{Space: printKeywordsNS, Local: "PageWatermark"}, wmOpts, 0, isPDC, sub))
 		addParam(printBuildIntParameterDef(xml.Name{Space: printKeywordsNS, Local: "PageWatermarkOriginWidth"}, "microns", "Conditional", -1000000, 1000000, 1, 0))
@@ -920,6 +984,13 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 		}
 		elements = append(elements, feat)
 	}
+	for _, propSpec := range spec.CustomProperties {
+		prop, err := printBuildCustomProperty(propSpec)
+		if err != nil {
+			return nil, nil, err
+		}
+		elements = append(elements, prop)
+	}
 	if spec.MaxCopies < 0 || spec.DefaultCopies < 0 {
 		return nil, nil, fmt.Errorf("%w: negative copy limits", ErrInvalid)
 	}
@@ -932,6 +1003,17 @@ func buildPrintCapabilitiesElements(spec PrintCapabilitiesSpec, isPDC bool) ([]P
 			return nil, nil, fmt.Errorf("%w: DefaultCopies exceeds MaxCopies", ErrInvalid)
 		}
 		addParam(printBuildIntParameterDef(xml.Name{Space: printKeywordsNS, Local: "JobCopiesAllDocuments"}, "copies", "Unconditional", 1, int64(spec.MaxCopies), 1, int64(defCopies)))
+	}
+	for _, paramSpec := range spec.CustomParameters {
+		def, err := printBuildCustomParameterDef(paramSpec)
+		if err != nil {
+			return nil, nil, err
+		}
+		key := printCanonicalKey(def.Name)
+		if paramSeen[key] {
+			return nil, nil, fmt.Errorf("%w: duplicate custom ParameterDef %s", ErrInvalid, def.Name.Local)
+		}
+		addParam(def)
 	}
 	elements = append(elements, params...)
 	return elements, defaultImageable, nil
@@ -1143,6 +1225,178 @@ func printBuildCustomTicketFeature(spec PrintCustomSelectionSpec) (PrintSetting,
 		children = append(children, sub)
 	}
 	return PrintSetting{Kind: PrintSettingFeature, Name: spec.Feature, Children: children}, nil
+}
+
+// printBuildCustomParameterDef 按自定义私有参数规格构造合规的ParameterDef节点，由调用方外层统一执行参数域校验
+// 入参: spec 自定义参数域规格
+// 返回: PrintSetting ParameterDef节点, error 名称、类型或必填约束非法错误
+func printBuildCustomParameterDef(spec PrintCustomParameterSpec) (PrintSetting, error) {
+	if spec.Name.Space == "" || !xmlNCName(spec.Name.Local) || !xmlTextValid(spec.Name.Space) || spec.Name.Space == xmlnsNamespace {
+		return PrintSetting{}, fmt.Errorf("%w: invalid custom ParameterDef name", ErrInvalid)
+	}
+	dataType := spec.DataType
+	if dataType == "" {
+		dataType = "string"
+	}
+	if dataType != "integer" && dataType != "decimal" && dataType != "string" && dataType != "QName" {
+		return PrintSetting{}, fmt.Errorf("%w: invalid custom ParameterDef DataType %s", ErrInvalid, dataType)
+	}
+	mandatory := spec.Mandatory
+	if mandatory == "" {
+		mandatory = "Conditional"
+	}
+	if mandatory != "Conditional" && mandatory != "Optional" && mandatory != "Unconditional" {
+		return PrintSetting{}, fmt.Errorf("%w: invalid custom ParameterDef Mandatory %s", ErrInvalid, mandatory)
+	}
+	children := []PrintSetting{
+		{
+			Kind: PrintSettingProperty,
+			Name: xml.Name{Space: printFrameworkNS, Local: "DataType"},
+			Children: []PrintSetting{{
+				Kind:  PrintSettingValue,
+				Value: &PrintValue{Type: xml.Name{Space: printValueNS, Local: "QName"}, Text: "xs:" + dataType, QName: xml.Name{Space: printValueNS, Local: dataType}},
+			}},
+		},
+		{
+			Kind: PrintSettingProperty,
+			Name: xml.Name{Space: printFrameworkNS, Local: "Mandatory"},
+			Children: []PrintSetting{{
+				Kind:  PrintSettingValue,
+				Value: &PrintValue{Type: xml.Name{Space: printValueNS, Local: "QName"}, Text: "psk:" + mandatory, QName: xml.Name{Space: printKeywordsNS, Local: mandatory}},
+			}},
+		},
+	}
+	if spec.UnitType != "" {
+		if !xmlTextValid(spec.UnitType) {
+			return PrintSetting{}, fmt.Errorf("%w: invalid custom ParameterDef UnitType", ErrInvalid)
+		}
+		children = append(children, PrintSetting{
+			Kind: PrintSettingProperty,
+			Name: xml.Name{Space: printFrameworkNS, Local: "UnitType"},
+			Children: []PrintSetting{{
+				Kind:  PrintSettingValue,
+				Value: &PrintValue{Type: xml.Name{Space: printValueNS, Local: "string"}, Text: spec.UnitType},
+			}},
+		})
+	}
+	if spec.DisplayName != "" {
+		if !xmlTextValid(spec.DisplayName) {
+			return PrintSetting{}, fmt.Errorf("%w: invalid custom ParameterDef DisplayName", ErrInvalid)
+		}
+		children = append(children, PrintSetting{
+			Kind: PrintSettingProperty,
+			Name: xml.Name{Space: printKeywordsNS, Local: "DisplayName"},
+			Children: []PrintSetting{{
+				Kind:  PrintSettingValue,
+				Value: &PrintValue{Type: xml.Name{Space: printValueNS, Local: "string"}, Text: spec.DisplayName},
+			}},
+		})
+	}
+	switch dataType {
+	case "integer", "decimal":
+		if spec.MinValue == "" || spec.MaxValue == "" {
+			return PrintSetting{}, fmt.Errorf("%w: custom numeric ParameterDef requires MinValue and MaxValue", ErrInvalid)
+		}
+		mult := spec.Multiple
+		if mult == "" {
+			mult = "1"
+		}
+		defVal := spec.DefaultValue
+		if defVal == "" {
+			defVal = spec.MinValue
+		}
+		valType := xml.Name{Space: printValueNS, Local: dataType}
+		children = append(children,
+			PrintSetting{Kind: PrintSettingProperty, Name: xml.Name{Space: printFrameworkNS, Local: "MinValue"}, Children: []PrintSetting{{Kind: PrintSettingValue, Value: &PrintValue{Type: valType, Text: spec.MinValue}}}},
+			PrintSetting{Kind: PrintSettingProperty, Name: xml.Name{Space: printFrameworkNS, Local: "MaxValue"}, Children: []PrintSetting{{Kind: PrintSettingValue, Value: &PrintValue{Type: valType, Text: spec.MaxValue}}}},
+			PrintSetting{Kind: PrintSettingProperty, Name: xml.Name{Space: printFrameworkNS, Local: "Multiple"}, Children: []PrintSetting{{Kind: PrintSettingValue, Value: &PrintValue{Type: valType, Text: mult}}}},
+			PrintSetting{Kind: PrintSettingProperty, Name: xml.Name{Space: printFrameworkNS, Local: "DefaultValue"}, Children: []PrintSetting{{Kind: PrintSettingValue, Value: &PrintValue{Type: valType, Text: defVal}}}},
+		)
+	case "string":
+		minLen := spec.MinValue
+		if minLen == "" {
+			minLen = "0"
+		}
+		if spec.MaxValue == "" {
+			return PrintSetting{}, fmt.Errorf("%w: custom string ParameterDef requires MaxValue", ErrInvalid)
+		}
+		intType := xml.Name{Space: printValueNS, Local: "integer"}
+		defVal := &PrintValue{Type: xml.Name{Space: printValueNS, Local: "string"}, Text: spec.DefaultValue, QName: spec.DefaultQName}
+		children = append(children,
+			PrintSetting{Kind: PrintSettingProperty, Name: xml.Name{Space: printFrameworkNS, Local: "MinLength"}, Children: []PrintSetting{{Kind: PrintSettingValue, Value: &PrintValue{Type: intType, Text: minLen}}}},
+			PrintSetting{Kind: PrintSettingProperty, Name: xml.Name{Space: printFrameworkNS, Local: "MaxLength"}, Children: []PrintSetting{{Kind: PrintSettingValue, Value: &PrintValue{Type: intType, Text: spec.MaxValue}}}},
+			PrintSetting{Kind: PrintSettingProperty, Name: xml.Name{Space: printFrameworkNS, Local: "DefaultValue"}, Children: []PrintSetting{{Kind: PrintSettingValue, Value: defVal}}},
+		)
+	case "QName":
+		if spec.DefaultQName.Space == "" || !xmlNCName(spec.DefaultQName.Local) || !xmlTextValid(spec.DefaultQName.Space) || spec.DefaultQName.Space == xmlnsNamespace {
+			return PrintSetting{}, fmt.Errorf("%w: custom QName ParameterDef requires valid DefaultQName", ErrInvalid)
+		}
+		text := spec.DefaultValue
+		if text == "" {
+			text = spec.DefaultQName.Local
+		}
+		children = append(children, PrintSetting{
+			Kind: PrintSettingProperty,
+			Name: xml.Name{Space: printFrameworkNS, Local: "DefaultValue"},
+			Children: []PrintSetting{{
+				Kind:  PrintSettingValue,
+				Value: &PrintValue{Type: xml.Name{Space: printValueNS, Local: "QName"}, Text: text, QName: spec.DefaultQName},
+			}},
+		})
+	}
+	return PrintSetting{Kind: PrintSettingParameterDef, Name: spec.Name, Children: children}, nil
+}
+
+// printBuildCustomParameterInit 按自定义私有参数初值规格构造ParameterInit节点
+// 入参: spec 自定义参数初值规格
+// 返回: PrintSetting ParameterInit节点, error 名称非法错误
+func printBuildCustomParameterInit(spec PrintCustomParameterInitSpec) (PrintSetting, error) {
+	if spec.Name.Space == "" || !xmlNCName(spec.Name.Local) || !xmlTextValid(spec.Name.Space) || spec.Name.Space == xmlnsNamespace {
+		return PrintSetting{}, fmt.Errorf("%w: invalid custom ParameterInit name", ErrInvalid)
+	}
+	val := spec.Value
+	if val.Type == (xml.Name{}) {
+		val.Type = xml.Name{Space: printValueNS, Local: "string"}
+	}
+	return PrintSetting{
+		Kind:     PrintSettingParameterInit,
+		Name:     spec.Name,
+		Children: []PrintSetting{{Kind: PrintSettingValue, Value: &val}},
+	}, nil
+}
+
+// printBuildCustomProperty 递归构造自定义私有命名空间Property节点，支持标量值与嵌套子Property
+// 入参: spec 自定义属性规格
+// 返回: PrintSetting Property节点, error 名称、空体或重复子项错误
+func printBuildCustomProperty(spec PrintCustomPropertySpec) (PrintSetting, error) {
+	if spec.Name.Space == "" || !xmlNCName(spec.Name.Local) || !xmlTextValid(spec.Name.Space) || spec.Name.Space == xmlnsNamespace {
+		return PrintSetting{}, fmt.Errorf("%w: invalid custom Property name", ErrInvalid)
+	}
+	if spec.Value == nil && len(spec.Children) == 0 {
+		return PrintSetting{}, fmt.Errorf("%w: empty custom Property %s", ErrInvalid, spec.Name.Local)
+	}
+	children := make([]PrintSetting, 0, len(spec.Children)+1)
+	if spec.Value != nil {
+		val := *spec.Value
+		if val.Type == (xml.Name{}) {
+			val.Type = xml.Name{Space: printValueNS, Local: "string"}
+		}
+		children = append(children, PrintSetting{Kind: PrintSettingValue, Value: &val})
+	}
+	seen := make(map[xml.Name]bool, len(spec.Children))
+	for _, childSpec := range spec.Children {
+		child, err := printBuildCustomProperty(childSpec)
+		if err != nil {
+			return PrintSetting{}, err
+		}
+		key := printCanonicalKey(child.Name)
+		if seen[key] {
+			return PrintSetting{}, fmt.Errorf("%w: duplicate custom child Property %s", ErrInvalid, child.Name.Local)
+		}
+		seen[key] = true
+		children = append(children, child)
+	}
+	return PrintSetting{Kind: PrintSettingProperty, Name: spec.Name, Children: children}, nil
 }
 
 // printBuildKeywordOptions 校验并构造公共关键字Option列表及默认选项下标，allowed为nil时校验合法NCName
@@ -1445,10 +1699,11 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 					Name: xml.Name{Space: printKeywordsNS, Local: spec.MediaStandardName},
 					Children: []PrintSetting{
 						printBuildIntScored("MediaSizeWidth", int64(dims[0])),
-						printBuildIntScored("MediaSizeHeight", spec.RollLengthMicrons),
+						printBuildRefScored("MediaSizeHeight", xml.Name{Space: printKeywordsNS, Local: "PageMediaSizeMediaSizeHeight"}),
 					},
 				}},
 			})
+			addIntParam("PageMediaSizeMediaSizeHeight", spec.RollLengthMicrons)
 		} else {
 			if spec.RollLengthMicrons != 0 {
 				return nil, fmt.Errorf("%w: RollLengthMicrons only applies to roll media", ErrInvalid)
@@ -1520,7 +1775,7 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 		})
 	}
 	if spec.Orientation != "" {
-		if !slices.Contains([]string{"Portrait", "Landscape", "ReversePortrait", "ReverseLandscape"}, spec.Orientation) {
+		if !slices.Contains(printAllowedOrientations, spec.Orientation) {
 			return nil, fmt.Errorf("%w: invalid ticket orientation %s", ErrInvalid, spec.Orientation)
 		}
 		elements = append(elements, PrintSetting{
@@ -1541,7 +1796,7 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 		})
 	}
 	if spec.MirrorImage != "" {
-		if !slices.Contains([]string{"None", "MirrorImageWidth", "MirrorImageHeight"}, spec.MirrorImage) {
+		if !slices.Contains(printAllowedMirrorImages, spec.MirrorImage) {
 			return nil, fmt.Errorf("%w: invalid ticket mirror image %s", ErrInvalid, spec.MirrorImage)
 		}
 		elements = append(elements, PrintSetting{
@@ -1551,15 +1806,14 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 		})
 	}
 	if spec.ScaleOffsetAlignment != "" {
-		if !slices.Contains([]string{"TopLeft", "TopCenter", "TopRight", "CenterLeft", "Center", "CenterRight", "BottomLeft", "BottomCenter", "BottomRight"}, spec.ScaleOffsetAlignment) {
+		if !slices.Contains(printAllowedScaleOffsetAlignments, spec.ScaleOffsetAlignment) {
 			return nil, fmt.Errorf("%w: invalid ticket ScaleOffsetAlignment %s", ErrInvalid, spec.ScaleOffsetAlignment)
 		}
 	}
 	if spec.Scaling != "" || spec.ScaleOffsetAlignment != "" {
 		var featChildren []PrintSetting
 		if spec.Scaling != "" {
-			allowedScalings := []string{"None", "Custom", "CustomSquare", "FitApplicationMediaSizeToPageImageableSize", "FitApplicationContentSizeToPageImageableSize", "FitApplicationBleedSizeToPageImageableSize", "FitApplicationMediaSizeToPageMediaSize"}
-			if !slices.Contains(allowedScalings, spec.Scaling) {
+			if !slices.Contains(printAllowedScalings, spec.Scaling) {
 				return nil, fmt.Errorf("%w: invalid ticket scaling %s", ErrInvalid, spec.Scaling)
 			}
 			var optChildren []PrintSetting
@@ -1646,7 +1900,7 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 		})
 	}
 	if spec.ColorManagement != "" {
-		if !slices.Contains([]string{PrintColorManagementNone, PrintColorManagementDevice, PrintColorManagementDriver, PrintColorManagementSystem}, spec.ColorManagement) {
+		if !slices.Contains(printAllowedColorManagements, spec.ColorManagement) {
 			return nil, fmt.Errorf("%w: invalid ticket color management %s", ErrInvalid, spec.ColorManagement)
 		}
 		elements = append(elements, PrintSetting{
@@ -1656,7 +1910,7 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 		})
 	}
 	if spec.RenderingIntent != "" {
-		if !slices.Contains([]string{"Photographs", "RelativeColorimetric", "BusinessGraphics", "AbsoluteColorimetric"}, spec.RenderingIntent) {
+		if !slices.Contains(printAllowedRenderingIntents, spec.RenderingIntent) {
 			return nil, fmt.Errorf("%w: invalid ticket rendering intent %s", ErrInvalid, spec.RenderingIntent)
 		}
 		elements = append(elements, PrintSetting{
@@ -1677,7 +1931,7 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 		})
 	}
 	if spec.OutputQuality != "" {
-		if !slices.Contains([]string{"Automatic", "Draft", "Fax", "High", "Normal", "Photographic", "Text"}, spec.OutputQuality) {
+		if !slices.Contains(printAllowedOutputQualities, spec.OutputQuality) {
 			return nil, fmt.Errorf("%w: invalid ticket output quality %s", ErrInvalid, spec.OutputQuality)
 		}
 		elements = append(elements, PrintSetting{
@@ -1687,7 +1941,7 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 		})
 	}
 	if spec.PhotoPrintingIntent != "" {
-		if !slices.Contains([]string{"None", "PhotoBest", "PhotoDraft", "PhotoStandard"}, spec.PhotoPrintingIntent) {
+		if !slices.Contains(printAllowedPhotoPrintingIntents, spec.PhotoPrintingIntent) {
 			return nil, fmt.Errorf("%w: invalid ticket photo printing intent %s", ErrInvalid, spec.PhotoPrintingIntent)
 		}
 		elements = append(elements, PrintSetting{
@@ -1742,15 +1996,22 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 			return nil, err
 		}
 		optChildren := []PrintSetting{
-			printBuildIntScored("OriginWidth", originX),
-			printBuildIntScored("OriginHeight", originY),
-			printBuildIntScored("Angle", int64(math.Round(wm.Angle))),
-			printBuildIntScored("FontSize", fontSizePt),
-			printBuildStringScored("FontColor", fmt.Sprintf("#%02X%02X%02X%02X", wm.Color.A, wm.Color.R, wm.Color.G, wm.Color.B)),
-			printBuildStringScored("Text", wm.Text),
+			printBuildRefScored("OriginWidth", xml.Name{Space: printKeywordsNS, Local: "PageWatermarkOriginWidth"}),
+			printBuildRefScored("OriginHeight", xml.Name{Space: printKeywordsNS, Local: "PageWatermarkOriginHeight"}),
+			printBuildRefScored("Angle", xml.Name{Space: printKeywordsNS, Local: "PageWatermarkTextAngle"}),
+			printBuildRefScored("FontSize", xml.Name{Space: printKeywordsNS, Local: "PageWatermarkTextFontSize"}),
+			printBuildRefScored("FontColor", xml.Name{Space: printKeywordsNS, Local: "PageWatermarkTextColor"}),
+			printBuildRefScored("Text", xml.Name{Space: printKeywordsNS, Local: "PageWatermarkTextText"}),
 		}
+		addIntParam("PageWatermarkOriginWidth", originX)
+		addIntParam("PageWatermarkOriginHeight", originY)
+		addIntParam("PageWatermarkTextAngle", int64(math.Round(wm.Angle)))
+		addIntParam("PageWatermarkTextFontSize", fontSizePt)
+		addStringParam("PageWatermarkTextColor", fmt.Sprintf("#%02X%02X%02X%02X", wm.Color.A, wm.Color.R, wm.Color.G, wm.Color.B))
+		addStringParam("PageWatermarkTextText", wm.Text)
 		if wm.HasTransparency || wm.Transparency > 0 {
-			optChildren = append(optChildren, printBuildIntScored("Transparency", int64(math.Round(wm.Transparency))))
+			optChildren = append(optChildren, printBuildRefScored("Transparency", xml.Name{Space: printKeywordsNS, Local: "PageWatermarkTransparency"}))
+			addIntParam("PageWatermarkTransparency", int64(math.Round(wm.Transparency)))
 		}
 		featChildren := []PrintSetting{{Kind: PrintSettingOption, Name: xml.Name{Space: printKeywordsNS, Local: "Text"}, Children: optChildren}}
 		if wm.Layer == PrintWatermarkOverlay || wm.Layer == PrintWatermarkUnderlay {
@@ -1779,7 +2040,7 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 		addIntParam("PageCopies", int64(spec.PageCopies))
 	}
 	if spec.Collate != "" {
-		if spec.Collate != "Collated" && spec.Collate != "Uncollated" {
+		if !slices.Contains(printAllowedCollateModes, spec.Collate) {
 			return nil, fmt.Errorf("%w: invalid ticket collate %s", ErrInvalid, spec.Collate)
 		}
 		collateFeat := "JobCollateAllDocuments"
@@ -1793,7 +2054,7 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 		})
 	}
 	if spec.DocumentCollate != "" {
-		if spec.DocumentCollate != "Collated" && spec.DocumentCollate != "Uncollated" {
+		if !slices.Contains(printAllowedCollateModes, spec.DocumentCollate) {
 			return nil, fmt.Errorf("%w: invalid ticket document collate %s", ErrInvalid, spec.DocumentCollate)
 		}
 		elements = append(elements, PrintSetting{
@@ -1824,7 +2085,7 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 		return nil, fmt.Errorf("%w: negative ticket NUp", ErrInvalid)
 	}
 	if spec.PresentationDirection != "" {
-		if !slices.Contains([]string{"RightBottom", "BottomRight", "LeftBottom", "BottomLeft", "RightTop", "TopRight", "LeftTop", "TopLeft"}, spec.PresentationDirection) {
+		if !slices.Contains(printAllowedPresentationDirections, spec.PresentationDirection) {
 			return nil, fmt.Errorf("%w: invalid ticket presentation direction %s", ErrInvalid, spec.PresentationDirection)
 		}
 	}
@@ -1855,7 +2116,7 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 		})
 	}
 	if spec.PageOrder != "" {
-		if spec.PageOrder != "Standard" && spec.PageOrder != "Reverse" {
+		if !slices.Contains(printAllowedPageOrders, spec.PageOrder) {
 			return nil, fmt.Errorf("%w: invalid ticket page order %s", ErrInvalid, spec.PageOrder)
 		}
 		elements = append(elements, PrintSetting{
@@ -1910,8 +2171,7 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 		})
 	}
 	if spec.Staple != "" {
-		allowedStaples := []string{"None", "SaddleStitch", "StapleBottomLeft", "StapleBottomRight", "StapleDualBottom", "StapleDualLeft", "StapleDualRight", "StapleDualTop", "StapleTopLeft", "StapleTopRight"}
-		if !slices.Contains(allowedStaples, spec.Staple) {
+		if !slices.Contains(printAllowedStapleOptions, spec.Staple) {
 			return nil, fmt.Errorf("%w: invalid ticket staple %s", ErrInvalid, spec.Staple)
 		}
 		featName := "DocumentStaple"
@@ -1925,8 +2185,7 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 		})
 	}
 	if spec.HolePunch != "" {
-		allowedPunches := []string{"None", "BottomEdge", "LeftEdge", "RightEdge", "TopEdge"}
-		if !slices.Contains(allowedPunches, spec.HolePunch) {
+		if !slices.Contains(printAllowedHolePunchOptions, spec.HolePunch) {
 			return nil, fmt.Errorf("%w: invalid ticket hole punch %s", ErrInvalid, spec.HolePunch)
 		}
 		featName := "DocumentHolePunch"
@@ -1939,27 +2198,26 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 			Children: []PrintSetting{{Kind: PrintSettingOption, Name: xml.Name{Space: printKeywordsNS, Local: spec.HolePunch}}},
 		})
 	}
-	if spec.Fold != "" {
-		allowedFolds := []string{"None", "HalfFold", "LetterFold", "ZFold", "GateFold", "AccordionFold", "DoubleGateFold", "EngineeringZFold"}
-		if !slices.Contains(allowedFolds, spec.Fold) {
-			return nil, fmt.Errorf("%w: invalid ticket fold %s", ErrInvalid, spec.Fold)
-		}
-		featName := "DocumentFold"
-		if spec.JobLevelFinishing {
-			featName = "JobFoldAllDocuments"
-		}
-		elements = append(elements, PrintSetting{
-			Kind:     PrintSettingFeature,
-			Name:     xml.Name{Space: printKeywordsNS, Local: featName},
-			Children: []PrintSetting{{Kind: PrintSettingOption, Name: xml.Name{Space: printKeywordsNS, Local: spec.Fold}}},
-		})
-	}
 	for _, custom := range spec.CustomFeatures {
 		feat, err := printBuildCustomTicketFeature(custom)
 		if err != nil {
 			return nil, err
 		}
 		elements = append(elements, feat)
+	}
+	for _, propSpec := range spec.CustomProperties {
+		prop, err := printBuildCustomProperty(propSpec)
+		if err != nil {
+			return nil, err
+		}
+		elements = append(elements, prop)
+	}
+	for _, paramSpec := range spec.CustomParameters {
+		paramInit, err := printBuildCustomParameterInit(paramSpec)
+		if err != nil {
+			return nil, err
+		}
+		params = append(params, paramInit)
 	}
 	elements = append(elements, params...)
 	return validatePrintSettingsModel(&PrintSettings{Version: version, Elements: elements}, configuration, printDocumentTicket)
@@ -1969,7 +2227,25 @@ func BuildPrintTicket(spec PrintTicketSpec) (*PrintSettings, error) {
 // 入参: ctx 取消Context，nil采用Background, pdc PSF2 PrintDeviceCapabilities结构, baseTicket 可选基准PrintTicket，nil按设备默认派生, opts 资源预算选项，Scope须为Unknown
 // 返回: *PrintCapabilities 派生后的PSF1能力文档, *PrintSettings 规范化后的默认PSF1票据, error 结构、能力、预算或取消错误
 func DerivePrintCapabilities(ctx context.Context, pdc *PrintSettings, baseTicket *PrintSettings, opts *PrintSettingsOptions) (*PrintCapabilities, *PrintSettings, error) {
-	configuration, err := printSettingsOptions(ctx, opts)
+	var deriveOpts *PrintDeriveOptions
+	if opts != nil {
+		deriveOpts = &PrintDeriveOptions{Settings: *opts}
+	}
+	return DerivePrintCapabilitiesWithOptions(ctx, pdc, baseTicket, deriveOpts)
+}
+
+// DerivePrintCapabilitiesWithOptions 执行Windows V4 PDC核心派生并支持可选自定义动态约束回调，回调执行后会重新校验能力文档合法性
+// 入参: ctx 取消Context，nil采用Background, pdc PSF2 PrintDeviceCapabilities结构, baseTicket 可选基准PrintTicket，nil按设备默认派生, opts 资源预算与自定义约束回调选项，nil采用默认值
+// 返回: *PrintCapabilities 派生后的PSF1能力文档, *PrintSettings 规范化后的默认PSF1票据, error 结构、能力、回调、预算或取消错误
+func DerivePrintCapabilitiesWithOptions(ctx context.Context, pdc *PrintSettings, baseTicket *PrintSettings, opts *PrintDeriveOptions) (*PrintCapabilities, *PrintSettings, error) {
+	var settingsOpts *PrintSettingsOptions
+	var customConstraints func(context.Context, *PrintSettings, *PrintCapabilities) error
+	if opts != nil {
+		copySettings := opts.Settings
+		settingsOpts = &copySettings
+		customConstraints = opts.CustomConstraints
+	}
+	configuration, err := printSettingsOptions(ctx, settingsOpts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1980,7 +2256,7 @@ func DerivePrintCapabilities(ctx context.Context, pdc *PrintSettings, baseTicket
 	if err != nil {
 		return nil, nil, err
 	}
-	effectiveTicket, _, err := normalizePrintSettingsInternal(baseTicket, nil, pdcModel, printDocumentDeviceCapabilities, configuration, true, false)
+	effectiveTicket, _, err := normalizePrintSettingsInternal(baseTicket, nil, pdcModel, printDocumentDeviceCapabilities, configuration, nil, true, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2015,10 +2291,21 @@ func DerivePrintCapabilities(ctx context.Context, pdc *PrintSettings, baseTicket
 	if err != nil {
 		return nil, nil, err
 	}
-	return &PrintCapabilities{Version: capModel.Version, Elements: capModel.Elements}, effectiveTicket, nil
+	derived := &PrintCapabilities{Version: capModel.Version, Elements: capModel.Elements}
+	if customConstraints != nil {
+		if err := customConstraints(configuration.context, printCloneSettings(effectiveTicket), derived); err != nil {
+			return nil, nil, err
+		}
+		rechecked, err := validatePrintSettingsModel(&PrintSettings{Version: derived.Version, Elements: derived.Elements}, configuration, printDocumentCapabilities)
+		if err != nil {
+			return nil, nil, err
+		}
+		derived = &PrintCapabilities{Version: rechecked.Version, Elements: rechecked.Elements}
+	}
+	return derived, effectiveTicket, nil
 }
 
-// printExtractDeriveState 从规范化基准票据与PDC提取动态PageImageableSize及约束判定状态
+// printExtractDeriveState 从规范化基准票据与PDC提取动态PageImageableSize（涵盖卷纸、自定义纸型与任意参数化介质）及约束判定状态
 // 入参: ticket 有效基准票据, pdc 已校验PDC模型, options 已校验配置
 // 返回: printDeriveState 派生状态
 func printExtractDeriveState(ticket, pdc *PrintSettings, options printSettingsConfig) printDeriveState {
@@ -2048,32 +2335,33 @@ func printExtractDeriveState(ticket, pdc *PrintSettings, options printSettingsCo
 		if mediaW > 0 && mediaH > 0 {
 			ox, oy, ew, eh := int64(0), int64(0), mediaW, mediaH
 			if !borderless {
-				if area, found := printFindPDCPortraitImageable(pdc, opt.Name); found {
-					if printPublicKeywordSpace(opt.Name.Space) && opt.Name.Local == "CustomMediaSize" {
-						defW, okW := printFindPDCParameterDefaultInt(pdc, "PageMediaSizeMediaSizeWidth")
-						defH, okH := printFindPDCParameterDefaultInt(pdc, "PageMediaSizeMediaSizeHeight")
-						if okW && okH && defW > 0 && defH > 0 && area[0] <= defW && area[1] <= defH && area[2] <= defW-area[0] && area[3] <= defH-area[1] {
-							left, top := area[0], area[1]
-							right, bottom := defW-area[0]-area[2], defH-area[1]-area[3]
-							ox = min(left, mediaW)
-							oy = min(top, mediaH)
-							ew = max(int64(0), mediaW-ox-right)
-							eh = max(int64(0), mediaH-oy-bottom)
+				if pdcOpt, area, found := printFindPDCMediaImageable(pdc, opt.Name); found {
+					refW, refH := mediaW, mediaH
+					dynamicDim := false
+					okRef := true
+					if wRef, hasWRef := printOptionScoredParamRef(pdcOpt, "MediaSizeWidth"); hasWRef {
+						dynamicDim = true
+						if defW, okW := printFindPDCParameterDefaultInt(pdc, wRef); okW && defW > 0 {
+							refW = defW
 						} else {
-							ox, oy, ew, eh = area[0], area[1], area[2], area[3]
-							if ox > mediaW {
-								ox = mediaW
-							}
-							if oy > mediaH {
-								oy = mediaH
-							}
-							if ew > mediaW-ox {
-								ew = mediaW - ox
-							}
-							if eh > mediaH-oy {
-								eh = mediaH - oy
-							}
+							okRef = false
 						}
+					}
+					if hRef, hasHRef := printOptionScoredParamRef(pdcOpt, "MediaSizeHeight"); hasHRef {
+						dynamicDim = true
+						if defH, okH := printFindPDCParameterDefaultInt(pdc, hRef); okH && defH > 0 {
+							refH = defH
+						} else {
+							okRef = false
+						}
+					}
+					if dynamicDim && okRef && refW > 0 && refH > 0 && area[0] <= refW && area[1] <= refH && area[2] <= refW-area[0] && area[3] <= refH-area[1] {
+						left, top := area[0], area[1]
+						right, bottom := refW-area[0]-area[2], refH-area[1]-area[3]
+						ox = min(left, mediaW)
+						oy = min(top, mediaH)
+						ew = max(int64(0), mediaW-ox-right)
+						eh = max(int64(0), mediaH-oy-bottom)
 					} else {
 						ox, oy, ew, eh = area[0], area[1], area[2], area[3]
 						if ox > mediaW {
@@ -2140,15 +2428,44 @@ func printExtractDeriveState(ticket, pdc *PrintSettings, options printSettingsCo
 	if dup, _, err := control.duplex("DocumentDuplex"); err == nil && dup != PrintSimplex {
 		state.hasDocDuplex = true
 	}
+	if opt, _, err := control.option(ticket.Elements, "JobStapleAllDocuments"); err == nil && opt != nil && (!printPublicKeywordSpace(opt.Name.Space) || opt.Name.Local != "None") {
+		state.hasJobStaple = true
+	}
+	if opt, _, err := control.option(ticket.Elements, "DocumentStaple"); err == nil && opt != nil && (!printPublicKeywordSpace(opt.Name.Space) || opt.Name.Local != "None") {
+		state.hasDocStaple = true
+	}
+	if opt, _, err := control.option(ticket.Elements, "JobHolePunch"); err == nil && opt != nil && (!printPublicKeywordSpace(opt.Name.Space) || opt.Name.Local != "None") {
+		state.hasJobHolePunch = true
+	}
+	if opt, _, err := control.option(ticket.Elements, "DocumentHolePunch"); err == nil && opt != nil && (!printPublicKeywordSpace(opt.Name.Space) || opt.Name.Local != "None") {
+		state.hasDocHolePunch = true
+	}
 	return state
 }
 
-// printFindPDCParameterDefaultInt 在PDC根级ParameterDef中查找指定公共整数参数的DefaultValue
-// 入参: pdc 已校验PDC模型, local 公共关键字本地名称
+// printOptionScoredParamRef 查找Option中指定公共ScoredProperty的ParameterRef展开名称
+// 入参: opt 介质Option节点, local 公共ScoredProperty本地名称
+// 返回: xml.Name ParameterRef展开名称, bool 是否引用了参数
+func printOptionScoredParamRef(opt PrintSetting, local string) (xml.Name, bool) {
+	for _, child := range opt.Children {
+		if child.Kind != PrintSettingScoredProperty || !printPublicKeywordSpace(child.Name.Space) || child.Name.Local != local {
+			continue
+		}
+		_, ref := printScoredValue(child.Children)
+		if ref != (xml.Name{}) {
+			return ref, true
+		}
+	}
+	return xml.Name{}, false
+}
+
+// printFindPDCParameterDefaultInt 在PDC根级ParameterDef中查找指定整数参数的DefaultValue
+// 入参: pdc 已校验PDC模型, target 目标参数展开名称
 // 返回: int64 参数默认值, bool 是否找到合法整数默认值
-func printFindPDCParameterDefaultInt(pdc *PrintSettings, local string) (int64, bool) {
+func printFindPDCParameterDefaultInt(pdc *PrintSettings, target xml.Name) (int64, bool) {
+	key := printCanonicalKey(target)
 	for _, element := range pdc.Elements {
-		if element.Kind != PrintSettingParameterDef || !printPublicKeywordSpace(element.Name.Space) || element.Name.Local != local {
+		if element.Kind != PrintSettingParameterDef || printCanonicalKey(element.Name) != key {
 			continue
 		}
 		for _, prop := range element.Children {
@@ -2164,10 +2481,10 @@ func printFindPDCParameterDefaultInt(pdc *PrintSettings, local string) (int64, b
 	return 0, false
 }
 
-// printFindPDCPortraitImageable 在PDC的PageMediaSize特性中查找指定纸型声明的PortraitImageableSize四元微米区域
+// printFindPDCMediaImageable 在PDC的PageMediaSize特性中查找指定纸型Option及其声明的PortraitImageableSize四元微米区域
 // 入参: pdc 已校验PDC模型, optionName 纸型Option展开名称
-// 返回: [4]int64 原点X、原点Y、宽、高微米值, bool 是否找到合法声明
-func printFindPDCPortraitImageable(pdc *PrintSettings, optionName xml.Name) ([4]int64, bool) {
+// 返回: PrintSetting 匹配的PDC纸型Option, [4]int64 原点X、原点Y、宽、高微米值, bool 是否找到合法声明
+func printFindPDCMediaImageable(pdc *PrintSettings, optionName xml.Name) (PrintSetting, [4]int64, bool) {
 	target := printCanonicalKey(optionName)
 	for _, element := range pdc.Elements {
 		if element.Kind != PrintSettingFeature || !printPublicKeywordSpace(element.Name.Space) || element.Name.Local != "PageMediaSize" {
@@ -2183,12 +2500,14 @@ func printFindPDCPortraitImageable(pdc *PrintSettings, optionName xml.Name) ([4]
 				}
 				val := prop.Children[0].Value
 				if val.Type == (xml.Name{Space: printFramework2NS, Local: "ImageableAreaType"}) {
-					return printParseImageableArea(val.Text)
+					if area, ok := printParseImageableArea(val.Text); ok {
+						return opt, area, true
+					}
 				}
 			}
 		}
 	}
-	return [4]int64{}, false
+	return PrintSetting{}, [4]int64{}, false
 }
 
 // printConvertSettingToV1Cap 将PDC节点递归转换为兼容PSF1 PrintCapabilities的节点，清除PSF2默认属性与ImageableAreaType并将默认项置前
@@ -2300,6 +2619,26 @@ func printApplyDeriveConstraints(feature *PrintSetting, state printDeriveState) 
 			}
 		case "DocumentDuplex":
 			if state.hasJobDuplex || (state.activeBooklet && printPublicKeywordSpace(opt.Name.Space) && opt.Name.Local == "OneSided") {
+				constrained = true
+			}
+		case "JobStapleAllDocuments":
+			isNone := printPublicKeywordSpace(opt.Name.Space) && opt.Name.Local == "None"
+			if state.hasDocStaple && !isNone {
+				constrained = true
+			}
+		case "DocumentStaple":
+			isNone := printPublicKeywordSpace(opt.Name.Space) && opt.Name.Local == "None"
+			if state.hasJobStaple && !isNone {
+				constrained = true
+			}
+		case "JobHolePunch":
+			isNone := printPublicKeywordSpace(opt.Name.Space) && opt.Name.Local == "None"
+			if state.hasDocHolePunch && !isNone {
+				constrained = true
+			}
+		case "DocumentHolePunch":
+			isNone := printPublicKeywordSpace(opt.Name.Space) && opt.Name.Local == "None"
+			if state.hasJobHolePunch && !isNone {
 				constrained = true
 			}
 		case "PagePoster":

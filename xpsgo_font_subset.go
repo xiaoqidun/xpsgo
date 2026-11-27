@@ -55,14 +55,6 @@ type cffProgRef struct {
 	index   int
 }
 
-// cffType2Origin 记录Type2操作数栈槽是否来自当前字节流内的独立整数字面量
-type cffType2Origin struct {
-	prog  cffProgRef
-	start int
-	end   int
-	valid bool
-}
-
 // cffType2CallSite 记录Type2字节流中单个静态子程序调用字面量区间及目标信息
 type cffType2CallSite struct {
 	start    int
@@ -86,7 +78,7 @@ type cffCompactPlan struct {
 	pruneEmptySubrs bool
 }
 
-// cffType2Tracer 追踪Type2字形与子程序的实际调用集合并记录静态字面量调用点
+// cffType2Tracer 复用共享Type2执行内核追踪字形与子程序的实际调用集合并记录静态字面量调用点
 type cffType2Tracer struct {
 	globalSubr   [][]byte
 	localSubr    [][]byte
@@ -99,13 +91,6 @@ type cffType2Tracer struct {
 	globalPinned *bool
 	localPinned  map[[2]uint32]bool
 	sites        map[cffProgRef]map[int][]cffType2CallSite
-	stack        [48]float64
-	origins      [48]cffType2Origin
-	n            int
-	transient    [32]float64
-	initialized  uint32
-	widthSeen    bool
-	stems        int
 }
 
 // fontSubsetFaceKey 区分原始字体目录、保留编号与必需隐式码点映射，重复字体面复用已重定位的候选目录
@@ -324,8 +309,6 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, requir
 		}
 	}
 	oldToNew, newToOld := buildSubsetGIDMap(needed, configuration.CompactGIDs)
-	head, _ := face.table("head")
-	short := binary.BigEndian.Uint16(head[50:]) == 0
 	var offsets []uint32
 	var glyf []byte
 	if configuration.CompactGIDs {
@@ -376,12 +359,11 @@ func subsetFontFace(ctx context.Context, face *fontFace, glyphs []uint16, requir
 			}
 		}
 	}
-	if short {
-		for _, offset := range offsets {
-			if offset&1 != 0 || offset > 131070 {
-				short = false
-				break
-			}
+	short := true
+	for _, offset := range offsets {
+		if offset&1 != 0 || offset > 131070 {
+			short = false
+			break
 		}
 	}
 	stride := 4
@@ -451,7 +433,8 @@ func encodeSubsetFont(ctx context.Context, face *fontFace, replacements map[stri
 		if compact {
 			switch tag {
 			case "kern", "GPOS", "GSUB", "GDEF", "JSTF", "BASE", "VORG", "MATH",
-				"morx", "mort", "kerx", "ankr", "lcar", "opbd", "prop", "feat", "trak", "Zapf",
+				"morx", "mort", "kerx", "ankr", "lcar", "opbd", "prop", "feat", "trak", "Zapf", "bsln", "just",
+				"COLR", "CPAL", "SVG ", "gvar", "HVAR", "VVAR", "MVAR", "cvar", "fvar", "avar", "STAT",
 				"hdmx", "LTSH", "VDMX", "EBLC", "EBDT", "EBSC", "CBDT", "CBLC", "sbix", "bloc", "bdat", "bhed":
 				return true
 			}
@@ -460,7 +443,8 @@ func encodeSubsetFont(ctx context.Context, face *fontFace, replacements map[stri
 			return false
 		}
 		switch tag {
-		case "hdmx", "LTSH", "VDMX", "EBLC", "EBDT", "EBSC", "CBDT", "CBLC", "sbix", "bloc", "bdat":
+		case "COLR", "CPAL", "SVG ", "gvar", "HVAR", "VVAR", "MVAR", "cvar", "fvar", "avar", "STAT", "bsln", "just",
+			"hdmx", "LTSH", "VDMX", "EBLC", "EBDT", "EBSC", "CBDT", "CBLC", "sbix", "bloc", "bdat":
 			return true
 		}
 		return false
@@ -1302,9 +1286,21 @@ func buildSubsetCFFCompactPlan(ctx context.Context, font *cffFont, programs [][]
 	localPinned := make(map[[2]uint32]bool)
 	sites := make(map[cffProgRef]map[int][]cffType2CallSite)
 	traceBudget := 1 << 20
-	if remaining != nil && *remaining > traceBudget {
-		traceBudget = *remaining
+	if remaining != nil {
+		if *remaining <= 0 {
+			return plan, fmt.Errorf("%w: Type2 trace operation budget", ErrLimit)
+		}
+		traceBudget = min(traceBudget, *remaining)
 	}
+	initialBudget := traceBudget
+	defer func() {
+		if remaining != nil {
+			spent := initialBudget - traceBudget
+			if spent > 0 {
+				*remaining = max(0, *remaining-spent)
+			}
+		}
+	}()
 	for gid, prog := range programs {
 		if err := checkContext(ctx); err != nil {
 			return plan, err
@@ -1333,7 +1329,7 @@ func buildSubsetCFFCompactPlan(ctx context.Context, font *cffFont, programs [][]
 		if fd.private.randomSeed != 0 {
 			tracer.randomState = uint32(fd.private.randomSeed)
 		}
-		if _, err := tracer.execute(prog, cffProgRef{kind: 0, index: gid}, 0); err != nil {
+		if err := tracer.trace(prog, cffProgRef{kind: 0, index: gid}); err != nil {
 			return plan, err
 		}
 	}
@@ -1372,14 +1368,14 @@ func buildSubsetCFFCompactPlan(ctx context.Context, font *cffFont, programs [][]
 				mapping[i] = i
 				order[i] = i
 			}
-			return mapping, order, cffSubrBias(len(orig))
+			return mapping, order, cffType2SubrBias(len(orig))
 		}
 		order := slices.Sorted(maps.Keys(used))
 		mapping := make(map[int]int, len(order))
 		for newIdx, oldIdx := range order {
 			mapping[oldIdx] = newIdx
 		}
-		return mapping, order, cffSubrBias(len(order))
+		return mapping, order, cffType2SubrBias(len(order))
 	}
 	globalMap, globalOrder, newGlobalBias := buildSubrMap(font.set.globalSubr, usedGlobal, globalPinned)
 	localMaps := make(map[[2]uint32]map[int]int, len(activePrivates))
@@ -1640,327 +1636,83 @@ func cffPrivateKey(fd cffFontDict) ([2]uint32, error) {
 	return key, nil
 }
 
-// cffSubrBias 按Adobe TN #5177计算Type2子程序表对应的索引偏置
-// 入参: count 子程序表条目数量
-// 返回: int 偏置值107、1131或32768
-func cffSubrBias(count int) int {
-	if count >= 33900 {
-		return 32768
-	}
-	if count >= 1240 {
-		return 1131
-	}
-	return 107
-}
-
-// execute 追踪单个Type2程序或子程序的栈状态、stem掩码与子程序调用点
-// 入参: data 当前Type2字节流, ref 当前程序标识, depth 当前子程序嵌套深度
-// 返回: bool 是否执行到endchar, error 程序语法、预算或取消错误
-func (t *cffType2Tracer) execute(data []byte, ref cffProgRef, depth int) (bool, error) {
-	if len(data) > 65535 || depth > 10 {
-		return false, fmt.Errorf("%w: Type2 charstring length or subroutine depth", ErrLimit)
-	}
-	for pc := 0; pc < len(data); {
-		if err := checkContext(t.ctx); err != nil {
-			return false, err
+// trace 通过共享Type2执行内核追踪字形程序与全部被调子程序，收集可达子程序与静态调用字面量区间
+// 入参: data 根Type2字形字节流, rootRef 根程序标识
+// 返回: error 程序语法、预算或取消错误
+func (t *cffType2Tracer) trace(data []byte, rootRef cffProgRef) error {
+	refs := []cffProgRef{rootRef}
+	progs := [][]byte{data}
+	refToTag := map[cffProgRef]uint64{rootRef: 0}
+	register := func(ref cffProgRef, code []byte) uint64 {
+		if tag, exists := refToTag[ref]; exists {
+			return tag
 		}
-		if t.work != nil {
-			if *t.work <= 0 {
-				return false, fmt.Errorf("%w: Type2 trace operation budget", ErrLimit)
-			}
-			*t.work--
-		}
-		start := pc
-		op := data[pc]
-		pc++
-		if op >= 32 || op == 28 {
-			value, consumed, err := type2Number(op, data[pc:])
-			if err != nil {
-				return false, err
-			}
-			pc += consumed
-			if t.n == len(t.stack) {
-				return false, fmt.Errorf("%w: Type2 operand stack", ErrLimit)
-			}
-			t.stack[t.n] = value
-			t.origins[t.n] = cffType2Origin{prog: ref, start: start, end: pc, valid: op != 255}
-			t.n++
-			continue
-		}
-		switch op {
-		case 10, 29:
-			if t.n == 0 {
-				return false, type2Arguments(op)
-			}
-			t.n--
-			operand := t.stack[t.n]
-			origin := t.origins[t.n]
-			isGlobal := op == 29
-			subr := t.localSubr
-			if isGlobal {
-				subr = t.globalSubr
-			}
-			bias := cffSubrBias(len(subr))
-			indexFloat := operand + float64(bias)
-			if math.Trunc(operand) != operand || !type2Integer(indexFloat, 0, len(subr)-1) {
-				return false, fmt.Errorf("%w: Type2 subroutine index", ErrInvalid)
-			}
-			idx := int(indexFloat)
-			if isGlobal {
-				t.usedGlobal[idx] = true
-			} else {
-				if t.usedLocal[t.privKey] == nil {
-					t.usedLocal[t.privKey] = make(map[int]bool)
+		tag := uint64(len(refs))
+		refs = append(refs, ref)
+		progs = append(progs, code)
+		refToTag[ref] = tag
+		return tag
+	}
+	engine := cffType2Engine{
+		globalSubr:  t.globalSubr,
+		localSubr:   t.localSubr,
+		randomState: t.randomState,
+		callbacks: cffType2Callbacks{
+			spend: func(count int) error {
+				if err := checkContext(t.ctx); err != nil {
+					return err
 				}
-				t.usedLocal[t.privKey][idx] = true
-			}
-			if origin.valid && origin.prog == ref {
-				if t.sites[ref] == nil {
-					t.sites[ref] = make(map[int][]cffType2CallSite)
+				if *t.work < count {
+					return fmt.Errorf("%w: Type2 trace operation budget", ErrLimit)
 				}
-				t.sites[ref][origin.start] = append(t.sites[ref][origin.start], cffType2CallSite{
-					start:    origin.start,
-					end:      origin.end,
-					isGlobal: isGlobal,
-					privKey:  t.privKey,
-					target:   idx,
-				})
-			} else if isGlobal {
-				*t.globalPinned = true
-			} else {
-				t.localPinned[t.privKey] = true
-			}
-			childRef := cffProgRef{kind: 2, privKey: t.privKey, index: idx}
-			if isGlobal {
-				childRef = cffProgRef{kind: 1, index: idx}
-			}
-			ended, err := t.execute(subr[idx], childRef, depth+1)
-			if err != nil {
-				return false, err
-			}
-			if ended {
-				return true, nil
-			}
-		case 11:
-			if depth == 0 {
-				return false, fmt.Errorf("%w: Type2 misplaced return", ErrInvalid)
-			}
-			return false, nil
-		case 12:
-			if pc == len(data) {
-				return false, fmt.Errorf("%w: truncated Type2 escape", ErrInvalid)
-			}
-			escape := data[pc]
-			pc++
-			if err := t.escape(escape); err != nil {
-				return false, err
-			}
-		case 14:
-			t.consumeWidth(op)
-			t.n = 0
-			return true, nil
-		case 1, 3, 18, 23, 19, 20:
-			t.consumeWidth(op)
-			t.stems += t.n / 2
-			t.n = 0
-			if op == 19 || op == 20 {
-				maskBytes := (t.stems + 7) / 8
-				if maskBytes == 0 || pc+maskBytes > len(data) {
-					return false, fmt.Errorf("%w: Type2 mask without stems or truncated mask", ErrInvalid)
+				*t.work -= count
+				return nil
+			},
+			onCallSubr: func(isGlobal bool, idx int, meta cffType2OperandMeta) (uint64, error) {
+				callOp := byte(10)
+				childRef := cffProgRef{kind: 2, privKey: t.privKey, index: idx}
+				childCode := t.localSubr[idx]
+				if isGlobal {
+					callOp = 29
+					childRef = cffProgRef{kind: 1, index: idx}
+					childCode = t.globalSubr[idx]
+					t.usedGlobal[idx] = true
+				} else {
+					if t.usedLocal[t.privKey] == nil {
+						t.usedLocal[t.privKey] = make(map[int]bool)
+					}
+					t.usedLocal[t.privKey][idx] = true
 				}
-				pc += maskBytes
-			}
-		case 4, 5, 6, 7, 8, 21, 22, 24, 25, 26, 27, 30, 31:
-			if op == 4 || op == 21 || op == 22 {
-				t.consumeWidth(op)
-			}
-			t.n = 0
-		default:
-			return false, fmt.Errorf("%w: undefined Type2 operator %d", ErrUnsupported, op)
-		}
+				static := false
+				if meta.literal {
+					raw := progs[meta.tag]
+					if meta.end < len(raw) && raw[meta.start] != 255 && raw[meta.end] == callOp {
+						static = true
+					}
+				}
+				if static {
+					ref := refs[meta.tag]
+					if t.sites[ref] == nil {
+						t.sites[ref] = make(map[int][]cffType2CallSite)
+					}
+					t.sites[ref][meta.start] = append(t.sites[ref][meta.start], cffType2CallSite{
+						start:    meta.start,
+						end:      meta.end,
+						isGlobal: isGlobal,
+						privKey:  t.privKey,
+						target:   idx,
+					})
+				} else if isGlobal {
+					*t.globalPinned = true
+				} else {
+					t.localPinned[t.privKey] = true
+				}
+				return register(childRef, childCode), nil
+			},
+		},
 	}
-	return false, fmt.Errorf("%w: unterminated Type2 program", ErrInvalid)
-}
-
-// consumeWidth 按Type2规范在首个清栈指令处剥离可选宽度操作数以维持精确stem计数
-// 入参: op 触发清栈的操作符编号
-func (t *cffType2Tracer) consumeWidth(op byte) {
-	if t.widthSeen {
-		return
-	}
-	t.widthSeen = true
-	present := false
-	switch op {
-	case 1, 3, 18, 23, 19, 20:
-		present = t.n%2 == 1
-	case 4, 22:
-		present = t.n == 2
-	case 21:
-		present = t.n == 3
-	case 14:
-		present = t.n == 1 || t.n == 5
-	}
-	if present && t.n > 0 {
-		copy(t.stack[:], t.stack[1:t.n])
-		copy(t.origins[:], t.origins[1:t.n])
-		t.n--
-	}
-}
-
-// escape 追踪Type2转义算术、栈、存储与flex指令，确保动态子程序索引与静态来源判定精确同步
-// 入参: op 转义操作符编号
-// 返回: error 操作数、能力或栈上限错误
-func (t *cffType2Tracer) escape(op byte) error {
-	if op >= 34 && op <= 37 {
-		t.n = 0
-		return nil
-	}
-	if op == 0 {
-		return nil
-	}
-	if op == 23 {
-		x := t.randomState
-		x ^= x << 13
-		x ^= x >> 17
-		x ^= x << 5
-		t.randomState = x
-		if t.n == len(t.stack) {
-			return fmt.Errorf("%w: Type2 operand stack", ErrLimit)
-		}
-		t.stack[t.n] = (float64(x) + 1) / 4294967296
-		t.origins[t.n] = cffType2Origin{}
-		t.n++
-		return nil
-	}
-	need := 0
-	switch op {
-	case 5, 9, 14, 18, 21, 26, 27, 29:
-		need = 1
-	case 3, 4, 10, 11, 12, 15, 20, 24, 28, 30:
-		need = 2
-	case 22:
-		need = 4
-	default:
-		return fmt.Errorf("%w: undefined Type2 escaped operator %d", ErrUnsupported, op)
-	}
-	if t.n < need {
-		return type2Arguments(op)
-	}
-	a := t.stack[t.n-need : t.n]
-	switch op {
-	case 27:
-		if t.n == len(t.stack) {
-			return fmt.Errorf("%w: Type2 operand stack", ErrLimit)
-		}
-		t.origins[t.n-1].valid = false
-		t.stack[t.n] = a[0]
-		t.origins[t.n] = cffType2Origin{}
-		t.n++
-		return nil
-	case 28:
-		a[0], a[1] = a[1], a[0]
-		t.origins[t.n-2], t.origins[t.n-1] = t.origins[t.n-1], t.origins[t.n-2]
-		return nil
-	case 29:
-		index := a[0]
-		t.n--
-		if !geometryFinite(index) || math.Trunc(index) != index {
-			return type2Arguments(op)
-		}
-		index = max(index, 0)
-		if !type2Integer(index, 0, t.n-1) {
-			return type2Arguments(op)
-		}
-		src := t.n - 1 - int(index)
-		t.origins[src].valid = false
-		t.stack[t.n] = t.stack[src]
-		t.origins[t.n] = cffType2Origin{}
-		t.n++
-		return nil
-	case 30:
-		count, shift := a[0], a[1]
-		t.n -= 2
-		if !type2Integer(count, 0, t.n) || math.Trunc(shift) != shift {
-			return type2Arguments(op)
-		}
-		if count != 0 {
-			n := int(count)
-			j := int(math.Mod(shift, count))
-			if j < 0 {
-				j += n
-			}
-			var copyStack [48]float64
-			var copyOrigins [48]cffType2Origin
-			copy(copyStack[:], t.stack[t.n-n:t.n])
-			copy(copyOrigins[:], t.origins[t.n-n:t.n])
-			for i := 0; i < n; i++ {
-				t.stack[t.n-n+(i+j)%n] = copyStack[i]
-				t.origins[t.n-n+(i+j)%n] = copyOrigins[i]
-			}
-		}
-		return nil
-	}
-	t.n -= need
-	value := 0.0
-	switch op {
-	case 3:
-		if a[0] != 0 && a[1] != 0 {
-			value = 1
-		}
-	case 4:
-		if a[0] != 0 || a[1] != 0 {
-			value = 1
-		}
-	case 5:
-		if a[0] == 0 {
-			value = 1
-		}
-	case 9:
-		value = math.Abs(a[0])
-	case 10:
-		value = a[0] + a[1]
-	case 11:
-		value = a[0] - a[1]
-	case 12:
-		value = a[0] / a[1]
-	case 14:
-		value = -a[0]
-	case 15:
-		if a[0] == a[1] {
-			value = 1
-		}
-	case 18:
-		return nil
-	case 20:
-		if !type2Integer(a[1], 0, 31) {
-			return type2Arguments(op)
-		}
-		index := uint32(a[1])
-		t.transient[index] = a[0]
-		t.initialized |= 1 << index
-		return nil
-	case 21:
-		if !type2Integer(a[0], 0, 31) || t.initialized&(1<<uint32(a[0])) == 0 {
-			return fmt.Errorf("%w: Type2 uninitialized or invalid transient index", ErrInvalid)
-		}
-		value = t.transient[uint32(a[0])]
-	case 22:
-		value = a[1]
-		if a[2] <= a[3] {
-			value = a[0]
-		}
-	case 24:
-		value = a[0] * a[1]
-	case 26:
-		value = math.Sqrt(a[0])
-	}
-	if !geometryFinite(value) {
-		return fmt.Errorf("%w: non-finite Type2 arithmetic", ErrInvalid)
-	}
-	t.stack[t.n] = value
-	t.origins[t.n] = cffType2Origin{}
-	t.n++
-	return nil
+	_, err := engine.execute(data, 0, 0)
+	return err
 }
 
 // encodeSubsetCFFCharsetFormat2 按连续区间编码紧凑的CFF Format 2字符集表
@@ -2980,6 +2732,12 @@ func applySubsetCmapAndOS2(face *fontFace, numGlyphs uint32, oldToNew map[uint16
 	updated := bytes.Clone(os2Data)
 	binary.BigEndian.PutUint16(updated[64:], firstCode)
 	binary.BigEndian.PutUint16(updated[66:], lastCode)
+	if len(updated) >= 86 && binary.BigEndian.Uint16(updated[:2]) >= 1 {
+		codePage1 := binary.BigEndian.Uint32(updated[78:82])
+		if codePage1&(1<<31) != 0 {
+			binary.BigEndian.PutUint32(updated[78:82], codePage1&^(uint32(1)<<31))
+		}
+	}
 	tables["OS/2"] = updated
 	return nil
 }

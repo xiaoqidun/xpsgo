@@ -621,10 +621,14 @@ func (c *compositionFontCheck) page(page packagePart, restricted map[string]bool
 			if err != nil {
 				return err
 			}
-			if metrics.fsType&4 != 0 && restricted == nil {
+			rights, err := fontEmbeddingRights(metrics)
+			if err != nil {
+				return &PartError{Part: glyphs.FontPart, Err: err}
+			}
+			if rights&4 != 0 && restricted == nil {
 				return &PartError{Part: page.name, Err: fmt.Errorf("%w: preview and print auxiliary page lacks document context", ErrUnsupported)}
 			}
-			if metrics.fsType&4 != 0 && !restricted[strings.ToLower(glyphs.FontPart)] {
+			if rights&4 != 0 && !restricted[strings.ToLower(glyphs.FontPart)] {
 				return &PartError{Part: glyphs.FontPart, Err: fmt.Errorf("%w: preview and print font lacks document restricted font relationship", ErrRestricted)}
 			}
 		}
@@ -2363,9 +2367,9 @@ func compositionPrintRepresentable(node *xmlElement, version uint32, capabilitie
 	return nil
 }
 
-// compositionPrintReplace 按互不重叠的字符范围替换数据，输出前恢复原编码并重新校验XML
+// compositionPrintReplace 按互不重叠的字符范围替换数据并恢复原编码
 // 入参: original 原数据, changes UTF-8范围及替换值, maximum 原编码上限, intermediate UTF-8上限, budget 共享预算
-// 返回: []byte 独立结果，失败为nil, bool 是否修改, error 范围、资源、XML或取消错误
+// 返回: []byte 独立结果，失败为nil, bool 是否修改, error 范围、编码、资源或取消错误
 func compositionPrintReplace(original []byte, changes []xmlValueReplacement, maximum, intermediate int64, budget *compositionBudget) ([]byte, bool, error) {
 	if err := budget.scan(int64(len(original))); err != nil {
 		return nil, false, err
@@ -2376,9 +2380,6 @@ func compositionPrintReplace(original []byte, changes []xmlValueReplacement, max
 	}
 	output, err := applyCompositionXMLSpans(original, input, changes, maximum, intermediate, true, budget)
 	if err != nil {
-		return nil, false, err
-	}
-	if _, err := decodeXMLVisit(output, budget.limits, func(_ xml.Token, _ *xmlElement) error { return budget.step(1) }); err != nil {
 		return nil, false, err
 	}
 	return output, true, nil
@@ -3251,9 +3252,6 @@ func rewriteCompositionMarkupWithStrip(original []byte, maximum int64, budget *c
 	if err != nil {
 		return nil, err
 	}
-	if _, err := decodeXMLVisit(output, budget.limits, func(_ xml.Token, _ *xmlElement) error { return checkContext(budget.context) }); err != nil {
-		return nil, err
-	}
 	return output, nil
 }
 
@@ -3521,9 +3519,6 @@ func transformCompositionPageMarkup(original []byte, format Format, transform co
 	}
 	output, err := applyCompositionXMLSpans(original, input, changes, maximum, intermediate, true, budget)
 	if err != nil {
-		return nil, err
-	}
-	if _, err := decodeXMLVisit(output, budget.limits, func(_ xml.Token, _ *xmlElement) error { return checkContext(budget.context) }); err != nil {
 		return nil, err
 	}
 	return output, nil

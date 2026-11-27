@@ -112,7 +112,6 @@ type PrintCapabilitiesSummary struct {
 	Bindings             []PrintBinding
 	Staples              []string
 	HolePunches          []string
-	Folds                []string
 	Borderless           bool
 	Watermark            bool
 	Parameters           []PrintParameterSummary
@@ -551,12 +550,35 @@ func resolvePrintParameterModel(model *PrintSettings, domains map[xml.Name]*prin
 			values[key] = value
 		}
 	}
+	mutexSatisfied := make(map[xml.Name]bool)
+	if len(domains) >= 2 && len(values) > 0 {
+		domainKeys := make([]xml.Name, 0, len(domains))
+		domainSettings := make(map[xml.Name]PrintSetting, len(domains))
+		for name := range domains {
+			domainKeys = append(domainKeys, name)
+			domainSettings[name] = PrintSetting{Kind: PrintSettingParameterDef, Name: name}
+		}
+		for _, group := range printBuildMutexKeyGroups(domainKeys, domainSettings, printMutexParameterGroups) {
+			hasValue := false
+			for _, member := range group {
+				if values[member] != nil {
+					hasValue = true
+					break
+				}
+			}
+			if hasValue {
+				for _, member := range group {
+					mutexSatisfied[member] = true
+				}
+			}
+		}
+	}
 	for name, domain := range domains {
 		scope := printKeywordScope(name)
 		if configuration.Scope != PrintScopeUnknown && scope != PrintScopeUnknown && scope < configuration.Scope {
 			continue
 		}
-		if domain.mandatory == "Unconditional" && values[name] == nil {
+		if domain.mandatory == "Unconditional" && values[name] == nil && !mutexSatisfied[name] {
 			return fmt.Errorf("%w: unconditional print parameter not initialized", ErrInvalid)
 		}
 	}
@@ -632,7 +654,7 @@ func ValidatePrintSelection(ctx context.Context, settings *PrintSettings, capabi
 			checker.domains[printCanonicalKey(setting.Name)] = domain
 		}
 	}
-	model.Elements = checker.filter(model.Elements)
+	model.Elements = checker.filter(model.Elements, capModel.Elements)
 	if err := resolvePrintParameterModel(model, checker.domains, configuration); err != nil {
 		return checker.diagnostics, err
 	}
@@ -651,17 +673,35 @@ func (c *printSelectionChecker) collectNamespaces(settings []PrintSetting) {
 	}
 }
 
-// filter 在参数解析前忽略未声明命名空间的设置，保留可能通过描述值匹配的Option名称
-// 入参: settings 已复制的候选内容
+// filter 在参数解析前忽略未声明命名空间的设置，开启IgnoreUndeclaredFeatures时亦忽略已知命名空间中能力未声明的扩展Feature并记录诊断
+// 入参: settings 已复制的候选内容, supported 同层级能力内容
 // 返回: []PrintSetting 保留内容
-func (c *printSelectionChecker) filter(settings []PrintSetting) []PrintSetting {
+func (c *printSelectionChecker) filter(settings, supported []PrintSetting) []PrintSetting {
+	var capFeats map[xml.Name]PrintSetting
+	if c.options.IgnoreUndeclaredFeatures && len(supported) > 0 {
+		capFeats = make(map[xml.Name]PrintSetting)
+		for _, item := range supported {
+			if item.Kind == PrintSettingFeature {
+				capFeats[printCanonicalKey(item.Name)] = item
+			}
+		}
+	}
 	result := settings[:0]
 	for _, setting := range settings {
 		if setting.Kind != PrintSettingOption && setting.Kind != PrintSettingParameterRef && setting.Name.Space != "" && !c.namespaces[printCanonicalKey(setting.Name).Space] {
 			c.ignored(setting)
 			continue
 		}
-		setting.Children = c.filter(setting.Children)
+		var nextSupported []PrintSetting
+		if setting.Kind == PrintSettingFeature && c.options.IgnoreUndeclaredFeatures {
+			capFeat, exists := capFeats[printCanonicalKey(setting.Name)]
+			if !exists {
+				c.diagnostics = append(c.diagnostics, Diagnostic{Element: "Feature", Attribute: "name", Message: "undeclared print Feature ignored"})
+				continue
+			}
+			nextSupported = capFeat.Children
+		}
+		setting.Children = c.filter(setting.Children, nextSupported)
 		result = append(result, setting)
 	}
 	return result
@@ -801,6 +841,13 @@ func printScoredCount(settings []PrintSetting) int {
 // 入参: requested 请求内容, supported 能力内容, subset 是否允许请求省略描述
 // 返回: bool 是否匹配, error 资源、参数定义或取消错误
 func (c *printSelectionChecker) scored(requested, supported []PrintSetting, subset bool) (bool, error) {
+	return printMatchScoredExact(requested, supported, subset, c.domains, nil, c.options, c.step, true)
+}
+
+// printMatchScoredExact 校验并匹配两组ScoredProperty及嵌套子项，供能力校验器与票据规范化器共享统一语义
+// 入参: requested 请求子元素, supported 能力子元素, subset 是否允许请求省略候选已知描述, domains 能力参数域索引, paramValues 可选票据参数初值映射, options 预算与取消配置, step 步进预算检查回调, strictMissingDomain 缺失ParameterDef时是否返回ErrUnsupported
+// 返回: bool 是否精确匹配, error 预算、缺失参数域或取消错误
+func printMatchScoredExact(requested, supported []PrintSetting, subset bool, domains map[xml.Name]*printParameterDomain, paramValues map[xml.Name]*PrintValue, options printSettingsConfig, step func() error, strictMissingDomain bool) (bool, error) {
 	if !subset && printScoredCount(requested) != printScoredCount(supported) {
 		return false, nil
 	}
@@ -814,33 +861,56 @@ func (c *printSelectionChecker) scored(requested, supported []PrintSetting, subs
 		if setting.Kind != PrintSettingScoredProperty {
 			continue
 		}
-		if err := c.step(); err != nil {
+		if err := step(); err != nil {
 			return false, err
 		}
 		capability, exists := index[printCanonicalKey(setting.Name)]
 		if !exists {
 			return false, nil
 		}
-		requestValue, _ := printScoredValue(setting.Children)
-		capValue, reference := printScoredValue(capability.Children)
-		if reference != (xml.Name{}) {
-			domain := c.domains[printCanonicalKey(reference)]
-			if domain == nil {
-				return false, fmt.Errorf("%w: print Option parameter definition not available", ErrUnsupported)
-			}
-			if _, err := domain.value(requestValue, c.options); err != nil {
-				if errors.Is(err, ErrInvalid) {
+		requestValue, requestRef := printScoredValue(setting.Children)
+		capValue, capRef := printScoredValue(capability.Children)
+		if capRef != (xml.Name{}) {
+			if requestRef != (xml.Name{}) {
+				if printCanonicalKey(requestRef) != printCanonicalKey(capRef) {
 					return false, nil
 				}
-				return false, err
+			} else {
+				domain := domains[printCanonicalKey(capRef)]
+				if domain == nil {
+					if strictMissingDomain {
+						return false, fmt.Errorf("%w: print Option parameter definition not available", ErrUnsupported)
+					}
+					return false, nil
+				}
+				if _, err := domain.value(requestValue, options); err != nil {
+					if errors.Is(err, ErrInvalid) {
+						return false, nil
+					}
+					return false, err
+				}
 			}
 		} else {
-			same, err := c.value(requestValue, capValue)
+			if requestRef != (xml.Name{}) {
+				refKey := printCanonicalKey(requestRef)
+				if paramValues != nil {
+					requestValue = paramValues[refKey]
+				}
+				if requestValue == nil {
+					if domain := domains[refKey]; domain != nil {
+						requestValue = &domain.defaultValue
+					}
+				}
+			}
+			if err := step(); err != nil {
+				return false, err
+			}
+			same, err := printValuesEqual(requestValue, capValue, options)
 			if err != nil || !same {
 				return same, err
 			}
 		}
-		if same, err := c.scored(setting.Children, capability.Children, subset); err != nil || !same {
+		if same, err := printMatchScoredExact(setting.Children, capability.Children, subset, domains, paramValues, options, step, strictMissingDomain); err != nil || !same {
 			return same, err
 		}
 	}
@@ -862,19 +932,16 @@ func printScoredValue(settings []PrintSetting) (*PrintValue, xml.Name) {
 	return nil, xml.Name{}
 }
 
-// printValuesEqual 按基本类型精确比较两个PrintValue是否等价，数值使用精确有理数比较
-// 入参: requested 请求值, supported 能力值, options 解析与数值预算选项, canonicalQName 是否按规范命名空间键比较QName
+// printValuesEqual 按基本类型精确比较两个PrintValue是否等价，数值使用精确有理数比较，QName按真实关键字命名空间与统一框架命名空间比较
+// 入参: requested 请求值, supported 能力值, options 解析与数值预算选项
 // 返回: bool 是否等值, error 预算或取消错误
-func printValuesEqual(requested, supported *PrintValue, options printSettingsConfig, canonicalQName bool) (bool, error) {
+func printValuesEqual(requested, supported *PrintValue, options printSettingsConfig) (bool, error) {
 	if requested == nil || supported == nil || requested.Type != supported.Type {
 		return false, nil
 	}
 	switch requested.Type.Local {
 	case "QName":
-		if canonicalQName {
-			return printCanonicalKey(requested.QName) == printCanonicalKey(supported.QName), nil
-		}
-		return requested.QName == supported.QName, nil
+		return printCanonicalKey(requested.QName) == printCanonicalKey(supported.QName), nil
 	case "integer", "decimal":
 		left, right := strings.Trim(requested.Text, " \t\r\n"), strings.Trim(supported.Text, " \t\r\n")
 		if left == "" || right == "" {
@@ -892,16 +959,6 @@ func printValuesEqual(requested, supported *PrintValue, options printSettingsCon
 	default:
 		return requested.Text == supported.Text, nil
 	}
-}
-
-// value 按基本类型比较值，数值采用精确比较，QName按展开名称比较
-// 入参: requested 请求值, supported 能力值
-// 返回: bool 是否等值, error 资源或取消错误
-func (c *printSelectionChecker) value(requested, supported *PrintValue) (bool, error) {
-	if err := c.step(); err != nil {
-		return false, err
-	}
-	return printValuesEqual(requested, supported, c.options, false)
 }
 
 // printSettingsHasAnonymousOption 递归检查设置树中是否存在无名称的Option节点
@@ -1623,19 +1680,29 @@ func validatePrintParameterDefaultQName(value *PrintSetting, strictURI bool) err
 // 入参: settings 已校验打印设置模型, options 已校验资源预算配置, mode 文档类别模式
 // 返回: error 命名空间URI非法、字节预算超限或取消错误
 func validatePrintSettingsOutputBudget(settings *PrintSettings, options printSettingsConfig, mode printDocumentMode) error {
-	_, err := printSettingsEncodedSize(settings, options, mode)
+	_, err := encodePrintSettingsDocument(nil, settings, options, mode)
 	return err
 }
 
-// Summary 提取PrintCapabilities的通用只读能力摘要视图，涵盖可打印区、支持纸型微米表、DPI列表、参数域与标准/自定义Feature
-// 返回: PrintCapabilitiesSummary 只读能力摘要视图, error 接收者为空或能力模型非法错误
+// Summary 使用默认资源预算提取PrintCapabilities的通用只读能力摘要视图，涵盖可打印区、支持纸型微米表、DPI列表、参数域与标准/自定义Feature
+// 返回: PrintCapabilitiesSummary 只读能力摘要视图, error 接收者为空、资源预算或能力模型非法错误
 func (p *PrintCapabilities) Summary() (PrintCapabilitiesSummary, error) {
+	return p.SummaryWithOptions(context.Background(), nil)
+}
+
+// SummaryWithOptions 按指定取消Context与自定义资源预算提取PrintCapabilities的通用只读能力摘要视图，支持高复杂度与大体积能力文档
+// 入参: ctx 取消Context，nil采用Background, options 校验预算参数，Scope须为Unknown，nil采用默认值
+// 返回: PrintCapabilitiesSummary 只读能力摘要视图, error 接收者为空、参数、预算、取消或能力模型非法错误
+func (p *PrintCapabilities) SummaryWithOptions(ctx context.Context, options *PrintSettingsOptions) (PrintCapabilitiesSummary, error) {
 	if p == nil {
 		return PrintCapabilitiesSummary{}, fmt.Errorf("%w: nil print capabilities", ErrInvalid)
 	}
-	configuration, err := printSettingsOptions(context.Background(), nil)
+	configuration, err := printSettingsOptions(ctx, options)
 	if err != nil {
 		return PrintCapabilitiesSummary{}, err
+	}
+	if configuration.Scope != PrintScopeUnknown {
+		return PrintCapabilitiesSummary{}, fmt.Errorf("%w: scope on print capabilities summary", ErrInvalid)
 	}
 	model, err := validatePrintSettingsModel(&PrintSettings{Version: p.Version, Elements: p.Elements}, configuration, printDocumentCapabilities)
 	if err != nil {
@@ -1849,8 +1916,6 @@ func (p *PrintCapabilities) Summary() (PrintCapabilitiesSummary, error) {
 			summary.Staples = printCollectPublicOptionKeywords(el, summary.Staples)
 		case "DocumentHolePunch", "JobHolePunch":
 			summary.HolePunches = printCollectPublicOptionKeywords(el, summary.HolePunches)
-		case "DocumentFold", "JobFoldAllDocuments":
-			summary.Folds = printCollectPublicOptionKeywords(el, summary.Folds)
 		case "PageBorderless":
 			for _, child := range el.Children {
 				if child.Kind == PrintSettingOption && printOptionUnconstrained(child) && printPublicKeywordSpace(child.Name.Space) && child.Name.Local == "Borderless" {

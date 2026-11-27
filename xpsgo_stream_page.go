@@ -31,7 +31,7 @@ import (
 )
 
 // StreamPage 表示前向流读取中资源已就绪的临时页面视图，Index为零基全局页号，DocumentPart为所属文档URI
-// Page、PageHeader、Walk、WalkPrint、Font、Image、ImageInfo、DecodeImageRows、ReadPart、ColorProfile、StoryFragments、Resources、ResolveColor、ResolveGradientStops、NewColorResolver、PrintTicketHierarchy、PrintSettings、PrintColorPlan、PrintLayout、CoreProperties、DocumentStructure、Render、RenderDevice、RenderElement、RenderElementMapped、RenderBrushTile与RenderBrushTileWithState仅在OnPage回调期间可用
+// Page、PageHeader、Walk、WalkPrint、Font、Image、ImageInfo、DecodeImageRows、ReadPart、ColorProfile、ColorProfileFrom、StoryFragments、Resources、Relationships、ThumbnailParts、Thumbnail、ResolveColor、ResolveColorFrom、ResolveGradientStops、NewColorResolver、PrintTicketHierarchy、PrintSettings、PrintColorPlan、PrintLayout、CoreProperties、DocumentStructure、Render、RenderDevice、RenderElement、RenderElementMapped、RenderBrushTile与RenderBrushTileWithState仅在OnPage回调期间可用
 // 回调结束后视图自动关闭，返回的页面数据、资源及图像独立于视图；Read或ConsumeStream成功前均为临时结果
 type StreamPage struct {
 	Index        int
@@ -53,7 +53,7 @@ type streamReaderView struct {
 	view *streamPageView
 }
 
-// streamPageView 保存临时流式视图的生命周期锁、关闭标记、只读阅读器、方言、页号、文档位置、模式、资源清单、读取进度、签名验证状态、未完流标志、所属流状态与流取消Context
+// streamPageView 保存临时流式视图的生命周期锁、关闭标记、只读阅读器、方言、页号、文档位置、模式、资源清单、读取进度、签名验证状态、未完流标志、所属流状态、单页解析缓存与流取消Context
 type streamPageView struct {
 	mu                sync.RWMutex
 	closed            bool
@@ -72,6 +72,10 @@ type streamPageView struct {
 	sigVerifiedOpts   *PrintSignatureOptions
 	streamIncomplete  bool
 	context           context.Context
+	pageMu            sync.Mutex
+	parsedPage        *Page
+	parsedPageShared  bool
+	parsedHeader      *PageHeader
 }
 
 // streamPartialPage 保存跨分片解析的页面标记与已校验根内容
@@ -153,25 +157,24 @@ func (p *StreamPage) Progress() StreamProgress {
 	return p.view.progress
 }
 
-// PageHeader 仅读取当前临时页FixedPage根标签属性返回页面尺寸、裁剪区域、语言与名称，回调完成后返回ErrClosed
-// 入参: ctx 取消Context，nil沿用流读取Context
-// 返回: *PageHeader 轻量页面头信息, error 状态、媒体类型、XML、取消或关闭错误
-func (p *StreamPage) PageHeader(ctx context.Context) (*PageHeader, error) {
-	r, headerCtx, release, err := p.lockReader(ctx)
-	if err != nil {
-		return nil, err
+// clonePageHeader 构造PageHeader的独立深拷贝，避免调用方修改Diagnostics影响视图缓存
+// 入参: src 原始页面头信息
+// 返回: *PageHeader 独立页面头副本
+func clonePageHeader(src *PageHeader) *PageHeader {
+	if src == nil {
+		return nil
 	}
-	defer release()
-	canonical, err := opcPartName(p.Reference.Part)
-	if err != nil {
-		return nil, err
-	}
-	if _, exists := r.pkg.parts[strings.ToLower(canonical)]; exists {
-		return r.readPageHeaderStream(headerCtx, canonical)
-	}
-	page, err := r.readPageHeader(p.view.index, nil, headerCtx)
-	if err != nil {
-		return nil, err
+	copied := *src
+	copied.Diagnostics = slices.Clone(src.Diagnostics)
+	return &copied
+}
+
+// pageHeaderFromPage 从已解析Page模型提取完整PageHeader并深拷贝Diagnostics
+// 入参: page 已解析页面模型
+// 返回: *PageHeader 独立页面头信息
+func pageHeaderFromPage(page *Page) *PageHeader {
+	if page == nil {
+		return nil
 	}
 	return &PageHeader{
 		Part:          page.Part,
@@ -183,16 +186,98 @@ func (p *StreamPage) PageHeader(ctx context.Context) (*PageHeader, error) {
 		HasBleedBox:   page.HasBleedBox,
 		Language:      page.Language,
 		Name:          page.Name,
-	}, nil
+		Diagnostics:   slices.Clone(page.Diagnostics),
+	}
 }
 
-// close 关闭临时流式视图并标记关闭状态，等待进行中的读锁调用完成后生效
+// pageStubFromHeader 将轻量PageHeader包装为仅含页头几何属性的Page，供打印布局计算复用
+// 入参: header 轻量页面头信息
+// 返回: *Page 仅含页头字段的轻量Page
+func pageStubFromHeader(header *PageHeader) *Page {
+	if header == nil {
+		return nil
+	}
+	return &Page{
+		Part:          header.Part,
+		Width:         header.Width,
+		Height:        header.Height,
+		ContentBox:    header.ContentBox,
+		BleedBox:      header.BleedBox,
+		HasContentBox: header.HasContentBox,
+		HasBleedBox:   header.HasBleedBox,
+		Language:      header.Language,
+		Name:          header.Name,
+		Diagnostics:   slices.Clone(header.Diagnostics),
+	}
+}
+
+// pageHeaderModel 在持有阅读器读锁期间优先复用缓存页头或流式根标签读取，回退路径完整保留Diagnostics
+// 入参: r 有效只读阅读器, ctx 取消Context
+// 返回: *PageHeader 独立页面头副本, error 状态、媒体类型、XML或取消错误
+func (p *StreamPage) pageHeaderModel(r *Reader, ctx context.Context) (*PageHeader, error) {
+	p.view.pageMu.Lock()
+	if p.view.parsedHeader != nil {
+		result := clonePageHeader(p.view.parsedHeader)
+		p.view.pageMu.Unlock()
+		return result, nil
+	}
+	if p.view.parsedPage != nil {
+		header := pageHeaderFromPage(p.view.parsedPage)
+		p.view.parsedHeader = header
+		result := clonePageHeader(header)
+		p.view.pageMu.Unlock()
+		return result, nil
+	}
+	p.view.pageMu.Unlock()
+	canonical, err := opcPartName(p.Reference.Part)
+	if err != nil {
+		return nil, err
+	}
+	var header *PageHeader
+	if _, exists := r.pkg.parts[strings.ToLower(canonical)]; exists {
+		header, err = r.readPageHeaderStream(ctx, canonical)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		page, err := r.readPageHeader(p.view.index, nil, ctx)
+		if err != nil {
+			return nil, err
+		}
+		header = pageHeaderFromPage(page)
+	}
+	p.view.pageMu.Lock()
+	if p.view.parsedHeader == nil {
+		p.view.parsedHeader = clonePageHeader(header)
+	}
+	p.view.pageMu.Unlock()
+	return header, nil
+}
+
+// PageHeader 仅读取当前临时页FixedPage根标签属性返回页面尺寸、裁剪区域、语言、名称与诊断，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context
+// 返回: *PageHeader 轻量页面头信息, error 状态、媒体类型、XML、取消或关闭错误
+func (p *StreamPage) PageHeader(ctx context.Context) (*PageHeader, error) {
+	r, headerCtx, release, err := p.lockReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return p.pageHeaderModel(r, headerCtx)
+}
+
+// close 关闭临时流式视图并标记关闭状态，等待进行中的读锁调用完成后释放页面缓存
 func (v *streamPageView) close() {
 	if v == nil {
 		return
 	}
 	v.mu.Lock()
 	v.closed = true
+	v.pageMu.Lock()
+	v.parsedPage = nil
+	v.parsedPageShared = false
+	v.parsedHeader = nil
+	v.pageMu.Unlock()
 	v.mu.Unlock()
 }
 
@@ -290,6 +375,34 @@ func (v *streamReaderView) newColorResolver() *ColorResolver {
 	return newStreamColorResolver(v.view)
 }
 
+// ResolveColorFrom 以指定基准部件解析sRGB、scRGB及含ICC配置的ContextColor，支持远程资源字典相对ICC引用，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context, basePart 基准部件URI，空值回退为包根, value 待解析颜色, options 色彩解析选项，nil采用默认值
+// 返回: ResolvedColor 解析后的多空间颜色结果, error 参数、部件、配置、转换、取消或关闭错误
+func (v *streamReaderView) ResolveColorFrom(ctx context.Context, basePart string, value Color, options *ColorResolveOptions) (ResolvedColor, error) {
+	r, colorCtx, cleanup, err := v.prepareCall(ctx)
+	if err != nil {
+		return ResolvedColor{}, err
+	}
+	defer cleanup()
+	if basePart == "" {
+		basePart = "/"
+	}
+	return r.ResolveColor(colorCtx, basePart, value, options)
+}
+
+// ColorProfileFrom 以指定基准部件解析URI并读取已到达ICC配置部件原始字节，支持远程资源字典相对ICC引用，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context, basePart 基准部件URI，空值回退为包根, profileURI 相对或包根ICC配置URI
+// 返回: []byte 独立ICC配置字节, error URI、类型、不存在、预算、取消或关闭错误
+func (v *streamReaderView) ColorProfileFrom(ctx context.Context, basePart, profileURI string) ([]byte, error) {
+	if v == nil {
+		return nil, ErrClosed
+	}
+	if basePart == "" {
+		basePart = "/"
+	}
+	return v.colorProfile(ctx, basePart, profileURI)
+}
+
 // colorProfile 相对基准部件解析URI并读取已到达ICC配置部件原始字节
 // 入参: ctx 取消Context，nil沿用流读取Context, basePart 基准部件URI, uri 相对或包根ICC配置URI
 // 返回: []byte 独立ICC配置字节, error URI、类型、不存在、预算、取消或关闭错误
@@ -337,6 +450,17 @@ func (p *StreamPage) Page(ctx context.Context) (*Page, error) {
 		return nil, err
 	}
 	defer release()
+	p.view.pageMu.Lock()
+	if p.view.parsedPage != nil && !p.view.parsedPageShared {
+		cached := p.view.parsedPage
+		if p.view.parsedHeader == nil {
+			p.view.parsedHeader = pageHeaderFromPage(cached)
+		}
+		p.view.parsedPage = nil
+		p.view.pageMu.Unlock()
+		return cached, nil
+	}
+	p.view.pageMu.Unlock()
 	return r.readPageSceneLoaders(p.view.index, false, nil, nil, pageCtx)
 }
 
@@ -373,6 +497,21 @@ func (p *StreamPage) Walk(ctx context.Context, visitor *SceneVisitor, options *W
 		return err
 	}
 	defer cleanup()
+	config, err := r.walkConfig(options)
+	if err != nil {
+		return err
+	}
+	if config.limits == r.limits {
+		p.view.pageMu.Lock()
+		cached := p.view.parsedPage
+		if cached != nil {
+			p.view.parsedPageShared = true
+		}
+		p.view.pageMu.Unlock()
+		if cached != nil {
+			return r.walkPageModel(walkCtx, cached, p.view.index, p.view.documentIndex, p.view.pageIndex, visitor, config)
+		}
+	}
 	return r.Walk(walkCtx, p.view.index, visitor, options)
 }
 
@@ -401,17 +540,21 @@ func (p *StreamPage) Font(ctx context.Context, fontURI string) (*FontResource, e
 	return r.Font(fontCtx, resolved)
 }
 
-// Image 在前向读取回调期间读取当前临时页引用的已到达图像资源，不访问未到达部件
+// Image 在前向读取回调期间相对当前页或包根解析URI并读取已到达图像资源，不访问未到达部件
 // 未指定Context时沿用流读取Context并同时响应两者取消信号，回调完成后返回ErrClosed
-// 入参: ctx 取消Context，nil沿用流读取Context, part 图像部件的包根URI, options 图像参数，nil采用默认值
-// 返回: *ImageResource 独立图像数据, error 输入、解码、资源、取消或关闭错误
+// 入参: ctx 取消Context，nil沿用流读取Context, part 相对或包根图像部件URI, options 图像参数，nil采用默认值
+// 返回: *ImageResource 独立图像数据, error 输入、URI、解码、资源、取消或关闭错误
 func (p *StreamPage) Image(ctx context.Context, part string, options *ImageOptions) (*ImageResource, error) {
 	r, imageCtx, cleanup, err := p.prepareCall(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer cleanup()
-	return r.Image(imageCtx, part, options)
+	resolved, err := resolvePart(p.Reference.Part, part)
+	if err != nil {
+		return nil, err
+	}
+	return r.Image(imageCtx, resolved, options)
 }
 
 // ImageInfo 相对当前页或包根解析URI并仅读取已到达图像文件头元数据，不解码像素，回调完成后返回ErrClosed
@@ -455,6 +598,11 @@ func (p *StreamPage) StoryFragments(ctx context.Context) (*StoryFragments, error
 		return nil, err
 	}
 	defer release()
+	if p.view.owner != nil && p.view.owner.storyFragCached != nil {
+		if cached := p.view.owner.storyFragCached[p.view.index]; cached != nil {
+			return cloneStoryFragments(cached), nil
+		}
+	}
 	return r.streamReadStoryFragmentsIfPresent(sfCtx, p.Reference.Part)
 }
 
@@ -470,16 +618,109 @@ func (p *StreamPage) Resources(ctx context.Context) ([]string, error) {
 	return slices.Clone(p.view.resources), nil
 }
 
+// Relationships 返回当前页已到达的OPC关系列表独立副本，未关联关系部件时返回空切片，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context
+// 返回: []Relationship 独立关系列表, error 关系、预算、取消或关闭错误
+func (p *StreamPage) Relationships(ctx context.Context) ([]Relationship, error) {
+	r, relCtx, release, err := p.lockReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	items, err := r.pkg.relationshipsContext(relCtx, p.Reference.Part)
+	if err != nil {
+		return nil, err
+	}
+	return slices.Clone(items), nil
+}
+
+// ThumbnailParts 枚举当前页已关联且已到达的缩略图部件元数据并按名称排序，未关联或目标尚未到达时返回空切片，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context
+// 返回: []PartInfo 独立缩略图部件列表, error 关系、类型、数量、预算、取消或关闭错误
+func (p *StreamPage) ThumbnailParts(ctx context.Context) ([]PartInfo, error) {
+	r, thumbCtx, release, err := p.lockReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	relations, err := r.pkg.relationshipsContext(thumbCtx, p.Reference.Part)
+	if err != nil {
+		return nil, err
+	}
+	targets, err := thumbnailTargets(p.Reference.Part, relations, true)
+	if err != nil {
+		return nil, err
+	}
+	var result []PartInfo
+	for _, part := range targets {
+		if err := checkContext(thumbCtx); err != nil {
+			return nil, err
+		}
+		key := strings.ToLower(part)
+		if _, exists := r.pkg.parts[key]; !exists {
+			continue
+		}
+		media, err := r.pkg.contentType(part)
+		if err != nil {
+			return nil, err
+		}
+		if !thumbnailMedia(media) {
+			return nil, &PartError{Part: part, Err: fmt.Errorf("%w: thumbnail requires JPEG or PNG", ErrInvalid)}
+		}
+		size, err := r.pkg.partSize(key)
+		if err != nil {
+			return nil, err
+		}
+		name := r.pkg.names[key]
+		if name == "" {
+			name = part
+		}
+		result = append(result, PartInfo{Name: name, ContentType: media, Size: int64(size)})
+	}
+	slices.SortFunc(result, func(a, b PartInfo) int { return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name)) })
+	if err := checkContext(thumbCtx); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// Thumbnail 读取当前页已关联且已到达的缩略图图像资源，未关联或目标尚未到达时返回nil，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context, options 图像参数，nil采用默认值
+// 返回: *ImageResource 独立缩略图图像或nil, error 关系、类型、解码、资源、取消或关闭错误
+func (p *StreamPage) Thumbnail(ctx context.Context, options *ImageOptions) (*ImageResource, error) {
+	parts, err := p.ThumbnailParts(ctx)
+	if err != nil || len(parts) == 0 {
+		return nil, err
+	}
+	r, thumbCtx, cleanup, err := p.prepareCall(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	return r.Image(thumbCtx, parts[0].Name, options)
+}
+
 // ResolveColor 以当前页部件为基准解析sRGB、scRGB及含ICC配置的ContextColor，回调完成后返回ErrClosed
 // 入参: ctx 取消Context，nil沿用流读取Context, value 待解析颜色, options 色彩解析选项，nil采用默认值
 // 返回: ResolvedColor 解析后的多空间颜色结果, error 参数、部件、配置、转换、取消或关闭错误
 func (p *StreamPage) ResolveColor(ctx context.Context, value Color, options *ColorResolveOptions) (ResolvedColor, error) {
-	r, colorCtx, cleanup, err := p.prepareCall(ctx)
-	if err != nil {
-		return ResolvedColor{}, err
+	if p == nil {
+		return ResolvedColor{}, ErrClosed
 	}
-	defer cleanup()
-	return r.ResolveColor(colorCtx, p.Reference.Part, value, options)
+	return p.ResolveColorFrom(ctx, p.Reference.Part, value, options)
+}
+
+// ResolveColorFrom 以指定基准部件解析sRGB、scRGB及含ICC配置的ContextColor，支持远程资源字典相对ICC引用，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context, basePart 基准部件URI，空值回退为当前页部件, value 待解析颜色, options 色彩解析选项，nil采用默认值
+// 返回: ResolvedColor 解析后的多空间颜色结果, error 参数、部件、配置、转换、取消或关闭错误
+func (p *StreamPage) ResolveColorFrom(ctx context.Context, basePart string, value Color, options *ColorResolveOptions) (ResolvedColor, error) {
+	if p == nil {
+		return ResolvedColor{}, ErrClosed
+	}
+	if basePart == "" {
+		basePart = p.Reference.Part
+	}
+	return p.streamReaderView.ResolveColorFrom(ctx, basePart, value, options)
 }
 
 // ResolveGradientStops 在前向读取回调期间以当前页为默认基准规范化解算渐变停靠点与几何，回调完成后返回ErrClosed
@@ -526,7 +767,20 @@ func (p *StreamPage) ColorProfile(ctx context.Context, uri string) ([]byte, erro
 	if p == nil {
 		return nil, ErrClosed
 	}
-	return p.streamReaderView.colorProfile(ctx, p.Reference.Part, uri)
+	return p.ColorProfileFrom(ctx, p.Reference.Part, uri)
+}
+
+// ColorProfileFrom 以指定基准部件解析URI并读取已到达ICC配置部件原始字节，支持远程资源字典相对ICC引用，回调完成后返回ErrClosed
+// 入参: ctx 取消Context，nil沿用流读取Context, basePart 基准部件URI，空值回退为当前页部件, profileURI 相对或包根ICC配置URI
+// 返回: []byte 独立ICC配置字节, error URI、类型、不存在、预算、取消或关闭错误
+func (p *StreamPage) ColorProfileFrom(ctx context.Context, basePart, profileURI string) ([]byte, error) {
+	if p == nil {
+		return nil, ErrClosed
+	}
+	if basePart == "" {
+		basePart = p.Reference.Part
+	}
+	return p.streamReaderView.ColorProfileFrom(ctx, basePart, profileURI)
 }
 
 // PrintSettings 在回调期间合并基础设置与当前临时页的三级PrintTicket，不修改输入设置
@@ -580,10 +834,11 @@ func (p *StreamPage) PrintLayout(ctx context.Context, options *PrintLayoutOption
 	if err != nil {
 		return nil, err
 	}
-	page, err := r.readPageHeader(p.view.index, nil, layoutCtx)
+	header, err := p.pageHeaderModel(r, layoutCtx)
 	if err != nil {
 		return nil, err
 	}
+	page := pageStubFromHeader(header)
 	effective := settings
 	if configuration.IgnoreUnsupportedFeatures {
 		effective = printStripPrivateExtensions(settings)
@@ -822,11 +1077,13 @@ func (p *StreamPage) buildStreamPrintSide(r *Reader, ctx context.Context, option
 	if effectivePolicy != PrintSignatureIgnore && p.view.streamIncomplete {
 		return nil, nil, fmt.Errorf("%w: digital signature verification requires completed package stream", ErrUnsupported)
 	}
-	page, err := r.readPageHeader(p.view.index, nil, ctx)
+	header, err := p.pageHeaderModel(r, ctx)
 	if err != nil {
 		return nil, nil, err
 	}
+	page := pageStubFromHeader(header)
 	state, err := preparePrintPageState(ctx, model, settingsCfg, page, media, printPageStateOptions{
+		validated:            true,
 		stripSignatures:      true,
 		stripPlanFeatures:    true,
 		ignoreUnsupported:    configuration.IgnoreUnsupportedFeatures,
@@ -885,8 +1142,14 @@ func (p *streamPackage) registerPagePart(part *streamPart) {
 		return
 	}
 	p.pagePkg.names[key] = part.name
-	for index := 0; index <= part.last; index++ {
-		p.pagePkg.parts[key] = append(p.pagePkg.parts[key], &zip.File{FileHeader: part.entries[index].header})
+	if part.compactData != nil {
+		p.pagePkg.parts[key] = []*zip.File{{FileHeader: zip.FileHeader{Name: strings.TrimPrefix(part.name, "/"), UncompressedSize64: part.bytes}}}
+	} else {
+		for index := 0; index <= part.last; index++ {
+			if entry := part.entries[index]; entry != nil {
+				p.pagePkg.parts[key] = append(p.pagePkg.parts[key], &zip.File{FileHeader: entry.header})
+			}
+		}
 	}
 	part.page = nil
 }
@@ -897,7 +1160,7 @@ func (p *streamPackage) preparePagePackage() {
 		p.pagePkg = &packageReader{limits: p.options.Limits, parts: make(map[string][]*zip.File), names: make(map[string]string), defaults: p.types.defaults, overrides: p.types.overrides, cache: p.cache}
 		p.pagePkg.open = func(key string) (io.ReadCloser, error) {
 			part := p.parts[key]
-			if part == nil || part.reclaimed || part.partiallyReclaimed || part.last < 0 || len(part.entries) != part.last+1 {
+			if part == nil || part.reclaimed || part.partiallyReclaimed || part.compactData == nil && (!part.isComplete() || len(part.entries) != part.last+1) {
 				return nil, fmt.Errorf("%w: streamed part %s: %w", ErrNotFound, key, fs.ErrNotExist)
 			}
 			return p.partReader(part), nil
@@ -1069,7 +1332,6 @@ func (p *streamPackage) emitReadyPages(name string) error {
 				return nil
 			}
 		}
-		var parsed *Page
 		if !p.pageValidated {
 			if missing := p.streamPageMissingResources(p.pages); len(missing) != 0 {
 				p.pageMissing = make(map[string]bool, len(missing))
@@ -1080,8 +1342,7 @@ func (p *streamPackage) emitReadyPages(name string) error {
 				return nil
 			}
 			p.pageWait = make(map[string]bool)
-			var err error
-			parsed, err = p.index.Page(p.context, p.pages)
+			parsed, err := p.index.Page(p.context, p.pages)
 			if err != nil {
 				if errors.Is(err, ErrInvalid) || errors.Is(err, ErrUnsupported) || errors.Is(err, fs.ErrNotExist) {
 					if len(p.pageWait) == 0 {
@@ -1098,14 +1359,17 @@ func (p *streamPackage) emitReadyPages(name string) error {
 			p.pageWait = nil
 			p.pageMissing = nil
 			p.pageValidated = true
+			p.pageParsed = parsed
 			p.pageResources = streamCollectResourceParts(parsed.resources, p.index.format, p.index.pkg.names)
 		}
 		waits, hold, err := p.streamPageTicketsReady(p.pages)
 		if err != nil {
+			p.pageParsed = nil
 			return err
 		}
 		if hold {
 			p.pageHold = true
+			p.pageParsed = nil
 			return nil
 		}
 		if len(waits) != 0 {
@@ -1115,6 +1379,8 @@ func (p *streamPackage) emitReadyPages(name string) error {
 			}
 			return nil
 		}
+		parsed := p.pageParsed
+		p.pageParsed = nil
 		if err := p.notifyPage(p.index, p.pages, parsed); err != nil {
 			return err
 		}
@@ -1131,7 +1397,7 @@ func (p *streamPackage) emitReadyPages(name string) error {
 }
 
 // notifyPage 创建仅供本次回调使用的页面视图，记录交付状态并在纯前向消费模式下回收已消费页面存储
-// 入参: source 当前文档索引, index 页面序号, parsed 可选已解析页面，用于复用资源清单
+// 入参: source 当前文档索引, index 页面序号, parsed 可选已解析页面，用于复用资源清单与页面模型
 // 返回: error 回调或取消错误
 func (p *streamPackage) notifyPage(source *Reader, index int, parsed *Page) error {
 	p.pageWait = nil
@@ -1142,7 +1408,7 @@ func (p *streamPackage) notifyPage(source *Reader, index int, parsed *Page) erro
 		return err
 	}
 	view := &Reader{pkg: source.pkg, limits: source.limits, format: source.format, sequence: source.sequence, documents: source.documents, pages: source.pages, fixedXML: source.fixedXML}
-	pageView := &streamPageView{reader: view, owner: p, format: source.format, index: index, streamIncomplete: source == p.index && (!p.centralVerified || p.reclaimed), context: p.context}
+	pageView := &streamPageView{reader: view, owner: p, format: source.format, index: index, streamIncomplete: source == p.index && (!p.centralVerified || p.reclaimed), context: p.context, parsedPage: parsed, parsedHeader: pageHeaderFromPage(parsed)}
 	defer func() {
 		pageView.close()
 		view.Close()
@@ -1227,7 +1493,7 @@ func (p *streamPackage) notifyPage(source *Reader, index int, parsed *Page) erro
 			tickets:       tickets,
 		})
 	}
-	if err := p.reclaimDeliveredPage(source, reference.Part, docIndex, pageIndex); err != nil {
+	if err := p.reclaimDeliveredPage(source, reference.Part, index, docIndex, pageIndex); err != nil {
 		return err
 	}
 	return p.releaseProcessed()
@@ -1391,11 +1657,14 @@ func streamPotentialPrintTicketMedia(format Format, media string) bool {
 	return true
 }
 
-// mayHavePrintTicket 检查内容类型流是否声明了任何可能作为打印票据的媒体类型
+// mayHavePrintTicket 检查内容类型流是否声明了任何可能作为打印票据的媒体类型，内容类型流未完结前保守返回true
 // 返回: bool 包内是否可能存在打印票据
 func (p *streamPackage) mayHavePrintTicket() bool {
 	if p.types == nil || p.index == nil {
 		return false
+	}
+	if !p.typesComplete {
+		return true
 	}
 	for _, media := range p.types.defaults {
 		if streamPotentialPrintTicketMedia(p.index.format, media) {
@@ -1442,12 +1711,15 @@ func (r *Reader) pageTicketTargets(ctx context.Context, index int) ([]string, er
 	return result, nil
 }
 
-// streamRelsPossible 检查内容类型流是否允许指定关系部件在包中出现
+// streamRelsPossible 检查内容类型流是否允许指定关系部件在包中出现，内容类型流未完结前保守返回true
 // 入参: relsKey 关系部件的小写规范URI
 // 返回: bool 该关系部件是否可能存在于当前包
 func (p *streamPackage) streamRelsPossible(relsKey string) bool {
 	if p.types == nil {
 		return false
+	}
+	if !p.typesComplete {
+		return true
 	}
 	if p.types.overrides[relsKey] != "" {
 		return true
@@ -1825,6 +2097,74 @@ func (r *Reader) streamReadCorePropertiesIfPresent(ctx context.Context) (*CorePr
 	return r.streamReadCorePropertiesPart(ctx, part)
 }
 
+// streamReadStoryFragmentsTarget 解析页面关系中的StoryFragments目标部件URI，未关联返回空字符串
+// 入参: pagePart 页面部件URI, relations 页面关系列表, format 文档方言
+// 返回: string 目标部件URI, error 外部目标、非法URI或多目标错误
+func streamReadStoryFragmentsTarget(pagePart string, relations []Relationship, format Format) (string, error) {
+	part := ""
+	typeURI := formatNamespace(format) + "/storyfragments"
+	for _, relation := range relations {
+		if relation.Type != typeURI {
+			continue
+		}
+		if relation.TargetMode != TargetModeInternal {
+			return "", &PartError{Part: pagePart, Err: fmt.Errorf("%w: external StoryFragments part", ErrInvalid)}
+		}
+		target, err := resolvePart(pagePart, relation.Target)
+		if err != nil {
+			return "", &PartError{Part: pagePart, Err: err}
+		}
+		if part != "" && !strings.EqualFold(part, target) {
+			return "", &PartError{Part: pagePart, Err: fmt.Errorf("%w: multiple distinct StoryFragments parts", ErrInvalid)}
+		}
+		part = target
+	}
+	return part, nil
+}
+
+// streamReadStoryFragmentsPart 直接按已确定的StoryFragments部件URI读取并校验故事片段，支持页面关系已被回收的后置到达场景
+// 入参: ctx 取消Context, part 故事片段部件URI
+// 返回: *StoryFragments 独立片段数据或nil, bool 是否已到达, error 媒体类型、结构、预算或取消错误
+func (r *Reader) streamReadStoryFragmentsPart(ctx context.Context, part string) (*StoryFragments, bool, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, false, err
+	}
+	key := strings.ToLower(part)
+	if _, exists := r.pkg.parts[key]; !exists {
+		return nil, false, nil
+	}
+	media, err := r.pkg.contentType(part)
+	if err != nil {
+		return nil, false, &PartError{Part: part, Err: err}
+	}
+	if !matchStandardContentType(r.format, media, fixedContentType("storyfragments")) {
+		return nil, false, &PartError{Part: part, Err: fmt.Errorf("%w: StoryFragments content type %q", ErrInvalid, media)}
+	}
+	data, err := r.pkg.readItemsContext(ctx, key, r.limits.MaxPartBytes)
+	if err != nil {
+		return nil, false, &PartError{Part: part, Err: err}
+	}
+	root, err := decodeXMLVisit(data, r.limits, func(_ xml.Token, _ *xmlElement) error { return checkContext(ctx) })
+	if err == nil {
+		root, err = preprocessXMLContext(root, []string{structureNamespace(r.format)}, ctx)
+	}
+	if err != nil {
+		return nil, false, &PartError{Part: part, Err: err}
+	}
+	if root.Name.Space != structureNamespace(r.format) || root.Name.Local != "StoryFragments" {
+		return nil, false, &PartError{Part: part, Element: root.Name.Local, Err: fmt.Errorf("%w: expected StoryFragments root", ErrInvalid)}
+	}
+	result, err := parseStoryFragments(root, structureNamespace(r.format), r.limits.MaxXMLDepth)
+	if err != nil {
+		return nil, false, &PartError{Part: part, Element: root.Name.Local, Err: err}
+	}
+	if err := checkContext(ctx); err != nil {
+		return nil, false, err
+	}
+	result.Part = part
+	return result, true, nil
+}
+
 // streamReadStoryFragmentsIfPresent 若指定页面已关联故事片段部件且目标已到达则解析返回，未关联或尚未到达时返回nil
 // 入参: ctx 取消Context, pagePart 页面部件URI
 // 返回: *StoryFragments 独立片段数据或nil, error 关系、媒体类型、结构、预算或取消错误
@@ -1836,61 +2176,12 @@ func (r *Reader) streamReadStoryFragmentsIfPresent(ctx context.Context, pagePart
 	if err != nil {
 		return nil, &PartError{Part: pagePart, Err: err}
 	}
-	part := ""
-	typeURI := formatNamespace(r.format) + "/storyfragments"
-	for _, relation := range relations {
-		if relation.Type != typeURI {
-			continue
-		}
-		if relation.TargetMode != TargetModeInternal {
-			return nil, &PartError{Part: pagePart, Err: fmt.Errorf("%w: external StoryFragments part", ErrInvalid)}
-		}
-		target, err := resolvePart(pagePart, relation.Target)
-		if err != nil {
-			return nil, &PartError{Part: pagePart, Err: err}
-		}
-		if part != "" && !strings.EqualFold(part, target) {
-			return nil, &PartError{Part: pagePart, Err: fmt.Errorf("%w: multiple distinct StoryFragments parts", ErrInvalid)}
-		}
-		part = target
-	}
-	if part == "" {
-		return nil, nil
-	}
-	key := strings.ToLower(part)
-	if _, exists := r.pkg.parts[key]; !exists {
-		return nil, nil
-	}
-	media, err := r.pkg.contentType(part)
-	if err != nil {
-		return nil, &PartError{Part: part, Err: err}
-	}
-	if !matchStandardContentType(r.format, media, fixedContentType("storyfragments")) {
-		return nil, &PartError{Part: part, Err: fmt.Errorf("%w: StoryFragments content type %q", ErrInvalid, media)}
-	}
-	data, err := r.pkg.readItemsContext(ctx, key, r.limits.MaxPartBytes)
-	if err != nil {
-		return nil, &PartError{Part: part, Err: err}
-	}
-	root, err := decodeXMLVisit(data, r.limits, func(_ xml.Token, _ *xmlElement) error { return checkContext(ctx) })
-	if err == nil {
-		root, err = preprocessXMLContext(root, []string{structureNamespace(r.format)}, ctx)
-	}
-	if err != nil {
-		return nil, &PartError{Part: part, Err: err}
-	}
-	if root.Name.Space != structureNamespace(r.format) || root.Name.Local != "StoryFragments" {
-		return nil, &PartError{Part: part, Element: root.Name.Local, Err: fmt.Errorf("%w: expected StoryFragments root", ErrInvalid)}
-	}
-	result, err := parseStoryFragments(root, structureNamespace(r.format), r.limits.MaxXMLDepth)
-	if err != nil {
-		return nil, &PartError{Part: part, Element: root.Name.Local, Err: err}
-	}
-	if err := checkContext(ctx); err != nil {
+	part, err := streamReadStoryFragmentsTarget(pagePart, relations, r.format)
+	if err != nil || part == "" {
 		return nil, err
 	}
-	result.Part = part
-	return result, nil
+	result, _, err := r.streamReadStoryFragmentsPart(ctx, part)
+	return result, err
 }
 
 // streamReadDocumentStructureTarget 解析文档关系中的DocumentStructure目标部件URI，未关联返回空字符串
@@ -2056,15 +2347,8 @@ func (r *Reader) streamReadJobPrintSettingsIfPresent(ctx context.Context, owner 
 	if known, capabilities := printResourceMedia(ticket.ContentType); !known || capabilities {
 		return nil, target, false, &PartError{Part: ticket.Part, Err: fmt.Errorf("%w: print ticket format %s", ErrUnsupported, ticket.ContentType)}
 	}
-	root, err := decodeXML(ticket.Data, normalized.Limits)
+	settings, err := decodeStreamPrintTicket(ctx, ticket.Data, normalized)
 	if err != nil {
-		return nil, target, false, &PartError{Part: ticket.Part, Err: err}
-	}
-	settings, err := parsePrintSettings(root, normalized)
-	if err != nil {
-		return nil, target, false, &PartError{Part: ticket.Part, Err: err}
-	}
-	if err := xmlNamespaceTreeOutput(root, ctx); err != nil {
 		return nil, target, false, &PartError{Part: ticket.Part, Err: err}
 	}
 	if owner != nil {
@@ -2159,7 +2443,52 @@ func cloneDocumentStructure(src *DocumentStructure) *DocumentStructure {
 	return dst
 }
 
-// emitMetadataCallbacks 在作业票据、核心属性或文档结构就绪时立即触发对应流式回调并缓存结果
+// cloneContentStructures 递归构造语义内容结构切片的独立深拷贝
+// 入参: src 原始语义结构切片
+// 返回: []ContentStructure 独立深拷贝切片
+func cloneContentStructures(src []ContentStructure) []ContentStructure {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]ContentStructure, len(src))
+	for i, item := range src {
+		dst[i] = ContentStructure{
+			Kind:          item.Kind,
+			NameReference: item.NameReference,
+			Marker:        cloneOptionalString(item.Marker),
+			RowSpan:       item.RowSpan,
+			ColumnSpan:    item.ColumnSpan,
+			Children:      cloneContentStructures(item.Children),
+		}
+	}
+	return dst
+}
+
+// cloneStoryFragments 构造StoryFragments的完整独立深拷贝
+// 入参: src 原始故事片段
+// 返回: *StoryFragments 独立深拷贝
+func cloneStoryFragments(src *StoryFragments) *StoryFragments {
+	if src == nil {
+		return nil
+	}
+	dst := &StoryFragments{Part: src.Part}
+	if len(src.Fragments) != 0 {
+		dst.Fragments = make([]StoryFragment, len(src.Fragments))
+		for i, frag := range src.Fragments {
+			dst.Fragments[i] = StoryFragment{
+				StoryName:    cloneOptionalString(frag.StoryName),
+				FragmentName: cloneOptionalString(frag.FragmentName),
+				Type:         frag.Type,
+				BreakBefore:  frag.BreakBefore,
+				BreakAfter:   frag.BreakAfter,
+				Content:      cloneContentStructures(frag.Content),
+			}
+		}
+	}
+	return dst
+}
+
+// emitMetadataCallbacks 在作业票据、核心属性、文档结构或故事片段就绪时立即触发对应流式回调并缓存结果
 // 返回: error 解析、预算、回调或取消错误
 func (p *streamPackage) emitMetadataCallbacks() error {
 	if p.pagePkg == nil {
@@ -2182,7 +2511,7 @@ func (p *streamPackage) emitMetadataCallbacks() error {
 				return err
 			}
 			if p.consumeOnly && p.ownedMemory != nil && p.options.OnPage == nil && target != "" {
-				p.requestReclaimPart(strings.ToLower(target))
+				p.compactPartStorage(p.parts[strings.ToLower(target)], true)
 			}
 		}
 	}
@@ -2279,10 +2608,76 @@ func (p *streamPackage) emitMetadataCallbacks() error {
 			}
 		}
 	}
+	if p.options.OnStoryFragments != nil && p.index != nil {
+		if p.storyFragDelivered == nil {
+			p.storyFragDelivered = make(map[int]bool)
+			p.storyFragCached = make(map[int]*StoryFragments)
+		}
+		for p.storyFragNext < len(p.index.pages) {
+			pageKey := strings.ToLower(p.index.pages[p.storyFragNext].Part)
+			pagePart := p.parts[pageKey]
+			doneNoTarget := pagePart != nil && pagePart.pageDelivered && pagePart.deliveredRelsClosed && p.storyFragTargets[pageKey] == ""
+			if !p.storyFragDelivered[p.storyFragNext] && !doneNoTarget {
+				break
+			}
+			p.storyFragNext++
+		}
+		for pageIdx := p.storyFragNext; pageIdx < len(p.index.pages); pageIdx++ {
+			if p.storyFragDelivered[pageIdx] {
+				continue
+			}
+			if err := checkContext(p.context); err != nil {
+				return err
+			}
+			var sf *StoryFragments
+			var arrived bool
+			var err error
+			pagePartName := p.index.pages[pageIdx].Part
+			pageKey := strings.ToLower(pagePartName)
+			if target := p.storyFragTargets[pageKey]; target != "" {
+				sf, arrived, err = p.index.streamReadStoryFragmentsPart(p.context, target)
+			} else if pagePart := p.parts[pageKey]; pagePart != nil && !pagePart.reclaimed {
+				relations, relErr := p.index.pkg.relationshipsContext(p.context, pagePartName)
+				if relErr != nil {
+					return &PartError{Part: pagePartName, Err: relErr}
+				}
+				resolvedTarget, targetErr := streamReadStoryFragmentsTarget(pagePartName, relations, p.index.format)
+				if targetErr != nil {
+					return targetErr
+				}
+				if resolvedTarget != "" {
+					if p.storyFragTargets == nil {
+						p.storyFragTargets = make(map[string]string)
+					}
+					p.storyFragTargets[pageKey] = resolvedTarget
+					sf, arrived, err = p.index.streamReadStoryFragmentsPart(p.context, resolvedTarget)
+				}
+			}
+			if err != nil {
+				return err
+			}
+			if arrived {
+				p.storyFragDelivered[pageIdx] = true
+				if pageIdx >= p.pages && p.options.OnPage != nil {
+					p.storyFragCached[pageIdx] = sf
+				}
+				delete(p.storyFragTargets, pageKey)
+				if err := p.options.OnStoryFragments(p.context, cloneStoryFragments(sf)); err != nil {
+					return err
+				}
+				if err := checkContext(p.context); err != nil {
+					return err
+				}
+				if p.consumeOnly && p.ownedMemory != nil {
+					p.requestReclaimPart(strings.ToLower(sf.Part))
+				}
+			}
+		}
+	}
 	return nil
 }
 
-// finishMetadataCallbacks 在EOF阶段补发此前因延迟或晚到未能触发的作业票据、核心属性与文档结构回调，并校验故事页码上界
+// finishMetadataCallbacks 在EOF阶段补发此前因延迟或晚到未能触发的作业票据、核心属性、文档结构与故事片段回调，并校验故事页码上界
 // 入参: r 已完成物理校验的最终阅读器
 // 返回: error 解析、页码越界、回调或取消错误
 func (p *streamPackage) finishMetadataCallbacks(r *Reader) error {
@@ -2352,6 +2747,32 @@ func (p *streamPackage) finishMetadataCallbacks(r *Reader) error {
 			}
 		}
 	}
+	if p.options.OnStoryFragments != nil {
+		for pageIdx := range r.pages {
+			if err := checkContext(p.context); err != nil {
+				return err
+			}
+			if p.storyFragDelivered != nil && p.storyFragDelivered[pageIdx] {
+				continue
+			}
+			sf, err := r.StoryFragments(p.context, pageIdx)
+			if err != nil {
+				return err
+			}
+			if sf != nil {
+				if p.storyFragDelivered == nil {
+					p.storyFragDelivered = make(map[int]bool)
+				}
+				p.storyFragDelivered[pageIdx] = true
+				if err := p.options.OnStoryFragments(p.context, cloneStoryFragments(sf)); err != nil {
+					return err
+				}
+				if err := checkContext(p.context); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -2364,7 +2785,7 @@ func (p *streamPackage) selectedPage(name, media string) bool {
 		return false
 	}
 	part := p.parts[key]
-	return part != nil && !part.reclaimed && (part.page != nil || part.last < 0 || len(part.entries) != part.last+1)
+	return part != nil && !part.reclaimed && (part.page != nil || !part.isComplete())
 }
 
 // consumePageMarkup 保持页面解析状态，按闭合顶层内容共用MCE、结构、名称及绘制属性校验
@@ -2689,12 +3110,18 @@ func (p *streamPackage) advanceLayoutIndex() error {
 // 返回: error 内容类型、XML或回调错误
 func (p *streamPackage) advanceMetadataPart(name, kind string) error {
 	part := p.parts[strings.ToLower(name)]
-	if part == nil || part.reclaimed {
+	if part == nil || part.reclaimed || p.types == nil {
 		return nil
 	}
 	media := p.types.declaredContentType(name)
+	if media == "" && !p.typesComplete {
+		return nil
+	}
 	if !matchStandardContentType(p.index.format, media, fixedContentType(kind)) {
 		return &PartError{Part: name, Err: fmt.Errorf("%w: streamed layout content type", ErrInvalid)}
+	}
+	if part.resolvedMedia == "" {
+		part.resolvedMedia = media
 	}
 	return p.advanceXML(part, media)
 }

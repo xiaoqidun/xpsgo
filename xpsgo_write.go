@@ -702,7 +702,8 @@ func (r *Reader) interleavePlan(ctx context.Context, options WriteOptions) ([]*i
 		if size != 0 {
 			count += (size - 1) / uint64(options.InterleaveBytes)
 		}
-		if count > uint64(r.limits.MaxPartCount)-entries {
+		maxEntries := uint64(streamMaxPhysicalEntries(r.limits.MaxPartCount))
+		if count > maxEntries-entries {
 			return nil, fmt.Errorf("%w: interleaved ZIP entry count", ErrLimit)
 		}
 		entries += count

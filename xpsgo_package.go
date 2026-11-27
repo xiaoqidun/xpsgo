@@ -132,6 +132,18 @@ type packageZIPLocal struct {
 	cdSizeZIP64  bool
 }
 
+// zipHeaderFields 保存ZIP本地头或中央目录条目的安全校验关键字段
+type zipHeaderFields struct {
+	name         string
+	version      uint16
+	flags        uint16
+	method       uint16
+	crc32        uint32
+	compressed   uint64
+	uncompressed uint64
+	zip64        bool
+}
+
 // newPackageReaderWithLimits 建立ZIP部件索引并解析内容类型，校验条目上限与声明解压字节上限
 // 入参: ctx 取消Context, r 随机读取器, size ZIP数据长度, limits 包、部件及XML资源上限
 // 返回: *packageReader 包读取器, error 错误信息
@@ -530,52 +542,63 @@ func (p *packageReader) parseContentTypesContext(ctx context.Context, data []byt
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
-		count++
-		if err := opcAttributes(attrs, "ContentType", "Extension", "PartName"); err != nil {
+		if _, _, err := p.registerContentTypeElement(element, attrs); err != nil {
 			return err
 		}
-		value := attrs["ContentType"]
-		mediaType, parameters, err := mime.ParseMediaType(value)
-		if err != nil || !strings.Contains(mediaType, "/") || strings.ContainsAny(value, "\r\n\t") || strings.TrimSpace(value) != value {
-			return fmt.Errorf("%w: invalid content type %q", ErrInvalid, value)
-		}
-		if len(parameters) != 0 && opcSpecificContentType(mediaType) {
-			return fmt.Errorf("%w: parameters on package-specific content type %q", ErrInvalid, value)
-		}
-		switch element.Name.Local {
-		case "Default":
-			ext := attrs["Extension"]
-			if len(attrs) != 2 || ext == "" {
-				return fmt.Errorf("%w: invalid Default attributes", ErrInvalid)
-			}
-			normalized, ok := opcNormalizeExtension(ext)
-			if !ok {
-				return fmt.Errorf("%w: invalid extension %q", ErrInvalid, ext)
-			}
-			key := strings.ToLower(normalized)
-			if _, exists := p.defaults[key]; exists {
-				return fmt.Errorf("%w: duplicate content type default %q", ErrInvalid, ext)
-			}
-			p.defaults[key] = value
-		case "Override":
-			name, err := opcPartName(attrs["PartName"])
-			if err != nil || len(attrs) != 2 {
-				return fmt.Errorf("%w: invalid Override part name or attributes", ErrInvalid)
-			}
-			key := strings.ToLower(name)
-			if _, exists := p.overrides[key]; exists {
-				return fmt.Errorf("%w: duplicate content type override %q", ErrInvalid, name)
-			}
-			p.overrides[key] = value
-		default:
-			return fmt.Errorf("%w: unexpected content type element %q", ErrInvalid, element.Name.Local)
-		}
+		count++
 		return nil
 	})
 	if err == nil && count == 0 {
 		return fmt.Errorf("%w: empty content types stream", ErrInvalid)
 	}
 	return err
+}
+
+// registerContentTypeElement 校验并登记单条Default或Override内容类型声明，供全量及交错流式解析共用
+// 入参: element 已过滤元素, attrs 无命名空间属性映射
+// 返回: string 命中的规范部件键（仅Override非空）, string 声明媒体类型, error 属性、MIME、扩展名或重复定义错误
+func (p *packageReader) registerContentTypeElement(element xml.StartElement, attrs map[string]string) (string, string, error) {
+	if err := opcAttributes(attrs, "ContentType", "Extension", "PartName"); err != nil {
+		return "", "", err
+	}
+	value := attrs["ContentType"]
+	mediaType, parameters, err := mime.ParseMediaType(value)
+	if err != nil || !strings.Contains(mediaType, "/") || strings.ContainsAny(value, "\r\n\t") || strings.TrimSpace(value) != value {
+		return "", "", fmt.Errorf("%w: invalid content type %q", ErrInvalid, value)
+	}
+	if len(parameters) != 0 && opcSpecificContentType(mediaType) {
+		return "", "", fmt.Errorf("%w: parameters on package-specific content type %q", ErrInvalid, value)
+	}
+	switch element.Name.Local {
+	case "Default":
+		ext := attrs["Extension"]
+		if len(attrs) != 2 || ext == "" {
+			return "", "", fmt.Errorf("%w: invalid Default attributes", ErrInvalid)
+		}
+		normalized, ok := opcNormalizeExtension(ext)
+		if !ok {
+			return "", "", fmt.Errorf("%w: invalid extension %q", ErrInvalid, ext)
+		}
+		key := strings.ToLower(normalized)
+		if _, exists := p.defaults[key]; exists {
+			return "", "", fmt.Errorf("%w: duplicate content type default %q", ErrInvalid, ext)
+		}
+		p.defaults[key] = value
+		return "", value, nil
+	case "Override":
+		name, err := opcPartName(attrs["PartName"])
+		if err != nil || len(attrs) != 2 {
+			return "", "", fmt.Errorf("%w: invalid Override part name or attributes", ErrInvalid)
+		}
+		key := strings.ToLower(name)
+		if _, exists := p.overrides[key]; exists {
+			return "", "", fmt.Errorf("%w: duplicate content type override %q", ErrInvalid, name)
+		}
+		p.overrides[key] = value
+		return key, value, nil
+	default:
+		return "", "", fmt.Errorf("%w: unexpected content type element %q", ErrInvalid, element.Name.Local)
+	}
 }
 
 // opcSpecificContentType 判断OPC自身定义且不允许参数的内容类型，不限制普通资源的MIME参数
@@ -1084,11 +1107,8 @@ func readPackageZIPLocal(input io.ReaderAt, boundary, offset int64, file *zip.Fi
 		return packageZIPLocal{}, fmt.Errorf("%w: ZIP local record signature", ErrInvalid)
 	}
 	version := binary.LittleEndian.Uint16(fixed[4:])
-	extendedSize := file.Flags&8 != 0 && (cdSizeZIP64 || file.CompressedSize64 >= 0xffffffff || file.UncompressedSize64 >= 0xffffffff)
-	versionMatch := version == file.ReaderVersion || (extendedOffset || extendedSize) && file.ReaderVersion == 45 && (version == 10 && file.Method == zip.Store || version == 20)
-	if !versionMatch || binary.LittleEndian.Uint16(fixed[6:]) != file.Flags || binary.LittleEndian.Uint16(fixed[8:]) != file.Method || binary.LittleEndian.Uint16(fixed[10:]) != file.ModifiedTime || binary.LittleEndian.Uint16(fixed[12:]) != file.ModifiedDate {
-		return packageZIPLocal{}, fmt.Errorf("%w: ZIP local/central common fields", ErrInvalid)
-	}
+	flags := binary.LittleEndian.Uint16(fixed[6:])
+	method := binary.LittleEndian.Uint16(fixed[8:])
 	nameBytes := int(binary.LittleEndian.Uint16(fixed[26:]))
 	extraBytes := int(binary.LittleEndian.Uint16(fixed[28:]))
 	if err := validateZIPMetadata(nameBytes, extraBytes, 0); err != nil {
@@ -1098,32 +1118,94 @@ func readPackageZIPLocal(input io.ReaderAt, boundary, offset int64, file *zip.Fi
 	if err := readPackageZIPAt(input, boundary, offset+30, variable); err != nil {
 		return packageZIPLocal{}, err
 	}
-	if string(variable[:nameBytes]) != file.Name {
-		return packageZIPLocal{}, fmt.Errorf("%w: ZIP local/central names", ErrInvalid)
-	}
 	uncompressed, compressed, zip64, err := packageZIPLocal64Values(variable[nameBytes:], uint64(binary.LittleEndian.Uint32(fixed[22:])), uint64(binary.LittleEndian.Uint32(fixed[18:])), file.Flags&8 != 0)
 	if err != nil {
 		return packageZIPLocal{}, err
 	}
-	if zip64 && (version != file.ReaderVersion || version < 45) {
-		return packageZIPLocal{}, fmt.Errorf("%w: ZIP64 local extraction version", ErrInvalid)
+	localFields := zipHeaderFields{
+		name:         string(variable[:nameBytes]),
+		version:      version,
+		flags:        flags,
+		method:       method,
+		crc32:        binary.LittleEndian.Uint32(fixed[14:]),
+		compressed:   compressed,
+		uncompressed: uncompressed,
+		zip64:        zip64,
 	}
-	checksum := binary.LittleEndian.Uint32(fixed[14:])
-	if file.Flags&8 == 0 {
-		if checksum != file.CRC32 || uncompressed != file.UncompressedSize64 || compressed != file.CompressedSize64 {
-			return packageZIPLocal{}, fmt.Errorf("%w: ZIP local/central CRC or sizes", ErrInvalid)
-		}
-	} else if checksum != 0 && checksum != file.CRC32 || uncompressed != 0 && uncompressed != file.UncompressedSize64 || compressed != 0 && compressed != file.CompressedSize64 {
-		return packageZIPLocal{}, fmt.Errorf("%w: ZIP descriptor local size placeholders", ErrInvalid)
+	centralFields := zipHeaderFields{
+		name:         file.Name,
+		version:      file.ReaderVersion,
+		flags:        file.Flags,
+		method:       file.Method,
+		crc32:        file.CRC32,
+		compressed:   file.CompressedSize64,
+		uncompressed: file.UncompressedSize64,
+		zip64:        extendedOffset || cdSizeZIP64,
+	}
+	if err := validateZIPLocalCentralHeaders(localFields, centralFields, file.Flags&8 == 0); err != nil {
+		return packageZIPLocal{}, err
 	}
 	data := offset + 30 + int64(len(variable))
 	if file.CompressedSize64 > uint64(boundary-data) {
 		return packageZIPLocal{}, fmt.Errorf("%w: ZIP data crosses central directory", ErrInvalid)
 	}
-	if file.Method == zip.Store && file.CompressedSize64 != file.UncompressedSize64 {
-		return packageZIPLocal{}, fmt.Errorf("%w: stored ZIP item sizes", ErrInvalid)
-	}
 	return packageZIPLocal{file: file, start: offset, data: data, end: data + int64(file.CompressedSize64), localVersion: version, zip64: zip64, cdSizeZIP64: cdSizeZIP64}, nil
+}
+
+// validZIPExtractVersion 判断ZIP提取版本号是否属于指定压缩方式与ZIP64条件下的合法APPNOTE标准版本集
+// 入参: version 提取版本号, method 压缩方式, requireZIP64 是否要求支持ZIP64扩展
+// 返回: bool 是否属于合法提取版本集
+func validZIPExtractVersion(version, method uint16, requireZIP64 bool) bool {
+	if requireZIP64 {
+		return version == 45
+	}
+	switch version {
+	case 10:
+		return method == zip.Store
+	case 20, 45:
+		return true
+	default:
+		return false
+	}
+}
+
+// validateZIPLocalCentralHeaders 统一校验ZIP本地头与中央目录的安全关键字段一致性，放宽时间戳、Deflate压缩提示位及合法版本集差异
+// 入参: local 本地头字段, central 中央目录字段, exactSizes 是否严格核对CRC与尺寸
+// 返回: error 名称、方法、标志、版本、CRC或尺寸冲突错误
+func validateZIPLocalCentralHeaders(local, central zipHeaderFields, exactSizes bool) error {
+	if local.name != central.name {
+		return fmt.Errorf("%w: ZIP local/central names", ErrInvalid)
+	}
+	if local.method != central.method {
+		return fmt.Errorf("%w: ZIP local/central common fields", ErrInvalid)
+	}
+	flagMask := uint16(0xffff)
+	if central.method == zip.Deflate {
+		flagMask &^= 0x0006
+	}
+	if local.flags&flagMask != central.flags&flagMask {
+		return fmt.Errorf("%w: ZIP local/central common fields", ErrInvalid)
+	}
+	needCDZIP64 := central.zip64 || central.compressed >= 0xffffffff || central.uncompressed >= 0xffffffff
+	if local.zip64 && local.version < 45 || needCDZIP64 && central.version < 45 || local.version >= 45 && central.version < 45 {
+		return fmt.Errorf("%w: ZIP64 extraction version", ErrInvalid)
+	}
+	if local.version != central.version {
+		if !validZIPExtractVersion(local.version, central.method, local.zip64) || !validZIPExtractVersion(central.version, central.method, needCDZIP64) {
+			return fmt.Errorf("%w: ZIP local/central extraction version", ErrInvalid)
+		}
+	}
+	if exactSizes {
+		if local.crc32 != central.crc32 || local.uncompressed != central.uncompressed || local.compressed != central.compressed {
+			return fmt.Errorf("%w: ZIP local/central CRC or sizes", ErrInvalid)
+		}
+	} else if local.crc32 != 0 && local.crc32 != central.crc32 || local.uncompressed != 0 && local.uncompressed != central.uncompressed || local.compressed != 0 && local.compressed != central.compressed {
+		return fmt.Errorf("%w: ZIP descriptor local size placeholders", ErrInvalid)
+	}
+	if central.method == zip.Store && central.compressed != central.uncompressed {
+		return fmt.Errorf("%w: stored ZIP item sizes", ErrInvalid)
+	}
+	return nil
 }
 
 // packageZIP64Extra 提取扩展字段中唯一的ZIP64载荷并校验全部扩展块边界
@@ -1189,7 +1271,7 @@ func packageZIPLocal64Values(extra []byte, uncompressed, compressed uint64, desc
 
 // packageZIP64Values 按占位字段顺序读取中央目录ZIP64扩展，校验哨兵字段完整存在
 // 入参: extra 扩展字段, uncompressed, compressed, offset, disk 传统字段
-// 返回: uint64 四项实际值, bool 是否存在ZIP64字段, error 扩展或缺失字段错误
+// 返回: uint64 实际未压缩尺寸, uint64 实际压缩尺寸, uint64 实际本地头偏移, uint64 实际起始磁盘号, bool 是否存在ZIP64字段, error 扩展或缺失字段错误
 func packageZIP64Values(extra []byte, uncompressed, compressed, offset, disk uint64) (uint64, uint64, uint64, uint64, bool, error) {
 	extended, present, err := packageZIP64Extra(extra)
 	if err != nil {

@@ -42,16 +42,26 @@ type StreamPlanPage struct {
 	Settings          *PrintSettings
 }
 
-// StreamPrintOptions 设置前向流式有界窗口拼版消费的读取参数、打印计划参数、常驻锁定部件列表与物理纸张回调
+// StreamPrintSummary 汇总流式打印拼版或消费完成后的作业装订、各文档装订、非致命诊断与可选数字签名报告
+type StreamPrintSummary struct {
+	JobFinishing      PrintFinishing
+	DocumentFinishing []PrintFinishing
+	Diagnostics       []Diagnostic
+	Signatures        *PrintSignatureReport
+}
+
+// StreamPrintOptions 设置前向流式有界窗口拼版消费的读取参数、打印计划参数、常驻锁定部件列表、物理纸张回调与完流汇总回调
 // Stream配置输入存储、内存配额与票据等待策略，OnPage非nil时在拼版前按页序交付页面视图；Plan配置默认票据、物理介质、预算与忽略策略
 // PinParts指定流式消费全程保持引用计数锁定的包内部件URI列表，防止外部水印字体等资源被自动丢弃或提前回收
 // OnSheet在窗口凑满物理纸张时实时交付临时纸张视图，回调返回后自动释放不再被窗口引用的页面与资源存储
-// 若有效票据要求逆序、小册子、逐份多副本或非单调页范围，则在完整接收流后于收尾阶段统一编排交付OnSheet
+// OnComplete在全部纸张交付完毕后触发，提供与Reader.PrintPlan等价的装订意图、去重诊断及数字签名报告
+// 若有效票据要求逆序、小册子、逐份多副本、非单调页范围或非Ignore签名策略，则在完整接收流后于收尾阶段统一编排或验签交付OnSheet
 type StreamPrintOptions struct {
-	Stream   StreamReadOptions
-	Plan     PrintPlanOptions
-	PinParts []string
-	OnSheet  func(context.Context, *StreamPrintSheet) error
+	Stream     StreamReadOptions
+	Plan       PrintPlanOptions
+	PinParts   []string
+	OnSheet    func(context.Context, *StreamPrintSheet) error
+	OnComplete func(context.Context, StreamPrintSummary) error
 }
 
 // StreamPrintSheet 表示前向流式拼版消费中窗口资源已就绪的临时物理纸张视图，Index为零基纸张序号
@@ -63,22 +73,25 @@ type StreamPrintSheet struct {
 	streamReaderView
 }
 
-// streamPendingSheet 保存因等待晚到票据包内ICC部件而暂缓交付的物理纸张与待到达键集合
+// streamPendingSheet 保存因等待晚到票据包内ICC部件或完流数字签名校验而暂缓交付的物理纸张与待到达键集合
 type streamPendingSheet struct {
 	sheet    PrintSheet
 	waitKeys map[string]bool
+	waitSig  bool
 	pinKeys  []string
 }
 
-// streamPrintCoordinator 协调前向流页面到达、有界窗口页资源锁定、晚到票据ICC等待、StreamPrintPlanner编排与及时内存回收
+// streamPrintCoordinator 协调前向流页面到达、有界窗口页资源锁定、晚到票据ICC等待、延迟签名验签、StreamPrintPlanner编排与及时内存回收
 type streamPrintCoordinator struct {
 	planOptions       PrintPlanOptions
 	onSheet           func(context.Context, *StreamPrintSheet) error
+	onComplete        func(context.Context, StreamPrintSummary) error
 	planner           *StreamPrintPlanner
 	owner             *streamPackage
 	lastDoc           int
 	sheetIndex        int
 	sigPolicy         PrintSignaturePolicy
+	sigReport         *PrintSignatureReport
 	sigVerified       bool
 	sigVerifiedPolicy PrintSignaturePolicy
 	sigVerifiedOpts   *PrintSignatureOptions
@@ -107,11 +120,12 @@ type streamDocumentConfig struct {
 	needsBuffer    bool
 }
 
-// streamBufferedDocument 保存随机访问模式下按文档分组缓冲的轻量页面元数据与文档级编排配置
+// streamBufferedDocument 保存随机访问模式下按文档分组缓冲的已选中轻量页面稀疏映射、原始页数与文档级编排配置
 type streamBufferedDocument struct {
 	documentIndex int
 	config        streamDocumentConfig
-	pages         []printPlanPage
+	pageCount     int
+	pages         map[int]printPlanPage
 }
 
 // StreamPrintPlanner 基于PrintSchema语义提供纯前向直通、滑动窗口与随机访问回退的流式拼版规划器
@@ -122,6 +136,9 @@ type StreamPrintPlanner struct {
 	settings           printSettingsConfig
 	jobSettings        *PrintSettings
 	jobFinishing       PrintFinishing
+	docFinishings      []PrintFinishing
+	diagnostics        []Diagnostic
+	diagnosticSeen     map[Diagnostic]struct{}
 	jobCopies          int
 	jobCollated        bool
 	reverseOrder       bool
@@ -134,7 +151,8 @@ type StreamPrintPlanner struct {
 	activeDoc          streamDocumentConfig
 	activeDocSet       bool
 	activeDocIndex     int
-	activeDocPages     []printPlanPage
+	activeDocPages     map[int]printPlanPage
+	activeDocPageCount int
 	readySheets        []PrintSheet
 	seenDocs           map[int]bool
 	builder            printPlanBuilder
@@ -178,7 +196,7 @@ func NewStreamPrintPlanner(ctx context.Context, defaults *PrintSettings, options
 	if err != nil {
 		return nil, err
 	}
-	settingsCfg.ignoreUnsupported = configuration.IgnoreUnsupportedFeatures || configuration.Print.IgnoreUnsupportedFeatures
+	settingsCfg.ignoreUnsupported = configuration.Print.IgnoreUnsupportedFeatures
 	jobSettings := &PrintSettings{Version: 1}
 	if configuration.Print.Defaults != nil {
 		jobSettings, err = mergeStreamPrintSettings(ctx, jobSettings, configuration.Print.Defaults, settingsCfg, PrintScopeUnknown)
@@ -265,6 +283,46 @@ func NewStreamPrintPlanner(ctx context.Context, defaults *PrintSettings, options
 	return planner, nil
 }
 
+// Summary 返回当前流式拼版规划器已收集的作业装订、各文档装订与去重非致命诊断独立副本
+// 返回: StreamPrintSummary 流式拼版汇总结果
+func (p *StreamPrintPlanner) Summary() StreamPrintSummary {
+	if p == nil {
+		return StreamPrintSummary{}
+	}
+	return StreamPrintSummary{
+		JobFinishing:      p.jobFinishing,
+		DocumentFinishing: slices.Clone(p.docFinishings),
+		Diagnostics:       slices.Clone(p.diagnostics),
+	}
+}
+
+// addDiagnostic 按去重集合记录流式规划阶段的非致命诊断，与Reader.PrintPlan口径一致
+// 入参: item 诊断条目
+func (p *StreamPrintPlanner) addDiagnostic(item Diagnostic) {
+	if p.diagnosticSeen == nil {
+		p.diagnosticSeen = make(map[Diagnostic]struct{})
+	}
+	if _, exists := p.diagnosticSeen[item]; exists {
+		return
+	}
+	p.diagnosticSeen[item] = struct{}{}
+	p.diagnostics = append(p.diagnostics, item)
+}
+
+// recordDocumentFinishing 按文档索引顺序登记文档级装订意图供Summary输出
+// 入参: docIndex 零基文档索引, finishing 文档级装订设置
+func (p *StreamPrintPlanner) recordDocumentFinishing(docIndex int, finishing PrintFinishing) {
+	if docIndex < 0 {
+		return
+	}
+	if docIndex >= len(p.docFinishings) {
+		grown := make([]PrintFinishing, docIndex+1)
+		copy(grown, p.docFinishings)
+		p.docFinishings = grown
+	}
+	p.docFinishings[docIndex] = finishing
+}
+
 // BeginDocument 在进入新文档边界时注册文档级打印设置并与作业基线合并，支持多文档异构票据编排并立即返回上一文档已结算的物理纸张
 // 入参: ctx 取消Context，nil采用Background, docIndex 零基文档序号, docSettings 当前文档级打印设置，nil沿用作业默认设置
 // 返回: []PrintSheet 切换文档边界时立即结算产出的物理纸张，无产出为nil, error 序号、冲突、票据、预算、关闭或取消错误
@@ -300,8 +358,11 @@ func (p *StreamPrintPlanner) BeginDocument(ctx context.Context, docIndex int, do
 	p.activeDoc = nextCfg
 	p.activeDocIndex = docIndex
 	p.activeDocSet = true
+	p.activeDocPages = nil
+	p.activeDocPageCount = 0
 	p.docPageCount = 0
 	p.docExplicitPageIdx = false
+	p.recordDocumentFinishing(docIndex, nextCfg.docFinishing)
 	return p.takeReadySheets(), nil
 }
 
@@ -316,6 +377,23 @@ func (p *StreamPrintPlanner) Capability() PrintStreamCapability {
 	return result
 }
 
+// willSelectPage 预判指定文档与文档内零基页号是否落入当前有效DocumentPageRanges范围内
+// 入参: docIndex 零基文档序号, localIndex 零基文档内页序号
+// 返回: bool 是否会被选中参与编排
+func (p *StreamPrintPlanner) willSelectPage(docIndex, localIndex int) bool {
+	if p == nil || localIndex < 0 {
+		return true
+	}
+	targetCfg := p.activeDoc
+	if !p.activeDocSet || docIndex != p.activeDocIndex {
+		targetCfg = p.defaultDoc
+	}
+	if !targetCfg.hasPageRanges {
+		return true
+	}
+	return streamPageRangeContains(targetCfg.rangeSpans, int64(localIndex)+1)
+}
+
 // PushPage 输入单个源页面，自动按页码范围过滤；直通或滑动窗口模式攒满物理纸张后立即返回对应PrintSheet并释放窗口内存，随机访问模式缓冲页头待Flush统一编排
 // 入参: ctx 取消Context，nil采用Background, page 源页面尺寸、盒子与可选页级打印设置
 // 返回: []PrintSheet 本次产出的完整物理纸张，未凑满窗口或缓冲模式返回nil, error 参数、票据、几何、容量、关闭或取消错误
@@ -324,7 +402,47 @@ func (p *StreamPrintPlanner) PushPage(ctx context.Context, page StreamPlanPage) 
 	return sheets, err
 }
 
-// pushPageWithColorPlan 输入单个源页面执行流式拼版或缓冲，并单次返回已解析的有效色彩计划供流式资源锁定复用
+// skipUnselectedPage 在流式消费预过滤确定页面不在DocumentPageRanges内时推进当前文档页数统计并跳过页级票据与布局解析
+// 入参: ctx 取消Context, docIndex 零基文档序号, docPageIndex 零基文档内页序号
+// 返回: error 参数、容量、关闭或取消错误
+func (p *StreamPrintPlanner) skipUnselectedPage(ctx context.Context, docIndex, docPageIndex int) error {
+	if p.flushed {
+		return ErrClosed
+	}
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if docIndex < 0 || docPageIndex < 0 {
+		return fmt.Errorf("%w: negative stream plan page index", ErrInvalid)
+	}
+	if p.totalPushed >= p.settings.Limits.MaxPageCount {
+		return fmt.Errorf("%w: stream print planner page count", ErrLimit)
+	}
+	if docPageIndex != 0 {
+		if docPageIndex != p.docPageCount {
+			return fmt.Errorf("%w: non-sequential document page index %d", ErrInvalid, docPageIndex)
+		}
+	} else if p.docExplicitPageIdx {
+		return fmt.Errorf("%w: non-sequential document page index %d", ErrInvalid, docPageIndex)
+	}
+	if p.capability.Mode == PrintStreamRandomAccess {
+		if len(p.bufferedDocs) == 0 || p.bufferedDocs[len(p.bufferedDocs)-1].documentIndex != docIndex {
+			p.bufferedDocs = append(p.bufferedDocs, streamBufferedDocument{documentIndex: docIndex, config: p.activeDoc})
+		}
+		p.bufferedDocs[len(p.bufferedDocs)-1].pageCount++
+	} else if p.activeDoc.needsBuffer {
+		p.activeDocPageCount++
+	}
+	p.docPageCount++
+	if docPageIndex != 0 {
+		p.docExplicitPageIdx = true
+	}
+	p.totalPushed++
+	return nil
+}
+
+// pushPageWithColorPlan 输入单个源页面执行流式拼版或缓冲，在缓冲入队前按DocumentPageRanges预过滤并单次返回已解析的有效色彩计划
 // 入参: ctx 取消Context，nil采用Background, page 源页面尺寸、盒子与可选页级打印设置
 // 返回: []PrintSheet 本次产出的完整物理纸张，未凑满窗口或缓冲模式返回nil, *PrintColorPlan 当前页有效色彩计划，跳过或未声明时为nil, error 参数、票据、几何、容量、关闭或取消错误
 func (p *StreamPrintPlanner) pushPageWithColorPlan(ctx context.Context, page StreamPlanPage) ([]PrintSheet, *PrintColorPlan, error) {
@@ -380,7 +498,10 @@ func (p *StreamPrintPlanner) pushPageWithColorPlan(ctx context.Context, page Str
 		p.activeDoc = targetCfg
 		p.activeDocIndex = page.DocumentIndex
 		p.activeDocSet = true
+		p.activeDocPages = nil
+		p.activeDocPageCount = 0
 		p.docExplicitPageIdx = false
+		p.recordDocumentFinishing(page.DocumentIndex, targetCfg.docFinishing)
 		return nil
 	}
 	commitPage := func() {
@@ -390,7 +511,19 @@ func (p *StreamPrintPlanner) pushPageWithColorPlan(ctx context.Context, page Str
 		}
 		p.totalPushed++
 	}
+	selected := !targetCfg.hasPageRanges || streamPageRangeContains(targetCfg.rangeSpans, int64(localIndex)+1)
 	if p.capability.Mode == PrintStreamRandomAccess {
+		if !selected {
+			if err := applyDocSwitch(); err != nil {
+				return nil, nil, err
+			}
+			if len(p.bufferedDocs) == 0 || p.bufferedDocs[len(p.bufferedDocs)-1].documentIndex != page.DocumentIndex {
+				p.bufferedDocs = append(p.bufferedDocs, streamBufferedDocument{documentIndex: page.DocumentIndex, config: p.activeDoc})
+			}
+			p.bufferedDocs[len(p.bufferedDocs)-1].pageCount++
+			commitPage()
+			return nil, nil, nil
+		}
 		planPage, err := p.preparePlanPage(ctx, page, targetCfg)
 		if err != nil {
 			return nil, nil, err
@@ -405,11 +538,23 @@ func (p *StreamPrintPlanner) pushPageWithColorPlan(ctx context.Context, page Str
 			p.bufferedDocs = append(p.bufferedDocs, streamBufferedDocument{documentIndex: page.DocumentIndex, config: p.activeDoc})
 		}
 		docBuf := &p.bufferedDocs[len(p.bufferedDocs)-1]
-		docBuf.pages = append(docBuf.pages, planPage)
+		if docBuf.pages == nil {
+			docBuf.pages = make(map[int]printPlanPage)
+		}
+		docBuf.pages[localIndex] = planPage
+		docBuf.pageCount++
 		commitPage()
 		return nil, planPage.colorPlan, nil
 	}
 	if targetCfg.needsBuffer {
+		if !selected {
+			if err := applyDocSwitch(); err != nil {
+				return nil, nil, err
+			}
+			p.activeDocPageCount++
+			commitPage()
+			return p.takeReadySheets(), nil, nil
+		}
 		planPage, err := p.preparePlanPage(ctx, page, targetCfg)
 		if err != nil {
 			return nil, nil, err
@@ -420,7 +565,11 @@ func (p *StreamPrintPlanner) pushPageWithColorPlan(ctx context.Context, page Str
 		if err := applyDocSwitch(); err != nil {
 			return nil, nil, err
 		}
-		p.activeDocPages = append(p.activeDocPages, planPage)
+		if p.activeDocPages == nil {
+			p.activeDocPages = make(map[int]printPlanPage)
+		}
+		p.activeDocPages[localIndex] = planPage
+		p.activeDocPageCount++
 		commitPage()
 		return p.takeReadySheets(), planPage.colorPlan, nil
 	}
@@ -442,6 +591,9 @@ func (p *StreamPrintPlanner) pushPageWithColorPlan(ctx context.Context, page Str
 	docCfg := targetCfg.toWindowDocument()
 	if planPage.poster > 1 && docCfg.nup != 1 {
 		return nil, nil, fmt.Errorf("%w: poster and NUp require incompatible sheet counts", ErrUnsupported)
+	}
+	if planPage.poster > 1 && docCfg.duplex != PrintSimplex {
+		p.addDiagnostic(Diagnostic{Element: "PagePoster", Message: "poster sheets use single-sided output"})
 	}
 	if err := applyDocSwitch(); err != nil {
 		return nil, nil, err
@@ -517,7 +669,7 @@ func (p *StreamPrintPlanner) Flush(ctx context.Context) ([]PrintSheet, error) {
 	return sheets, checkContext(ctx)
 }
 
-// mergeStreamPrintSettings 在纯内存中按作用域校验增量设置并与基线合并，避免无意义的XML往返
+// mergeStreamPrintSettings 在纯内存中按作用域校验增量设置并使用内部免重复校验核心与基线合并，避免重复整树校验与XML往返
 // 入参: ctx 取消Context, base 已校验基线设置, delta 待合并增量设置, cfg 解析与预算配置, scope 增量设置的作用域过滤
 // 返回: *PrintSettings 独立合并设置, error 结构、预算或取消错误
 func mergeStreamPrintSettings(ctx context.Context, base, delta *PrintSettings, cfg printSettingsConfig, scope PrintScope) (*PrintSettings, error) {
@@ -531,18 +683,7 @@ func mergeStreamPrintSettings(ctx context.Context, base, delta *PrintSettings, c
 	mergeCfg := cfg
 	mergeCfg.context = ctx
 	mergeCfg.Scope = PrintScopeUnknown
-	merged, err := mergePrintSettingsValidated(printCloneSettings(base), change, mergeCfg)
-	if err != nil {
-		return nil, err
-	}
-	result, err := validatePrintSettingsModel(merged, mergeCfg, printDocumentTicket)
-	if err != nil {
-		return nil, err
-	}
-	if err := validatePrintSettingsOutputBudget(result, mergeCfg, printDocumentTicket); err != nil {
-		return nil, err
-	}
-	return result, nil
+	return mergePrintSettingsInternal(base, change, mergeCfg)
 }
 
 // resolveDocumentConfig 在当前作业基线上合并文档级打印设置并解析文档编排参数及流式缓冲策略
@@ -641,7 +782,7 @@ func (p *StreamPrintPlanner) resolveDocumentConfig(ctx context.Context, docSetti
 		pageRanges = value.Text
 		hasPageRanges = value.Text != ""
 		monotonicRange = monotonic
-		if hasPageRanges && monotonicRange {
+		if hasPageRanges {
 			rangeSpans, err = parsePrintPageRangeSpans(pageRanges, cfg)
 			if err != nil {
 				return streamDocumentConfig{}, err
@@ -745,10 +886,11 @@ func (p *StreamPrintPlanner) finishActiveDocument(ctx context.Context, next *str
 		return nil
 	}
 	if p.activeDoc.needsBuffer {
-		if err := p.flushBufferedDocument(ctx, p.activeDoc, p.activeDocPages); err != nil {
+		if err := p.flushBufferedDocument(ctx, p.activeDoc, p.activeDocPages, p.activeDocPageCount); err != nil {
 			return err
 		}
 		p.activeDocPages = nil
+		p.activeDocPageCount = 0
 		if next == nil || p.activeDoc.separate || next.separate {
 			if err := p.packer.flush(); err != nil {
 				return err
@@ -760,6 +902,9 @@ func (p *StreamPrintPlanner) finishActiveDocument(ctx context.Context, next *str
 			p.readySheets = append(p.readySheets, drained...)
 		}
 		return nil
+	}
+	if p.activeDoc.hasPageRanges && streamPageRangesOutOfBounds(p.activeDoc.rangeSpans, p.docPageCount) {
+		p.addDiagnostic(Diagnostic{Element: "ParameterInit", Attribute: "name", Message: "out-of-range document pages ignored"})
 	}
 	if next == nil || p.activeDoc.separate || next.separate {
 		if err := p.packer.flush(); err != nil {
@@ -777,18 +922,21 @@ func (p *StreamPrintPlanner) finishActiveDocument(ctx context.Context, next *str
 }
 
 // flushBufferedDocument 在流式作业中对单个含小册子、逐份副本或非单调页范围的文档执行与Reader.PrintPlan等价的编排
-// 入参: ctx 已规范化取消Context, docCfg 当前文档配置, pages 当前文档缓冲页面列表
+// 入参: ctx 已规范化取消Context, docCfg 当前文档配置, pages 当前文档稀疏缓冲页面映射, pageCount 当前文档原始总页数
 // 返回: error 冲突、容量、预算或取消错误
-func (p *StreamPrintPlanner) flushBufferedDocument(ctx context.Context, docCfg streamDocumentConfig, pages []printPlanPage) error {
-	if len(pages) == 0 {
+func (p *StreamPrintPlanner) flushBufferedDocument(ctx context.Context, docCfg streamDocumentConfig, pages map[int]printPlanPage, pageCount int) error {
+	if pageCount == 0 {
 		return nil
 	}
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
-	indices, _, err := printPageRanges(docCfg.pageRanges, len(pages), p.options.MaxPlacements-p.builder.selected, p.builder.settings)
+	indices, outside, err := printPageRanges(docCfg.pageRanges, pageCount, p.options.MaxPlacements-p.builder.selected, p.builder.settings)
 	if err != nil {
 		return err
+	}
+	if outside {
+		p.addDiagnostic(Diagnostic{Element: "ParameterInit", Attribute: "name", Message: "out-of-range document pages ignored"})
 	}
 	p.builder.selected += len(indices)
 	doc := docCfg.toPlanDocument(len(indices))
@@ -799,6 +947,9 @@ func (p *StreamPrintPlanner) flushBufferedDocument(ctx context.Context, docCfg s
 		}
 		if pg.poster > 1 && doc.nup != 1 {
 			return fmt.Errorf("%w: poster and NUp require incompatible sheet counts", ErrUnsupported)
+		}
+		if pg.poster > 1 && doc.duplex != PrintSimplex {
+			p.addDiagnostic(Diagnostic{Element: "PagePoster", Message: "poster sheets use single-sided output"})
 		}
 		doc.pages = append(doc.pages, pg)
 	}
@@ -990,6 +1141,7 @@ func (p *StreamPrintPlanner) preparePlanPage(ctx context.Context, page StreamPla
 		return printPlanPage{}, err
 	}
 	state, err := preparePrintPageState(ctx, model, p.builder.settings, headerPage, p.options.Print.Media, printPageStateOptions{
+		validated:            true,
 		stripPlanFeatures:    true,
 		ignoreUnsupported:    p.settings.ignoreUnsupported,
 		ignoreColorPlanError: p.settings.ignoreUnsupported,
@@ -1057,9 +1209,12 @@ func (p *StreamPrintPlanner) flushRandomAccess(ctx context.Context) ([]PrintShee
 		if err := checkContext(ctx); err != nil {
 			return nil, err
 		}
-		indices, _, err := printPageRanges(bufDoc.config.pageRanges, len(bufDoc.pages), p.options.MaxPlacements-selected, p.builder.settings)
+		indices, outside, err := printPageRanges(bufDoc.config.pageRanges, bufDoc.pageCount, p.options.MaxPlacements-selected, p.builder.settings)
 		if err != nil {
 			return nil, err
+		}
+		if outside {
+			p.addDiagnostic(Diagnostic{Element: "ParameterInit", Attribute: "name", Message: "out-of-range document pages ignored"})
 		}
 		selected += len(indices)
 		doc := bufDoc.config.toPlanDocument(len(indices))
@@ -1070,6 +1225,9 @@ func (p *StreamPrintPlanner) flushRandomAccess(ctx context.Context) ([]PrintShee
 			}
 			if pg.poster > 1 && doc.nup != 1 {
 				return nil, fmt.Errorf("%w: poster and NUp require incompatible sheet counts", ErrUnsupported)
+			}
+			if pg.poster > 1 && doc.duplex != PrintSimplex {
+				p.addDiagnostic(Diagnostic{Element: "PagePoster", Message: "poster sheets use single-sided output"})
 			}
 			doc.pages = append(doc.pages, pg)
 		}
@@ -1140,6 +1298,41 @@ func streamPageRangeHits(spans []printPageRangeSpan, pageNumber int64) int {
 		}
 	}
 	return hits
+}
+
+// streamPageRangeContains 判断指定一基页码是否落入任意正向或反向页码范围闭区间内
+// 入参: spans 页码闭区间列表, pageNumber 一基文档内页码
+// 返回: bool 是否至少命中一个区间
+func streamPageRangeContains(spans []printPageRangeSpan, pageNumber int64) bool {
+	target := big.NewInt(pageNumber)
+	for _, span := range spans {
+		lo, hi := span.start, span.end
+		if lo.Cmp(hi) > 0 {
+			lo, hi = hi, lo
+		}
+		if target.Cmp(lo) >= 0 && target.Cmp(hi) <= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// streamPageRangesOutOfBounds 检查页码范围区间列表中是否存在超出文档实际页数的端点
+// 入参: spans 页码闭区间列表, pageCount 文档实际页数
+// 返回: bool 是否存在越界页码
+func streamPageRangesOutOfBounds(spans []printPageRangeSpan, pageCount int) bool {
+	one := big.NewInt(1)
+	limit := big.NewInt(int64(pageCount))
+	for _, span := range spans {
+		lo, hi := span.start, span.end
+		if lo.Cmp(hi) > 0 {
+			lo, hi = hi, lo
+		}
+		if lo.Cmp(one) < 0 || hi.Cmp(limit) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Mode 返回当前流式拼版规划器的执行模式，无效或未初始化返回PrintStreamPassthrough
@@ -1505,9 +1698,9 @@ func (s *StreamPrintSheet) RenderBrushTileWithState(ctx context.Context, brush *
 
 // ConsumeStreamPrintPlan 以有界窗口流式消费XPS或OpenXPS输入并实时驱动StreamPrintPlanner产出物理纸张视图
 // 在OnSheet回调期间可直接执行WalkPrintSide、RenderPrintSide或RenderPrintSideDevice，窗口滑出后立即释放不再被引用的源页面与资源存储
-// 内存占用严格受Stream.MaxMemoryBytes约束；多文档异构票据按文档边界自动切换并与Reader.PrintPlan保持等价
-// 入参: ctx 取消Context，nil采用Background, input 前向输入, options 流式读取、打印计划及纸张回调参数，nil采用默认值
-// 返回: error 输入、封装、票据、拼版、存储、回调、预算或取消错误
+// 内存占用严格受Stream.MaxMemoryBytes约束；支持非Ignore数字签名延迟验签、错误报告纸与OnComplete完流汇总回调，并与Reader.PrintPlan保持等价
+// 入参: ctx 取消Context，nil采用Background, input 前向输入, options 流式读取、打印计划、纸张与完流汇总回调参数，nil采用默认值
+// 返回: error 输入、封装、票据、拼版、签名、存储、回调、预算或取消错误
 func ConsumeStreamPrintPlan(ctx context.Context, input io.Reader, options *StreamPrintOptions) error {
 	ctx = normalizeContext(ctx)
 	if err := checkContext(ctx); err != nil {
@@ -1516,8 +1709,22 @@ func ConsumeStreamPrintPlan(ctx context.Context, input io.Reader, options *Strea
 	streamOpts := DefaultStreamReadOptions()
 	planOpts := DefaultPrintPlanOptions()
 	var onSheet func(context.Context, *StreamPrintSheet) error
+	var onComplete func(context.Context, StreamPrintSummary) error
 	var userOnPage func(context.Context, *StreamPage) error
 	var pinKeys []string
+	pinSeen := make(map[string]bool)
+	addPin := func(part string) error {
+		canonical, err := opcPartName(part)
+		if err != nil {
+			return err
+		}
+		key := strings.ToLower(canonical)
+		if !pinSeen[key] {
+			pinSeen[key] = true
+			pinKeys = append(pinKeys, key)
+		}
+		return nil
+	}
 	if options != nil {
 		streamOpts = options.Stream
 		userOnPage = options.Stream.OnPage
@@ -1532,18 +1739,10 @@ func ConsumeStreamPrintPlan(ctx context.Context, input io.Reader, options *Strea
 			planOpts.MaxWork = 1 << 28
 		}
 		onSheet = options.OnSheet
-		if len(options.PinParts) != 0 {
-			seen := make(map[string]bool, len(options.PinParts))
-			for _, part := range options.PinParts {
-				canonical, err := opcPartName(part)
-				if err != nil {
-					return err
-				}
-				key := strings.ToLower(canonical)
-				if !seen[key] {
-					seen[key] = true
-					pinKeys = append(pinKeys, key)
-				}
+		onComplete = options.OnComplete
+		for _, part := range options.PinParts {
+			if err := addPin(part); err != nil {
+				return err
 			}
 		}
 	}
@@ -1556,9 +1755,42 @@ func ConsumeStreamPrintPlan(ctx context.Context, input io.Reader, options *Strea
 	if planOpts.Signatures != nil && planOpts.Signatures.Policy > PrintSignatureRequireValid {
 		return fmt.Errorf("%w: stream print signature policy", ErrInvalid)
 	}
+	if planOpts.Signatures != nil && planOpts.Signatures.ReportPage != "" {
+		if err := addPin(planOpts.Signatures.ReportPage); err != nil {
+			return err
+		}
+	}
+	needFullStream := false
+	if planOpts.Signatures != nil && planOpts.Signatures.Policy != PrintSignatureIgnore && planOpts.Signatures.Policy != PrintSignatureFromTicket {
+		needFullStream = true
+	} else if (planOpts.Signatures == nil || planOpts.Signatures.Policy == PrintSignatureFromTicket) && planOpts.Print.Defaults != nil {
+		if defPolicy, err := printSignaturePolicy(planOpts.Print.Defaults, ctx); err == nil && defPolicy != PrintSignatureIgnore {
+			needFullStream = true
+		}
+	}
+	if needFullStream && streamOpts.Storage == nil {
+		limits := mergeLimits(DefaultLimits(), streamOpts.Limits)
+		maxInput := streamOpts.MaxInputBytes
+		if maxInput == 0 {
+			maxInput = limits.MaxPackageBytes
+		}
+		memLimit := streamOpts.MaxMemoryBytes
+		if memLimit == 0 {
+			memLimit = maxInput
+		}
+		if maxInput > 0 && maxInput < memLimit {
+			memLimit = maxInput
+		}
+		if memLimit > 0 && maxInput > 0 {
+			retained := &streamMemory{limit: memLimit, reclaim: false}
+			defer retained.Close()
+			streamOpts.Storage = retained
+		}
+	}
 	coord := &streamPrintCoordinator{
 		planOptions:  planOpts,
 		onSheet:      onSheet,
+		onComplete:   onComplete,
 		lastDoc:      -1,
 		sigPolicy:    PrintSignatureIgnore,
 		pinnedByPage: make(map[int][]string),
@@ -1585,6 +1817,68 @@ func ConsumeStreamPrintPlan(ctx context.Context, input io.Reader, options *Strea
 		},
 	}
 	return consumeStreamInternal(ctx, input, &streamOpts, hooks)
+}
+
+// promoteStreamMemoryToRetained 在流中途发现需要完流签名验签且尚未发生任何分块回收时，就地将可回收内存存储原子转换为有界非回收内存存储
+// 入参: owner 流式包状态
+// 返回: error 已回收、缺失分块或超限错误
+func promoteStreamMemoryToRetained(owner *streamPackage) error {
+	if owner == nil {
+		return nil
+	}
+	if owner.reclaimed {
+		return fmt.Errorf("%w: digital signature verification requires completed package stream", ErrUnsupported)
+	}
+	mem := owner.ownedMemory
+	if mem == nil {
+		return nil
+	}
+	mem.mu.Lock()
+	defer mem.mu.Unlock()
+	if mem.closed {
+		return ErrClosed
+	}
+	if mem.reclaim {
+		if mem.size > mem.limit {
+			return fmt.Errorf("%w: stream memory bytes", ErrLimit)
+		}
+		blockSize := mem.chunkSize
+		if blockSize <= 0 {
+			blockSize = streamBufferBytes
+		}
+		var chunks [][]byte
+		var offset int64
+		for offset < mem.size {
+			chunkIdx := int(offset / blockSize)
+			src := mem.liveChunks[chunkIdx]
+			if src == nil {
+				return fmt.Errorf("%w: digital signature verification requires completed package stream", ErrUnsupported)
+			}
+			remain := int(min(blockSize, mem.size-offset))
+			data := src[:remain]
+			for len(data) != 0 {
+				dstIdx := int(offset / streamBufferBytes)
+				dstPos := int(offset % streamBufferBytes)
+				if dstIdx == len(chunks) {
+					capacity := int(min(int64(streamBufferBytes), mem.limit-int64(dstIdx)*streamBufferBytes))
+					chunks = append(chunks, make([]byte, capacity))
+				}
+				n := copy(chunks[dstIdx][dstPos:], data)
+				offset += int64(n)
+				data = data[n:]
+			}
+		}
+		mem.chunks = chunks
+		mem.liveChunks = nil
+		mem.liveFreed = nil
+		mem.chunkSize = 0
+		mem.live = 0
+		mem.reclaim = false
+	}
+	owner.ownedMemory = nil
+	owner.input.ownedMemory = nil
+	owner.input.onLimit = nil
+	return nil
 }
 
 // readSingleScopePrintSettings 仅按指定作用域从单个固定布局部件关系中读取并解析打印票据，未关联时返回nil
@@ -1709,7 +2003,7 @@ func collectStreamSheetICCKeys(sheet PrintSheet) []string {
 	return keys
 }
 
-// handlePage 处理单页到达事件：按需初始化规划器或切换文档边界、锁定窗口页资源并及时交付已就绪纸张
+// handlePage 处理单页到达事件：按需初始化规划器、切换文档边界、按DocumentPageRanges预过滤跳过未选中页，锁定窗口页资源并及时交付或延迟暂存纸张
 // 入参: ctx 取消Context, sp 当前到达的临时页面视图
 // 返回: error 票据、拼版、签名、回调、预算或取消错误
 func (c *streamPrintCoordinator) handlePage(ctx context.Context, sp *StreamPage) error {
@@ -1742,9 +2036,11 @@ func (c *streamPrintCoordinator) handlePage(ctx context.Context, sp *StreamPage)
 			effectiveSig = c.planOptions.Signatures.Policy
 		}
 		c.sigPolicy = effectiveSig
-		if effectiveSig != PrintSignatureIgnore && owner != nil && (owner.ownedMemory != nil || owner.reclaimed) {
-			release()
-			return fmt.Errorf("%w: digital signature verification requires completed package stream", ErrUnsupported)
+		if effectiveSig != PrintSignatureIgnore {
+			if err := promoteStreamMemoryToRetained(owner); err != nil {
+				release()
+				return err
+			}
 		}
 		c.planner = planner
 	}
@@ -1755,6 +2051,33 @@ func (c *streamPrintCoordinator) handlePage(ctx context.Context, sp *StreamPage)
 		docTicket, err = readSingleScopePrintSettings(pageCtx, r, sp.DocumentPart, PrintScopeDocument, c.planOptions.Print.Settings)
 		if err != nil {
 			release()
+			return err
+		}
+	}
+	incomplete := sp.view.streamIncomplete
+	progress := sp.view.progress
+	if needDocSwitch {
+		release()
+		docSheets, err := c.planner.BeginDocument(ctx, docIdx, docTicket)
+		if err != nil {
+			return err
+		}
+		c.lastDoc = docIdx
+		if len(docSheets) != 0 {
+			if err := c.enqueueOrDeliverSheets(ctx, r, docSheets, progress, incomplete); err != nil {
+				return err
+			}
+		}
+	}
+	if !c.planner.willSelectPage(docIdx, sp.view.pageIndex) {
+		if !needDocSwitch {
+			release()
+		}
+		return c.planner.skipUnselectedPage(ctx, docIdx, sp.view.pageIndex)
+	}
+	if needDocSwitch {
+		r, pageCtx, release, err = sp.lockReader(ctx)
+		if err != nil {
 			return err
 		}
 	}
@@ -1769,21 +2092,9 @@ func (c *streamPrintCoordinator) handlePage(ctx context.Context, sp *StreamPage)
 		return err
 	}
 	resources := slices.Clone(sp.view.resources)
-	incomplete := sp.view.streamIncomplete
-	progress := sp.view.progress
+	incomplete = sp.view.streamIncomplete
+	progress = sp.view.progress
 	release()
-	if needDocSwitch {
-		docSheets, err := c.planner.BeginDocument(ctx, docIdx, docTicket)
-		if err != nil {
-			return err
-		}
-		c.lastDoc = docIdx
-		if len(docSheets) != 0 {
-			if err := c.enqueueOrDeliverSheets(ctx, r, docSheets, progress, incomplete); err != nil {
-				return err
-			}
-		}
-	}
 	sheets, colorPlan, err := c.planner.pushPageWithColorPlan(ctx, StreamPlanPage{
 		PageIndex:         sp.Index,
 		DocumentIndex:     docIdx,
@@ -1817,11 +2128,12 @@ func (c *streamPrintCoordinator) handlePage(ctx context.Context, sp *StreamPage)
 	return c.enqueueOrDeliverSheets(ctx, r, sheets, progress, incomplete)
 }
 
-// enqueueOrDeliverSheets 检查待交付纸张引用的票据包内ICC部件是否均已到达，缺件时锁定并暂存待到达后再交付
+// enqueueOrDeliverSheets 检查待交付纸张引用的票据包内ICC部件与数字签名就绪状态，缺件或待完流验签时锁定并暂存待就绪后再交付
 // 入参: ctx 取消Context, source 当前只读阅读器, sheets 待交付物理纸张列表, progress 进度快照, incomplete 未完流标志
 // 返回: error 签名、回调或取消错误
 func (c *streamPrintCoordinator) enqueueOrDeliverSheets(ctx context.Context, source *Reader, sheets []PrintSheet, progress StreamProgress, incomplete bool) error {
 	mode := c.planner.Capability().Mode
+	needSigHold := incomplete && c.sigPolicy != PrintSignatureIgnore
 	for idx, sheet := range sheets {
 		if err := checkContext(ctx); err != nil {
 			return err
@@ -1838,10 +2150,7 @@ func (c *streamPrintCoordinator) enqueueOrDeliverSheets(ctx context.Context, sou
 				}
 			}
 		}
-		if len(c.pendingSheets) == 0 && len(waitKeys) == 0 {
-			if incomplete && c.sigPolicy != PrintSignatureIgnore {
-				return fmt.Errorf("%w: digital signature verification requires completed package stream", ErrUnsupported)
-			}
+		if len(c.pendingSheets) == 0 && len(waitKeys) == 0 && !needSigHold {
 			sheet.Front.SignaturePolicy = c.sigPolicy
 			if sheet.Back != nil {
 				sheet.Back.SignaturePolicy = c.sigPolicy
@@ -1865,6 +2174,7 @@ func (c *streamPrintCoordinator) enqueueOrDeliverSheets(ctx context.Context, sou
 		c.pendingSheets = append(c.pendingSheets, streamPendingSheet{
 			sheet:    sheet,
 			waitKeys: waitKeys,
+			waitSig:  needSigHold,
 			pinKeys:  pinKeys,
 		})
 	}
@@ -1884,15 +2194,12 @@ func (c *streamPrintCoordinator) handlePartReady(ctx context.Context, key string
 	}
 	source := c.owner.index
 	mode := c.planner.Capability().Mode
-	for len(c.pendingSheets) != 0 && len(c.pendingSheets[0].waitKeys) == 0 {
+	for len(c.pendingSheets) != 0 && len(c.pendingSheets[0].waitKeys) == 0 && !c.pendingSheets[0].waitSig {
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
 		item := c.pendingSheets[0]
 		incomplete := !c.owner.centralVerified || c.owner.reclaimed
-		if incomplete && c.sigPolicy != PrintSignatureIgnore {
-			return fmt.Errorf("%w: digital signature verification requires completed package stream", ErrUnsupported)
-		}
 		c.pendingSheets = c.pendingSheets[1:]
 		progress := StreamProgress{
 			BytesRead:          c.owner.input.count,
@@ -1944,14 +2251,20 @@ func streamSheetsContainPage(sheets []PrintSheet, pageIndex int) bool {
 	return false
 }
 
-// finish 在全流校验完成后刷出残余等待队列、窗口或随机访问缓冲的全部物理纸张，并在交付后释放全部锁定资源
+// finish 在全流校验完成后执行延迟签名验签、生成可选错误报告纸、刷出残余等待队列与窗口或随机访问缓冲的全部物理纸张，并在交付后触发OnComplete与释放全部锁定资源
 // 入参: ctx 取消Context, source 完整或终审只读阅读器, complete 整包压缩字节是否完整未回收
 // 返回: error 签名、拼版、回调、预算或取消错误
 func (c *streamPrintCoordinator) finish(ctx context.Context, source *Reader, complete bool) error {
 	defer c.releaseAll()
 	if c.planner == nil {
+		if c.onComplete != nil {
+			if err := c.onComplete(ctx, StreamPrintSummary{}); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
+	var errorSheet *PrintSheet
 	if c.sigPolicy != PrintSignatureIgnore {
 		if !complete {
 			return fmt.Errorf("%w: digital signature verification requires completed package stream", ErrUnsupported)
@@ -1960,26 +2273,39 @@ func (c *streamPrintCoordinator) finish(ctx context.Context, source *Reader, com
 		if err != nil {
 			return err
 		}
+		c.sigReport = report
 		if !report.Allowed {
 			return &PrintSignatureError{Report: report}
-		}
-		if report.NeedsErrorSheet {
-			return fmt.Errorf("%w: signature error sheet requires Reader.PrintPlan", ErrUnsupported)
 		}
 		c.sigPolicy = report.Policy
 		c.sigVerified = true
 		c.sigVerifiedPolicy = report.Policy
 		c.sigVerifiedOpts = c.planOptions.Signatures
+		if report.NeedsErrorSheet {
+			c.planner.builder.settings.context = ctx
+			built, err := c.planner.builder.buildSignatureErrorSheet(source)
+			if err == nil {
+				checkPlan := &PrintPlan{}
+				if err = c.planner.builder.appendSheet(checkPlan, built, false); err == nil {
+					built = checkPlan.Sheets[0]
+				}
+			}
+			c.planner.builder.settings.context = nil
+			if err != nil {
+				return err
+			}
+			errorSheet = &built
+		}
 	}
 	tailSheets, err := c.planner.Flush(ctx)
 	if err != nil {
 		return err
 	}
+	if errorSheet != nil {
+		tailSheets = append(tailSheets, *errorSheet)
+	}
 	pending := c.pendingSheets
 	c.pendingSheets = nil
-	if len(pending) == 0 && len(tailSheets) == 0 {
-		return nil
-	}
 	var progress StreamProgress
 	if c.owner != nil {
 		progress = StreamProgress{
@@ -2030,10 +2356,19 @@ func (c *streamPrintCoordinator) finish(ctx context.Context, source *Reader, com
 		remaining = append(remaining, tailSheets...)
 		c.releaseUnusedPages(nil, remaining)
 	}
-	if len(tailSheets) == 0 {
-		return nil
+	if len(tailSheets) != 0 {
+		if err := c.deliverSheets(ctx, source, tailSheets, progress, incomplete); err != nil {
+			return err
+		}
 	}
-	return c.deliverSheets(ctx, source, tailSheets, progress, incomplete)
+	if c.onComplete != nil {
+		summary := c.planner.Summary()
+		summary.Signatures = c.sigReport
+		if err := c.onComplete(ctx, summary); err != nil {
+			return err
+		}
+	}
+	return checkContext(ctx)
 }
 
 // deliverSheets 逐张创建临时StreamPrintSheet视图交付OnSheet，并在每张返回后立即释放不再被引用的窗口页面

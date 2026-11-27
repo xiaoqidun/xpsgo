@@ -1871,29 +1871,13 @@ func iccDisplayD65Matrix() [9]float64 {
 func iccDisplayMatrix() [9]float64 {
 	white := [3]float64{0.3127 / 0.3290, 1, (1 - 0.3127 - 0.3290) / 0.3290}
 	display := iccDisplayD65Matrix()
-	bradford := [9]float64{0.8951, 0.2664, -0.1614, -0.7502, 1.7135, 0.0367, 0.0389, -0.0685, 1.0296}
-	coneSource, coneTarget := iccMatrixColor(bradford, iccPCSWhite), iccMatrixColor(bradford, white)
-	adapt := bradford
+	coneSource, coneTarget := iccMatrixColor(cicpBradford, iccPCSWhite), iccMatrixColor(cicpBradford, white)
+	adapt := cicpBradford
 	for row := range 3 {
 		for column := range 3 {
 			adapt[row*3+column] *= coneTarget[row] / coneSource[row]
 		}
 	}
-	back, _ := iccInverseMatrix(bradford)
-	var combined, out [9]float64
-	for row := range 3 {
-		for column := range 3 {
-			for axis := range 3 {
-				combined[row*3+column] += back[row*3+axis] * adapt[axis*3+column]
-			}
-		}
-	}
-	for row := range 3 {
-		for column := range 3 {
-			for axis := range 3 {
-				out[row*3+column] += display[row*3+axis] * combined[axis*3+column]
-			}
-		}
-	}
-	return out
+	combined := cicpMulMatrix3(cicpBradfordInverse, adapt)
+	return cicpMulMatrix3(display, combined)
 }

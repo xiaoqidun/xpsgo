@@ -135,6 +135,7 @@ type printResourceCollector struct {
 
 // printPageStateOptions 配置单页打印票据拆解与布局准备的可选策略
 type printPageStateOptions struct {
+	validated            bool
 	stripPrivate         bool
 	stripSignatures      bool
 	stripSinglePoster    bool
@@ -240,6 +241,7 @@ func (r *Reader) renderPrint(ctx context.Context, pageIndex int, options *PrintR
 	}
 	printConfig := printSettingsConfig{PrintSettingsOptions: configuration.Print.Settings, context: ctx}
 	state, err := preparePrintPageState(ctx, ticket, printConfig, nil, PrintMedia{}, printPageStateOptions{
+		validated:            true,
 		stripPrivate:         configuration.Print.IgnoreUnsupportedFeatures,
 		stripSignatures:      true,
 		stripSinglePoster:    true,
@@ -272,7 +274,13 @@ func (r *Reader) renderPrint(ctx context.Context, pageIndex int, options *PrintR
 	if err != nil {
 		return nil, err
 	}
-	watermarks := newPrintWatermarkRenderer(r, configuration.Watermark, settings)
+	watermarkOpts := configuration.Watermark
+	if watermarkOpts != nil && watermarkOpts.ImageableOrigin == (Point{}) && (layout.ImageableArea.X != 0 || layout.ImageableArea.Y != 0) {
+		copied := *watermarkOpts
+		copied.ImageableOrigin = Point{X: layout.ImageableArea.X, Y: layout.ImageableArea.Y}
+		watermarkOpts = &copied
+	}
+	watermarks := newPrintWatermarkRenderer(r, watermarkOpts, settings)
 	elements, err := watermarks.elements(page.Part, page.Elements, state.watermark)
 	if err != nil {
 		return nil, err
@@ -1262,9 +1270,12 @@ func preparePrintPageState(ctx context.Context, ticket *PrintSettings, config pr
 	if opts.stripPrivate {
 		model = printStripPrivateExtensions(model)
 	}
-	validated, err := validatePrintSettingsModel(model, configuration, printDocumentTicket)
-	if err != nil {
-		return state, err
+	validated := model
+	if !opts.validated {
+		validated, err = validatePrintSettingsModel(model, configuration, printDocumentTicket)
+		if err != nil {
+			return state, err
+		}
 	}
 	control := newPrintLayoutSettings(validated, configuration)
 	hasPoster, hasWatermark, hasOutputColor, hasResolution := false, false, false, false

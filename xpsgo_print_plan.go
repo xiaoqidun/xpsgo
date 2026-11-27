@@ -27,7 +27,6 @@ import (
 	"math/big"
 	"slices"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 )
 
@@ -126,16 +125,15 @@ type PrintPlan struct {
 	Signatures        *PrintSignatureReport
 }
 
-// PrintPlanOptions 设置有效票据、介质、作业编排预算及忽略策略，零值预算采用默认上限
-// MaxSheets和MaxPlacements限制纸张与页面放置数，MaxWork限制票据与编排步骤，IgnoreUnsupportedFeatures跳过设备控制Feature
+// PrintPlanOptions 设置有效票据、介质与作业编排预算，零值预算采用默认上限
+// MaxSheets和MaxPlacements限制纸张与页面放置数，MaxWork限制票据与编排步骤，忽略策略统一由Print.IgnoreUnsupportedFeatures配置
 // Signatures设置整包签名检查，需要错误报告时须提供包内报告页并在末尾追加独立单面纸
 type PrintPlanOptions struct {
-	Print                     PrintLayoutOptions
-	MaxSheets                 int
-	MaxPlacements             int
-	MaxWork                   uint64
-	Signatures                *PrintSignatureOptions
-	IgnoreUnsupportedFeatures bool
+	Print         PrintLayoutOptions
+	MaxSheets     int
+	MaxPlacements int
+	MaxWork       uint64
+	Signatures    *PrintSignatureOptions
 }
 
 // printPlanPage 保存可重复编排的轻量页面描述，不保留已解析场景或票据树
@@ -345,7 +343,7 @@ type PrintTicketSummary struct {
 	ColorPlan             *PrintColorPlan
 }
 
-// PrintPageMapping 保存源页面在打印计划某张纸面中的放置索引、独立放置副本及所在纸面上下文
+// PrintPageMapping 保存源页面在打印计划某张纸面中的放置索引、独立放置副本及所在纸面信息
 type PrintPageMapping struct {
 	SheetIndex        int
 	IsBack            bool
@@ -487,7 +485,7 @@ func (r *Reader) PrintPlan(ctx context.Context, options *PrintPlanOptions) (*Pri
 	if err != nil {
 		return nil, err
 	}
-	settings.ignoreUnsupported = configuration.IgnoreUnsupportedFeatures || configuration.Print.IgnoreUnsupportedFeatures
+	settings.ignoreUnsupported = configuration.Print.IgnoreUnsupportedFeatures
 	if len(r.pages) > settings.Limits.MaxPageCount {
 		return nil, fmt.Errorf("%w: print plan input page count", ErrLimit)
 	}
@@ -866,17 +864,15 @@ func clonePrintPlacements(source []PrintPlacement) []PrintPlacement {
 	return result
 }
 
-// parsePrintPageRangeSpans 严格校验并解析DocumentPageRanges词法为闭区间列表，禁止任何空白字符
+// parsePrintPageRangeSpans 校验并解析DocumentPageRanges词法为闭区间列表，按Print Schema规范忽略分隔空白并拒绝数字内部空白断裂
 // 入参: text 原始范围文本, options 数值预算及取消配置
 // 返回: []printPageRangeSpan 闭区间列表, error 词法、数值预算或取消错误
 func parsePrintPageRangeSpans(text string, options printSettingsConfig) ([]printPageRangeSpan, error) {
 	if text == "" {
 		return nil, checkContext(options.context)
 	}
-	for _, r := range text {
-		if unicode.IsSpace(r) {
-			return nil, fmt.Errorf("%w: print page range whitespace", ErrInvalid)
-		}
+	if strings.TrimSpace(text) == "" {
+		return nil, fmt.Errorf("%w: empty print page range", ErrInvalid)
 	}
 	var spans []printPageRangeSpan
 	for {
@@ -889,7 +885,8 @@ func parsePrintPageRangeSpans(text string, options printSettingsConfig) ([]print
 			endText = startText
 		}
 		var bounds [2]*big.Int
-		for index, number := range []string{startText, endText} {
+		for index, raw := range []string{startText, endText} {
+			number := strings.TrimSpace(raw)
 			if number == "" {
 				return nil, fmt.Errorf("%w: empty print page range endpoint", ErrInvalid)
 			}
@@ -913,7 +910,7 @@ func parsePrintPageRangeSpans(text string, options printSettingsConfig) ([]print
 	return spans, nil
 }
 
-// printPageRanges 解析严格范围词法，遵循Print Schema规范禁止任何空白字符，保留列表顺序、重复页和反向区间，先裁至文档范围再展开
+// printPageRanges 解析范围词法，按Print Schema规范忽略分隔空白，保留列表顺序、重复页和反向区间，先裁至文档范围再展开
 // 入参: text 原始范围文本，空表示全部, count 文档页数, maximum 输出选择上限, options 数值及取消参数
 // 返回: []int 零基页号, bool 是否含越界页, error 词法、数量、资源或取消错误
 func printPageRanges(text string, count, maximum int, options printSettingsConfig) ([]int, bool, error) {
@@ -1101,8 +1098,9 @@ func (b *printPlanBuilder) page(index int, source string, document *PrintSetting
 	if err != nil {
 		return result, err
 	}
-	ignoreUnsupported := b.options.IgnoreUnsupportedFeatures || b.options.Print.IgnoreUnsupportedFeatures
+	ignoreUnsupported := b.settings.ignoreUnsupported
 	state, err := preparePrintPageState(b.settings.context, model, b.settings, nil, PrintMedia{}, printPageStateOptions{
+		validated:            true,
 		stripSignatures:      b.signatures != nil,
 		stripPlanFeatures:    true,
 		ignoreUnsupported:    ignoreUnsupported,
@@ -1140,7 +1138,7 @@ func (b *printPlanBuilder) page(index int, source string, document *PrintSetting
 	return result, nil
 }
 
-// merge 复用票据链校验与根设置合并，同一票据载荷仅从封装读取一次，无独立票据时通过纯内存预算校验直接复用基线
+// merge 复用票据链校验与内部免重复校验合并路径，同一票据载荷仅从封装读取一次，无独立票据时直接复用已校验基线
 // 入参: source 固定布局源部件, base 已继承设置
 // 返回: *PrintSettings 独立有效设置, error 读取、合并、预算或取消错误
 func (b *printPlanBuilder) merge(source string, base *PrintSettings) (*PrintSettings, error) {
@@ -1159,10 +1157,7 @@ func (b *printPlanBuilder) merge(source string, base *PrintSettings) (*PrintSett
 		if err != nil {
 			return nil, err
 		}
-		size, err := printSettingsEncodedSize(validated, b.settings, printDocumentTicket)
-		if err != nil {
-			return nil, err
-		}
+		size := printSettingsApproxBytes(validated)
 		if err := b.step(uint64(size) * 3); err != nil {
 			return nil, err
 		}
@@ -1173,21 +1168,17 @@ func (b *printPlanBuilder) merge(source string, base *PrintSettings) (*PrintSett
 		return validated, nil
 	}
 	size, ok := b.validated[base]
-	if !ok || size < 0 {
-		checked := base
-		if !ok {
-			checked, err = validatePrintSettingsModel(base, b.settings, printDocumentTicket)
-			if err != nil {
-				return nil, err
-			}
-		}
-		size, err = printSettingsEncodedSize(checked, b.settings, printDocumentTicket)
+	if !ok {
+		validated, err := validatePrintSettingsModel(base, b.settings, printDocumentTicket)
 		if err != nil {
 			return nil, err
 		}
-		if ok {
-			b.validated[base] = size
+		if b.settings.ignoreUnsupported {
+			validated = printStripPrivateExtensions(validated)
 		}
+		base = validated
+		size = printSettingsApproxBytes(base)
+		b.validated[base] = size
 	}
 	if err := b.step(uint64(size) * 3); err != nil {
 		return nil, err
@@ -1211,15 +1202,36 @@ func (b *printPlanBuilder) merge(source string, base *PrintSettings) (*PrintSett
 	if err != nil {
 		return nil, &PartError{Part: ticket.Part, Err: err}
 	}
-	merged, err := MergePrintSettings(b.settings.context, base, delta, &b.settings.PrintSettingsOptions)
+	if b.settings.ignoreUnsupported {
+		delta = printStripPrivateExtensions(delta)
+	}
+	merged, err := mergePrintSettingsInternal(base, delta, b.settings)
 	if err != nil {
 		return nil, err
 	}
-	if b.settings.ignoreUnsupported {
-		merged = printStripPrivateExtensions(merged)
-	}
-	b.validated[merged] = -1
+	b.validated[merged] = printSettingsApproxBytes(merged)
 	return merged, nil
+}
+
+// printSettingsApproxBytes 在纯内存中快速估算已校验设置树的工作计费字节规模，避免热路径模拟完整XML编码
+// 入参: settings 打印设置模型
+// 返回: int64 估算字节规模
+func printSettingsApproxBytes(settings *PrintSettings) int64 {
+	var walk func([]PrintSetting) int64
+	walk = func(items []PrintSetting) int64 {
+		var total int64
+		for _, item := range items {
+			total += int64(len(item.Name.Local)) + 16
+			if item.Value != nil {
+				total += int64(len(item.Value.Text)) + int64(len(item.Value.QName.Local)) + 8
+			}
+			if len(item.Children) > 0 {
+				total += walk(item.Children)
+			}
+		}
+		return total
+	}
+	return 32 + walk(settings.Elements)
 }
 
 // printParamValue 按Print Schema公共关键字命名空间优先级查找参数值
@@ -2615,42 +2627,52 @@ func printSignatureEvidence(entry PrintSignatureResult) int {
 	return count
 }
 
+// buildSignatureErrorSheet 按打印签名配置读取错误报告固定页并构造独立单面报告纸
+// 入参: reader 完整只读阅读器
+// 返回: PrintSheet 错误报告纸张, error 报告页、布局、预算或取消错误
+func (b *printPlanBuilder) buildSignatureErrorSheet(reader *Reader) (PrintSheet, error) {
+	if b.options.Signatures == nil || b.options.Signatures.ReportPage == "" {
+		return PrintSheet{}, fmt.Errorf("%w: signature error report requires a FixedPage", ErrUnsupported)
+	}
+	part, err := opcPartName(b.options.Signatures.ReportPage)
+	if err != nil {
+		return PrintSheet{}, err
+	}
+	size, err := reader.pkg.partSize(strings.ToLower(part))
+	if err != nil {
+		return PrintSheet{}, err
+	}
+	if err := b.step(size); err != nil {
+		return PrintSheet{}, err
+	}
+	if actual := reader.pkg.names[strings.ToLower(part)]; actual != "" {
+		part = actual
+	}
+	root, err := reader.readFixedPartLoader(part, "fixedpage", "FixedPage", nil, b.settings.context)
+	if err != nil {
+		return PrintSheet{}, err
+	}
+	page, err := parsePageHeader(root, part, reader.format)
+	if err != nil {
+		return PrintSheet{}, err
+	}
+	layout, err := (&PrintSettings{Version: 1}).Layout(b.settings.context, page, b.options.Print.Media, &b.settings.PrintSettingsOptions)
+	if err != nil {
+		return PrintSheet{}, err
+	}
+	placement := PrintPlacement{Page: -1, DocumentIndex: -1, Part: part, Transform: layout.Transform, PageClip: layout.PageClip, MediaClip: layout.MediaClip}
+	return PrintSheet{Front: PrintSide{Width: layout.Width, Height: layout.Height, MediaClip: layout.MediaClip, Pages: []PrintPlacement{placement}}, Duplex: PrintSimplex}, nil
+}
+
 // finish 在正文编排完成后按需在计划末尾追加独立错误报告纸
 // 入参: plan 已完成正文编排的私有计划
 // 返回: *PrintPlan 完整计划，失败为空, error 报告页、容量或取消错误
 func (b *printPlanBuilder) finish(plan *PrintPlan) (*PrintPlan, error) {
 	if b.signatures != nil && b.signatures.NeedsErrorSheet {
-		if b.options.Signatures == nil || b.options.Signatures.ReportPage == "" {
-			return nil, fmt.Errorf("%w: signature error report requires a FixedPage", ErrUnsupported)
-		}
-		part, err := opcPartName(b.options.Signatures.ReportPage)
+		sheet, err := b.buildSignatureErrorSheet(b.reader)
 		if err != nil {
 			return nil, err
 		}
-		size, err := b.reader.pkg.partSize(strings.ToLower(part))
-		if err != nil {
-			return nil, err
-		}
-		if err := b.step(size); err != nil {
-			return nil, err
-		}
-		if actual := b.reader.pkg.names[strings.ToLower(part)]; actual != "" {
-			part = actual
-		}
-		root, err := b.reader.readFixedPartLoader(part, "fixedpage", "FixedPage", nil, b.settings.context)
-		if err != nil {
-			return nil, err
-		}
-		page, err := parsePageHeader(root, part, b.reader.format)
-		if err != nil {
-			return nil, err
-		}
-		layout, err := (&PrintSettings{Version: 1}).Layout(b.settings.context, page, b.options.Print.Media, &b.settings.PrintSettingsOptions)
-		if err != nil {
-			return nil, err
-		}
-		placement := PrintPlacement{Page: -1, DocumentIndex: -1, Part: part, Transform: layout.Transform, PageClip: layout.PageClip, MediaClip: layout.MediaClip}
-		sheet := PrintSheet{Front: PrintSide{Width: layout.Width, Height: layout.Height, MediaClip: layout.MediaClip, Pages: []PrintPlacement{placement}}, Duplex: PrintSimplex}
 		if err := b.appendSheet(plan, sheet, false); err != nil {
 			return nil, err
 		}
@@ -3339,7 +3361,7 @@ func printSideVisibleRegions(mediaClip Rect, gutter *Rect) ([]Rect, bool) {
 	return visible, ok && len(visible) > 0
 }
 
-// MapPage 查找指定零基源页面在打印计划全部纸张正反面中的所有放置映射，返回含所在纸面上下文的独立副本列表
+// MapPage 查找指定零基源页面在打印计划全部纸张正反面中的所有放置映射，返回含所在纸面信息的独立副本列表
 // 入参: sourcePage 零基源页面序号
 // 返回: []PrintPageMapping 按纸张与面顺序排列的放置映射切片
 func (p *PrintPlan) MapPage(sourcePage int) []PrintPageMapping {

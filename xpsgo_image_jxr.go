@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"io"
 	"math"
 	"sync"
 
@@ -956,14 +957,24 @@ func jxrImageError(err error) error {
 // 入参: ctx 已规范化取消Context, data JPEG XR字节数据, part 部件包根URI, media 内容类型, maxBytes 字节上限
 // 返回: *ImageInfo 主图视觉头元数据, error 容器、目录、预算或取消错误
 func readJXRImageInfo(ctx context.Context, data []byte, part, media string, maxBytes uint64) (*ImageInfo, error) {
+	return readJXRImageInfoAt(ctx, bytes.NewReader(data), int64(len(data)), part, media, maxBytes)
+}
+
+// readJXRImageInfoAt 基于io.ReaderAt解析JPEG XR容器主图文件头元数据，不触发像素解码或整图缓冲
+// 入参: ctx 已规范化取消Context, ra 图像按需随机读取器, size 图像逻辑总字节数, part 部件包根URI, media 内容类型, maxBytes 字节上限
+// 返回: *ImageInfo 主图视觉头元数据, error 容器、目录、预算或取消错误
+func readJXRImageInfoAt(ctx context.Context, ra io.ReaderAt, size int64, part, media string, maxBytes uint64) (*ImageInfo, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
-	if maxBytes > 0 && uint64(len(data)) > maxBytes {
+	if size < 0 {
+		return nil, fmt.Errorf("%w: negative JPEG XR size", ErrInvalid)
+	}
+	if maxBytes > 0 && uint64(size) > maxBytes {
 		return nil, fmt.Errorf("%w: JPEG XR input byte budget", ErrLimit)
 	}
-	limits := jxrgo.Limits{MaxInputBytes: uint64(max(1, len(data))), MaxPixels: uint64(rasterMaxDimension) * uint64(rasterMaxDimension), MaxMemoryBytes: jxrDecodeMemoryLimit(uint64(len(data)), 1<<24, maxBytes)}
-	decoder, err := jxrgo.NewDecoderAt(ctx, bytes.NewReader(data), int64(len(data)), &jxrgo.DecodeOptions{Workers: 1, Limits: limits})
+	limits := jxrgo.Limits{MaxInputBytes: uint64(max(1, size)), MaxPixels: uint64(rasterMaxDimension) * uint64(rasterMaxDimension), MaxMemoryBytes: jxrDecodeMemoryLimit(uint64(size), 1<<24, maxBytes)}
+	decoder, err := jxrgo.NewDecoderAt(ctx, ra, size, &jxrgo.DecodeOptions{Workers: 1, Limits: limits})
 	if err != nil {
 		return nil, jxrImageError(err)
 	}

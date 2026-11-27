@@ -256,6 +256,26 @@ type fontUsageCollector struct {
 	context  context.Context
 }
 
+// fontUsageAltState 跟踪单遍FontUsage扫描中的AlternateContent结构校验状态
+type fontUsageAltState struct {
+	depth         int
+	contentDepths []int
+	choices       int
+	fallbackSeen  bool
+	isRoot        bool
+	selected      bool
+	branchActive  bool
+	branchDepths  []int
+	rootElements  int
+}
+
+// fontUsageMCEChecker 在单遍词元扫描中补充校验MCE控制结构、根元素约束与属性合法性
+type fontUsageMCEChecker struct {
+	tracker *resourceMarkupScopeTracker
+	alts    []fontUsageAltState
+	depth   int
+}
+
 // readFontFaceLimit 按实际解压数据限制字体读取，不仅依赖ZIP声明的部件长度
 // 入参: part 字体部件URI, index 字体面索引, maximum 本次读取上限
 // 返回: *fontFace 已解除混淆的字体面, error 字体、封装或预算错误
@@ -1057,6 +1077,20 @@ func (f *FontResource) RuneGlyph(r rune) (uint16, bool) {
 	return gid, true
 }
 
+// RuneVariationGlyph 按字体cmap Format 14变体序列子表查找Unicode码点与变体选择符对应的字形编号，支持默认与非默认UVS
+// 入参: r 基础Unicode码点, variationSelector 变体选择符Unicode码点
+// 返回: uint16 命中的字形编号, bool 是否命中有效非零UVS字形
+func (f *FontResource) RuneVariationGlyph(r, variationSelector rune) (uint16, bool) {
+	if f == nil || f.source == nil {
+		return 0, false
+	}
+	gid, found, err := f.source.variationGlyphIndex(r, variationSelector)
+	if err != nil || !found || gid == 0 {
+		return 0, false
+	}
+	return gid, true
+}
+
 // fontResourceEmbedding 提取OS/2原始fsType标志并归类嵌入许可级别及受限状态
 // 入参: os2 已解析的OS/2度量，无OS/2表时为nil
 // 返回: uint16 原始fsType标志, FontEmbeddingPermission 许可级别, bool 是否禁止编辑、子集化或矢量轮廓嵌入
@@ -1236,15 +1270,18 @@ func parseFontResourceNames(face *fontFace) fontResourceNameSet {
 			}
 		}
 	}
-	if family == "" {
-		family = typoFamily
-	}
+	resolvedFamily := typoFamily
 	resolvedSubfamily := typoSubfamily
-	if resolvedSubfamily == "" {
+	if resolvedFamily != "" {
+		if resolvedSubfamily == "" {
+			resolvedSubfamily = subfamily
+		}
+	} else {
+		resolvedFamily = family
 		resolvedSubfamily = subfamily
 	}
 	return fontResourceNameSet{
-		family:     family,
+		family:     resolvedFamily,
 		subfamily:  resolvedSubfamily,
 		full:       fullName,
 		postScript: postScript,
@@ -1834,7 +1871,7 @@ func (m *fontMetrics) verticalOrigin(gid uint16, glyphYMax float64) (Point, erro
 			return Point{}, err
 		}
 		origin.Y = glyphYMax + float64(bearing)
-	case m.os2 != nil:
+	case m.os2 != nil && (m.os2.typoAscender != 0 || m.os2.typoDescender != 0):
 		origin.Y = float64(m.os2.typoAscender)
 	default:
 		origin.Y = float64(m.hhea.ascender)
@@ -2168,8 +2205,6 @@ func collectFontUsage(ctx context.Context, r *Reader, options *OptimizationOptio
 	if collectImplicit {
 		c.implicit = make(map[fontCacheKey]map[rune]uint16)
 	}
-	namespace := formatNamespace(r.format)
-	keyNS := namespace + "/resourcedictionary-key"
 	for _, key := range slices.Sorted(maps.Keys(r.pkg.parts)) {
 		if err := c.charge(1); err != nil {
 			return nil, nil, err
@@ -2196,20 +2231,20 @@ func collectFontUsage(ctx context.Context, r *Reader, options *OptimizationOptio
 		if !markup {
 			continue
 		}
-		limit := min(r.limits.MaxMetadataBytes, r.limits.MaxPartBytes, c.fonts.remaining)
+		limit := min(signaturePartByteLimit(part, opcMediaTypeBase(media), r.limits), c.fonts.remaining)
 		data, err := r.pkg.readItems(key, limit)
 		if err != nil {
 			return nil, nil, err
 		}
 		c.fonts.remaining -= int64(len(data))
-		tracker := newResourceMarkupScopeTracker(r.format, r.format == FormatOpenXPS, ctx)
-		root, err := decodeXMLVisit(data, r.limits, func(token xml.Token, node *xmlElement) error {
+		checker := fontUsageMCEChecker{tracker: newResourceMarkupScopeTracker(r.format, r.format == FormatOpenXPS, ctx)}
+		_, err = decodeXMLVisit(data, r.limits, func(token xml.Token, node *xmlElement) error {
 			if _, start := token.(xml.StartElement); start {
 				if err := c.charge(1); err != nil {
 					return err
 				}
 			}
-			skip, _, err := tracker.visit(token, node)
+			skip, err := checker.visit(token, node)
 			if err != nil {
 				return err
 			}
@@ -2222,9 +2257,6 @@ func collectFontUsage(ctx context.Context, r *Reader, options *OptimizationOptio
 			return c.element(part, node)
 		})
 		if err != nil {
-			return nil, nil, &PartError{Part: part, Err: err}
-		}
-		if _, err := preprocessXMLContext(root, []string{namespace, keyNS, structureNamespace(r.format)}, ctx); err != nil {
 			return nil, nil, &PartError{Part: part, Err: err}
 		}
 	}
@@ -2272,6 +2304,130 @@ func (c *fontUsageCollector) charge(count int) error {
 	}
 	c.work -= count
 	return nil
+}
+
+// visit 在单遍XML词元遍历中同步执行MCE作用域追踪、AlternateContent结构校验与属性合法性检验
+// 入参: token 当前XML词元, node 当前元素节点
+// 返回: bool 是否跳过Glyphs收集, error MCE结构、属性或未支持命名空间错误
+func (m *fontUsageMCEChecker) visit(token xml.Token, node *xmlElement) (bool, error) {
+	if _, end := token.(xml.EndElement); end {
+		if m.tracker.ignoredDepth == 0 && len(m.alts) != 0 {
+			top := &m.alts[len(m.alts)-1]
+			if m.depth == top.depth {
+				choices, isRoot, rootElements := top.choices, top.isRoot, top.rootElements
+				m.alts = m.alts[:len(m.alts)-1]
+				m.depth--
+				_, _, err := m.tracker.visit(token, node)
+				if err != nil {
+					return false, err
+				}
+				if choices == 0 {
+					return false, fmt.Errorf("%w: AlternateContent requires a Choice", ErrInvalid)
+				}
+				if isRoot && rootElements != 1 {
+					return false, fmt.Errorf("%w: AlternateContent root must expand to one element", ErrInvalid)
+				}
+				return true, nil
+			}
+			if len(top.contentDepths) != 0 && m.depth == top.contentDepths[len(top.contentDepths)-1] {
+				top.contentDepths = top.contentDepths[:len(top.contentDepths)-1]
+			}
+			if top.branchActive && len(top.branchDepths) != 0 && m.depth == top.branchDepths[len(top.branchDepths)-1] {
+				top.branchDepths = top.branchDepths[:len(top.branchDepths)-1]
+				if len(top.branchDepths) == 0 {
+					top.branchActive = false
+				}
+			}
+		}
+		m.depth--
+		_, _, err := m.tracker.visit(token, node)
+		return true, err
+	}
+	if data, ok := token.(xml.CharData); ok {
+		if m.tracker.ignoredDepth == 0 && len(m.alts) != 0 {
+			top := &m.alts[len(m.alts)-1]
+			if m.depth == top.contentDepths[len(top.contentDepths)-1] && len(compatibilityWords(string(data))) != 0 {
+				return false, fmt.Errorf("%w: text directly inside AlternateContent", ErrInvalid)
+			}
+		}
+		_, _, err := m.tracker.visit(token, node)
+		return true, err
+	}
+	if _, start := token.(xml.StartElement); !start {
+		_, _, err := m.tracker.visit(token, node)
+		return true, err
+	}
+	parentDepth := m.depth
+	wasIgnored := m.tracker.ignoredDepth > 0
+	skip, scope, err := m.tracker.visit(token, node)
+	if err != nil {
+		return false, err
+	}
+	m.depth++
+	if wasIgnored {
+		return skip, nil
+	}
+	if m.depth == 1 && node.Name != (xml.Name{Space: mcNamespace, Local: "AlternateContent"}) && skip {
+		return false, fmt.Errorf("%w: root element removed by MCE", ErrInvalid)
+	}
+	if len(m.alts) != 0 {
+		top := &m.alts[len(m.alts)-1]
+		if parentDepth == top.contentDepths[len(top.contentDepths)-1] {
+			if node.Name.Space == mcNamespace && (node.Name.Local == "Choice" || node.Name.Local == "Fallback") {
+				if top.fallbackSeen {
+					return false, fmt.Errorf("%w: misplaced %s inside AlternateContent", ErrInvalid, node.Name.Local)
+				}
+				if err := compatibilityNoXMLContext(node); err != nil {
+					return false, err
+				}
+				if err := m.tracker.processor.validateAttributes(node, scope, true); err != nil {
+					return false, err
+				}
+				if node.Name.Local == "Choice" {
+					top.choices++
+				} else {
+					top.fallbackSeen = true
+				}
+				if top.isRoot && !top.selected {
+					top.selected = true
+					top.branchActive = true
+					top.branchDepths = []int{m.depth}
+				}
+				return true, nil
+			}
+			if skip && m.tracker.ignoredDepth == 0 {
+				top.contentDepths = append(top.contentDepths, m.depth)
+				return true, nil
+			}
+			return false, fmt.Errorf("%w: unexpected child %s inside AlternateContent", ErrInvalid, node.Name.Local)
+		}
+		if top.isRoot && top.branchActive && parentDepth == top.branchDepths[len(top.branchDepths)-1] {
+			if skip && m.tracker.ignoredDepth == 0 {
+				top.branchDepths = append(top.branchDepths, m.depth)
+			} else if !skip {
+				top.rootElements++
+			}
+		}
+	}
+	if node.Name.Space == mcNamespace {
+		if node.Name.Local != "AlternateContent" {
+			return false, fmt.Errorf("%w: unexpected MCE element %s", ErrInvalid, node.Name.Local)
+		}
+		if err := compatibilityNoXMLContext(node); err != nil {
+			return false, err
+		}
+		if err := m.tracker.processor.validateAttributes(node, scope, true); err != nil {
+			return false, err
+		}
+		m.alts = append(m.alts, fontUsageAltState{depth: m.depth, contentDepths: []int{m.depth}, isRoot: m.depth == 1})
+		return true, nil
+	}
+	if !skip {
+		if err := m.tracker.processor.validateAttributes(node, scope, false); err != nil {
+			return false, err
+		}
+	}
+	return skip, nil
 }
 
 // element 校验Glyphs原始属性并汇总字形，不过滤兼容分支或不可见内容

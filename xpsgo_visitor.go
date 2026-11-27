@@ -412,6 +412,12 @@ func (e WalkGlyphsEvent) Element() Element {
 	return e.element
 }
 
+// FontMetrics 返回已解析字体的设计单位每em数、上升部与下降部度量，未加载字体或字体不可用时返回零值
+// 返回: float64 每em设计单位数, float64 上升部设计度量, float64 下降部设计度量
+func (e WalkGlyphsEvent) FontMetrics() (unitsPerEm, ascender, descender float64) {
+	return e.unitsPerEm, e.ascender, e.descender
+}
+
 // Bounds 按字形定位、步进向量与字体升降部计算页面空间轴对齐外包矩形
 // 空字形列表或无效字号返回零矩形
 // 返回: Rect 页面或纸面坐标系中的文字外包矩形
@@ -513,23 +519,7 @@ func (r *Reader) Walk(ctx context.Context, pageIndex int, visitor *SceneVisitor,
 	if err != nil {
 		return err
 	}
-	walker := newSceneWalker(r, visitor, config)
-	initial := WalkState{
-		PagePart:       page.Part,
-		PageWidth:      page.Width,
-		PageHeight:     page.Height,
-		PageContentBox: page.ContentBox,
-		PageBleedBox:   page.BleedBox,
-		Index:          pageIndex,
-		DocumentIndex:  docIndex,
-		PageIndex:      localIndex,
-		PlacementIndex: -1,
-		Matrix:         config.rootTransform,
-		Clip:           walkPageRootClips(page, config.rootTransform),
-		Opacity:        1,
-		Language:       page.Language,
-	}
-	return walker.walkPageElements(ctx, page.Diagnostics, page.Elements, initial)
+	return r.walkPageModel(ctx, page, pageIndex, docIndex, localIndex, visitor, config)
 }
 
 // WalkPart 按页面部件URI遍历固定页面场景，支持未列入主索引的辅助页面
@@ -548,6 +538,13 @@ func (r *Reader) WalkPart(ctx context.Context, part string, visitor *SceneVisito
 	if err != nil {
 		return err
 	}
+	return r.walkPageModel(ctx, page, globalIndex, docIndex, localIndex, visitor, config)
+}
+
+// walkPageModel 在不持有阅读器读锁的条件下遍历已加载的只读页面场景树，供随机及流式页面视图共用
+// 入参: ctx 取消Context, page 已加载只读页面, globalIndex 全局零基页号, docIndex 文档序号, localIndex 文档内局部页号, visitor 事件回调集合, config 归一化遍历配置
+// 返回: error 遍历、资源上限、取消或回调错误
+func (r *Reader) walkPageModel(ctx context.Context, page *Page, globalIndex, docIndex, localIndex int, visitor *SceneVisitor, config walkConfiguration) error {
 	walker := newSceneWalker(r, visitor, config)
 	initial := WalkState{
 		PagePart:       page.Part,
@@ -1040,9 +1037,9 @@ func (w *sceneWalker) walkElement(ctx context.Context, element Element, parent W
 	}
 }
 
-// elementHasInvisibleMetadata 判断透明元素及其子树是否携带超链接或命名锚点元数据
+// elementHasInvisibleMetadata 判断透明元素及其子树是否携带超链接、命名锚点、无障碍属性或隐藏文本元数据
 // 入参: element 待检元素, inheritedURI 继承的超链接URI, depth 当前嵌套深度
-// 返回: bool 是否需要保留遍历以供调用方提取热区或锚点
+// 返回: bool 是否需要保留遍历以供调用方提取热区、无障碍节点或OCR隐藏文字层
 func (w *sceneWalker) elementHasInvisibleMetadata(element Element, inheritedURI string, depth int) bool {
 	if inheritedURI != "" {
 		return true
@@ -1061,16 +1058,35 @@ func (w *sceneWalker) elementHasInvisibleMetadata(element Element, inheritedURI 
 		if props.Name != "" || props.NavigateURI != nil && *props.NavigateURI != "" {
 			return true
 		}
-		if canvas, ok := el.(*Canvas); ok {
-			for _, child := range canvas.Elements {
+		switch typed := el.(type) {
+		case *Canvas:
+			if typed.AutomationName != "" || typed.AutomationHelpText != "" {
+				return true
+			}
+			for _, child := range typed.Elements {
 				if scan(child, d+1) {
 					return true
 				}
+			}
+		case *Path:
+			if typed.AutomationName != "" || typed.AutomationHelpText != "" {
+				return true
+			}
+		case *Glyphs:
+			if typed.Text != "" || len(typed.Indices) > 0 {
+				return true
 			}
 		}
 		return false
 	}
 	return scan(element, depth)
+}
+
+// pathHasInvisibleMetadata 判断路径元素是否携带超链接、名称或无障碍属性元数据
+// 入参: path 路径元素, inheritedURI 当前有效超链接URI
+// 返回: bool 是否需要作为不可见逻辑热区或无障碍元素保留
+func pathHasInvisibleMetadata(path *Path, inheritedURI string) bool {
+	return inheritedURI != "" || path.Name != "" || path.AutomationName != "" || path.AutomationHelpText != ""
 }
 
 // walkCanvas 发出Canvas进入与离开组事件并按声明顺序遍历子元素
@@ -1214,7 +1230,7 @@ func (w *sceneWalker) pathFallbackReasonsWithImage(ctx context.Context, path *Pa
 // 入参: ctx 取消Context, path 路径元素, state 当前有效状态, depth 元素深度, brushDepth 画刷深度
 // 返回: error 遍历或回调错误
 func (w *sceneWalker) walkPath(ctx context.Context, path *Path, state WalkState, depth, brushDepth int) error {
-	invisibleMeta := w.config.includeInvisible && (state.NavigateURI != "" || path.Name != "")
+	invisibleMeta := w.config.includeInvisible && pathHasInvisibleMetadata(path, state.NavigateURI)
 	if path.Fill == nil && path.Stroke == nil {
 		if !invisibleMeta {
 			return nil
@@ -1408,7 +1424,7 @@ func (w *sceneWalker) emitImageBrush(ctx context.Context, path *Path, state Walk
 			}
 		}
 		if transformOK && geometryMatrixSingular(brushMatrix) {
-			if brush.TileMode == TileNone {
+			if brush.TileMode == TileNone && !keepStroke && !(w.config.includeInvisible && pathHasInvisibleMetadata(path, state.NavigateURI)) {
 				return nil
 			}
 			w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "ImageBrush", Attribute: "Transform", Message: "singular image brush transform"})
@@ -1599,6 +1615,9 @@ func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *
 			w.reportDiagnostic(Diagnostic{Part: state.PagePart, Element: "VisualBrush", Attribute: "Transform", Message: "singular tiled visual brush transform"})
 			return false, baseReason, nil
 		}
+		if w.config.includeInvisible && pathHasInvisibleMetadata(path, state.NavigateURI) && path.Stroke == nil {
+			return false, FallbackNone, nil
+		}
 		return true, FallbackNone, nil
 	}
 	if !geometryFinite(brush.Viewbox.X, brush.Viewbox.Y, brush.Viewbox.Width, brush.Viewbox.Height, brush.Viewport.X, brush.Viewport.Y, brush.Viewport.Width, brush.Viewport.Height) || brush.Viewbox.Width <= 0 || brush.Viewbox.Height <= 0 || brush.Viewport.Width <= 0 || brush.Viewport.Height <= 0 {
@@ -1620,6 +1639,9 @@ func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *
 	}
 	effectiveOpacity := colorClamp(state.Opacity * brush.Opacity)
 	if effectiveOpacity == 0 {
+		if w.config.includeInvisible && pathHasInvisibleMetadata(path, state.NavigateURI) && path.Stroke == nil {
+			return false, FallbackNone, nil
+		}
 		return true, FallbackNone, nil
 	}
 	clipAliased := state.EdgeMode == EdgeModeAliased
@@ -1688,10 +1710,10 @@ func (w *sceneWalker) expandVisualBrush(ctx context.Context, path *Path, brush *
 // 入参: ctx 取消Context, glyphs 字形元素, state 当前有效状态
 // 返回: error 资源上限、取消或回调错误
 func (w *sceneWalker) walkGlyphs(ctx context.Context, glyphs *Glyphs, state WalkState) error {
-	if w.visitor.Glyphs == nil || glyphs.FontRenderingEmSize == 0 {
+	if w.visitor.Glyphs == nil {
 		return nil
 	}
-	if glyphs.Fill == nil && !(w.config.includeInvisible && (state.NavigateURI != "" || glyphs.Name != "")) {
+	if !w.config.includeInvisible && (glyphs.FontRenderingEmSize == 0 || glyphs.Fill == nil) {
 		return nil
 	}
 	fontPart := glyphs.FontPart

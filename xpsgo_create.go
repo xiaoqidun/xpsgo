@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/xml"
 	"fmt"
@@ -54,13 +55,14 @@ type PackageOptions struct {
 	Compact        bool
 }
 
-// AddFontOptions 设置字体嵌入时的混淆策略、内容去重与TTC/OTC集合面索引
+// AddFontOptions 设置字体嵌入时的混淆策略、内容去重、TTC/OTC集合面索引与单面提取策略
 // Obfuscate为nil时默认按ODTTF混淆嵌入，设为false时仅允许无限制字体按OpenType明文嵌入
-// Deduplicate为true时按内容摘要与字节比对复用已嵌入部件；CollectionIndex指定TTC/OTC返回的#index面索引
+// Deduplicate为true时按内容摘要与字节比对复用已嵌入部件；CollectionIndex指定TTC/OTC目标面索引；ExtractCollectionFace为true时仅校验并提取指定集合面为独立单面字体嵌入
 type AddFontOptions struct {
-	Obfuscate       *bool
-	Deduplicate     bool
-	CollectionIndex int
+	Obfuscate             *bool
+	Deduplicate           bool
+	CollectionIndex       int
+	ExtractCollectionFace bool
 }
 
 // Package 持有独立的文档、页面和资源数据，修改成功后才更新状态，支持并发读取及串行修改
@@ -88,6 +90,9 @@ type Package struct {
 	dirtyRels      map[string]bool
 	deleted        map[string]bool
 	protected      map[string]bool
+	partHashes     map[[32]byte][]string
+	fontHashes     map[[32]byte][]string
+	hashPartsCount int
 }
 
 // packagePart 保存不可修改的部件数据，来源参数在写入模型时复制
@@ -108,9 +113,13 @@ type packageItem struct {
 // createdNavigationKind 表示固定布局部件的导航地址角色
 type createdNavigationKind uint8
 
-// createdNavigation 保存当前固定布局的部件角色，供写出前检查内部链接地址
+// createdNavigation 保存当前固定布局的部件角色、页数与目标锚点索引，供写出前检查内部链接与大纲目标
 type createdNavigation struct {
-	parts map[string]createdNavigationKind
+	parts         map[string]createdNavigationKind
+	pageCount     int
+	docTargets    map[string]map[string]bool
+	allTargets    map[string]bool
+	existingParts map[string]bool
 }
 
 // createdStoryGraph 保存单次关联校验的预算和私有索引，共享部件按各引用位置绑定
@@ -363,9 +372,9 @@ func (p *Package) AddFont(data []byte) (string, error) {
 	return p.AddFontWithOptions(context.Background(), data, nil)
 }
 
-// AddFontWithOptions 按指定选项校验许可、可选去重与混淆嵌入字体，对TTC/OTC集合返回带#index的FontUri
+// AddFontWithOptions 按指定选项校验许可、可选单面提取、去重与混淆嵌入字体，整份TTC/OTC集合返回带#index的FontUri
 // 入参: ctx 取消Context，nil采用Background, data 原始OpenType/TrueType或TTC/OTC字体字节, options 嵌入选项，nil默认混淆
-// 返回: string 字体部件URI，集合字体附加#index片段, error 字体格式、许可、索引、取消或资源错误
+// 返回: string 字体部件URI，保留集合封装时附加#index片段, error 字体格式、许可、索引、取消或资源错误
 func (p *Package) AddFontWithOptions(ctx context.Context, data []byte, options *AddFontOptions) (string, error) {
 	ctx = normalizeContext(ctx)
 	if err := checkContext(ctx); err != nil {
@@ -378,21 +387,29 @@ func (p *Package) AddFontWithOptions(ctx context.Context, data []byte, options *
 	obfuscate := true
 	deduplicate := false
 	collectionIndex := 0
+	extractFace := false
 	if options != nil {
 		if options.Obfuscate != nil {
 			obfuscate = *options.Obfuscate
 		}
 		deduplicate = options.Deduplicate
 		collectionIndex = options.CollectionIndex
+		extractFace = options.ExtractCollectionFace
 	}
-	isCollection, isCFF, err := validateEmbeddedFontData(ctx, data, p.limits.MaxPartBytes, obfuscate, collectionIndex)
+	isCollection, isCFF, err := validateEmbeddedFontDataWithPolicy(ctx, data, p.limits.MaxPartBytes, obfuscate, collectionIndex, extractFace)
 	if err != nil {
 		return "", err
 	}
-	media := "application/vnd.ms-package.obfuscated-opentype"
-	if !obfuscate {
-		media = "application/vnd.ms-opentype"
+	if isCollection && extractFace {
+		extracted, faceCFF, extractErr := extractCollectionFaceSFNT(ctx, data, uint32(collectionIndex), p.limits.MaxPartBytes)
+		if extractErr != nil {
+			return "", extractErr
+		}
+		data = extracted
+		isCollection = false
+		isCFF = faceCFF
 	}
+	media, pattern := embeddedFontMediaAndPattern(obfuscate, isCollection, isCFF)
 	if deduplicate {
 		if existing, found := p.findDuplicateFontLocked(data, media, obfuscate); found {
 			if isCollection {
@@ -402,17 +419,9 @@ func (p *Package) AddFontWithOptions(ctx context.Context, data []byte, options *
 		}
 	}
 	var part string
-	pattern := ""
 	if obfuscate {
-		part, err = p.newFontPart()
+		part, err = allocateObfuscatedFontPart(p.available)
 	} else {
-		ext := "ttf"
-		if isCollection {
-			ext = "ttc"
-		} else if isCFF {
-			ext = "otf"
-		}
-		pattern = "/Resources/Fonts/%d." + ext
 		part, err = p.newName(pattern, ctx)
 	}
 	if err != nil {
@@ -438,10 +447,56 @@ func (p *Package) AddFontWithOptions(ctx context.Context, data []byte, options *
 	return part, nil
 }
 
-// validateEmbeddedFontData 校验待嵌入字体的全部字体面格式、索引范围与OS/2嵌入及混淆许可规则
-// 入参: ctx 取消Context, data 原始字体字节, maxBytes 字节上限, obfuscate 是否执行混淆嵌入, collectionIndex 目标字体面索引
-// 返回: bool 是否为TTC/OTC集合, bool 首面是否为CFF轮廓, error 格式、索引、许可、预算或取消错误
-func validateEmbeddedFontData(ctx context.Context, data []byte, maxBytes int64, obfuscate bool, collectionIndex int) (bool, bool, error) {
+// fontFaceHasVectorOutline 判断OpenType或TrueType字体面是否包含矢量字形轮廓表
+// 入参: face 已解析的SFNT字体面
+// 返回: bool 包含glyf、CFF或CFF2矢量轮廓表时为true
+func fontFaceHasVectorOutline(face *fontFace) bool {
+	if face == nil {
+		return false
+	}
+	if face.cff {
+		return true
+	}
+	if _, hasGlyf := face.tables["glyf"]; hasGlyf {
+		return true
+	}
+	if _, hasCFF2 := face.tables["CFF2"]; hasCFF2 {
+		return true
+	}
+	return false
+}
+
+// validateEmbeddedFontFace 校验单个字体面的OS/2嵌入、混淆及纯位图嵌入许可规则
+// 入参: face 已解析的SFNT字体面, obfuscate 是否执行混淆嵌入
+// 返回: error 缺失OS/2表、非法fsType、禁止嵌入、需混淆或位图限制含矢量轮廓错误
+func validateEmbeddedFontFace(face *fontFace, obfuscate bool) error {
+	os2, err := parseFontOS2Metrics(face)
+	if err != nil {
+		return err
+	}
+	if os2 == nil {
+		return fmt.Errorf("%w: producer font needs OS/2", ErrInvalid)
+	}
+	rights, err := fontEmbeddingRights(os2)
+	if err != nil {
+		return err
+	}
+	if rights&2 != 0 {
+		return fmt.Errorf("%w: font prohibits embedding", ErrRestricted)
+	}
+	if rights&0x200 != 0 && fontFaceHasVectorOutline(face) {
+		return fmt.Errorf("%w: bitmap-only font prohibits vector outline embedding", ErrRestricted)
+	}
+	if !obfuscate && rights&0x30c != 0 {
+		return fmt.Errorf("%w: font requires obfuscation", ErrRestricted)
+	}
+	return nil
+}
+
+// validateEmbeddedFontDataWithPolicy 按单面提取或整集合策略校验待嵌入字体的格式、索引与OS/2许可规则
+// 入参: ctx 取消Context, data 原始字体字节, maxBytes 字节上限, obfuscate 是否执行混淆嵌入, collectionIndex 目标字体面索引, targetOnly 集合字体是否仅校验目标面
+// 返回: bool 是否为TTC/OTC集合, bool 目标或首面是否为CFF轮廓, error 格式、索引、许可、预算或取消错误
+func validateEmbeddedFontDataWithPolicy(ctx context.Context, data []byte, maxBytes int64, obfuscate bool, collectionIndex int, targetOnly bool) (bool, bool, error) {
 	if err := checkContext(ctx); err != nil {
 		return false, false, err
 	}
@@ -465,6 +520,19 @@ func validateEmbeddedFontData(ctx context.Context, data []byte, maxBytes int64, 
 		if uint64(collectionIndex) >= uint64(count) {
 			return false, false, fmt.Errorf("%w: font collection index out of range", ErrInvalid)
 		}
+		if targetOnly {
+			targetFace := face
+			if collectionIndex != 0 {
+				targetFace, err = parseFontFace(data, uint32(collectionIndex))
+				if err != nil {
+					return false, false, err
+				}
+			}
+			if err := validateEmbeddedFontFace(targetFace, obfuscate); err != nil {
+				return false, false, err
+			}
+			return true, targetFace.cff, nil
+		}
 	} else if collectionIndex != 0 {
 		return false, false, fmt.Errorf("%w: collection index %d on standalone font", ErrInvalid, collectionIndex)
 	}
@@ -482,35 +550,168 @@ func validateEmbeddedFontData(ctx context.Context, data []byte, maxBytes int64, 
 		if checked[face.offset] {
 			continue
 		}
-		os2, err := parseFontOS2Metrics(face)
-		if err != nil {
+		if err := validateEmbeddedFontFace(face, obfuscate); err != nil {
 			return false, false, err
-		}
-		if os2 == nil {
-			return false, false, fmt.Errorf("%w: producer font needs OS/2", ErrInvalid)
-		}
-		rights, err := fontEmbeddingRights(os2)
-		if err != nil {
-			return false, false, err
-		}
-		if rights&2 != 0 {
-			return false, false, fmt.Errorf("%w: font prohibits embedding", ErrRestricted)
-		}
-		if !obfuscate && rights&0x30c != 0 {
-			return false, false, fmt.Errorf("%w: font requires obfuscation", ErrRestricted)
 		}
 		checked[face.offset] = true
 	}
 	return isCollection, isCFF, nil
 }
 
-// findDuplicateFontLocked 在已存入部件中按媒体类型与完整字节查找可复用的同类型字体部件
+// extractCollectionFaceSFNT 从TTC/OTC集合中提取指定索引的独立单面SFNT字体并移除已失效的集合签名表DSIG
+// 入参: ctx 取消Context, data 原始集合字体字节, collectionIndex 目标字体面索引, maxBytes 输出字节上限
+// 返回: []byte 独立单面SFNT字节, bool 是否为CFF轮廓, error 索引、封装、预算或取消错误
+func extractCollectionFaceSFNT(ctx context.Context, data []byte, collectionIndex uint32, maxBytes int64) ([]byte, bool, error) {
+	face, err := parseFontFace(data, collectionIndex)
+	if err != nil {
+		return nil, false, err
+	}
+	tags := slices.Sorted(maps.Keys(face.tables))
+	tags = slices.DeleteFunc(tags, func(tag string) bool { return tag == "DSIG" })
+	out, err := assembleSFNT(ctx, face, tags, nil, maxBytes, 54)
+	if err != nil {
+		return nil, false, err
+	}
+	return out, face.cff, nil
+}
+
+// embeddedFontMediaAndPattern 按混淆标志与字体容器类型返回标准媒体类型与默认路径模板
+// 入参: obfuscate 是否混淆嵌入, isCollection 是否为TTC/OTC集合, isCFF 是否为CFF轮廓
+// 返回: string 内容类型, string 非混淆时的路径模板（混淆时为空串）
+func embeddedFontMediaAndPattern(obfuscate, isCollection, isCFF bool) (string, string) {
+	if obfuscate {
+		return "application/vnd.ms-package.obfuscated-opentype", ""
+	}
+	ext := "ttf"
+	if isCollection {
+		ext = "ttc"
+	} else if isCFF {
+		ext = "otf"
+	}
+	return "application/vnd.ms-opentype", "/Resources/Fonts/%d." + ext
+}
+
+// allocateObfuscatedFontPart 生成与当前名称表不冲突的UUIDv4混淆字体部件路径
+// 入参: available 检查候选路径是否可用的回调，返回nil表示可用
+// 返回: string 规范化混淆字体URI, error 随机数或冲突耗尽错误
+func allocateObfuscatedFontPart(available func(string) error) (string, error) {
+	var raw [16]byte
+	for range 1024 {
+		if _, err := rand.Read(raw[:]); err != nil {
+			return "", err
+		}
+		raw[6] = raw[6]&0x0f | 0x40
+		raw[8] = raw[8]&0x3f | 0x80
+		part := fmt.Sprintf("/Resources/Fonts/%X-%X-%X-%X-%X.odttf", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16])
+		if available(part) == nil {
+			return part, nil
+		}
+	}
+	return "", fmt.Errorf("%w: unable to allocate unique font part", ErrLimit)
+}
+
+// extractAllocatedPatternIndex 从已分配的部件路径中提取模板%d对应的正整数编号
+// 入参: pattern 含唯一%d占位的路径模板, part 已分配部件路径
+// 返回: int 提取到的编号, bool 是否匹配模板且为合法整数
+func extractAllocatedPatternIndex(pattern, part string) (int, bool) {
+	if pattern == "" {
+		return 0, false
+	}
+	prefix, suffix, err := packageNamePattern(pattern, nil)
+	if err != nil || len(part) <= len(prefix)+len(suffix) || !strings.HasPrefix(part, prefix) || !strings.HasSuffix(part, suffix) {
+		return 0, false
+	}
+	index, err := strconv.Atoi(part[len(prefix) : len(part)-len(suffix)])
+	if err != nil {
+		return 0, false
+	}
+	return index, true
+}
+
+// layoutPartScope 根据固定文档序列与文档索引判定源部件对应的标准打印作用域
+// 入参: sequence 主序列部件URI, documents 文档索引列表, source 待判定源部件URI
+// 返回: PrintScope 作业、文档、页面或未知作用域
+func layoutPartScope(sequence string, documents []Document, source string) PrintScope {
+	if strings.EqualFold(source, sequence) {
+		return PrintScopeJob
+	}
+	for _, document := range documents {
+		if strings.EqualFold(source, document.Part) {
+			return PrintScopeDocument
+		}
+		for _, page := range document.Pages {
+			if strings.EqualFold(source, page.Part) {
+				return PrintScopePage
+			}
+		}
+	}
+	return PrintScopeUnknown
+}
+
+// ensurePartHashIndexLocked 按需惰性构建包内普通资源与字体的SHA-256哈希去重索引，须持有写锁
+func (p *Package) ensurePartHashIndexLocked() {
+	if p.partHashes != nil && p.fontHashes != nil && p.hashPartsCount == len(p.parts) {
+		return
+	}
+	p.partHashes = make(map[[32]byte][]string, len(p.parts))
+	p.fontHashes = make(map[[32]byte][]string)
+	for _, key := range slices.Sorted(maps.Keys(p.parts)) {
+		p.indexPartHashLocked(key, p.parts[key])
+	}
+	p.hashPartsCount = len(p.parts)
+}
+
+// indexPartHashLocked 将单个部件登记到SHA-256普通索引或字体明文摘要索引，须持有写锁
+// 入参: key 部件小写键, part 部件数据
+func (p *Package) indexPartHashLocked(key string, part packagePart) {
+	digest := sha256.Sum256(part.data)
+	if !slices.Contains(p.partHashes[digest], key) {
+		p.partHashes[digest] = append(p.partHashes[digest], key)
+	}
+	if strings.EqualFold(part.media, "application/vnd.ms-package.obfuscated-opentype") {
+		if len(part.data) >= 32 {
+			if xorKey, err := FontObfuscationKey(part.name); err == nil {
+				var prefix [32]byte
+				copy(prefix[:], part.data[:32])
+				for i := range 32 {
+					prefix[i] ^= xorKey[i%len(xorKey)]
+				}
+				h := sha256.New()
+				_, _ = h.Write(prefix[:])
+				_, _ = h.Write(part.data[32:])
+				var plainDigest [32]byte
+				h.Sum(plainDigest[:0])
+				if !slices.Contains(p.fontHashes[plainDigest], key) {
+					p.fontHashes[plainDigest] = append(p.fontHashes[plainDigest], key)
+				}
+			}
+		}
+		return
+	}
+	if strings.EqualFold(part.media, "application/vnd.ms-opentype") {
+		if !slices.Contains(p.fontHashes[digest], key) {
+			p.fontHashes[digest] = append(p.fontHashes[digest], key)
+		}
+	}
+}
+
+// invalidatePartHashIndexLocked 清空包级哈希去重索引以在下次去重时按最新状态重建，须持有写锁
+func (p *Package) invalidatePartHashIndexLocked() {
+	p.partHashes = nil
+	p.fontHashes = nil
+	p.hashPartsCount = 0
+}
+
+// findDuplicateFontLocked 在已存入部件中按SHA-256索引、媒体类型与完整字节查找可复用的同类型字体部件
 // 入参: raw 原始未混淆字体字节, media 目标媒体类型, obfuscated 是否混淆部件
 // 返回: string 已存在的字体部件URI, bool 是否命中复用
 func (p *Package) findDuplicateFontLocked(raw []byte, media string, obfuscated bool) (string, bool) {
-	for _, key := range slices.Sorted(maps.Keys(p.parts)) {
-		part := p.parts[key]
-		if !strings.EqualFold(part.media, media) || len(part.data) != len(raw) {
+	p.ensurePartHashIndexLocked()
+	digest := sha256.Sum256(raw)
+	candidates := p.fontHashes[digest]
+	for _, key := range candidates {
+		part, exists := p.parts[key]
+		if !exists || !strings.EqualFold(part.media, media) || len(part.data) != len(raw) {
 			continue
 		}
 		candidate := part.data
@@ -539,13 +740,15 @@ func (p *Package) findDuplicateFontLocked(raw []byte, media string, obfuscated b
 	return "", false
 }
 
-// findDuplicatePartLocked 在已存入部件中按媒体类型与完整字节查找可复用的相同资源部件
+// findDuplicatePartLocked 在已存入部件中按SHA-256索引、媒体类型与完整字节查找可复用的相同资源部件
 // 入参: media 目标媒体类型, data 原始资源字节
 // 返回: string 已存在的部件URI, bool 是否命中复用
 func (p *Package) findDuplicatePartLocked(media string, data []byte) (string, bool) {
-	for _, key := range slices.Sorted(maps.Keys(p.parts)) {
-		part := p.parts[key]
-		if !strings.EqualFold(part.media, media) || len(part.data) != len(data) {
+	p.ensurePartHashIndexLocked()
+	digest := sha256.Sum256(data)
+	for _, key := range p.partHashes[digest] {
+		part, exists := p.parts[key]
+		if !exists || !strings.EqualFold(part.media, media) || len(part.data) != len(data) {
 			continue
 		}
 		if bytes.Equal(part.data, data) {
@@ -553,24 +756,6 @@ func (p *Package) findDuplicatePartLocked(media string, data []byte) (string, bo
 		}
 	}
 	return "", false
-}
-
-// newFontPart 生成包内不冲突的UUIDv4混淆字体部件路径
-// 返回: string 规范化字体部件URI, error 随机数或冲突错误
-func (p *Package) newFontPart() (string, error) {
-	var raw [16]byte
-	for range 1024 {
-		if _, err := rand.Read(raw[:]); err != nil {
-			return "", err
-		}
-		raw[6] = raw[6]&0x0f | 0x40
-		raw[8] = raw[8]&0x3f | 0x80
-		part := fmt.Sprintf("/Resources/Fonts/%X-%X-%X-%X-%X.odttf", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16])
-		if p.available(part) == nil {
-			return part, nil
-		}
-	}
-	return "", fmt.Errorf("%w: unable to allocate unique font part", ErrLimit)
 }
 
 // AddImage 按魔数识别PNG、JPEG、TIFF或JPEG XR图像并分配唯一路径存入包中
@@ -655,6 +840,52 @@ func (p *Package) AddImageFromRows(ctx context.Context, info jxrgo.Info, read jx
 		return "", err
 	}
 	return p.storeAllocatedResourceLocked(ctx, "/Resources/Images/%d.jxr", "image/vnd.ms-photo", buf.Bytes())
+}
+
+// AddPNGFromRows 通过逐行扫描回调流式编码标准PNG图像并嵌入包中
+// 入参: ctx 取消Context，nil采用Background, options 图像尺寸、位深、色彩模型、分辨率与ICC配置, readRow 按零基行号填充原始扫描行的回调
+// 返回: string 图像部件的包根URI, error 参数、回调、编码、预算或取消错误
+func (p *Package) AddPNGFromRows(ctx context.Context, options StreamImageRowOptions, readRow func(y int, dst []byte) error) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	if readRow == nil {
+		return "", fmt.Errorf("%w: missing PNG row reader", ErrInvalid)
+	}
+	if err := p.lock(); err != nil {
+		return "", err
+	}
+	defer p.mu.Unlock()
+	var buf bytes.Buffer
+	counted := packageOutput{writer: &buf, context: ctx, limit: p.limits.MaxPartBytes}
+	if err := encodePNGFromRowsTo(ctx, &counted, options, p.maxImagePixels, readRow); err != nil {
+		return "", err
+	}
+	return p.storeAllocatedResourceLocked(ctx, "/Resources/Images/%d.png", "image/png", buf.Bytes())
+}
+
+// AddTIFFFromRows 通过逐行扫描回调按多Strip编码Little-Endian Baseline TIFF并嵌入包中
+// 入参: ctx 取消Context，nil采用Background, options 图像尺寸、位深、色彩模型、压缩方式、分辨率与ICC配置, readRow 按零基行号填充原始像素的回调，16位样本按大端字节序
+// 返回: string 图像部件的包根URI, error 参数、回调、编码、预算或取消错误
+func (p *Package) AddTIFFFromRows(ctx context.Context, options StreamImageRowOptions, readRow func(y int, dst []byte) error) (string, error) {
+	ctx = normalizeContext(ctx)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	if readRow == nil {
+		return "", fmt.Errorf("%w: missing TIFF row reader", ErrInvalid)
+	}
+	if err := p.lock(); err != nil {
+		return "", err
+	}
+	defer p.mu.Unlock()
+	var buf bytes.Buffer
+	counted := packageOutput{writer: &buf, context: ctx, limit: p.limits.MaxPartBytes}
+	if err := encodeTIFFFromRowsTo(ctx, &counted, options, p.limits.MaxPartBytes, p.maxImagePixels, readRow); err != nil {
+		return "", err
+	}
+	return p.storeAllocatedResourceLocked(ctx, "/Resources/Images/%d.tif", "image/tiff", buf.Bytes())
 }
 
 // validateImageRowsInfoLimits 前置校验逐行流式编码图像头尺寸与像素预算上限
@@ -1080,13 +1311,20 @@ func (p *Package) storePart(part, media string, data []byte, checkName bool) err
 	if int64(len(data)) > p.limits.MaxPackageBytes-size {
 		return fmt.Errorf("%w: package byte budget", ErrLimit)
 	}
-	p.parts[key] = packagePart{name: part, media: media, data: bytes.Clone(data)}
+	stored := packagePart{name: part, media: media, data: bytes.Clone(data)}
+	p.parts[key] = stored
 	if !exists {
 		p.registerName(part)
 	}
 	p.total = size + int64(len(data))
 	p.dirty[key] = true
 	delete(p.deleted, key)
+	if exists {
+		p.invalidatePartHashIndexLocked()
+	} else if p.partHashes != nil && p.fontHashes != nil {
+		p.indexPartHashLocked(key, stored)
+		p.hashPartsCount = len(p.parts)
+	}
 	return nil
 }
 
@@ -1159,7 +1397,7 @@ func SolidBrush(c color.Color) *Brush {
 	return &Brush{Kind: BrushSolidColor, Opacity: 1, Color: colorToSRGB(c)}
 }
 
-// colorToSRGB 将标准颜色转换为满足8位精确编码要求的非预乘sRGB颜色
+// colorToSRGB 将标准颜色量化转换为8位非预乘sRGB颜色
 // 入参: c 标准颜色值
 // 返回: Color 精确8位sRGB颜色
 func colorToSRGB(c color.Color) Color {
@@ -1253,6 +1491,17 @@ func (p *Page) AddImage(imageURI string, viewbox, viewport Rect) *Path {
 	return p.AddPath(geometry, ImageBrush(imageURI, viewbox, viewport), nil)
 }
 
+// AddCanvas 向页面追加不透明画布容器元素，页面为nil时返回nil
+// 返回: *Canvas 新建并已追加的画布元素
+func (p *Page) AddCanvas() *Canvas {
+	if p == nil {
+		return nil
+	}
+	canvas := NewCanvas()
+	p.Elements = append(p.Elements, canvas)
+	return canvas
+}
+
 // validateRequiredResourceLinks 校验待写包全部关系分支的必要资源来源、内部目标及存在性，不解码额外资源
 // 入参: ctx 取消Context，nil不取消
 // 返回: error 关系位置、模式、缺失目标、预算或取消错误
@@ -1317,17 +1566,37 @@ func (r *Reader) validateRequiredResourceLinks(ctx context.Context) error {
 	return checkContext(ctx)
 }
 
-// newCreatedNavigation 按已校验的序列和文档索引建立导航角色映射，不读取页面内容
+// newCreatedNavigation 按已校验的序列、文档、链接目标与现存部件建立导航索引，不读取页面内容
 // 入参: r 当前包快照, ctx 取消Context
-// 返回: *createdNavigation 只读角色索引, error 取消错误
+// 返回: *createdNavigation 只读角色与目标索引, error 取消错误
 func newCreatedNavigation(r *Reader, ctx context.Context) (*createdNavigation, error) {
-	n := &createdNavigation{parts: make(map[string]createdNavigationKind, len(r.documents)+len(r.pages)+1)}
+	n := &createdNavigation{
+		parts:      make(map[string]createdNavigationKind, len(r.documents)+len(r.pages)+1),
+		pageCount:  len(r.pages),
+		docTargets: make(map[string]map[string]bool, len(r.documents)),
+		allTargets: make(map[string]bool),
+	}
+	if r.pkg != nil {
+		n.existingParts = make(map[string]bool, len(r.pkg.parts))
+		for key := range r.pkg.parts {
+			n.existingParts[key] = true
+		}
+	}
 	n.parts[strings.ToLower(r.sequence)] = createdNavigationSequence
 	for _, document := range r.documents {
 		if err := checkContext(ctx); err != nil {
 			return nil, err
 		}
-		n.parts[strings.ToLower(document.Part)] = createdNavigationDocument
+		docKey := strings.ToLower(document.Part)
+		n.parts[docKey] = createdNavigationDocument
+		targets := make(map[string]bool)
+		for _, page := range document.Pages {
+			for _, target := range page.LinkTargets {
+				targets[target] = true
+				n.allTargets[target] = true
+			}
+		}
+		n.docTargets[docKey] = targets
 	}
 	for _, page := range r.pages {
 		if err := checkContext(ctx); err != nil {
@@ -1396,6 +1665,64 @@ func (n *createdNavigation) target(source, value string) error {
 		}
 	} else if kind == createdNavigationPage {
 		return fmt.Errorf("%w: M9.4 named address must target a fixed document or sequence", ErrInvalid)
+	}
+	return nil
+}
+
+// outlineTarget 校验大纲书签OutlineEntry.Target的目标部件存在性、页码边界与LinkTarget锚点存在性
+// 入参: source 文档结构部件URI, value 原始OutlineTarget声明
+// 返回: error 空地址、URI语法、部件缺失、页码越界或锚点缺失错误
+func (n *createdNavigation) outlineTarget(source, value string) error {
+	value = structureURI(value)
+	if value == "" {
+		return fmt.Errorf("%w: empty outline target URI on %s", ErrInvalid, source)
+	}
+	if linkExternal(value) {
+		return nil
+	}
+	uri, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("%w: outline target URI: %w", ErrInvalid, err)
+	}
+	part := source
+	if uri.Path != "" {
+		part, err = resolvePart(source, uri.EscapedPath())
+		if err != nil {
+			return err
+		}
+	}
+	partKey := strings.ToLower(part)
+	kind := n.parts[partKey]
+	if kind == createdNavigationOther {
+		if n.existingParts != nil && !n.existingParts[partKey] {
+			return fmt.Errorf("%w: outline target part %s does not exist", ErrInvalid, part)
+		}
+		return nil
+	}
+	if uri.Fragment == "" {
+		return nil
+	}
+	if linkPageNumber(uri.Fragment) {
+		if kind != createdNavigationSequence {
+			return fmt.Errorf("%w: M9.8 page address must target the fixed document sequence", ErrInvalid)
+		}
+		number, parseErr := strconv.ParseUint(uri.Fragment, 10, 64)
+		if parseErr != nil || number < 1 || number > uint64(n.pageCount) {
+			return fmt.Errorf("%w: outline page number #%s out of range (1..%d)", ErrInvalid, uri.Fragment, n.pageCount)
+		}
+		return nil
+	}
+	if kind == createdNavigationPage {
+		return fmt.Errorf("%w: M9.4 named address must target a fixed document or sequence", ErrInvalid)
+	}
+	if kind == createdNavigationDocument {
+		if !n.docTargets[partKey][uri.Fragment] {
+			return fmt.Errorf("%w: outline LinkTarget %q does not exist in %s", ErrInvalid, uri.Fragment, part)
+		}
+	} else if kind == createdNavigationSequence {
+		if !n.allTargets[uri.Fragment] {
+			return fmt.Errorf("%w: outline LinkTarget %q does not exist in %s", ErrInvalid, uri.Fragment, part)
+		}
 	}
 	return nil
 }
@@ -1553,18 +1880,9 @@ func packageNameSlot(pattern string, ctx context.Context) (int, error) {
 // commitName 提交成功操作所用编号，空模板表示调用方指定名称
 // 入参: pattern 已通过newName校验的模板, part 同次查找返回的部件URI
 func (p *Package) commitName(pattern, part string) {
-	if pattern == "" {
-		return
+	if index, ok := extractAllocatedPatternIndex(pattern, part); ok {
+		p.allocated[pattern] = index
 	}
-	prefix, suffix, err := packageNamePattern(pattern, nil)
-	if err != nil || len(part) <= len(prefix)+len(suffix) || !strings.HasPrefix(part, prefix) || !strings.HasSuffix(part, suffix) {
-		return
-	}
-	index, err := strconv.Atoi(part[len(prefix) : len(part)-len(suffix)])
-	if err != nil {
-		return
-	}
-	p.allocated[pattern] = index
 }
 
 // validateCreatedFontsCollect 校验页面资源图中所有被引用字体面的封装、度量及嵌入许可，onErr非nil时按节点非短路收集诊断
@@ -1691,7 +2009,7 @@ func validateCreatedFontsCollect(cache *fontCache, graph *resourceGraph, format 
 			}
 		}
 		if rights&0x200 != 0 {
-			if _, outline := source.face.tables["glyf"]; outline || source.face.cff {
+			if fontFaceHasVectorOutline(source.face) {
 				if stop, retErr := report(part, "Glyphs", "FontUri", &PartError{Part: part, Err: fmt.Errorf("%w: bitmap-only embedding contains outlines", ErrInvalid)}); stop {
 					return nil, retErr
 				}
@@ -1729,7 +2047,7 @@ func validateCreatedFontsCollect(cache *fontCache, graph *resourceGraph, format 
 				continue
 			}
 		}
-		if source.metrics.os2.fsType&4 != 0 && !seen[key.part] {
+		if rights&4 != 0 && !seen[key.part] {
 			seen[key.part] = true
 			restricted = append(restricted, part)
 		}
@@ -1924,6 +2242,10 @@ func (r *Reader) validateStoryLinks(ctx context.Context) error {
 	pkg := backend
 	pkg.relation = g.relationships
 	g.reader = &Reader{pkg: &pkg, format: r.format, limits: r.limits, sequence: r.sequence, documents: r.documents, pages: r.pages}
+	navigation, err := newCreatedNavigation(g.reader, ctx)
+	if err != nil {
+		return err
+	}
 	first := 0
 	for index, document := range r.documents {
 		if err := g.step(1); err != nil {
@@ -1935,6 +2257,16 @@ func (r *Reader) validateStoryLinks(ctx context.Context) error {
 		}
 		known := make(map[string]bool)
 		if structure != nil {
+			if structure.Outline != nil {
+				for _, entry := range structure.Outline.Entries {
+					if err := g.step(1); err != nil {
+						return err
+					}
+					if err := navigation.outlineTarget(structure.Part, entry.Target); err != nil {
+						return &PartError{Part: structure.Part, Element: "OutlineEntry", Err: err}
+					}
+				}
+			}
 			for _, story := range structure.Stories {
 				if err := g.step(1); err != nil {
 					return err
@@ -2453,16 +2785,20 @@ func (p *Package) assembleAndValidate(ctx context.Context, collect bool) (*Reade
 		docTargets := make(map[string]string)
 		for _, pageRef := range document.Pages {
 			allPages = append(allPages, pageRef)
-			if collect && len(pageRef.LinkTargets) != 0 {
+			if len(pageRef.LinkTargets) != 0 {
 				pageSeen := make(map[string]bool, len(pageRef.LinkTargets))
 				for _, target := range pageRef.LinkTargets {
 					if pageSeen[target] {
-						diagnostics = append(diagnostics, Diagnostic{Part: document.Part, Element: "LinkTarget", Attribute: "Name", Message: fmt.Sprintf("duplicate LinkTarget %q on page %s", target, pageRef.Part)})
+						if err := report(document.Part, "LinkTarget", "Name", fmt.Errorf("%w: duplicate LinkTarget %q on page %s", ErrInvalid, target, pageRef.Part)); err != nil {
+							return nil, nil, err
+						}
 					}
 					pageSeen[target] = true
 					if p.format == FormatXPS {
 						if prev, exists := docTargets[target]; exists {
-							diagnostics = append(diagnostics, Diagnostic{Part: document.Part, Element: "LinkTarget", Attribute: "Name", Message: fmt.Sprintf("duplicate XPS LinkTarget %q on pages %s and %s", target, prev, pageRef.Part)})
+							if err := report(document.Part, "LinkTarget", "Name", fmt.Errorf("%w: duplicate XPS LinkTarget %q on pages %s and %s", ErrInvalid, target, prev, pageRef.Part)); err != nil {
+								return nil, nil, err
+							}
 						} else {
 							docTargets[target] = pageRef.Part
 						}
@@ -2581,7 +2917,9 @@ func (p *Package) assembleAndValidate(ctx context.Context, collect bool) (*Reade
 				}
 				for _, target := range page.LinkTargets {
 					if !pageNames[target] {
-						diagnostics = append(diagnostics, Diagnostic{Part: page.Part, Element: "LinkTarget", Attribute: "Name", Message: fmt.Sprintf("LinkTarget %q is absent from page", target)})
+						if err := report(page.Part, "LinkTarget", "Name", fmt.Errorf("%w: LinkTarget %q is absent from page", ErrInvalid, target)); err != nil {
+							return nil, nil, err
+						}
 					}
 				}
 			}

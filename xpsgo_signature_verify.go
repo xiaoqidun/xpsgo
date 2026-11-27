@@ -98,18 +98,20 @@ type signatureRetrievalPart struct {
 // SignatureStatus 表示当前方言签名策略下的判断，零值不表示验证已经完成
 type SignatureStatus uint8
 
-// SignatureVerifyOptions 设置公钥、显式证书信任与调用方理解的MCE扩展命名空间，调用期间不得修改
+// SignatureVerifyOptions 设置公钥、显式证书信任、证书撤销检查回调与调用方理解的MCE扩展命名空间，调用期间不得修改
 // PublicKey非nil时直接用该公钥验签而不强制证书链校验；未提供Trust.Roots时不使用系统根
+// CheckRevocation非nil时在证书链信任验证通过后对验证链执行外部撤销检查，返回非nil错误视为信任失败
 // Namespaces仅声明调用方扩展理解，不为本库渲染器增加对应功能
 type SignatureVerifyOptions struct {
-	PublicKey  crypto.PublicKey
-	Trust      x509.VerifyOptions
-	Namespaces []string
+	PublicKey       crypto.PublicKey
+	Trust           x509.VerifyOptions
+	CheckRevocation func(context.Context, []*x509.Certificate) error
+	Namespaces      []string
 }
 
 // SignatureVerification 保存单份签名的策略判定、密码学、信任及MCE证据，SignatureVerified仅在全部摘要与签名验证后为true
 // MatchedCertificate保存证书模式下通过密码学验签的独立证书副本，信任链失败时仍保留
-// Signer非nil表示显式证书链策略接受了签名者，不包含吊销或可信时间戳结论
+// Signer非nil表示显式证书链策略及可选撤销检查均接受了签名者，不包含可信时间戳结论
 type SignatureVerification struct {
 	Part               PartInfo
 	Status             SignatureStatus
@@ -120,6 +122,28 @@ type SignatureVerification struct {
 	SignatureError     error
 	TrustError         error
 	UnknownNamespaces  []SignatureNamespace
+}
+
+// PackageSignatureDefinitionStatus 保存单个签署请求槽位的定义来源、绑定签名部件及有效签名满足状态
+// Signatures列出所有Signature.Id匹配该SpotID的签名部件，ValidSignatures仅列出其中状态为SignatureValid的签名部件
+// Satisfied仅在ValidSignatures非空时为true
+type PackageSignatureDefinitionStatus struct {
+	DefinitionPart  PartInfo
+	Definition      SignatureDefinition
+	Signatures      []PartInfo
+	ValidSignatures []PartInfo
+	Satisfied       bool
+}
+
+// PackageSignatureSummary 保存整个XPS包的聚合数字签名验证结果、签署请求槽位满足明细及包级整体签名状态
+// HasSignatures为false表示包内不含关联数字签名，此时Status为SignatureUnknown
+// AllDefinitionsSatisfied在不存在未满足签署请求槽位时为true，存在未满足槽位时整体Status不会判定为SignatureValid
+type PackageSignatureSummary struct {
+	Status                  SignatureStatus
+	HasSignatures           bool
+	AllDefinitionsSatisfied bool
+	Signatures              []*SignatureVerification
+	Definitions             []PackageSignatureDefinitionStatus
 }
 
 // String 返回数字签名状态的可读名称
@@ -179,13 +203,6 @@ func (v *signatureVerifier) charge(size int64) error {
 	}
 	v.work -= size
 	return nil
-}
-
-// canonical 对原始XML或前一次字节输出执行C14N，子树选择仅用于第一次同文档引用
-// 入参: data XML字节, algorithm 规范化算法, comments 是否保留当前输入中的注释, selectElement 可选子树选择
-// 返回: []byte 独立规范化输出, error 规范化、预算或取消错误
-func (v *signatureVerifier) canonical(data []byte, algorithm string, comments bool, selectElement func(*xmlElement, []xml.Name) bool) ([]byte, error) {
-	return v.canonicalExclusive(data, algorithm, nil, comments, v.limits.MaxMetadataBytes, selectElement)
 }
 
 // canonicalExclusive 按指定字节上限与可选InclusiveNamespaces前缀列表对XML执行规范化
@@ -369,10 +386,10 @@ func signatureTrustOptions(options x509.VerifyOptions) x509.VerifyOptions {
 	return options
 }
 
-// verifySignatureSigner 共用摘要、包内证书匹配及显式信任验证，不把缺少证书当作密码学成功
-// 入参: info 同次读取的声明, data 原始签名XML, graph 私有读取预算, limits 处理上限, options 独立信任参数
+// verifySignatureSignerWithRevocation 在完成摘要、包内证书匹配与显式证书链信任验证后执行可选证书撤销回调
+// 入参: info 同次读取的声明, data 原始签名XML, graph 私有读取预算, limits 处理上限, options 独立信任参数, checkRevocation 可选证书链撤销检查回调
 // 返回: *SignatureSigner 已信任签名者, *x509.Certificate 通过密码学验签的独立证书副本, bool 签名值是否曾由包内证书或公钥验证, error 数据、密码学、信任、能力、资源或取消错误
-func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePartGraph, limits Limits, options x509.VerifyOptions) (*SignatureSigner, *x509.Certificate, bool, error) {
+func verifySignatureSignerWithRevocation(info *SignatureInfo, data []byte, graph *signaturePartGraph, limits Limits, options x509.VerifyOptions, checkRevocation func(context.Context, []*x509.Certificate) error) (*SignatureSigner, *x509.Certificate, bool, error) {
 	ctx := graph.context
 	certificates, err := loadSignatureCertificates(info, graph)
 	if err != nil {
@@ -447,6 +464,41 @@ func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePar
 		if err := ctx.Err(); err != nil {
 			return nil, nil, true, err
 		}
+		if checkRevocation != nil {
+			var validChains [][]*x509.Certificate
+			var revocationErr error
+			for _, chain := range chains {
+				if err := ctx.Err(); err != nil {
+					return nil, nil, true, err
+				}
+				chainCopy, err := cloneSignatureCertificateChain(ctx, chain)
+				if err != nil {
+					return nil, nil, true, err
+				}
+				if err := checkRevocation(ctx, chainCopy); err != nil {
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return nil, nil, true, err
+					}
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return nil, nil, true, ctxErr
+					}
+					if revocationErr == nil {
+						if errors.Is(err, ErrTrust) {
+							revocationErr = err
+						} else {
+							revocationErr = fmt.Errorf("%w: certificate revocation: %w", ErrTrust, err)
+						}
+					}
+					continue
+				}
+				validChains = append(validChains, chain)
+			}
+			if len(validChains) == 0 {
+				trustError = revocationErr
+				continue
+			}
+			chains = validChains
+		}
 		signer, err := buildSignatureSigner(ctx, certificate, chains, localCerts)
 		if err != nil {
 			return nil, nil, true, err
@@ -480,6 +532,24 @@ func verifySignatureSigner(info *SignatureInfo, data []byte, graph *signaturePar
 		return nil, nil, false, capabilityError
 	}
 	return nil, nil, false, fmt.Errorf("%w: no certificate matches the signature value", ErrSignature)
+}
+
+// cloneSignatureCertificateChain 通过DER重解析深拷贝单条验证证书链，避免外部撤销回调修改内部或证书池对象
+// 入参: ctx 取消Context, chain 已验证的证书链
+// 返回: []*x509.Certificate 独立证书链副本, error 取消或证书重解析错误
+func cloneSignatureCertificateChain(ctx context.Context, chain []*x509.Certificate) ([]*x509.Certificate, error) {
+	result := make([]*x509.Certificate, 0, len(chain))
+	for _, item := range chain {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		copied, err := copySignatureCertificate(item)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, copied)
+	}
+	return result, checkContext(ctx)
 }
 
 // verifySignaturePublicKeys 依次使用KeyInfo解析出的公钥尝试验证签名值，区分密码学通过、不匹配与能力错误
@@ -1201,6 +1271,152 @@ func signatureRetrievalTarget(root *xmlElement, ids map[string]*xmlElement, frag
 	return ids[id], retain, nil
 }
 
+// VerifySignatures 一次性遍历并验证包内全部关联数字签名及全部SignatureDefinitions签署请求槽位
+// 返回每份签名的独立验证结论、各签署请求槽位的有效签名满足明细及包级整体签名状态，失败时不返回部分结果
+// 入参: ctx 取消Context，nil采用Background, options 验证参数，nil不信任任何根
+// 返回: *PackageSignatureSummary 包级聚合签名验证摘要, error 结构、能力、资源、关闭或取消错误
+func (r *Reader) VerifySignatures(ctx context.Context, options *SignatureVerifyOptions) (*PackageSignatureSummary, error) {
+	if err := r.readLock(); err != nil {
+		return nil, err
+	}
+	defer r.mu.RUnlock()
+	ctx = normalizeContext(ctx)
+	configuration := SignatureVerifyOptions{}
+	if options != nil {
+		configuration = *options
+	}
+	if err := validateSignatureVerifyOptions(ctx, configuration, r.limits); err != nil {
+		return nil, err
+	}
+	g := signaturePartGraph{context: ctx, remaining: r.limits.MaxPackageBytes, maximum: r.limits.MaxPartCount}
+	pkg := *r.pkg
+	pkg.beforeRead, g.pkg = g.readAllowance, &pkg
+	requests, err := g.definitions(r.documents, r.format, r.limits)
+	if err != nil {
+		return nil, err
+	}
+	parts, err := g.read()
+	if err != nil {
+		return nil, err
+	}
+	boundAll := make(map[string][]PartInfo)
+	boundValid := make(map[string][]PartInfo)
+	verifications := make([]*SignatureVerification, 0, len(parts))
+	for _, part := range parts {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		info, data, err := r.loadSignaturePart(part.Part, &g)
+		if err != nil {
+			return nil, err
+		}
+		verification, err := r.verifyLoadedDocumentSignature(info, data, &g, configuration)
+		if err != nil {
+			return nil, err
+		}
+		verifications = append(verifications, verification)
+		if info.ID != "" {
+			boundAll[info.ID] = append(boundAll[info.ID], part.Part)
+			if verification.Status == SignatureValid {
+				boundValid[info.ID] = append(boundValid[info.ID], part.Part)
+			}
+		}
+	}
+	var defStatuses []PackageSignatureDefinitionStatus
+	allSatisfied := true
+	for _, reqPart := range requests {
+		for _, def := range reqPart.Definitions {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			validParts := slices.Clone(boundValid[def.ID])
+			satisfied := len(validParts) > 0
+			if !satisfied {
+				allSatisfied = false
+			}
+			defStatuses = append(defStatuses, PackageSignatureDefinitionStatus{
+				DefinitionPart:  reqPart.Part,
+				Definition:      cloneSignatureDefinition(def),
+				Signatures:      slices.Clone(boundAll[def.ID]),
+				ValidSignatures: validParts,
+				Satisfied:       satisfied,
+			})
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return &PackageSignatureSummary{
+		Status:                  aggregatePackageSignatureStatus(verifications, allSatisfied),
+		HasSignatures:           len(verifications) > 0,
+		AllDefinitionsSatisfied: allSatisfied,
+		Signatures:              verifications,
+		Definitions:             defStatuses,
+	}, nil
+}
+
+// cloneSignatureDefinition 深拷贝单个签署请求定义及其可选指针字段
+// 入参: src 源签署请求定义
+// 返回: SignatureDefinition 独立签署请求副本
+func cloneSignatureDefinition(src SignatureDefinition) SignatureDefinition {
+	dst := SignatureDefinition{ID: src.ID}
+	if src.SignerName != nil {
+		v := *src.SignerName
+		dst.SignerName = &v
+	}
+	if src.Language != nil {
+		v := *src.Language
+		dst.Language = &v
+	}
+	if src.Spot != nil {
+		v := *src.Spot
+		dst.Spot = &v
+	}
+	if src.Intent != nil {
+		v := *src.Intent
+		dst.Intent = &v
+	}
+	if src.SignBy != nil {
+		v := *src.SignBy
+		dst.SignBy = &v
+	}
+	if src.SigningLocation != nil {
+		v := *src.SigningLocation
+		dst.SigningLocation = &v
+	}
+	return dst
+}
+
+// aggregatePackageSignatureStatus 按最严重状态优先级汇总包内全部签名的整体状态并结合签署请求满足情况判定
+// 入参: signatures 包内全部签名验证结论, allDefinitionsSatisfied 是否全部签署请求槽位均已由有效签名满足
+// 返回: SignatureStatus 包级整体签名状态
+func aggregatePackageSignatureStatus(signatures []*SignatureVerification, allDefinitionsSatisfied bool) SignatureStatus {
+	if len(signatures) == 0 {
+		return SignatureUnknown
+	}
+	hasBroken, hasIncompliant, hasQuestionable := false, false, false
+	for _, item := range signatures {
+		switch item.Status {
+		case SignatureBroken:
+			hasBroken = true
+		case SignatureIncompliant:
+			hasIncompliant = true
+		case SignatureQuestionable, SignatureUnknown:
+			hasQuestionable = true
+		}
+	}
+	if hasBroken {
+		return SignatureBroken
+	}
+	if hasIncompliant {
+		return SignatureIncompliant
+	}
+	if hasQuestionable || !allDefinitionsSatisfied {
+		return SignatureQuestionable
+	}
+	return SignatureValid
+}
+
 // VerifySignature 按当前方言覆盖规则、OPC密码学、公钥或显式证书信任及MCE规则综合判定单个签名
 // PublicKey非nil时直接用该公钥验签而无需证书链校验；资源、取消或结构错误直接返回错误而非验证结论
 // 入参: ctx 取消Context，nil采用Background, part 已关联签名部件包根URI, options 验证参数，nil不信任任何根
@@ -1290,7 +1506,7 @@ func (r *Reader) verifyLoadedDocumentSignature(info *SignatureInfo, data []byte,
 			result.SignatureVerified = true
 		}
 	} else {
-		signer, matchedCert, verified, err := verifySignatureSigner(info, data, graph, r.limits, signatureTrustOptions(configuration.Trust))
+		signer, matchedCert, verified, err := verifySignatureSignerWithRevocation(info, data, graph, r.limits, signatureTrustOptions(configuration.Trust), configuration.CheckRevocation)
 		result.SignatureVerified, result.MatchedCertificate = verified, matchedCert
 		if err != nil {
 			var failure *packageReadError

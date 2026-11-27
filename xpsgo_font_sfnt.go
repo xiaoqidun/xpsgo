@@ -279,6 +279,13 @@ type fontBitmapRunRect struct {
 // 入参: set 已解析的字体集, index 字体集中的零基序号
 // 返回: *cffFont 字体程序, error 结构、能力或资源限制错误
 func parseCFFFont(set *cffSet, index int) (*cffFont, error) {
+	return parseCFFFontWithOptions(set, index, false)
+}
+
+// parseCFFFontWithOptions 按指定严格度解析CFF字体，在OpenType宿主模式下允许将非CID字体Encoding异常降级为诊断
+// 入参: set 已解析的字体集, index 字体集中的零基序号, tolerateEncoding 是否容忍非CID字体Encoding解析失败并记录诊断
+// 返回: *cffFont 字体程序, error 结构、能力或资源限制错误
+func parseCFFFontWithOptions(set *cffSet, index int, tolerateEncoding bool) (*cffFont, error) {
 	if set == nil || index < 0 || index >= len(set.top) || index >= len(set.names) {
 		return nil, fmt.Errorf("%w: CFF font index", ErrInvalid)
 	}
@@ -291,9 +298,6 @@ func parseCFFFont(set *cffSet, index int) (*cffFont, error) {
 		if entry.operator == 16 {
 			encodings++
 		}
-	}
-	if encodings > 1 {
-		return nil, fmt.Errorf("%w: repeated CFF Encoding operator", ErrInvalid)
 	}
 	if _, present := dict.value(0x0c14); present {
 		return nil, fmt.Errorf("%w: CFF SyntheticBase", ErrUnsupported)
@@ -324,6 +328,9 @@ func parseCFFFont(set *cffSet, index int) (*cffFont, error) {
 		}
 		font.cid = true
 	}
+	if !font.cid && encodings > 1 && !tolerateEncoding {
+		return nil, fmt.Errorf("%w: repeated CFF Encoding operator", ErrInvalid)
+	}
 	parser := cffFontParser{set: set, entries: cffMaxDictEntries, subrs: 1 << 20, private: make(map[[2]uint32]cffPrivate)}
 	var err error
 	font.top, err = parser.fontDict(dict, !font.cid)
@@ -350,12 +357,14 @@ func parseCFFFont(set *cffSet, index int) (*cffFont, error) {
 		return nil, err
 	}
 	if !font.cid {
-		offset, err = cffOptionalOffset(dict, 16)
-		if err != nil {
-			return nil, err
-		}
-		if _, err = parseCFFEncoding(set.data, offset, font.charset); err != nil {
-			return nil, err
+		if !tolerateEncoding {
+			offset, err = cffOptionalOffset(dict, 16)
+			if err == nil {
+				_, err = parseCFFEncoding(set.data, offset, font.charset)
+			}
+			if err != nil {
+				return nil, err
+			}
 		}
 		return font, nil
 	}
@@ -583,6 +592,17 @@ func (f *fontSource) glyphIndex(char rune) (uint16, error) {
 		return 0, f.cmapErr
 	}
 	return f.cmap.unicodeGlyph(char)
+}
+
+// variationGlyphIndex 按Format 14变体序列子表查询Unicode字符与变体选择符对应的字形编号
+// 入参: char 基础Unicode字符, selector 变体选择符Unicode字符
+// 返回: uint16 命中的字形编号, bool 是否命中Format 14 UVS记录, error 映射表或查表错误
+func (f *fontSource) variationGlyphIndex(char, selector rune) (uint16, bool, error) {
+	f.cmapOnce.Do(f.loadCmap)
+	if f.cmapErr != nil {
+		return 0, false, f.cmapErr
+	}
+	return f.cmap.unicodeVariationGlyph(char, selector)
 }
 
 // glyphRunes 按需扫描源字体cmap中映射到指定非零字形编号的升序去重Unicode码点并受条目上限约束
@@ -893,7 +913,7 @@ func (f *fontSource) loadOutline() {
 		f.outlineErr = fmt.Errorf("%w: selecting a font from a multi-font CFF table", ErrUnsupported)
 		return
 	}
-	f.cff, err = parseCFFFont(set, 0)
+	f.cff, err = parseCFFFontWithOptions(set, 0, true)
 	if err == nil && len(f.cff.charstrings) != int(f.metrics.numGlyphs) {
 		err = fmt.Errorf("%w: CFF CharStrings count does not match maxp", ErrInvalid)
 	}
@@ -1076,7 +1096,7 @@ func (f *fontSource) bitmapGlyphTop(metrics fontBitmapMetrics, selection fontBit
 	}
 	if metrics.hasVertical {
 		ascender := float64(f.metrics.hhea.ascender)
-		if f.metrics.os2 != nil {
+		if f.metrics.os2 != nil && (f.metrics.os2.typoAscender != 0 || f.metrics.os2.typoDescender != 0) {
 			ascender = float64(f.metrics.os2.typoAscender)
 		}
 		return ascender - math.Round(float64(metrics.vertical.bearingY)*selection.scaleY)*unitsY, nil

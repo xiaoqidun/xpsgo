@@ -1448,7 +1448,7 @@ func iccInverseCurveSample(curve iccCurve, index int) float64 {
 	return float64(binary.BigEndian.Uint16(curve.values[index*2:])) / 65535
 }
 
-// parseICCLUT 解析lut8Type和lut16Type，检查矩阵条件及全部表格范围后再建立视图
+// parseICCLUT 解析lut8Type和lut16Type，仅在XYZ输入时读取矩阵并检查全部表格范围后再建立视图
 // 入参: data 标签字节, inputXYZ 输入是否为XYZ空间
 // 返回: *iccPipeline 转换阶段, error 数据、能力或资源错误
 func parseICCLUT(data []byte, inputXYZ bool) (*iccPipeline, error) {
@@ -1481,21 +1481,23 @@ func parseICCLUT(data []byte, inputXYZ bool) (*iccPipeline, error) {
 	if points < 2 {
 		return nil, fmt.Errorf("%w: ICC LUT grid", ErrInvalid)
 	}
-	matrix := iccStage{kind: iccStageMatrix}
-	identity := true
-	for i := range 9 {
-		matrix.matrix[i] = iccFixed(data[12+4*i:])
-		want := 0.0
-		if i%4 == 0 {
-			want = 1
+	var matrix iccStage
+	useMatrix := false
+	if inputXYZ {
+		if inputs != 3 {
+			return nil, fmt.Errorf("%w: ICC XYZ LUT input count", ErrInvalid)
 		}
-		identity = identity && matrix.matrix[i] == want
-	}
-	if !inputXYZ && !identity {
-		return nil, fmt.Errorf("%w: ICC LUT matrix requires XYZ input", ErrInvalid)
-	}
-	if inputXYZ && inputs != 3 {
-		return nil, fmt.Errorf("%w: ICC XYZ LUT input count", ErrInvalid)
+		matrix = iccStage{kind: iccStageMatrix}
+		for i := range 9 {
+			matrix.matrix[i] = iccFixed(data[12+4*i:])
+			want := 0.0
+			if i%4 == 0 {
+				want = 1
+			}
+			if matrix.matrix[i] != want {
+				useMatrix = true
+			}
+		}
 	}
 	cells := uint64(outputs)
 	for range inputs {
@@ -1510,7 +1512,7 @@ func parseICCLUT(data []byte, inputXYZ bool) (*iccPipeline, error) {
 		return nil, fmt.Errorf("%w: ICC LUT data size", ErrInvalid)
 	}
 	p := &iccPipeline{inputs: inputs, outputs: outputs, legacyLab: precision == 2, inputPrecision: precision}
-	if inputXYZ && !identity {
+	if useMatrix {
 		p.stages = append(p.stages, matrix)
 	}
 	input := iccStage{kind: iccStageCurves}

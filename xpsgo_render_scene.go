@@ -23,6 +23,7 @@ import (
 	"image/color"
 	"math"
 	"math/bits"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,13 +52,22 @@ type RenderedElement struct {
 	PixelBounds image.Rectangle
 }
 
+// sceneBrushRefKey 按画刷定义节点与静态资源键缓存独立引用副本，避免污染字典原始定义
+type sceneBrushRefKey struct {
+	element *xmlElement
+	key     string
+}
+
 // sceneParser 将资源图中的已绑定定义解析为页面绘制数据
 type sceneParser struct {
 	format          Format
 	resources       *resourceGraph
+	context         context.Context
+	pageResources   *ResourceDictionary
 	geometries      map[*xmlElement]*Geometry
 	matrices        map[*xmlElement]Matrix
 	brushes         map[*xmlElement]*Brush
+	brushRefs       map[sceneBrushRefKey]*Brush
 	elements        map[*xmlElement]Element
 	budget          *printSideGeometryBudget
 	allowUnresolved bool
@@ -160,6 +170,7 @@ type sceneWorkerState struct {
 	coarse        image.Alpha
 	part          image.Alpha
 	clip          image.Alpha
+	clipStack     []*image.Alpha
 	imageCache    imageSampleCache
 	isolated      []*renderSurface
 	printIsolated []*printSurfaceBuffer
@@ -194,13 +205,24 @@ type sceneRenderer struct {
 // 入参: format 文档格式, resources 已完成引用绑定的资源图
 // 返回: *sceneParser 页面解析器
 func newSceneParser(format Format, resources *resourceGraph) *sceneParser {
-	return &sceneParser{format: format, resources: resources, geometries: make(map[*xmlElement]*Geometry), matrices: make(map[*xmlElement]Matrix), brushes: make(map[*xmlElement]*Brush), elements: make(map[*xmlElement]Element)}
+	return &sceneParser{
+		format:     format,
+		resources:  resources,
+		geometries: make(map[*xmlElement]*Geometry),
+		matrices:   make(map[*xmlElement]Matrix),
+		brushes:    make(map[*xmlElement]*Brush),
+		brushRefs:  make(map[sceneBrushRefKey]*Brush),
+		elements:   make(map[*xmlElement]Element),
+	}
 }
 
 // parseDefinitions 按依赖顺序解析资源图中的全部几何、变换、画刷与视觉定义
 // 入参: ctx 可选取消Context，nil跳过取消检查
 // 返回: error 取消或资源解析错误
 func (p *sceneParser) parseDefinitions(ctx context.Context) error {
+	prev := p.context
+	p.context = ctx
+	defer func() { p.context = prev }()
 	for _, definition := range p.resources.Definitions {
 		if err := checkContext(ctx); err != nil {
 			return err
@@ -231,12 +253,30 @@ func (p *sceneParser) parseDefinitions(ctx context.Context) error {
 // 入参: root 页面根元素
 // 返回: []Element 绘制元素, error 错误信息
 func (p *sceneParser) parse(root *xmlElement) ([]Element, error) {
-	if err := p.parseDefinitions(nil); err != nil {
+	return p.parseContext(p.context, root)
+}
+
+// parseContext 在取消Context保护下按依赖顺序解析资源定义、页面资源字典与绘制元素
+// 入参: ctx 可选取消Context，nil跳过取消检查, root 页面根元素
+// 返回: []Element 绘制元素, error 取消或解析错误
+func (p *sceneParser) parseContext(ctx context.Context, root *xmlElement) ([]Element, error) {
+	prev := p.context
+	p.context = ctx
+	defer func() { p.context = prev }()
+	if err := p.parseDefinitions(ctx); err != nil {
 		return nil, err
 	}
 	var elements []Element
 	for _, child := range root.Children {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
 		if child.Name.Local == "FixedPage.Resources" {
+			dict, err := p.parseDictionary(ctx, child)
+			if err != nil {
+				return nil, err
+			}
+			p.pageResources = dict
 			continue
 		}
 		value, err := p.elementValue(child)
@@ -245,13 +285,130 @@ func (p *sceneParser) parse(root *xmlElement) ([]Element, error) {
 		}
 		elements = append(elements, value)
 	}
-	return elements, nil
+	return elements, checkContext(ctx)
+}
+
+// cloneSceneBrush 返回画刷的独立浅拷贝，隔离停靠点、颜色分量及变换指针
+// 入参: src 源画刷
+// 返回: *Brush 独立副本，src为nil时返回nil
+func cloneSceneBrush(src *Brush) *Brush {
+	if src == nil {
+		return nil
+	}
+	copied := *src
+	if src.Transform != nil {
+		m := *src.Transform
+		copied.Transform = &m
+	}
+	if len(src.Color.Components) != 0 {
+		copied.Color.Components = slices.Clone(src.Color.Components)
+	}
+	if len(src.Stops) != 0 {
+		copied.Stops = make([]GradientStop, len(src.Stops))
+		for i, stop := range src.Stops {
+			stop.Color.Components = slices.Clone(stop.Color.Components)
+			copied.Stops[i] = stop
+		}
+	}
+	return &copied
+}
+
+// cloneSceneGeometry 返回几何数据的独立副本，隔离变换指针及子路径切片
+// 入参: src 源几何
+// 返回: *Geometry 独立副本，src为nil时返回nil
+func cloneSceneGeometry(src *Geometry) *Geometry {
+	if src == nil {
+		return nil
+	}
+	copied := *src
+	if src.Transform != nil {
+		m := *src.Transform
+		copied.Transform = &m
+	}
+	if len(src.Figures) != 0 {
+		copied.Figures = make([]GeometryFigure, len(src.Figures))
+		for i, fig := range src.Figures {
+			fig.Segments = slices.Clone(fig.Segments)
+			copied.Figures[i] = fig
+		}
+	}
+	return &copied
+}
+
+// parseDictionary 将FixedPage.Resources或Canvas.Resources容器转换为公开的ResourceDictionary副本
+// 入参: ctx 可选取消Context, container 资源容器属性元素
+// 返回: *ResourceDictionary 独立资源字典，无字典子节点时返回nil, error 取消或解析错误
+func (p *sceneParser) parseDictionary(ctx context.Context, container *xmlElement) (*ResourceDictionary, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if container == nil || len(container.Children) == 0 || container.Children[0] == nil {
+		return nil, nil
+	}
+	dictNode := container.Children[0]
+	if source, ok := dictNode.attribute("Source"); ok {
+		basePart := p.resources.Parts[dictNode]
+		if basePart == "" {
+			basePart = p.resources.PagePart
+		}
+		target := strings.Trim(source, " \t\r\n")
+		if basePart != "" {
+			resolved, err := resolvePart(basePart, target)
+			if err != nil {
+				return nil, p.elementError(dictNode, err)
+			}
+			target = resolved
+		}
+		return &ResourceDictionary{Source: target}, nil
+	}
+	keyNS := formatNamespace(p.format) + "/resourcedictionary-key"
+	entries := make([]ResourceEntry, 0, len(dictNode.Children))
+	for _, child := range dictNode.Children {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		key, _ := child.attributeNS(keyNS, "Key")
+		var val any
+		switch resourceKind(child.Name.Local) {
+		case "geometry":
+			g, err := p.geometry(child, true)
+			if err != nil {
+				return nil, err
+			}
+			val = cloneSceneGeometry(g)
+		case "matrix":
+			m, err := p.matrix(child, true)
+			if err != nil {
+				return nil, err
+			}
+			val = &m
+		case "brush":
+			b, err := p.brush(child, true)
+			if err != nil {
+				return nil, err
+			}
+			copied := cloneSceneBrush(b)
+			copied.ResourceKey = ""
+			val = copied
+		case "visual":
+			el, err := p.elementValue(child)
+			if err != nil {
+				return nil, err
+			}
+			val = el
+		}
+		entries = append(entries, ResourceEntry{Key: key, Value: val})
+	}
+	return &ResourceDictionary{Entries: entries}, nil
 }
 
 // elementValue 将绘制节点转换为保留局部属性的类型化元素
 // 入参: node 绘制节点
 // 返回: Element 绘制元素, error 错误信息
 func (p *sceneParser) elementValue(node *xmlElement) (Element, error) {
+	if err := checkContext(p.context); err != nil {
+		return nil, err
+	}
 	if value := p.elements[node]; value != nil {
 		return value, nil
 	}
@@ -275,6 +432,14 @@ func (p *sceneParser) elementValue(node *xmlElement) (Element, error) {
 		value.AutomationName, _ = node.attribute("AutomationProperties.Name")
 		value.AutomationHelpText, _ = node.attribute("AutomationProperties.HelpText")
 		for _, child := range node.Children {
+			if child.Name.Local == "Canvas.Resources" {
+				dict, err := p.parseDictionary(p.context, child)
+				if err != nil {
+					return nil, err
+				}
+				value.Resources = dict
+				continue
+			}
 			if strings.HasPrefix(child.Name.Local, "Canvas.") {
 				continue
 			}
@@ -314,7 +479,7 @@ func (p *sceneParser) elementProperties(node *xmlElement) (ElementProperties, er
 		value.Opacity, _ = xmlNumber(text)
 	}
 	var err error
-	value.RenderTransform, err = p.matrixProperty(node, "RenderTransform")
+	value.RenderTransform, value.RenderTransformResource, err = p.matrixPropertyKey(node, "RenderTransform")
 	if err != nil {
 		return value, err
 	}
@@ -456,7 +621,22 @@ func (p *sceneParser) brushProperty(node *xmlElement, name string) (*Brush, erro
 		if definition.Key != key || resourceKind(definition.Kind) != "brush" {
 			return nil, p.elementError(node, fmt.Errorf("%w: unresolved brush %q", ErrInvalid, key))
 		}
-		return p.brush(definition.Element, true)
+		resolved, err := p.brush(definition.Element, true)
+		if err != nil {
+			return nil, err
+		}
+		if resolved.ResourceKey == "" || resolved.ResourceKey == key {
+			resolved.ResourceKey = key
+			return resolved, nil
+		}
+		refKey := sceneBrushRefKey{element: definition.Element, key: key}
+		if cached := p.brushRefs[refKey]; cached != nil {
+			return cached, nil
+		}
+		cloned := cloneSceneBrush(resolved)
+		cloned.ResourceKey = key
+		p.brushRefs[refKey] = cloned
+		return cloned, nil
 	}
 	if name == "OpacityMask" {
 		return nil, p.elementError(node, fmt.Errorf("%w: OpacityMask requires a brush", ErrInvalid))
@@ -478,7 +658,9 @@ func (p *sceneParser) brush(node *xmlElement, resource bool) (*Brush, error) {
 	if err := p.budget.resource(node); err != nil {
 		return nil, p.elementError(node, err)
 	}
+	var transformResource string
 	value, err := parseBrushElement(node, func(key string) (Matrix, error) {
+		transformResource = key
 		definition, err := p.binding(node, "Transform", key, "MatrixTransform")
 		if err != nil {
 			return Matrix{}, err
@@ -492,6 +674,7 @@ func (p *sceneParser) brush(node *xmlElement, resource bool) (*Brush, error) {
 		return nil, p.elementError(node, err)
 	}
 	value.Part = p.resources.Parts[node]
+	value.TransformResource = transformResource
 	if value.VisualReference != "" {
 		definition := p.resources.Bindings[node]["Visual"]
 		if definition == nil {
@@ -609,46 +792,49 @@ func (p *sceneParser) geometryProperty(node *xmlElement, name string) (*Geometry
 	return value, nil
 }
 
-// matrixProperty 读取矩阵属性的数值、资源引用或内联元素
+// matrixPropertyKey 读取矩阵属性并同步返回静态资源键，内联或字面量变换时键为空字符串
 // 入参: node 属性所属元素, name 属性名称
-// 返回: *Matrix 仿射矩阵，未指定时为nil, error 错误信息
-func (p *sceneParser) matrixProperty(node *xmlElement, name string) (*Matrix, error) {
+// 返回: *Matrix 仿射矩阵，未指定时为nil, string 静态资源键, error 错误信息
+func (p *sceneParser) matrixPropertyKey(node *xmlElement, name string) (*Matrix, string, error) {
 	inline, err := p.property(node, name)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if inline != nil {
 		value, err := p.matrix(inline, false)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return &value, nil
+		return &value, "", nil
 	}
 	text, present := node.attribute(name)
 	if !present {
-		return nil, nil
+		return nil, "", nil
 	}
 	key, reference, err := parseResourceReference(text)
 	if err != nil {
-		return nil, p.elementError(node, err)
+		return nil, "", p.elementError(node, err)
 	}
 	var value Matrix
 	if reference {
 		definition, err := p.binding(node, name, key, "MatrixTransform")
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if definition == nil {
-			return nil, nil
+			return nil, key, nil
 		}
 		value, err = p.matrix(definition.Element, true)
-	} else {
-		value, err = ParseMatrix(text)
+		if err != nil {
+			return nil, "", p.elementError(node, err)
+		}
+		return &value, key, nil
 	}
+	value, err = ParseMatrix(text)
 	if err != nil {
-		return nil, p.elementError(node, err)
+		return nil, "", p.elementError(node, err)
 	}
-	return &value, nil
+	return &value, "", nil
 }
 
 // property 读取单值属性元素并拒绝重复的属性表示
@@ -979,6 +1165,17 @@ func releaseSceneWorker(state *sceneWorkerState) {
 	}
 	if cap(state.clip.Pix) > sceneScratchPoolMax {
 		state.clip.Pix = nil
+	}
+	for i := range state.clipStack {
+		if cap(state.clipStack[i].Pix) > sceneScratchPoolMax {
+			state.clipStack[i].Pix = nil
+		}
+	}
+	if len(state.clipStack) > 8 {
+		for i := 8; i < len(state.clipStack); i++ {
+			state.clipStack[i] = nil
+		}
+		state.clipStack = state.clipStack[:8]
 	}
 	if cap(state.raster.prepared) > 4096 {
 		state.raster = rasterScratch{}
@@ -1369,7 +1566,7 @@ func printColorPreviewMaxBytes(pixels int) int64 {
 	return max(minBytes, int64(pixels)*8)
 }
 
-// attachPrintColorPlanPreview 为NRGBA隔离渲染配置基于标准sRGB目标的打印色彩管理执行上下文
+// attachPrintColorPlanPreview 为NRGBA隔离渲染配置基于标准sRGB目标的打印色彩管理执行环境
 // 入参: ctx 取消Context, settings 待配置的内部场景参数, config 渲染配置, root 承载颜色计划的根画布, plan 打印色彩管理计划
 // 返回: error 目标初始化或参数错误
 func attachPrintColorPlanPreview(ctx context.Context, settings *sceneRenderOptions, config RenderOptions, root *Canvas, plan *PrintColorPlan) error {
@@ -1468,7 +1665,7 @@ func runPreparedTiles[S any](r *sceneRenderer, nodes []*sceneNode, bounds image.
 	}
 	if workers > 1 {
 		available := uint64(max(0, r.options.pixels-r.live))
-		perWorker := uint64(tileW) * uint64(tileH) * pixelScale * uint64(1+sceneMaxIsolatedDepth(nodes))
+		perWorker := uint64(tileW) * uint64(tileH) * pixelScale * uint64(1+sceneMaxIsolatedDepthMode(nodes, pixelScale > 1))
 		if r.hasFiltered {
 			if available <= perWorker*2 {
 				workers = 1
@@ -1790,17 +1987,17 @@ func renderBoundsToPageRect(bounds image.Rectangle, options RenderOptions, devTr
 	return Rect{X: minX, Y: minY, Width: width, Height: height}, nil
 }
 
-// sceneMaxIsolatedDepth 计算已准备场景树中同时活跃的最大隔离表面嵌套深度
-// 入参: nodes 已准备场景节点列表
+// sceneMaxIsolatedDepthMode 计算场景树同时活跃的最大隔离表面嵌套深度，支持按路径选择是否将纯裁剪计入隔离
+// 入参: nodes 已准备场景节点列表, includeClip 是否将纯裁剪节点计入隔离深度
 // 返回: int 最大隔离深度
-func sceneMaxIsolatedDepth(nodes []*sceneNode) int {
+func sceneMaxIsolatedDepthMode(nodes []*sceneNode, includeClip bool) int {
 	maximum := 0
 	for _, node := range nodes {
 		if node == nil || node.opacity == 0 {
 			continue
 		}
-		depth := sceneMaxIsolatedDepth(node.children)
-		if node.opacity != 1 || node.mask != nil || node.clip != nil || node.negative {
+		depth := sceneMaxIsolatedDepthMode(node.children, includeClip)
+		if node.opacity != 1 || node.mask != nil || node.negative || includeClip && node.clip != nil {
 			depth++
 		}
 		if depth > maximum {
@@ -2465,7 +2662,7 @@ func (r *sceneRenderer) tile(nodes []*sceneNode, surface *renderSurface, output 
 			if node.opacity != 0 && node.bounds.Overlaps(bounds) {
 				touched = true
 			}
-			if err := r.draw(node, surface, bounds, subClip, 0, worker); err != nil {
+			if err := r.draw(node, surface, bounds, subClip, nil, 0, 0, worker); err != nil {
 				return err
 			}
 		}
@@ -2630,10 +2827,92 @@ func sceneRegionEdgeCost(region rasterRegion, minY, maxY float64) uint64 {
 	return count
 }
 
-// draw 先完成节点内部绘制，再施加节点裁剪、透明度掩模及整体透明度
-// 入参: node 绘制节点, target 背景表面, bounds 输出像素范围, subClip 有效子像素半开裁剪范围, isoDepth 当前隔离嵌套深度, worker 工作Goroutine独占状态
+// renderAxisAlignedClipRect 判断裁剪区域是否等价于单个轴对齐矩形，并返回与subClip求交后的精确子像素矩形
+// 入参: region 已准备的裁剪区域, aliased 裁剪区域是否采用粗像素空间, samples 线性采样倍率, subClip 当前有效子像素半开裁剪范围
+// 返回: image.Rectangle 收缩后的精确子像素半开裁剪范围, bool 是否可直接以矩形边界替代掩模光栅化
+func renderAxisAlignedClipRect(region rasterRegion, aliased bool, samples int, subClip image.Rectangle) (image.Rectangle, bool) {
+	var vEdges [2]geometryEdge
+	count := 0
+	for _, edge := range region.edges {
+		if !geometryFinite(edge.start.X, edge.start.Y, edge.end.X, edge.end.Y) {
+			return image.Rectangle{}, false
+		}
+		if edge.start.Y == edge.end.Y {
+			continue
+		}
+		if edge.start.X != edge.end.X || count >= 2 {
+			return image.Rectangle{}, false
+		}
+		vEdges[count] = edge
+		count++
+	}
+	if count == 0 {
+		return image.Rectangle{}, true
+	}
+	if count != 2 {
+		return image.Rectangle{}, false
+	}
+	e0, e1 := vEdges[0], vEdges[1]
+	if (e0.start.Y < e0.end.Y) == (e1.start.Y < e1.end.Y) {
+		return image.Rectangle{}, false
+	}
+	y0Lo, y0Hi := min(e0.start.Y, e0.end.Y), max(e0.start.Y, e0.end.Y)
+	y1Lo, y1Hi := min(e1.start.Y, e1.end.Y), max(e1.start.Y, e1.end.Y)
+	if y0Lo != y1Lo || y0Hi != y1Hi {
+		return image.Rectangle{}, false
+	}
+	xLo, xHi := min(e0.start.X, e1.start.X), max(e0.start.X, e1.start.X)
+	if xLo >= xHi {
+		return image.Rectangle{}, true
+	}
+	if !aliased || samples == 1 {
+		x0, x1 := renderSubClipInterval(xLo, xHi, subClip.Min.X, subClip.Max.X)
+		y0, y1 := renderSubClipInterval(y0Lo, y0Hi, subClip.Min.Y, subClip.Max.Y)
+		return image.Rect(x0, y0, x1, y1), true
+	}
+	cx0, cx1 := renderSubClipInterval(xLo, xHi, renderFloorDiv(subClip.Min.X, samples), renderCeilDiv(subClip.Max.X, samples))
+	cy0, cy1 := renderSubClipInterval(y0Lo, y0Hi, renderFloorDiv(subClip.Min.Y, samples), renderCeilDiv(subClip.Max.Y, samples))
+	return image.Rect(cx0*samples, cy0*samples, cx1*samples, cy1*samples).Intersect(subClip), true
+}
+
+// sceneIntersectAlphaMask 将目标二值覆盖掩模与父级裁剪掩模就地求交，交集范围外全部清零
+// 入参: dst 待裁剪的目标二值掩模, clip 父级二值裁剪掩模
+func sceneIntersectAlphaMask(dst, clip *image.Alpha) {
+	if dst == nil || clip == nil || dst.Rect.Empty() {
+		return
+	}
+	inter := dst.Rect.Intersect(clip.Rect)
+	if inter.Empty() {
+		clear(dst.Pix)
+		return
+	}
+	width := dst.Rect.Dx()
+	for y := dst.Rect.Min.Y; y < dst.Rect.Max.Y; y++ {
+		dstRow := dst.Pix[(y-dst.Rect.Min.Y)*dst.Stride : (y-dst.Rect.Min.Y)*dst.Stride+width]
+		if y < inter.Min.Y || y >= inter.Max.Y {
+			clear(dstRow)
+			continue
+		}
+		left := inter.Min.X - dst.Rect.Min.X
+		right := inter.Max.X - dst.Rect.Min.X
+		if left > 0 {
+			clear(dstRow[:left])
+		}
+		if right < width {
+			clear(dstRow[right:])
+		}
+		cOff := (y-clip.Rect.Min.Y)*clip.Stride + (inter.Min.X - clip.Rect.Min.X)
+		clipRow := clip.Pix[cOff : cOff+inter.Dx()]
+		for col, m := range clipRow {
+			dstRow[left+col] &= m
+		}
+	}
+}
+
+// draw 先完成节点内部绘制，再施加节点裁剪、透明度掩模及整体透明度；纯裁剪节点就地裁剪求交而不分配离屏表面
+// 入参: node 绘制节点, target 背景表面, bounds 输出像素范围, subClip 有效子像素半开裁剪范围, clipMask 父级非矩形裁剪掩模, isoDepth 当前隔离嵌套深度, clipDepth 当前非矩形裁剪嵌套深度, worker 工作Goroutine独占状态
 // 返回: error 带部件位置的绘制错误
-func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds, subClip image.Rectangle, isoDepth int, worker *sceneWorkerState) (err error) {
+func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds, subClip image.Rectangle, clipMask *image.Alpha, isoDepth, clipDepth int, worker *sceneWorkerState) (err error) {
 	defer func() {
 		if err != nil {
 			err = wrapPartError(node.part, node.kind, err)
@@ -2647,11 +2926,46 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds, sub
 		return nil
 	}
 	samples := r.options.samples
-	isolated := node.opacity != 1 || node.mask != nil || node.clip != nil || node.negative
+	isolated := node.opacity != 1 || node.mask != nil || node.negative
 	surface := target
 	nextDepth := isoDepth
+	nextClipDepth := clipDepth
 	drawBounds := bounds
 	childClip := subClip
+	childClipMask := clipMask
+	if !isolated && node.clip != nil {
+		if rectClip, ok := renderAxisAlignedClipRect(*node.clip, node.aliased, samples, subClip); ok {
+			if rectClip.Empty() {
+				return nil
+			}
+			childClip = rectClip
+		} else {
+			clipSub := image.Rect(nodeTile.Min.X*samples, nodeTile.Min.Y*samples, nodeTile.Max.X*samples, nodeTile.Max.Y*samples).Intersect(subClip)
+			if clipSub.Empty() {
+				return nil
+			}
+			minY, maxY := float64(clipSub.Min.Y), float64(clipSub.Max.Y)
+			if node.aliased {
+				minY, maxY = float64(nodeTile.Min.Y), float64(nodeTile.Max.Y)
+			}
+			if err := r.charge(uint64(clipSub.Dx())*uint64(clipSub.Dy()) + sceneRegionEdgeCost(*node.clip, minY, maxY)); err != nil {
+				return err
+			}
+			for len(worker.clipStack) <= clipDepth {
+				worker.clipStack = append(worker.clipStack, &image.Alpha{})
+			}
+			localMask, err := r.coverageScratch([]rasterRegion{*node.clip}, node.aliased, clipSub, worker.clipStack[clipDepth], worker)
+			if err != nil {
+				return err
+			}
+			if clipMask != nil {
+				sceneIntersectAlphaMask(localMask, clipMask)
+			}
+			childClip = clipSub
+			childClipMask = localMask
+			nextClipDepth = clipDepth + 1
+		}
+	}
 	if isolated {
 		isoBounds := image.Rect(nodeTile.Min.X*samples, nodeTile.Min.Y*samples, nodeTile.Max.X*samples, nodeTile.Max.Y*samples).Intersect(subClip)
 		if isoBounds.Empty() {
@@ -2669,6 +2983,7 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds, sub
 		nextDepth = isoDepth + 1
 		drawBounds = nodeTile
 		childClip = isoBounds
+		childClipMask = nil
 	}
 	scale := float64(samples)
 	for _, paint := range node.paints {
@@ -2709,6 +3024,9 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds, sub
 		if err != nil {
 			return err
 		}
+		if childClipMask != nil {
+			sceneIntersectAlphaMask(mask, childClipMask)
+		}
 		switch {
 		case paint.solid:
 			err = surface.paintBinarySolid(mask, paint.solidColor)
@@ -2734,7 +3052,7 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds, sub
 		}
 	}
 	for _, child := range node.children {
-		if err := r.draw(child, surface, drawBounds, childClip, nextDepth, worker); err != nil {
+		if err := r.draw(child, surface, drawBounds, childClip, childClipMask, nextDepth, nextClipDepth, worker); err != nil {
 			return err
 		}
 	}
@@ -2746,7 +3064,7 @@ func (r *sceneRenderer) draw(node *sceneNode, target *renderSurface, bounds, sub
 	if !isolated {
 		return nil
 	}
-	return r.composite(node, surface, target, drawBounds, worker)
+	return r.composite(node, surface, target, drawBounds, clipMask, worker)
 }
 
 // coverageScratch 生成统一采样空间的二值掩模并复用工作Goroutine的扫描与字节缓冲，支持非对齐子像素裁剪范围
@@ -2827,15 +3145,18 @@ func (r *sceneRenderer) coverageScratch(regions []rasterRegion, aliased bool, bo
 }
 
 // composite 在统一采样位置施加裁剪及画刷掩模，不量化中间透明度
-// 入参: node 隔离节点, source 内部绘制完成的表面, target 背景表面, bounds 当前图块输出像素范围, worker 工作Goroutine独占状态
+// 入参: node 隔离节点, source 内部绘制完成的表面, target 背景表面, bounds 当前图块输出像素范围, parentClip 来自父级纯裁剪节点的非矩形裁剪掩模, worker 工作Goroutine独占状态
 // 返回: error 裁剪、采样或合成错误
-func (r *sceneRenderer) composite(node *sceneNode, source, target *renderSurface, bounds image.Rectangle, worker *sceneWorkerState) error {
+func (r *sceneRenderer) composite(node *sceneNode, source, target *renderSurface, bounds image.Rectangle, parentClip *image.Alpha, worker *sceneWorkerState) error {
 	samples := r.options.samples
 	compTile := node.bounds.Intersect(bounds)
 	if compTile.Empty() {
 		return nil
 	}
 	subBounds := image.Rect(compTile.Min.X*samples, compTile.Min.Y*samples, compTile.Max.X*samples, compTile.Max.Y*samples).Intersect(source.bounds).Intersect(target.bounds)
+	if parentClip != nil {
+		subBounds = subBounds.Intersect(parentClip.Rect)
+	}
 	if subBounds.Empty() {
 		return nil
 	}
@@ -2857,6 +3178,11 @@ func (r *sceneRenderer) composite(node *sceneNode, source, target *renderSurface
 		if err != nil {
 			return err
 		}
+		if parentClip != nil {
+			sceneIntersectAlphaMask(clip, parentClip)
+		}
+	} else if parentClip != nil {
+		clip = parentClip
 	}
 	width := subBounds.Dx()
 	srcStride := source.bounds.Dx()

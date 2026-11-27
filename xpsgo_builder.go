@@ -286,6 +286,13 @@ type pngRowEncoder struct {
 	closed   bool
 }
 
+// StoryFragmentsBuilder 链式构建合标的XPS StoryFragments页面故事片段与语义结构树
+type StoryFragmentsBuilder struct {
+	part      string
+	fragments []StoryFragment
+	err       error
+}
+
 // String 返回图像编码格式的可读名称
 // 返回: string 格式名称
 func (f ImageEncodeFormat) String() string {
@@ -2722,4 +2729,479 @@ func encodeGoImageJXR(ctx context.Context, img image.Image, cfg ImageEncodeOptio
 		return nil, err
 	}
 	return out.Bytes(), nil
+}
+
+// encodePNGFromRowsTo 通过逐行扫描回调流式编码标准PNG并写入目标输出流
+// 入参: ctx 已规范化取消Context, w 目标输出流, options 图像尺寸、位深、色彩模型、分辨率与ICC配置, maxPixels 像素总数上限, readRow 按零基行号填充原始扫描行的回调
+// 返回: error 参数、回调、编码、预算或取消错误
+func encodePNGFromRowsTo(ctx context.Context, w io.Writer, options StreamImageRowOptions, maxPixels uint64, readRow func(y int, dst []byte) error) error {
+	dpix, dpiy, bitDepth, colorType, rowBytes, err := validateStreamPNGRowOptions(ctx, options, maxPixels)
+	if err != nil {
+		return err
+	}
+	return encodePNGFromValidatedRowsTo(ctx, w, options, dpix, dpiy, bitDepth, colorType, rowBytes, readRow)
+}
+
+// encodePNGFromValidatedRowsTo 使用已校验PNG规格与扫描行宽流式编码标准PNG并写入目标输出流
+// 入参: ctx 已规范化取消Context, w 目标输出流, options 图像尺寸与ICC配置, dpix 水平分辨率, dpiy 垂直分辨率, bitDepth 位深度, colorType PNG颜色类型, rowBytes 单行原始字节数, readRow 按零基行号填充原始扫描行的回调
+// 返回: error 回调、编码、预算或取消错误
+func encodePNGFromValidatedRowsTo(ctx context.Context, w io.Writer, options StreamImageRowOptions, dpix, dpiy float64, bitDepth int, colorType byte, rowBytes int, readRow func(y int, dst []byte) error) error {
+	enc, err := newPNGRowEncoder(ctx, w, options.Width, options.Height, uint8(bitDepth), colorType, dpix, dpiy, options.ICCProfile)
+	if err != nil {
+		return err
+	}
+	rowBuf := make([]byte, rowBytes)
+	for y := 0; y < options.Height; y++ {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		if err := readRow(y, rowBuf); err != nil {
+			return err
+		}
+		if err := enc.writeRow(ctx, rowBuf); err != nil {
+			return err
+		}
+	}
+	return enc.close(ctx)
+}
+
+// encodeTIFFFromRowsTo 通过逐行扫描回调按多Strip编码Little-Endian Baseline TIFF并直接写入目标输出流
+// 无压缩模式恒定单条带内存直接前向写出；压缩模式复用单条带原始缓冲逐条带压缩并暂存压缩条带，全部压缩后释放原始缓冲并在写出时逐条释放压缩条带以降低内存峰值
+// 入参: ctx 已规范化取消Context, w 目标输出流, options 图像尺寸、位深、色彩模型、压缩方式、分辨率与ICC配置, maxBytes 输出字节上限, maxPixels 像素总数上限, readRow 按零基行号填充原始像素的回调
+// 返回: error 参数、回调、编码、预算或取消错误
+func encodeTIFFFromRowsTo(ctx context.Context, w io.Writer, options StreamImageRowOptions, maxBytes int64, maxPixels uint64, readRow func(y int, dst []byte) error) error {
+	spec, rowBytes, err := validateStreamTIFFRowOptions(ctx, options, maxPixels)
+	if err != nil {
+		return err
+	}
+	return encodeTIFFFromValidatedRowsTo(ctx, w, spec, rowBytes, maxBytes, readRow)
+}
+
+// encodeTIFFFromValidatedRowsTo 使用已校验TIFF规格与扫描行宽按多Strip编码Little-Endian Baseline TIFF并直接写入目标输出流
+// 入参: ctx 已规范化取消Context, w 目标输出流, spec 已校验TIFF写入规格, rowBytes 单行原始字节数, maxBytes 输出字节上限, readRow 按零基行号填充原始像素的回调
+// 返回: error 回调、编码、预算或取消错误
+func encodeTIFFFromValidatedRowsTo(ctx context.Context, w io.Writer, spec tiffStripSpec, rowBytes int, maxBytes int64, readRow func(y int, dst []byte) error) error {
+	rowsPerStrip, err := tiffRowsPerStrip(rowBytes, spec.height, maxBytes)
+	if err != nil {
+		return err
+	}
+	spec.rowsPerStrip = rowsPerStrip
+	stripCount := (spec.height + rowsPerStrip - 1) / rowsPerStrip
+	rawBuf := make([]byte, rowsPerStrip*rowBytes)
+	fillStrip := func(startY, rows int) ([]byte, error) {
+		chunk := rawBuf[:rows*rowBytes]
+		for row := range rows {
+			if err := checkContext(ctx); err != nil {
+				return nil, err
+			}
+			dst := chunk[row*rowBytes : (row+1)*rowBytes]
+			if err := readRow(startY+row, dst); err != nil {
+				return nil, err
+			}
+			if spec.bps == 16 {
+				swapUint16Bytes(dst)
+			}
+		}
+		return chunk, nil
+	}
+	if spec.compression == TIFFCompressionNone {
+		if int64(spec.height) > maxBytes/int64(rowBytes) {
+			return fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+		}
+		offsets := make([]uint32, stripCount)
+		counts := make([]uint32, stripCount)
+		cursor := int64(8)
+		for i := range stripCount {
+			rows := min(rowsPerStrip, spec.height-i*rowsPerStrip)
+			n := int64(rows * rowBytes)
+			if cursor+n > maxBytes || cursor+n > math.MaxUint32 {
+				return fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+			}
+			offsets[i] = uint32(cursor)
+			counts[i] = uint32(n)
+			cursor += n
+		}
+		pad := cursor & 1
+		ifdOffset := cursor + pad
+		if ifdOffset > math.MaxUint32 {
+			return fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+		}
+		ifdBytes, err := encodeTIFFIFD(spec, offsets, counts, uint32(ifdOffset))
+		if err != nil {
+			return err
+		}
+		if ifdOffset+int64(len(ifdBytes)) > maxBytes || ifdOffset+int64(len(ifdBytes)) > math.MaxUint32 {
+			return fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+		}
+		var header [8]byte
+		copy(header[0:2], "II")
+		binary.LittleEndian.PutUint16(header[2:4], 42)
+		binary.LittleEndian.PutUint32(header[4:8], uint32(ifdOffset))
+		if _, err := w.Write(header[:]); err != nil {
+			return err
+		}
+		for i := range stripCount {
+			rows := min(rowsPerStrip, spec.height-i*rowsPerStrip)
+			chunk, err := fillStrip(i*rowsPerStrip, rows)
+			if err != nil {
+				return err
+			}
+			if _, err := w.Write(chunk); err != nil {
+				return err
+			}
+		}
+		if pad != 0 {
+			if _, err := w.Write([]byte{0}); err != nil {
+				return err
+			}
+		}
+		_, err = w.Write(ifdBytes)
+		return err
+	}
+	strips := make([][]byte, 0, stripCount)
+	offsets := make([]uint32, stripCount)
+	counts := make([]uint32, stripCount)
+	cursor := int64(8)
+	for i := range stripCount {
+		rows := min(rowsPerStrip, spec.height-i*rowsPerStrip)
+		chunk, err := fillStrip(i*rowsPerStrip, rows)
+		if err != nil {
+			return err
+		}
+		remaining := maxBytes - cursor
+		if remaining <= 0 {
+			return fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+		}
+		encoded, err := encodeTIFFStripData(ctx, chunk, spec.width, rows, rowBytes, spec.compression, remaining)
+		if err != nil {
+			return err
+		}
+		if int64(len(encoded)) > math.MaxUint32 || cursor+int64(len(encoded)) > maxBytes || cursor+int64(len(encoded)) > math.MaxUint32 {
+			return fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+		}
+		offsets[i] = uint32(cursor)
+		counts[i] = uint32(len(encoded))
+		cursor += int64(len(encoded))
+		strips = append(strips, encoded)
+	}
+	rawBuf = nil
+	pad := cursor & 1
+	ifdOffset := cursor + pad
+	if ifdOffset > math.MaxUint32 {
+		return fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+	}
+	ifdBytes, err := encodeTIFFIFD(spec, offsets, counts, uint32(ifdOffset))
+	if err != nil {
+		return err
+	}
+	if ifdOffset+int64(len(ifdBytes)) > maxBytes || ifdOffset+int64(len(ifdBytes)) > math.MaxUint32 {
+		return fmt.Errorf("%w: encoded TIFF exceeds byte budget", ErrLimit)
+	}
+	var header [8]byte
+	copy(header[0:2], "II")
+	binary.LittleEndian.PutUint16(header[2:4], 42)
+	binary.LittleEndian.PutUint32(header[4:8], uint32(ifdOffset))
+	if _, err := w.Write(header[:]); err != nil {
+		return err
+	}
+	for i := range strips {
+		strip := strips[i]
+		strips[i] = nil
+		if _, err := w.Write(strip); err != nil {
+			return err
+		}
+	}
+	if pad != 0 {
+		if _, err := w.Write([]byte{0}); err != nil {
+			return err
+		}
+	}
+	_, err = w.Write(ifdBytes)
+	return err
+}
+
+// NewStoryFragmentsBuilder 创建页面故事片段链式构建器，part为空表示由宿主按默认规则分配部件路径
+// 入参: part 可选部件URI，非空时校验为合规OPC部件路径
+// 返回: *StoryFragmentsBuilder 故事片段构建器
+func NewStoryFragmentsBuilder(part string) *StoryFragmentsBuilder {
+	b := &StoryFragmentsBuilder{}
+	if part != "" {
+		normalized, err := opcPartName(part)
+		if err != nil {
+			b.err = err
+			return b
+		}
+		b.part = normalized
+	}
+	return b
+}
+
+// AddFragment 新建故事片段并将其设为当前活动片段，后续内容追加操作将作用于该片段
+// 入参: fragmentType 片段类型（如FragmentContent）, storyName 可选所属故事名称，空串省略, fragmentName 可选片段名称，空串省略且非空时要求storyName非空
+// 返回: *StoryFragmentsBuilder 构建器本身以支持链式调用
+func (b *StoryFragmentsBuilder) AddFragment(fragmentType FragmentType, storyName, fragmentName string) *StoryFragmentsBuilder {
+	if b == nil || b.err != nil {
+		return b
+	}
+	switch fragmentType {
+	case FragmentContent, FragmentHeader, FragmentFooter:
+	default:
+		b.err = fmt.Errorf("%w: unsupported StoryFragment type %q", ErrInvalid, fragmentType)
+		return b
+	}
+	if fragmentName != "" && storyName == "" {
+		b.err = fmt.Errorf("%w: StoryFragment FragmentName requires StoryName", ErrInvalid)
+		return b
+	}
+	frag := StoryFragment{Type: fragmentType}
+	if storyName != "" {
+		s := storyName
+		frag.StoryName = &s
+	}
+	if fragmentName != "" {
+		f := fragmentName
+		frag.FragmentName = &f
+	}
+	b.fragments = append(b.fragments, frag)
+	return b
+}
+
+// SetBreaks 设置当前活动故事片段的前后分页断行标志
+// 入参: before 是否在片段前断页, after 是否在片段后断页
+// 返回: *StoryFragmentsBuilder 构建器本身以支持链式调用
+func (b *StoryFragmentsBuilder) SetBreaks(before, after bool) *StoryFragmentsBuilder {
+	if b == nil || b.err != nil {
+		return b
+	}
+	if len(b.fragments) == 0 {
+		b.err = fmt.Errorf("%w: no active StoryFragment for SetBreaks", ErrInvalid)
+		return b
+	}
+	b.fragments[len(b.fragments)-1].BreakBefore = before
+	b.fragments[len(b.fragments)-1].BreakAfter = after
+	return b
+}
+
+// AddContent 向当前活动故事片段追加一个或多个语义结构节点，自动深拷贝防止调用方后续修改影响构建器状态
+// 入参: nodes 待追加的语义结构节点列表
+// 返回: *StoryFragmentsBuilder 构建器本身以支持链式调用
+func (b *StoryFragmentsBuilder) AddContent(nodes ...ContentStructure) *StoryFragmentsBuilder {
+	if b == nil || b.err != nil {
+		return b
+	}
+	if len(b.fragments) == 0 {
+		b.err = fmt.Errorf("%w: no active StoryFragment for AddContent", ErrInvalid)
+		return b
+	}
+	for _, node := range nodes {
+		cloned, err := cloneStoryContentStructure(node, 0)
+		if err != nil {
+			b.err = err
+			return b
+		}
+		b.fragments[len(b.fragments)-1].Content = append(b.fragments[len(b.fragments)-1].Content, cloned)
+	}
+	return b
+}
+
+// AddNamedElement 向当前活动故事片段追加一个引用页面命名元素的NamedElement节点
+// 入参: nameRef 页面中对应元素的Name标识
+// 返回: *StoryFragmentsBuilder 构建器本身以支持链式调用
+func (b *StoryFragmentsBuilder) AddNamedElement(nameRef string) *StoryFragmentsBuilder {
+	return b.AddContent(NewStoryNamedElement(nameRef))
+}
+
+// AddParagraph 向当前活动故事片段追加一个包含若干命名元素引用的段落结构节点
+// 入参: nameRefs 段落内按阅读顺序排列的页面元素Name标识列表
+// 返回: *StoryFragmentsBuilder 构建器本身以支持链式调用
+func (b *StoryFragmentsBuilder) AddParagraph(nameRefs ...string) *StoryFragmentsBuilder {
+	return b.AddContent(NewStoryParagraph(nameRefs...))
+}
+
+// AddFigure 向当前活动故事片段追加一个包含若干命名元素引用的插图结构节点
+// 入参: nameRefs 插图内按阅读顺序排列的页面元素Name标识列表
+// 返回: *StoryFragmentsBuilder 构建器本身以支持链式调用
+func (b *StoryFragmentsBuilder) AddFigure(nameRefs ...string) *StoryFragmentsBuilder {
+	children := make([]ContentStructure, 0, len(nameRefs))
+	for _, ref := range nameRefs {
+		children = append(children, NewStoryNamedElement(ref))
+	}
+	return b.AddContent(ContentStructure{Kind: StructureFigure, Children: children})
+}
+
+// AddSection 向当前活动故事片段追加一个章节容器节点
+// 入参: children 章节内部语义子节点列表
+// 返回: *StoryFragmentsBuilder 构建器本身以支持链式调用
+func (b *StoryFragmentsBuilder) AddSection(children ...ContentStructure) *StoryFragmentsBuilder {
+	return b.AddContent(ContentStructure{Kind: StructureSection, Children: children})
+}
+
+// AddList 向当前活动故事片段追加一个列表容器节点
+// 入参: items 列表项子节点列表
+// 返回: *StoryFragmentsBuilder 构建器本身以支持链式调用
+func (b *StoryFragmentsBuilder) AddList(items ...ContentStructure) *StoryFragmentsBuilder {
+	return b.AddContent(ContentStructure{Kind: StructureList, Children: items})
+}
+
+// AddTable 向当前活动故事片段追加一个表格容器节点，传入直接行节点时自动归入表格行组以满足规范层级要求
+// 入参: rows 表格行或行组子节点列表
+// 返回: *StoryFragmentsBuilder 构建器本身以支持链式调用
+func (b *StoryFragmentsBuilder) AddTable(rows ...ContentStructure) *StoryFragmentsBuilder {
+	groups := make([]ContentStructure, 0, len(rows))
+	var pending []ContentStructure
+	flushRows := func() {
+		if len(pending) != 0 {
+			groups = append(groups, ContentStructure{Kind: StructureRowGroup, Children: pending})
+			pending = nil
+		}
+	}
+	for _, item := range rows {
+		if item.Kind == StructureRow {
+			pending = append(pending, item)
+			continue
+		}
+		flushRows()
+		groups = append(groups, item)
+	}
+	flushRows()
+	return b.AddContent(ContentStructure{Kind: StructureTable, Children: groups})
+}
+
+// Err 返回故事片段构建器链式操作期间记录的首个错误
+// 返回: error 首个错误，无错为nil
+func (b *StoryFragmentsBuilder) Err() error {
+	if b == nil {
+		return fmt.Errorf("%w: nil StoryFragmentsBuilder", ErrInvalid)
+	}
+	return b.err
+}
+
+// Build 校验已添加片段并生成独立的StoryFragments模型，构建成功后可继续复用或安全传入SetStoryFragments
+// 返回: *StoryFragments 独立的页面故事片段模型, error 参数或结构校验错误
+func (b *StoryFragmentsBuilder) Build() (*StoryFragments, error) {
+	if b == nil {
+		return nil, fmt.Errorf("%w: nil StoryFragmentsBuilder", ErrInvalid)
+	}
+	if b.err != nil {
+		return nil, b.err
+	}
+	if len(b.fragments) == 0 {
+		return nil, fmt.Errorf("%w: StoryFragmentsBuilder requires at least one StoryFragment", ErrInvalid)
+	}
+	out := &StoryFragments{Part: b.part, Fragments: make([]StoryFragment, len(b.fragments))}
+	for i, frag := range b.fragments {
+		copied := StoryFragment{Type: frag.Type, BreakBefore: frag.BreakBefore, BreakAfter: frag.BreakAfter}
+		if frag.StoryName != nil {
+			s := *frag.StoryName
+			copied.StoryName = &s
+		}
+		if frag.FragmentName != nil {
+			f := *frag.FragmentName
+			copied.FragmentName = &f
+		}
+		if len(frag.Content) != 0 {
+			copied.Content = make([]ContentStructure, len(frag.Content))
+			for j, node := range frag.Content {
+				cloned, err := cloneStoryContentStructure(node, 0)
+				if err != nil {
+					return nil, err
+				}
+				copied.Content[j] = cloned
+			}
+		}
+		out.Fragments[i] = copied
+	}
+	return out, nil
+}
+
+// NewStoryNamedElement 构造引用单个页面命名元素的StoryFragments语义叶节点
+// 入参: nameRef 页面元素Name标识
+// 返回: ContentStructure NamedElement节点
+func NewStoryNamedElement(nameRef string) ContentStructure {
+	return ContentStructure{Kind: StructureNamedElement, NameReference: nameRef}
+}
+
+// NewStoryParagraph 构造包含若干命名元素引用的段落语义节点
+// 入参: nameRefs 段落内的页面元素Name标识列表
+// 返回: ContentStructure 段落结构节点
+func NewStoryParagraph(nameRefs ...string) ContentStructure {
+	children := make([]ContentStructure, 0, len(nameRefs))
+	for _, ref := range nameRefs {
+		children = append(children, NewStoryNamedElement(ref))
+	}
+	return ContentStructure{Kind: StructureParagraph, Children: children}
+}
+
+// NewStoryListItem 构造可选项目符号引用的列表项语义节点
+// 入参: marker 可选项目符号页面元素Name标识，空串省略, children 列表项内部子节点列表
+// 返回: ContentStructure 列表项结构节点
+func NewStoryListItem(marker string, children ...ContentStructure) ContentStructure {
+	var ptr *string
+	if marker != "" {
+		m := marker
+		ptr = &m
+	}
+	return ContentStructure{Kind: StructureListItem, Marker: ptr, Children: slices.Clone(children)}
+}
+
+// NewStoryTableRow 构造表格行语义节点
+// 入参: cells 单元格子节点列表
+// 返回: ContentStructure 表格行结构节点
+func NewStoryTableRow(cells ...ContentStructure) ContentStructure {
+	return ContentStructure{Kind: StructureRow, Children: slices.Clone(cells)}
+}
+
+// NewStoryTableCell 构造带跨行跨列属性的表格单元格语义节点
+// 入参: rowSpan 跨行数，非正数按1处理, colSpan 跨列数，非正数按1处理, children 单元格内部子节点列表
+// 返回: ContentStructure 表格单元格结构节点
+func NewStoryTableCell(rowSpan, colSpan int, children ...ContentStructure) ContentStructure {
+	if rowSpan <= 0 {
+		rowSpan = 1
+	}
+	if colSpan <= 0 {
+		colSpan = 1
+	}
+	return ContentStructure{Kind: StructureCell, RowSpan: int32(rowSpan), ColumnSpan: int32(colSpan), Children: slices.Clone(children)}
+}
+
+// cloneStoryContentStructure 递归校验并深拷贝故事内容语义节点，防止调用方修改共享切片
+// 入参: node 源语义节点, depth 当前递归深度
+// 返回: ContentStructure 独立语义节点副本, error 节点种类、空引用或深度超限错误
+func cloneStoryContentStructure(node ContentStructure, depth int) (ContentStructure, error) {
+	if depth > DefaultLimits().MaxXMLDepth {
+		return ContentStructure{}, fmt.Errorf("%w: StoryFragments content depth", ErrLimit)
+	}
+	switch node.Kind {
+	case StructureNamedElement:
+		if strings.TrimSpace(node.NameReference) == "" {
+			return ContentStructure{}, fmt.Errorf("%w: NamedElement requires NameReference", ErrInvalid)
+		}
+		if len(node.Children) != 0 {
+			return ContentStructure{}, fmt.Errorf("%w: NamedElement cannot contain children", ErrInvalid)
+		}
+	case StructureSection, StructureParagraph, StructureFigure, StructureList, StructureListItem, StructureTable, StructureRowGroup, StructureRow, StructureCell:
+	default:
+		return ContentStructure{}, fmt.Errorf("%w: unsupported ContentStructure kind %q", ErrInvalid, node.Kind)
+	}
+	out := ContentStructure{
+		Kind:          node.Kind,
+		NameReference: node.NameReference,
+		RowSpan:       node.RowSpan,
+		ColumnSpan:    node.ColumnSpan,
+	}
+	if node.Marker != nil {
+		m := *node.Marker
+		out.Marker = &m
+	}
+	if len(node.Children) != 0 {
+		out.Children = make([]ContentStructure, len(node.Children))
+		for i, child := range node.Children {
+			cloned, err := cloneStoryContentStructure(child, depth+1)
+			if err != nil {
+				return ContentStructure{}, err
+			}
+			out.Children[i] = cloned
+		}
+	}
+	return out, nil
 }

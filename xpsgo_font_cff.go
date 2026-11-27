@@ -160,21 +160,49 @@ type type2Seac struct {
 	accent uint8
 }
 
-// type2Interpreter 保存一个字形跨子程序共享的有界执行状态
+// cffType2OperandMeta 记录Type2操作数在源字节码中的切片来源，供子程序重编号追踪复用
+type cffType2OperandMeta struct {
+	tag     uint64
+	start   int
+	end     int
+	literal bool
+}
+
+// cffType2Callbacks 定义共享Type2执行内核对轮廓构建或子程序追踪的回调钩子
+type cffType2Callbacks struct {
+	spend      func(count int) error
+	onCallSubr func(isGlobal bool, index int, meta cffType2OperandMeta) (uint64, error)
+	onWidth    func(delta float64) error
+	onPath     func(op byte, args []float64) error
+	onFlex     func(op byte, args []float64) error
+	onEndChar  func(args []float64) error
+}
+
+// cffType2Engine 封装Type2字形程序的共享字节码解码、操作数栈、暂存区、提示与子程序调度内核
+type cffType2Engine struct {
+	globalSubr    [][]byte
+	localSubr     [][]byte
+	stack         [48]float64
+	meta          [48]cffType2OperandMeta
+	n             int
+	transient     [32]float64
+	transientMeta [32]cffType2OperandMeta
+	initialized   uint32
+	widthSeen     bool
+	stems         int
+	stage         int
+	randomState   uint32
+	strictHints   bool
+	callbacks     cffType2Callbacks
+}
+
+// type2Interpreter 保存一个字形跨子程序共享的轮廓构建状态并复用共享Type2内核
 type type2Interpreter struct {
-	context     type2Context
-	glyph       type2Glyph
-	stack       [48]float64
-	n           int
-	transient   [32]float64
-	initialized uint32
-	point       Point
-	widthSeen   bool
-	stems       int
-	stage       int
-	plainStems  bool
-	remaining   int
-	randomState uint32
+	context   type2Context
+	glyph     type2Glyph
+	point     Point
+	remaining int
+	engine    cffType2Engine
 }
 
 // parseCFFSet 读取CFF1文件头及按固定顺序排列的四个索引，兼容同一主版本的扩展头
@@ -693,8 +721,8 @@ func parseCFFEncodingRecord(data []byte, offset uint32, charset *cffCharset) (*[
 			sid := binary.BigEndian.Uint16(data[position+1:])
 			position += 3
 			mapped, ok := charset.glyph(sid)
-			if !ok || mapped == 0 || int(mapped) >= gid || encoding[code] != 0 {
-				return nil, nil, fmt.Errorf("%w: CFF supplement must add a code for a main-encoding glyph", ErrInvalid)
+			if !ok || mapped == 0 || int(mapped) >= len(charset.values) || encoding[code] != 0 {
+				return nil, nil, fmt.Errorf("%w: CFF supplement references invalid glyph", ErrInvalid)
 			}
 			encoding[code] = mapped
 		}
@@ -707,6 +735,392 @@ func parseCFFEncodingRecord(data []byte, offset uint32, charset *cffCharset) (*[
 // 返回: uint16 字符串标识，未定义字符码返回零
 func cffStandardSID(code byte) uint16 {
 	return cffStandardEncoding[code]
+}
+
+// cffType2SubrBias 按CFF规范根据子程序表长度计算调用偏置
+// 入参: count 子程序表条目数量
+// 返回: int 子程序调用偏置值
+func cffType2SubrBias(count int) int {
+	if count >= 33900 {
+		return 32768
+	}
+	if count >= 1240 {
+		return 1131
+	}
+	return 107
+}
+
+// spend 扣减共享Type2执行内核的预算计数
+// 入参: count 执行单元数量
+// 返回: error 预算或取消错误
+func (e *cffType2Engine) spend(count int) error {
+	if e.callbacks.spend != nil {
+		return e.callbacks.spend(count)
+	}
+	return nil
+}
+
+// push 将有限数及其源码位置元数据压入规范限定的48项参数栈
+// 入参: value 数值, meta 操作数字面来源元数据
+// 返回: error 栈上限或非有限数值错误
+func (e *cffType2Engine) push(value float64, meta cffType2OperandMeta) error {
+	if !geometryFinite(value) {
+		return fmt.Errorf("%w: non-finite Type2 arithmetic", ErrInvalid)
+	}
+	if e.n == len(e.stack) {
+		return fmt.Errorf("%w: Type2 operand stack", ErrLimit)
+	}
+	e.stack[e.n] = value
+	e.meta[e.n] = meta
+	e.n++
+	return nil
+}
+
+// consumeWidth 在第一个允许携带宽度的清栈操作处提取可选宽度增量
+// 入参: op 操作符编号，0表示转义dotsection
+// 返回: error 宽度回调错误
+func (e *cffType2Engine) consumeWidth(op byte) error {
+	if e.widthSeen {
+		return nil
+	}
+	e.widthSeen = true
+	present := false
+	switch op {
+	case 0:
+		present = e.n == 1
+	case 1, 3, 18, 23, 19, 20:
+		present = e.n%2 == 1
+	case 4, 22:
+		present = e.n == 2
+	case 21:
+		present = e.n == 3
+	case 14:
+		present = e.n == 1 || e.n == 5
+	}
+	if present {
+		delta := e.stack[0]
+		copy(e.stack[:], e.stack[1:e.n])
+		copy(e.meta[:], e.meta[1:e.n])
+		e.n--
+		if e.callbacks.onWidth != nil {
+			if err := e.callbacks.onWidth(delta); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// hint 处理有序stem声明及掩码字节，允许hstem或vstem与hintmask或cntrmask组合
+// 入参: op 提示操作符, data 紧随操作符的字节
+// 返回: int 掩码字节数, error 提示结构或限制错误
+func (e *cffType2Engine) hint(op byte, data []byte) (int, error) {
+	if err := e.consumeWidth(op); err != nil {
+		return 0, err
+	}
+	stage := 0
+	switch op {
+	case 1:
+		stage = 1
+	case 18:
+		stage = 2
+	case 3:
+		stage = 3
+	case 23:
+		stage = 4
+	case 20:
+		stage = 5
+	case 19:
+		stage = 6
+	}
+	mask := op == 19 || op == 20
+	if e.n%2 != 0 || !mask && (e.n == 0 || e.stage > stage) || mask && e.n != 0 && e.stage >= 5 || op == 20 && e.stage > 5 {
+		return 0, type2Arguments(op)
+	}
+	e.stems += e.n / 2
+	e.n = 0
+	if e.stems > 96 {
+		return 0, fmt.Errorf("%w: Type2 stem count", ErrLimit)
+	}
+	e.stage = max(e.stage, stage)
+	if !mask {
+		return 0, nil
+	}
+	count := (e.stems + 7) / 8
+	if count == 0 || len(data) < count {
+		return 0, fmt.Errorf("%w: Type2 mask without stems or truncated mask", ErrInvalid)
+	}
+	if e.strictHints {
+		if unused := (8 - e.stems%8) % 8; data[count-1]&byte((1<<unused)-1) != 0 {
+			return 0, fmt.Errorf("%w: nonzero Type2 mask padding", ErrInvalid)
+		}
+		if err := e.spend(count); err != nil {
+			return 0, err
+		}
+	}
+	return count, nil
+}
+
+// escape 执行Type2转义算术、逻辑、栈、存储、dotsection及flex操作
+// 入参: op 转义操作符编号
+// 返回: error 操作数、能力或限制错误
+func (e *cffType2Engine) escape(op byte) error {
+	if op >= 34 && op <= 37 {
+		args := e.stack[:e.n]
+		e.n = 0
+		e.stage = 7
+		if e.callbacks.onFlex != nil {
+			return e.callbacks.onFlex(op, args)
+		}
+		return nil
+	}
+	if op == 0 {
+		if err := e.consumeWidth(0); err != nil {
+			return err
+		}
+		args := e.stack[:e.n]
+		e.n = 0
+		if len(args) != 0 {
+			return type2Arguments(op)
+		}
+		return nil
+	}
+	if op == 23 {
+		x := e.randomState
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		e.randomState = x
+		return e.push((float64(x)+1)/4294967296, cffType2OperandMeta{})
+	}
+	need := 0
+	switch op {
+	case 5, 9, 14, 18, 21, 26, 27, 29:
+		need = 1
+	case 3, 4, 10, 11, 12, 15, 20, 24, 28, 30:
+		need = 2
+	case 22:
+		need = 4
+	default:
+		return fmt.Errorf("%w: undefined Type2 escaped operator %d", ErrUnsupported, op)
+	}
+	if e.n < need {
+		return type2Arguments(op)
+	}
+	a := e.stack[e.n-need : e.n]
+	m := e.meta[e.n-need : e.n]
+	switch op {
+	case 27:
+		return e.push(a[0], m[0])
+	case 28:
+		a[0], a[1] = a[1], a[0]
+		m[0], m[1] = m[1], m[0]
+		return nil
+	case 29:
+		index := a[0]
+		e.n--
+		if !geometryFinite(index) || math.Trunc(index) != index {
+			return type2Arguments(op)
+		}
+		index = max(index, 0)
+		if !type2Integer(index, 0, e.n-1) {
+			return type2Arguments(op)
+		}
+		slot := e.n - 1 - int(index)
+		return e.push(e.stack[slot], e.meta[slot])
+	case 30:
+		count, shift := a[0], a[1]
+		e.n -= 2
+		if !type2Integer(count, 0, e.n) || math.Trunc(shift) != shift {
+			return type2Arguments(op)
+		}
+		if count != 0 {
+			n := int(count)
+			j := int(math.Mod(shift, count))
+			if j < 0 {
+				j += n
+			}
+			var copyStack [48]float64
+			var copyMeta [48]cffType2OperandMeta
+			copy(copyStack[:], e.stack[e.n-n:e.n])
+			copy(copyMeta[:], e.meta[e.n-n:e.n])
+			for i := 0; i < n; i++ {
+				e.stack[e.n-n+(i+j)%n] = copyStack[i]
+				e.meta[e.n-n+(i+j)%n] = copyMeta[i]
+			}
+		}
+		return nil
+	}
+	e.n -= need
+	value := 0.0
+	var outMeta cffType2OperandMeta
+	switch op {
+	case 3:
+		if a[0] != 0 && a[1] != 0 {
+			value = 1
+		}
+	case 4:
+		if a[0] != 0 || a[1] != 0 {
+			value = 1
+		}
+	case 5:
+		if a[0] == 0 {
+			value = 1
+		}
+	case 9:
+		value = math.Abs(a[0])
+	case 10:
+		value = a[0] + a[1]
+	case 11:
+		value = a[0] - a[1]
+	case 12:
+		value = a[0] / a[1]
+	case 14:
+		value = -a[0]
+	case 15:
+		if a[0] == a[1] {
+			value = 1
+		}
+	case 18:
+		return nil
+	case 20:
+		if !type2Integer(a[1], 0, 31) {
+			return type2Arguments(op)
+		}
+		index := uint32(a[1])
+		e.transient[index] = a[0]
+		e.transientMeta[index] = m[0]
+		e.initialized |= 1 << index
+		return nil
+	case 21:
+		if !type2Integer(a[0], 0, 31) || e.initialized&(1<<uint32(a[0])) == 0 {
+			return fmt.Errorf("%w: Type2 uninitialized or invalid transient index", ErrInvalid)
+		}
+		idx := uint32(a[0])
+		value = e.transient[idx]
+		outMeta = e.transientMeta[idx]
+	case 22:
+		value, outMeta = a[1], m[1]
+		if a[2] <= a[3] {
+			value, outMeta = a[0], m[0]
+		}
+	case 24:
+		value = a[0] * a[1]
+	case 26:
+		value = math.Sqrt(a[0])
+	}
+	return e.push(value, outMeta)
+}
+
+// execute 执行一段Type2 charstring或子程序，endchar终止整个字形而return仅返回当前调用
+// 入参: data 当前字节码, progTag 当前程序标识供调用点元数据透传, depth 子程序嵌套层数
+// 返回: bool 是否已执行endchar, error 执行错误
+func (e *cffType2Engine) execute(data []byte, progTag uint64, depth int) (bool, error) {
+	if len(data) > 65535 || depth > 10 {
+		return false, fmt.Errorf("%w: Type2 charstring length or subroutine depth", ErrLimit)
+	}
+	for pc := 0; pc < len(data); {
+		if err := e.spend(1); err != nil {
+			return false, err
+		}
+		start := pc
+		op := data[pc]
+		pc++
+		if op >= 32 || op == 28 {
+			value, consumed, err := type2Number(op, data[pc:])
+			if err != nil {
+				return false, err
+			}
+			pc += consumed
+			if err := e.push(value, cffType2OperandMeta{tag: progTag, start: start, end: pc, literal: true}); err != nil {
+				return false, err
+			}
+			continue
+		}
+		switch op {
+		case 10, 29:
+			if e.n == 0 {
+				return false, type2Arguments(op)
+			}
+			e.n--
+			isGlobal := op == 29
+			subr := e.localSubr
+			if isGlobal {
+				subr = e.globalSubr
+			}
+			operand := e.stack[e.n]
+			meta := e.meta[e.n]
+			index := operand + float64(cffType2SubrBias(len(subr)))
+			if math.Trunc(operand) != operand || !type2Integer(index, 0, len(subr)-1) {
+				return false, fmt.Errorf("%w: Type2 subroutine index", ErrInvalid)
+			}
+			subrIndex := int(index)
+			childTag := progTag
+			if e.callbacks.onCallSubr != nil {
+				var err error
+				childTag, err = e.callbacks.onCallSubr(isGlobal, subrIndex, meta)
+				if err != nil {
+					return false, err
+				}
+			}
+			ended, err := e.execute(subr[subrIndex], childTag, depth+1)
+			if err != nil {
+				return false, err
+			}
+			if ended {
+				return true, nil
+			}
+		case 11:
+			if depth == 0 {
+				return false, fmt.Errorf("%w: Type2 misplaced return", ErrInvalid)
+			}
+			return false, nil
+		case 12:
+			if pc == len(data) {
+				return false, fmt.Errorf("%w: truncated Type2 escape", ErrInvalid)
+			}
+			escape := data[pc]
+			pc++
+			if err := e.escape(escape); err != nil {
+				return false, err
+			}
+		case 14:
+			if err := e.consumeWidth(op); err != nil {
+				return false, err
+			}
+			args := e.stack[:e.n]
+			e.n = 0
+			if e.callbacks.onEndChar != nil {
+				if err := e.callbacks.onEndChar(args); err != nil {
+					return false, err
+				}
+			}
+			return true, nil
+		case 1, 3, 18, 23, 19, 20:
+			consumed, err := e.hint(op, data[pc:])
+			if err != nil {
+				return false, err
+			}
+			pc += consumed
+		case 4, 5, 6, 7, 8, 21, 22, 24, 25, 26, 27, 30, 31:
+			if op == 4 || op == 21 || op == 22 {
+				if err := e.consumeWidth(op); err != nil {
+					return false, err
+				}
+			}
+			args := e.stack[:e.n]
+			e.n = 0
+			e.stage = 7
+			if e.callbacks.onPath != nil {
+				if err := e.callbacks.onPath(op, args); err != nil {
+					return false, err
+				}
+			}
+		default:
+			return false, fmt.Errorf("%w: undefined Type2 operator %d", ErrUnsupported, op)
+		}
+	}
+	return false, fmt.Errorf("%w: unterminated Type2 program", ErrInvalid)
 }
 
 // parseType2 执行CFF1的Type2字形程序并生成设计单位轮廓，不执行hint网格调整或FontMatrix变换
@@ -723,13 +1137,27 @@ func parseType2(data []byte, context type2Context) (*type2Glyph, error) {
 	if budget == 0 {
 		budget = 1 << 20
 	}
-	p := &type2Interpreter{context: context, remaining: budget, randomState: 0x6d2b79f5}
+	seed := uint32(0x6d2b79f5)
 	if context.randomSeed != 0 {
-		p.randomState = uint32(context.randomSeed)
+		seed = uint32(context.randomSeed)
 	}
+	p := &type2Interpreter{context: context, remaining: budget}
 	p.glyph.width = context.defaultWidth
 	p.glyph.geometry.FillRule = GeometryNonZero
-	ended, err := p.execute(data, 0)
+	p.engine = cffType2Engine{
+		globalSubr:  context.globalSubr,
+		localSubr:   context.localSubr,
+		randomState: seed,
+		strictHints: true,
+		callbacks: cffType2Callbacks{
+			spend:     p.spend,
+			onWidth:   p.setWidth,
+			onPath:    p.path,
+			onFlex:    p.flex,
+			onEndChar: p.endChar,
+		},
+	}
+	ended, err := p.engine.execute(data, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -759,117 +1187,31 @@ func (p *type2Interpreter) spend(count int) error {
 	return nil
 }
 
-// push 将有限数压入规范限定的48项参数栈
-// 入参: value 数值
-// 返回: error 栈或数值错误
-func (p *type2Interpreter) push(value float64) error {
-	if !geometryFinite(value) {
-		return fmt.Errorf("%w: non-finite Type2 arithmetic", ErrInvalid)
+// setWidth 记录首处提取到的字形宽度增量并检查有限性
+// 入参: delta 相对于nominalWidthX的增量
+// 返回: error 非有限宽度错误
+func (p *type2Interpreter) setWidth(delta float64) error {
+	p.glyph.width = p.context.nominalWidth + delta
+	if !geometryFinite(p.glyph.width) {
+		return fmt.Errorf("%w: non-finite Type2 width", ErrInvalid)
 	}
-	if p.n == len(p.stack) {
-		return fmt.Errorf("%w: Type2 operand stack", ErrLimit)
-	}
-	p.stack[p.n] = value
-	p.n++
 	return nil
 }
 
-// execute 执行一个charstring或子程序，endchar终止整个字形而return仅返回当前调用，不执行不可达尾部
-// 入参: data 当前程序, depth 子程序嵌套层数
-// 返回: bool 是否已执行endchar, error 执行错误
-func (p *type2Interpreter) execute(data []byte, depth int) (bool, error) {
-	if len(data) > 65535 || depth > 10 {
-		return false, fmt.Errorf("%w: Type2 charstring length or subroutine depth", ErrLimit)
+// endChar 校验endchar剩余操作数并记录可选StandardEncoding组合字形信息
+// 入参: a 清栈后的endchar操作数
+// 返回: error 参数数量或seac字符码错误
+func (p *type2Interpreter) endChar(a []float64) error {
+	if len(a) != 0 && len(a) != 4 {
+		return type2Arguments(14)
 	}
-	for pc := 0; pc < len(data); {
-		if err := p.spend(1); err != nil {
-			return false, err
+	if len(a) == 4 {
+		if !type2Integer(a[2], 0, 255) || !type2Integer(a[3], 0, 255) {
+			return fmt.Errorf("%w: Type2 seac character code", ErrInvalid)
 		}
-		op := data[pc]
-		pc++
-		if op >= 32 || op == 28 {
-			value, consumed, err := type2Number(op, data[pc:])
-			if err != nil {
-				return false, err
-			}
-			pc += consumed
-			if err := p.push(value); err != nil {
-				return false, err
-			}
-			continue
-		}
-		switch op {
-		case 10, 29:
-			if p.n == 0 {
-				return false, type2Arguments(op)
-			}
-			p.n--
-			subr := p.context.localSubr
-			if op == 29 {
-				subr = p.context.globalSubr
-			}
-			bias := 107
-			if len(subr) >= 33900 {
-				bias = 32768
-			} else if len(subr) >= 1240 {
-				bias = 1131
-			}
-			operand := p.stack[p.n]
-			index := operand + float64(bias)
-			if math.Trunc(operand) != operand || !type2Integer(index, 0, len(subr)-1) {
-				return false, fmt.Errorf("%w: Type2 subroutine index", ErrInvalid)
-			}
-			ended, err := p.execute(subr[int(index)], depth+1)
-			if err != nil {
-				return false, err
-			}
-			if ended {
-				return true, nil
-			}
-		case 11:
-			if depth == 0 {
-				return false, fmt.Errorf("%w: Type2 misplaced return", ErrInvalid)
-			}
-			return false, nil
-		case 12:
-			if pc == len(data) {
-				return false, fmt.Errorf("%w: truncated Type2 escape", ErrInvalid)
-			}
-			escape := data[pc]
-			pc++
-			if err := p.escape(escape); err != nil {
-				return false, err
-			}
-		case 14:
-			if err := p.width(op); err != nil {
-				return false, err
-			}
-			if p.n != 0 && p.n != 4 {
-				return false, type2Arguments(op)
-			}
-			if p.n == 4 {
-				if !type2Integer(p.stack[2], 0, 255) || !type2Integer(p.stack[3], 0, 255) {
-					return false, fmt.Errorf("%w: Type2 seac character code", ErrInvalid)
-				}
-				p.glyph.seac = &type2Seac{offset: Point{p.stack[0], p.stack[1]}, base: uint8(p.stack[2]), accent: uint8(p.stack[3])}
-			}
-			p.n = 0
-			return true, nil
-		case 1, 3, 18, 23, 19, 20:
-			consumed, err := p.hint(op, data[pc:])
-			if err != nil {
-				return false, err
-			}
-			pc += consumed
-		case 4, 5, 6, 7, 8, 21, 22, 24, 25, 26, 27, 30, 31:
-			if err := p.path(op); err != nil {
-				return false, err
-			}
-		default:
-			return false, fmt.Errorf("%w: undefined Type2 operator %d", ErrUnsupported, op)
-		}
+		p.glyph.seac = &type2Seac{offset: Point{a[0], a[1]}, base: uint8(a[2]), accent: uint8(a[3])}
 	}
-	return false, fmt.Errorf("%w: unterminated Type2 program", ErrInvalid)
+	return nil
 }
 
 // type2Number 解码Type2整数、shortint及有符号16.16定点数
@@ -914,90 +1256,6 @@ func type2Integer(value float64, minimum, maximum int) bool {
 // 返回: error 可识别的无效数据错误
 func type2Arguments(op byte) error {
 	return fmt.Errorf("%w: Type2 operator %d operands or placement", ErrInvalid, op)
-}
-
-// width 在第一个允许携带宽度的清栈操作处提取可选宽度
-// 入参: op 操作符编号
-// 返回: error 宽度计算错误
-func (p *type2Interpreter) width(op byte) error {
-	if p.widthSeen {
-		return nil
-	}
-	p.widthSeen = true
-	present := false
-	switch op {
-	case 1, 3, 18, 23, 19, 20:
-		present = p.n%2 == 1
-	case 4, 22:
-		present = p.n == 2
-	case 21:
-		present = p.n == 3
-	case 14:
-		present = p.n == 1 || p.n == 5
-	}
-	if present {
-		p.glyph.width = p.context.nominalWidth + p.stack[0]
-		if !geometryFinite(p.glyph.width) {
-			return fmt.Errorf("%w: non-finite Type2 width", ErrInvalid)
-		}
-		copy(p.stack[:], p.stack[1:p.n])
-		p.n--
-	}
-	return nil
-}
-
-// hint 处理有序stem声明及掩码字节，但不执行像素网格调整
-// 入参: op 提示操作符, data 紧随操作符的字节
-// 返回: int 掩码字节数, error 提示结构或限制错误
-func (p *type2Interpreter) hint(op byte, data []byte) (int, error) {
-	if err := p.width(op); err != nil {
-		return 0, err
-	}
-	stage := 0
-	switch op {
-	case 1:
-		stage = 1
-	case 18:
-		stage = 2
-	case 3:
-		stage = 3
-	case 23:
-		stage = 4
-	case 20:
-		stage = 5
-	case 19:
-		stage = 6
-	}
-	mask := op == 19 || op == 20
-	if p.n%2 != 0 || !mask && (p.n == 0 || p.stage > stage) || mask && p.n != 0 && p.stage >= 5 || op == 20 && p.stage > 5 {
-		return 0, type2Arguments(op)
-	}
-	if op == 1 || op == 3 {
-		p.plainStems = true
-	}
-	if (op == 19 || op == 20) && p.plainStems {
-		return 0, fmt.Errorf("%w: Type2 mask requires hm stem declarations", ErrInvalid)
-	}
-	p.stems += p.n / 2
-	p.n = 0
-	if p.stems > 96 {
-		return 0, fmt.Errorf("%w: Type2 stem count", ErrLimit)
-	}
-	p.stage = max(p.stage, stage)
-	if !mask {
-		return 0, nil
-	}
-	count := (p.stems + 7) / 8
-	if count == 0 || len(data) < count {
-		return 0, fmt.Errorf("%w: Type2 mask without stems or truncated mask", ErrInvalid)
-	}
-	if unused := (8 - p.stems%8) % 8; data[count-1]&byte((1<<unused)-1) != 0 {
-		return 0, fmt.Errorf("%w: nonzero Type2 mask padding", ErrInvalid)
-	}
-	if err := p.spend(count); err != nil {
-		return 0, err
-	}
-	return count, nil
 }
 
 // move 创建自动闭合的非零填充子路径，后续移动仍相对于上一实际终点
@@ -1063,20 +1321,13 @@ func (p *type2Interpreter) curve(dx1, dy1, dx2, dy2, dx3, dy3 float64) error {
 	return nil
 }
 
-// path 执行全部单字节路径命令并消费完整参数栈
-// 入参: op 路径操作符
+// path 执行全部单字节路径命令并消费已清栈操作数
+// 入参: op 路径操作符, a 路径操作数列表
 // 返回: error 参数、路径或坐标错误
-func (p *type2Interpreter) path(op byte) error {
-	if op == 4 || op == 21 || op == 22 {
-		if err := p.width(op); err != nil {
-			return err
-		}
-	} else if !p.widthSeen || len(p.glyph.geometry.Figures) == 0 {
+func (p *type2Interpreter) path(op byte, a []float64) error {
+	if op != 4 && op != 21 && op != 22 && (!p.engine.widthSeen || len(p.glyph.geometry.Figures) == 0) {
 		return type2Arguments(op)
 	}
-	p.stage = 7
-	a := p.stack[:p.n]
-	p.n = 0
 	n := len(a)
 	switch op {
 	case 4, 22:
@@ -1181,10 +1432,9 @@ func (p *type2Interpreter) path(op byte) error {
 }
 
 // flex 将四种flex命令展开为两条原始三次曲线，不应用设备像素拉直提示
-// 入参: op 转义操作符编号
+// 入参: op 转义操作符编号, a flex操作数列表
 // 返回: error 参数或路径错误
-func (p *type2Interpreter) flex(op byte) error {
-	a := p.stack[:p.n]
+func (p *type2Interpreter) flex(op byte, a []float64) error {
 	var d [12]float64
 	switch op {
 	case 34:
@@ -1214,140 +1464,8 @@ func (p *type2Interpreter) flex(op byte) error {
 			d[10], d[11] = -dx, a[10]
 		}
 	}
-	p.n = 0
-	p.stage = 7
 	if err := p.curve(d[0], d[1], d[2], d[3], d[4], d[5]); err != nil {
 		return err
 	}
 	return p.curve(d[6], d[7], d[8], d[9], d[10], d[11])
-}
-
-// escape 执行Type2转义算术、逻辑、栈、存储及flex操作
-// 入参: op 转义操作符编号
-// 返回: error 操作数、能力或限制错误
-func (p *type2Interpreter) escape(op byte) error {
-	if op >= 34 && op <= 37 {
-		return p.flex(op)
-	}
-	if op == 0 {
-		if p.n != 0 {
-			return type2Arguments(op)
-		}
-		return nil
-	}
-	if op == 23 {
-		x := p.randomState
-		x ^= x << 13
-		x ^= x >> 17
-		x ^= x << 5
-		p.randomState = x
-		return p.push((float64(x) + 1) / 4294967296)
-	}
-	need := 0
-	switch op {
-	case 5, 9, 14, 18, 21, 26, 27, 29:
-		need = 1
-	case 3, 4, 10, 11, 12, 15, 20, 24, 28, 30:
-		need = 2
-	case 22:
-		need = 4
-	default:
-		return fmt.Errorf("%w: undefined Type2 escaped operator %d", ErrUnsupported, op)
-	}
-	if p.n < need {
-		return type2Arguments(op)
-	}
-	a := p.stack[p.n-need : p.n]
-	switch op {
-	case 27:
-		return p.push(a[0])
-	case 28:
-		a[0], a[1] = a[1], a[0]
-		return nil
-	case 29:
-		index := a[0]
-		p.n--
-		if !geometryFinite(index) || math.Trunc(index) != index {
-			return type2Arguments(op)
-		}
-		index = max(index, 0)
-		if !type2Integer(index, 0, p.n-1) {
-			return type2Arguments(op)
-		}
-		return p.push(p.stack[p.n-1-int(index)])
-	case 30:
-		count, shift := a[0], a[1]
-		p.n -= 2
-		if !type2Integer(count, 0, p.n) || math.Trunc(shift) != shift {
-			return type2Arguments(op)
-		}
-		if count != 0 {
-			n := int(count)
-			j := int(math.Mod(shift, count))
-			if j < 0 {
-				j += n
-			}
-			var copyStack [48]float64
-			copy(copyStack[:], p.stack[p.n-n:p.n])
-			for i := 0; i < n; i++ {
-				p.stack[p.n-n+(i+j)%n] = copyStack[i]
-			}
-		}
-		return nil
-	}
-	p.n -= need
-	value := 0.0
-	switch op {
-	case 3:
-		if a[0] != 0 && a[1] != 0 {
-			value = 1
-		}
-	case 4:
-		if a[0] != 0 || a[1] != 0 {
-			value = 1
-		}
-	case 5:
-		if a[0] == 0 {
-			value = 1
-		}
-	case 9:
-		value = math.Abs(a[0])
-	case 10:
-		value = a[0] + a[1]
-	case 11:
-		value = a[0] - a[1]
-	case 12:
-		value = a[0] / a[1]
-	case 14:
-		value = -a[0]
-	case 15:
-		if a[0] == a[1] {
-			value = 1
-		}
-	case 18:
-		return nil
-	case 20:
-		if !type2Integer(a[1], 0, 31) {
-			return type2Arguments(op)
-		}
-		index := uint32(a[1])
-		p.transient[index] = a[0]
-		p.initialized |= 1 << index
-		return nil
-	case 21:
-		if !type2Integer(a[0], 0, 31) || p.initialized&(1<<uint32(a[0])) == 0 {
-			return fmt.Errorf("%w: Type2 uninitialized or invalid transient index", ErrInvalid)
-		}
-		value = p.transient[uint32(a[0])]
-	case 22:
-		value = a[1]
-		if a[2] <= a[3] {
-			value = a[0]
-		}
-	case 24:
-		value = a[0] * a[1]
-	case 26:
-		value = math.Sqrt(a[0])
-	}
-	return p.push(value)
 }

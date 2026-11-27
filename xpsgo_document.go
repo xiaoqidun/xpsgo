@@ -615,10 +615,11 @@ func (r *Reader) readPageSceneContent(page *Page, retainVisuals bool, dictionari
 		return nil, err
 	}
 	parser := newSceneParser(r.format, page.resources)
-	page.Elements, err = parser.parse(page.root)
+	page.Elements, err = parser.parseContext(ctx, page.root)
 	if err != nil {
 		return nil, err
 	}
+	page.Resources = parser.pageResources
 	if retainVisuals {
 		page.visuals = parser.elements
 	}
@@ -680,13 +681,6 @@ func parsePageHeader(root *xmlElement, part string, format Format) (*Page, error
 		}
 	}
 	return page, nil
-}
-
-// readFixedPart 读取并核对固定布局部件的类型与根元素
-// 入参: part 部件名称, kind 部件种类, rootName 根元素名称
-// 返回: *xmlElement 根元素, error 错误信息
-func (r *Reader) readFixedPart(part, kind, rootName string) (*xmlElement, error) {
-	return r.readFixedPartLoader(part, kind, rootName, nil, nil)
 }
 
 // readFixedPartLoader 共用固定布局校验，私有读取器不调用StreamPage专用的fixedXML钩子

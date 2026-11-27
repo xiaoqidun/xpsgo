@@ -18,17 +18,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
+	"io"
 	"math"
 	"math/bits"
 )
 
-// tiffDirectory 保存首个图像目录及原始字节，不读取后续目录
+// tiffDirectory 保存首个图像目录及原始字节或按需随机读取器，不读取后续目录
 type tiffDirectory struct {
 	data  []byte
+	ra    io.ReaderAt
+	size  uint64
+	ctx   context.Context
 	order binary.ByteOrder
 	entry map[uint16][]byte
 }
@@ -44,11 +49,24 @@ type tiffLayout struct {
 	count          int
 	rowBytes       int
 	rowChannels    int
+	ycbcrSubX      int
+	ycbcrSubY      int
+	chromaRowBytes int
 	tiled          bool
 	offsets        []byte
 	counts         []byte
 	offsetWidth    int
 	countWidth     int
+}
+
+// tiffYCbCrSpec 保存非JPEG压缩YCbCr图像的色度子采样、亮度系数及参考黑白电平参数
+type tiffYCbCrSpec struct {
+	subX      int
+	subY      int
+	lumaRed   float64
+	lumaGreen float64
+	lumaBlue  float64
+	refBW     [6]float64
 }
 
 // tiffLegacyJPEG 保存旧式TIFF/JPEG的分量码表、抽样及重启参数
@@ -112,6 +130,7 @@ type tiffPixelFormat struct {
 	hasSMax      bool
 	sMin         [5]float64
 	sMax         [5]float64
+	ycbcr        tiffYCbCrSpec
 }
 
 // tiffDecodeSpec 保存完成全部IFD标签、样本布局、压缩参数与块边界校验的TIFF解码规格，供整图与流式解码共用
@@ -170,6 +189,105 @@ func readTIFFDirectory(data []byte) (*tiffDirectory, error) {
 	return d, nil
 }
 
+// tiffReadAtExact 按指定偏移从io.ReaderAt精确读取目标字节长度，保留取消与预算错误
+// 入参: ctx 取消Context, ra 按需随机读取器, dst 目标缓冲, offset 起始偏移
+// 返回: error 取消、预算或读取截断错误
+func tiffReadAtExact(ctx context.Context, ra io.ReaderAt, dst []byte, offset int64) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if len(dst) == 0 {
+		return nil
+	}
+	n, err := ra.ReadAt(dst, offset)
+	if err != nil && !(err == io.EOF && n == len(dst)) {
+		if errors.Is(err, ErrLimit) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		return fmt.Errorf("%w: TIFF read", ErrInvalid)
+	}
+	if n != len(dst) {
+		return fmt.Errorf("%w: truncated TIFF data", ErrInvalid)
+	}
+	return checkContext(ctx)
+}
+
+// readTIFFDirectoryAt 通过io.ReaderAt按需读取经典TIFF头及首个IFD目录，不读取后续目录或像素数据
+// 入参: ctx 取消Context, ra 按需随机读取器, size 逻辑文件总字节数
+// 返回: *tiffDirectory 按需读取目录, error 取消、头结构或资源错误
+func readTIFFDirectoryAt(ctx context.Context, ra io.ReaderAt, size int64) (*tiffDirectory, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	if size < 8 {
+		return nil, fmt.Errorf("%w: TIFF header", ErrInvalid)
+	}
+	var head [8]byte
+	if err := tiffReadAtExact(ctx, ra, head[:], 0); err != nil {
+		return nil, err
+	}
+	d := &tiffDirectory{ra: ra, size: uint64(size), ctx: ctx, entry: make(map[uint16][]byte)}
+	switch string(head[:2]) {
+	case "II":
+		d.order = binary.LittleEndian
+	case "MM":
+		d.order = binary.BigEndian
+	default:
+		return nil, fmt.Errorf("%w: TIFF byte order", ErrInvalid)
+	}
+	if d.order.Uint16(head[2:]) != 42 {
+		return nil, fmt.Errorf("%w: TIFF version", ErrUnsupported)
+	}
+	offset := uint64(d.order.Uint32(head[4:]))
+	if offset < 8 || offset+2 > d.size {
+		return nil, fmt.Errorf("%w: TIFF directory offset", ErrInvalid)
+	}
+	var countBuf [2]byte
+	if err := tiffReadAtExact(ctx, ra, countBuf[:], int64(offset)); err != nil {
+		return nil, err
+	}
+	count := uint64(d.order.Uint16(countBuf[:]))
+	if count > 4096 {
+		return nil, fmt.Errorf("%w: TIFF directory entries", ErrLimit)
+	}
+	if count == 0 || offset+2+count*12+4 > d.size {
+		return nil, fmt.Errorf("%w: TIFF directory size", ErrInvalid)
+	}
+	rawEntries := make([]byte, int(count*12))
+	if err := tiffReadAtExact(ctx, ra, rawEntries, int64(offset+2)); err != nil {
+		return nil, err
+	}
+	for i := range count {
+		entry := rawEntries[i*12 : (i+1)*12]
+		tag := d.order.Uint16(entry)
+		if d.entry[tag] != nil {
+			return nil, fmt.Errorf("%w: duplicate TIFF tag %d", ErrInvalid, tag)
+		}
+		d.entry[tag] = entry
+	}
+	return d, nil
+}
+
+// slice 按偏移和字节数取得目录外部载荷，内存模式零拷贝切片，随机读取模式按需读取
+// 入参: offset 起始偏移, size 载荷字节数
+// 返回: []byte 载荷字节, error 越界、预算或取消错误
+func (d *tiffDirectory) slice(offset, size uint64) ([]byte, error) {
+	if d.ra != nil {
+		if offset > d.size || size > d.size-offset {
+			return nil, fmt.Errorf("%w: TIFF field offset", ErrInvalid)
+		}
+		buf := make([]byte, int(size))
+		if err := tiffReadAtExact(d.ctx, d.ra, buf, int64(offset)); err != nil {
+			return nil, err
+		}
+		return buf, nil
+	}
+	if offset > uint64(len(d.data)) || size > uint64(len(d.data))-offset {
+		return nil, fmt.Errorf("%w: TIFF field offset", ErrInvalid)
+	}
+	return d.data[offset : offset+size], nil
+}
+
 // field 检查字段类型与数量后取得数据，不复制字段内容
 // 入参: tag 字段标识, count 所需数量, long 是否接受LONG类型
 // 返回: []byte 字段数据, int 单项字节数, error 字段错误
@@ -193,10 +311,14 @@ func (d *tiffDirectory) field(tag uint16, count int, long bool) ([]byte, int, er
 		return entry[8 : 8+size], width, nil
 	}
 	offset := uint64(d.order.Uint32(entry[8:]))
-	if offset > uint64(len(d.data)) || size > uint64(len(d.data))-offset {
+	raw, err := d.slice(offset, size)
+	if err != nil {
+		if errors.Is(err, ErrLimit) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, 0, err
+		}
 		return nil, 0, fmt.Errorf("%w: TIFF tag %d offset", ErrInvalid, tag)
 	}
-	return d.data[offset : offset+size], width, nil
+	return raw, width, nil
 }
 
 // byteField 读取UNDEFINED字段，保留字节流自身的编码及字节序
@@ -269,10 +391,14 @@ func (d *tiffDirectory) resolution() (Point, error) {
 			return Point{}, fmt.Errorf("%w: TIFF resolution field", ErrInvalid)
 		}
 		offset := uint64(d.order.Uint32(entry[8:]))
-		if offset+8 > uint64(len(d.data)) {
+		raw, err := d.slice(offset, 8)
+		if err != nil {
+			if errors.Is(err, ErrLimit) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return Point{}, err
+			}
 			return Point{}, fmt.Errorf("%w: TIFF resolution offset", ErrInvalid)
 		}
-		n, q := d.order.Uint32(d.data[offset:]), d.order.Uint32(d.data[offset+4:])
+		n, q := d.order.Uint32(raw), d.order.Uint32(raw[4:])
 		if n == 0 || q == 0 {
 			return Point{}, fmt.Errorf("%w: TIFF resolution value", ErrInvalid)
 		}
@@ -299,6 +425,13 @@ func parseTIFFHeader(data []byte) (*tiffHeader, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseTIFFHeaderFromDirectory(d)
+}
+
+// parseTIFFHeaderFromDirectory 从已读取的首个TIFF目录解析并校验全部头元数据标签
+// 入参: d 已读取的TIFF首目录
+// 返回: *tiffHeader 已校验TIFF头元数据, error 标签、压缩或能力错误
+func parseTIFFHeaderFromDirectory(d *tiffDirectory) (*tiffHeader, error) {
 	width, err := d.number(256, 0, true)
 	if err != nil {
 		return nil, err
@@ -335,7 +468,7 @@ func parseTIFFHeader(data []byte) (*tiffHeader, error) {
 		return nil, err
 	}
 	jpegCompression := compression == 6 || compression == 7
-	if photo > 3 && photo != 5 && (photo != 6 || !jpegCompression) {
+	if photo > 3 && photo != 5 && photo != 6 {
 		return nil, fmt.Errorf("%w: TIFF photometric interpretation %d", ErrUnsupported, photo)
 	}
 	channels, err := d.number(277, 1, false)
@@ -461,14 +594,10 @@ func parseTIFFHeader(data []byte) (*tiffHeader, error) {
 	}, nil
 }
 
-// readTIFFImageInfo 仅解析TIFF首个IFD目录标签返回轻量图像元数据，不解码任何条带或图块像素
-// 入参: data 完整TIFF图像字节, part 部件包根URI, media 内容类型
-// 返回: *ImageInfo 视觉方向规范化后的图像头信息, error 目录、标签或能力错误
-func readTIFFImageInfo(data []byte, part, media string) (*ImageInfo, error) {
-	hdr, err := parseTIFFHeader(data)
-	if err != nil {
-		return nil, err
-	}
+// tiffHeaderToImageInfo 将已校验的TIFF首目录头信息转换为视觉方向规范化的ImageInfo
+// 入参: hdr 已校验TIFF头元数据, part 部件包根URI, media 内容类型
+// 返回: *ImageInfo 视觉方向规范化后的图像头信息
+func tiffHeaderToImageInfo(hdr *tiffHeader, part, media string) *ImageInfo {
 	w, h := int(hdr.width), int(hdr.height)
 	dpiX, dpiY := hdr.dpi.X, hdr.dpi.Y
 	if hdr.orientation >= 5 && hdr.orientation <= 8 {
@@ -488,12 +617,130 @@ func readTIFFImageInfo(data []byte, part, media string) (*ImageInfo, error) {
 		IsFloat:       hdr.sampleFormat == 3,
 		Orientation:   hdr.orientation,
 		HasICCProfile: hdr.dir.entry[34675] != nil,
-	}, nil
+	}
 }
 
-// parseTIFFDecodeSpec 统一校验TIFF目录样本布局、ICC配置、预测器、传真与JPEG参数及全部块偏移，供整图与流式解码共用
-// 当allowJPEG为false且遇到JPEG压缩、转置方向或分块存储时返回nil规格与nil错误，提示流式路径平滑回退整图解码
-// 入参: data 完整TIFF字节, maxPixels 像素容量上限, profileLimit ICC配置字节上限，零采用64MiB, allowJPEG 是否允许JPEG、分块及转置方向
+// readTIFFImageInfo 仅解析TIFF首个IFD目录标签返回轻量图像元数据，不解码任何条带或图块像素
+// 入参: data 完整TIFF图像字节, part 部件包根URI, media 内容类型
+// 返回: *ImageInfo 视觉方向规范化后的图像头信息, error 目录、标签或能力错误
+func readTIFFImageInfo(data []byte, part, media string) (*ImageInfo, error) {
+	hdr, err := parseTIFFHeader(data)
+	if err != nil {
+		return nil, err
+	}
+	return tiffHeaderToImageInfo(hdr, part, media), nil
+}
+
+// readTIFFImageInfoAt 基于io.ReaderAt按需读取TIFF首个IFD目录标签返回轻量元数据，不读入像素载荷
+// 入参: ctx 取消Context, ra 图像按需随机读取器, size 图像逻辑总字节数, part 部件包根URI, media 内容类型
+// 返回: *ImageInfo 视觉方向规范化后的图像头信息, error 取消、预算、目录、标签或能力错误
+func readTIFFImageInfoAt(ctx context.Context, ra io.ReaderAt, size int64, part, media string) (*ImageInfo, error) {
+	d, err := readTIFFDirectoryAt(ctx, ra, size)
+	if err != nil {
+		return nil, err
+	}
+	hdr, err := parseTIFFHeaderFromDirectory(d)
+	if err != nil {
+		return nil, err
+	}
+	return tiffHeaderToImageInfo(hdr, part, media), nil
+}
+
+// rationalSlice 读取指定数量的RATIONAL字段为浮点数切片，字段缺省时返回present=false
+// 入参: tag 字段标识, count 所需有理数个数
+// 返回: []float64 浮点数切片, bool 字段是否存在, error 字段类型、数量、偏移或除零错误
+func (d *tiffDirectory) rationalSlice(tag uint16, count int) ([]float64, bool, error) {
+	entry := d.entry[tag]
+	if entry == nil {
+		return nil, false, nil
+	}
+	if d.order.Uint16(entry[2:]) != 5 || d.order.Uint32(entry[4:]) != uint32(count) {
+		return nil, false, fmt.Errorf("%w: TIFF rational tag %d", ErrInvalid, tag)
+	}
+	offset := uint64(d.order.Uint32(entry[8:]))
+	size := uint64(count) * 8
+	if offset > uint64(len(d.data)) || size > uint64(len(d.data))-offset {
+		return nil, false, fmt.Errorf("%w: TIFF rational tag %d offset", ErrInvalid, tag)
+	}
+	values := make([]float64, count)
+	for i := range count {
+		n := d.order.Uint32(d.data[offset+uint64(i)*8:])
+		q := d.order.Uint32(d.data[offset+uint64(i)*8+4:])
+		if q == 0 {
+			return nil, false, fmt.Errorf("%w: TIFF rational tag %d denominator", ErrInvalid, tag)
+		}
+		values[i] = float64(n) / float64(q)
+	}
+	return values, true, nil
+}
+
+// parseNonJPEGYCbCr 解析非JPEG压缩YCbCr图像的色度子采样、亮度系数、参考黑白电平与色度定位并校验约束
+// 入参: bits 样本位深, channels 样本通道数, base 基础颜色通道数, predictor 水平预测器标识
+// 返回: tiffYCbCrSpec 已校验YCbCr参数, error 字段、预测器或能力错误
+func (d *tiffDirectory) parseNonJPEGYCbCr(bits, channels, base, predictor uint32) (tiffYCbCrSpec, error) {
+	if bits != 8 && bits != 16 {
+		return tiffYCbCrSpec{}, fmt.Errorf("%w: TIFF YCbCr precision", ErrUnsupported)
+	}
+	subX, subY := 2, 2
+	if d.entry[530] != nil {
+		field, _, err := d.field(530, 2, false)
+		if err != nil {
+			return tiffYCbCrSpec{}, err
+		}
+		subX = int(d.order.Uint16(field))
+		subY = int(d.order.Uint16(field[2:]))
+	}
+	if subX != 1 && subX != 2 && subX != 4 || subY != 1 && subY != 2 && subY != 4 {
+		return tiffYCbCrSpec{}, fmt.Errorf("%w: TIFF YCbCr subsampling", ErrUnsupported)
+	}
+	if subX > 1 || subY > 1 {
+		if predictor != 1 {
+			return tiffYCbCrSpec{}, fmt.Errorf("%w: TIFF subsampled YCbCr predictor", ErrUnsupported)
+		}
+		if channels != base {
+			return tiffYCbCrSpec{}, fmt.Errorf("%w: TIFF subsampled YCbCr extra sample", ErrUnsupported)
+		}
+	}
+	pos, err := d.number(531, 1, false)
+	if err != nil {
+		return tiffYCbCrSpec{}, err
+	}
+	if pos != 1 && pos != 2 {
+		return tiffYCbCrSpec{}, fmt.Errorf("%w: TIFF YCbCr positioning", ErrUnsupported)
+	}
+	spec := tiffYCbCrSpec{
+		subX:      subX,
+		subY:      subY,
+		lumaRed:   0.299,
+		lumaGreen: 0.587,
+		lumaBlue:  0.114,
+		refBW:     [6]float64{0, 255, 128, 255, 128, 255},
+	}
+	if bits == 16 {
+		spec.refBW = [6]float64{0, 65535, 32768, 65535, 32768, 65535}
+	}
+	if coeffs, ok, err := d.rationalSlice(529, 3); err != nil {
+		return tiffYCbCrSpec{}, err
+	} else if ok {
+		if coeffs[0] <= 0 || coeffs[1] <= 0 || coeffs[2] <= 0 || coeffs[0] >= 1 || coeffs[2] >= 1 {
+			return tiffYCbCrSpec{}, fmt.Errorf("%w: TIFF YCbCr coefficients", ErrInvalid)
+		}
+		spec.lumaRed, spec.lumaGreen, spec.lumaBlue = coeffs[0], coeffs[1], coeffs[2]
+	}
+	if refBW, ok, err := d.rationalSlice(532, 6); err != nil {
+		return tiffYCbCrSpec{}, err
+	} else if ok {
+		if refBW[1] == refBW[0] || refBW[3] == refBW[2] || refBW[5] == refBW[4] {
+			return tiffYCbCrSpec{}, fmt.Errorf("%w: TIFF ReferenceBlackWhite range", ErrInvalid)
+		}
+		copy(spec.refBW[:], refBW)
+	}
+	return spec, nil
+}
+
+// parseTIFFDecodeSpec 统一校验TIFF目录样本布局、ICC配置、预测器、传真、YCbCr与JPEG参数及全部块偏移，供整图与流式解码共用
+// 当allowJPEG为false且遇到JPEG压缩或转置方向时返回nil规格与nil错误，提示流式路径平滑回退整图解码
+// 入参: data 完整TIFF字节, maxPixels 像素容量上限, profileLimit ICC配置字节上限，零采用64MiB, allowJPEG 是否允许JPEG及转置方向
 // 返回: *tiffDecodeSpec 已校验解码规格, error 结构、能力或资源错误
 func parseTIFFDecodeSpec(data []byte, maxPixels, profileLimit uint64, allowJPEG bool) (*tiffDecodeSpec, error) {
 	hdr, err := parseTIFFHeader(data)
@@ -551,7 +798,7 @@ func parseTIFFDecodeSpec(data []byte, maxPixels, profileLimit uint64, allowJPEG 
 	if fillOrder != 1 && fillOrder != 2 {
 		return nil, fmt.Errorf("%w: TIFF fill order", ErrInvalid)
 	}
-	if fillOrder == 2 && (bits != 1 || compression > 4) {
+	if fillOrder == 2 && bits != 1 {
 		return nil, fmt.Errorf("%w: TIFF low-bit-order sample format", ErrUnsupported)
 	}
 	planar, err := d.number(284, 1, false)
@@ -604,6 +851,15 @@ func parseTIFFDecodeSpec(data []byte, maxPixels, profileLimit uint64, allowJPEG 
 			}
 		}
 	}
+	var ycbcr tiffYCbCrSpec
+	subX, subY := 1, 1
+	if !jpegCompression && photo == 6 {
+		ycbcr, err = d.parseNonJPEGYCbCr(bits, channels, base, predictor)
+		if err != nil {
+			return nil, err
+		}
+		subX, subY = ycbcr.subX, ycbcr.subY
+	}
 	var jpegTables tiffJPEGTable
 	var legacy tiffLegacyJPEG
 	var legacyExtra tiffLegacyExtraJPEG
@@ -636,12 +892,9 @@ func parseTIFFDecodeSpec(data []byte, maxPixels, profileLimit uint64, allowJPEG 
 			}
 		}
 	}
-	layout, err := d.imageLayout(width, height, channels, bits, compression, planar)
+	layout, err := d.imageLayout(width, height, channels, bits, compression, planar, subX, subY)
 	if err != nil {
 		return nil, err
-	}
-	if !allowJPEG && layout.tiled {
-		return nil, nil
 	}
 	var palette []byte
 	if photo == 3 {
@@ -668,7 +921,7 @@ func parseTIFFDecodeSpec(data []byte, maxPixels, profileLimit uint64, allowJPEG 
 	return &tiffDecodeSpec{
 		hdr:         hdr,
 		layout:      layout,
-		format:      tiffPixelFormat{order: d.order, photo: photo, bits: bits, channels: channels, alpha: alpha, sampleFormat: sampleFormat, palette: palette, hasSMin: hasSMin, hasSMax: hasSMax, sMin: sMin, sMax: sMax},
+		format:      tiffPixelFormat{order: d.order, photo: photo, bits: bits, channels: channels, alpha: alpha, sampleFormat: sampleFormat, palette: palette, hasSMin: hasSMin, hasSMax: hasSMax, sMin: sMin, sMax: sMax, ycbcr: ycbcr},
 		profile:     profile,
 		fillOrder:   fillOrder,
 		predictor:   predictor,
@@ -723,10 +976,10 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 		out = image.NewNRGBA64(bounds)
 		result.pixels = out
 	}
-	var buffer, combined, floatScratch []byte
+	var buffer, combined, floatScratch, reverseScratch []byte
 	if !jpegCompression {
-		buffer = make([]byte, layout.rowBytes*layout.blockHeight*layout.planes)
-		if layout.planes > 1 {
+		buffer = make([]byte, layout.blockBufferSize())
+		if layout.planes > 1 && !(photo == 6 && (layout.ycbcrSubX > 1 || layout.ycbcrSubY > 1)) {
 			combined = make([]byte, layout.rowBytes*layout.planes)
 		}
 		if predictor == 3 {
@@ -734,6 +987,7 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 		}
 	}
 	var jpegFrame tiffJPEGTable
+	subsampledYCbCr := !jpegCompression && photo == 6 && (layout.ycbcrSubX > 1 || layout.ycbcrSubY > 1)
 	for i := range layout.blocksPerPlane {
 		region := layout.region(i)
 		visible := region.Intersect(bounds)
@@ -783,22 +1037,21 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 			}
 			continue
 		}
-		planeSize := layout.rowBytes * region.Dy()
-		for plane := range layout.planes {
-			offset, size := layout.block(d, plane*layout.blocksPerPlane+i)
-			strip := buffer[plane*planeSize : (plane+1)*planeSize]
-			if fax {
-				if err := faxStrip(strip, data[offset:offset+size], region.Dx(), compression, fillOrder, faxOptions); err != nil {
-					return nil, err
-				}
-			} else if err := decodeTIFFStrip(strip, data[offset:offset+size], compression, layout.rowBytes); err != nil {
-				return nil, err
-			}
+		planeOffsets, planeNeedRev, err := decodeTIFFBlockPlanes(buffer, data, d, layout, i, region, compression, fillOrder, fax, faxOptions, &reverseScratch)
+		if err != nil {
+			return nil, err
 		}
+		if subsampledYCbCr {
+			for y := range visible.Dy() {
+				format.writeSubsampledYCbCrRow(out, visible.Min.X, visible.Min.Y+y, visible.Dx(), y, layout, buffer, planeOffsets)
+			}
+			continue
+		}
+		planeSize := layout.rowBytes * region.Dy()
 		for y := range visible.Dy() {
 			for plane := range layout.planes {
-				row := buffer[plane*planeSize+y*layout.rowBytes : plane*planeSize+(y+1)*layout.rowBytes]
-				if fillOrder == 2 && !fax {
+				row := buffer[planeOffsets[plane]+y*layout.rowBytes : planeOffsets[plane]+(y+1)*layout.rowBytes]
+				if planeNeedRev[plane] {
 					reverseTIFFBits(row)
 				}
 				if predictor == 2 {
@@ -829,10 +1082,38 @@ func decodeTIFFImage(data []byte, maxPixels uint64) (*rasterImage, error) {
 	return result, nil
 }
 
-// decodeTIFFImageRows 按Strip增量流式解码非分块、非JPEG、非转置TIFF并逐行色彩管理输出，峰值内存仅占单Strip与单行缓冲
-// 对分块TIFF、JPEG压缩TIFF或需转置方向返回handled=false由上层回退整帧解码路径
-// 入参: ctx 已规范化取消Context, data 完整TIFF字节, maxPixels 像素容量上限, profileBudget 色彩配置字节上限, stripBudget 显式收紧的Strip解压内存上限，零表示跟随像素解码预算, cfg 已校验色彩转换选项, fn 逐行消费回调
-// 返回: bool 是否已由Strip流式路径处理, error 解码、色彩、预算、回调或取消错误
+// decodeTIFFBlockPlanes 解压单个条带或图块的全部平面到复用缓冲并记录各平面偏移及解包后位反转标记
+// 入参: buffer 复用解压缓冲, data 完整TIFF字节, d 目录, layout 存储布局, blockIdx 平面内块号, region 块矩形, compression 压缩标识, fillOrder 位序标识, fax 是否传真压缩, faxOptions 传真选项, reverseScratch 可复用位反转临时缓冲
+// 返回: [5]int 各平面起始偏移, [5]bool 各平面是否需逐行反转位序, error 解码错误
+func decodeTIFFBlockPlanes(buffer, data []byte, d *tiffDirectory, layout tiffLayout, blockIdx int, region image.Rectangle, compression, fillOrder uint32, fax bool, faxOptions uint32, reverseScratch *[]byte) ([5]int, [5]bool, error) {
+	var offsets [5]int
+	var needRev [5]bool
+	pos := 0
+	for plane := range layout.planes {
+		planeSize, packRowBytes := layout.planeBufferSize(plane, region.Dy())
+		offsets[plane] = pos
+		strip := buffer[pos : pos+planeSize]
+		pos += planeSize
+		offset, size := layout.block(d, plane*layout.blocksPerPlane+blockIdx)
+		if fax {
+			if err := faxStrip(strip, data[offset:offset+size], region.Dx(), compression, fillOrder, faxOptions); err != nil {
+				return offsets, needRev, err
+			}
+		} else {
+			rev, err := decodeTIFFBlockPayload(strip, data[offset:offset+size], compression, fillOrder, packRowBytes, reverseScratch)
+			if err != nil {
+				return offsets, needRev, err
+			}
+			needRev[plane] = rev
+		}
+	}
+	return offsets, needRev, nil
+}
+
+// decodeTIFFImageRows 按单Strip或单Tile-Row增量流式解码非JPEG非转置TIFF并逐行色彩管理输出，峰值内存远低于整帧缓冲
+// 对JPEG压缩TIFF或需转置方向（EXIF 5至8）返回handled=false由上层平滑回退整帧解码路径
+// 入参: ctx 已规范化取消Context, data 完整TIFF字节, maxPixels 像素容量上限, profileBudget 色彩配置字节上限, stripBudget 显式收紧的解压带内存上限，零表示跟随像素解码预算, cfg 已校验色彩转换选项, fn 逐行消费回调
+// 返回: bool 是否已由流式路径处理, error 解码、色彩、预算、回调或取消错误
 func decodeTIFFImageRows(ctx context.Context, data []byte, maxPixels, profileBudget, stripBudget uint64, cfg ImageConvertOptions, fn func(y int, nrgba []byte) error) (bool, error) {
 	if err := checkContext(ctx); err != nil {
 		return false, err
@@ -846,15 +1127,36 @@ func decodeTIFFImageRows(ctx context.Context, data []byte, maxPixels, profileBud
 	}
 	hdr, layout, format := spec.hdr, spec.layout, spec.format
 	d := hdr.dir
-	width := hdr.width
+	width, height := hdr.width, hdr.height
 	compression, photo, sampleFormat, bits, alpha := hdr.compression, hdr.photo, hdr.sampleFormat, hdr.bits, hdr.alpha
 	fillOrder, predictor, fax, faxOptions := spec.fillOrder, spec.predictor, spec.fax, spec.faxOptions
-	stripMem := uint64(layout.rowBytes) * uint64(layout.blockHeight) * uint64(layout.planes)
-	if stripBudget > 0 && stripMem > stripBudget {
+	bandHeight := 1
+	if layout.tiled {
+		bandHeight = min(layout.blockHeight, int(height))
+	}
+	peakMem := uint64(layout.blockBufferSize())
+	if layout.tiled {
+		pixelBytes := uint64(8)
+		if sampleFormat == 3 {
+			stride := uint64(hdr.colorChannels)
+			if alpha != 0 {
+				stride++
+			}
+			pixelBytes = stride * 8
+		} else if photo == 5 {
+			stride := uint64(4)
+			if alpha != 0 {
+				stride++
+			}
+			pixelBytes = stride * 2
+		}
+		peakMem += uint64(width) * uint64(bandHeight) * pixelBytes
+	}
+	if stripBudget > 0 && peakMem > stripBudget {
 		return false, fmt.Errorf("%w: TIFF strip buffer memory budget", ErrLimit)
 	}
-	rowBounds := image.Rect(0, 0, int(width), 1)
-	rowRaster := &rasterImage{
+	bandBounds := image.Rect(0, 0, int(width), bandHeight)
+	bandRaster := &rasterImage{
 		dpi:         hdr.dpi,
 		channels:    hdr.colorChannels,
 		profile:     spec.profile,
@@ -864,23 +1166,23 @@ func decodeTIFFImageRows(ctx context.Context, data []byte, maxPixels, profileBud
 		floating:    sampleFormat == 3,
 		orientation: 1,
 	}
-	var rowOut *image.NRGBA64
+	var bandOut *image.NRGBA64
 	if sampleFormat == 3 {
-		rowRaster.native, err = newTIFFFloatComponents(rowBounds, hdr.colorChannels, alpha != 0, maxPixels)
+		bandRaster.native, err = newTIFFFloatComponents(bandBounds, hdr.colorChannels, alpha != 0, maxPixels)
 		if err != nil {
 			return false, err
 		}
-		rowRaster.linear = photo != 5
+		bandRaster.linear = photo != 5
 	} else if photo == 5 {
-		rowRaster.native, err = newImageComponents(rowBounds, 4, alpha != 0, maxPixels)
+		bandRaster.native, err = newImageComponents(bandBounds, 4, alpha != 0, maxPixels)
 		if err != nil {
 			return false, err
 		}
 	} else {
-		rowOut = image.NewNRGBA64(rowBounds)
-		rowRaster.pixels = rowOut
+		bandOut = image.NewNRGBA64(bandBounds)
+		bandRaster.pixels = bandOut
 	}
-	sampler, err := prepareImageConvertSampler(&ImageResource{source: rowRaster}, cfg, profileBudget)
+	sampler, err := prepareImageConvertSampler(&ImageResource{source: bandRaster}, cfg, profileBudget)
 	if err != nil {
 		return false, err
 	}
@@ -890,73 +1192,151 @@ func decodeTIFFImageRows(ctx context.Context, data []byte, maxPixels, profileBud
 	if hasBG {
 		bgLinear, bgAlpha, _ = imageConvertBackground(cfg.Background)
 	}
-	buffer := make([]byte, layout.rowBytes*layout.blockHeight*layout.planes)
-	var combined, floatScratch []byte
-	if layout.planes > 1 {
+	subsampledYCbCr := photo == 6 && (layout.ycbcrSubX > 1 || layout.ycbcrSubY > 1)
+	buffer := make([]byte, layout.blockBufferSize())
+	var combined, floatScratch, reverseScratch []byte
+	if layout.planes > 1 && !subsampledYCbCr {
 		combined = make([]byte, layout.rowBytes*layout.planes)
 	}
 	if predictor == 3 {
 		floatScratch = make([]byte, layout.rowBytes)
 	}
 	rowBuf := make([]byte, int(width)*4)
-	reverseStrips := hdr.orientation == 3 || hdr.orientation == 4
+	reverseY := hdr.orientation == 3 || hdr.orientation == 4
 	flipX := hdr.orientation == 2 || hdr.orientation == 3
 	outY := 0
 	var jxrCache jxrRowCache
+	if layout.tiled {
+		tileRows := (int(height) + layout.blockHeight - 1) / layout.blockHeight
+		for rowBandStep := range tileRows {
+			if err := checkContext(ctx); err != nil {
+				return true, err
+			}
+			ty := rowBandStep
+			if reverseY {
+				ty = tileRows - 1 - rowBandStep
+			}
+			visH := min(layout.blockHeight, int(height)-ty*layout.blockHeight)
+			for tx := range layout.across {
+				if err := checkContext(ctx); err != nil {
+					return true, err
+				}
+				blockIdx := ty*layout.across + tx
+				region := layout.region(blockIdx)
+				visX := region.Min.X
+				visW := min(region.Dx(), int(width)-visX)
+				if visW <= 0 {
+					continue
+				}
+				planeOffsets, planeNeedRev, err := decodeTIFFBlockPlanes(buffer, data, d, layout, blockIdx, region, compression, fillOrder, fax, faxOptions, &reverseScratch)
+				if err != nil {
+					return true, err
+				}
+				if subsampledYCbCr {
+					for y := range visH {
+						format.writeSubsampledYCbCrRow(bandOut, visX, y, visW, y, layout, buffer, planeOffsets)
+					}
+					continue
+				}
+				planeSize := layout.rowBytes * region.Dy()
+				for y := range visH {
+					for plane := range layout.planes {
+						row := buffer[planeOffsets[plane]+y*layout.rowBytes : planeOffsets[plane]+(y+1)*layout.rowBytes]
+						if planeNeedRev[plane] {
+							reverseTIFFBits(row)
+						}
+						if predictor == 2 {
+							restoreTIFFPredictor(row, layout.rowChannels, int(bits), d.order)
+						} else if predictor == 3 {
+							restoreTIFFFloatPredictor(row, floatScratch, layout.rowChannels, d.order)
+						}
+					}
+					row := buffer[y*layout.rowBytes : (y+1)*layout.rowBytes]
+					if layout.planes > 1 {
+						interleaveTIFFPlaneRows(combined, buffer, planeSize, layout.rowBytes, y, visW, layout.planes, int(bits/8))
+						row = combined
+					}
+					if sampleFormat == 3 {
+						if err := format.writeFloatRange(bandRaster.native, visX, y, visW, row); err != nil {
+							return true, err
+						}
+					} else if bandRaster.native != nil {
+						format.writeComponentRange(bandRaster.native, visX, y, visW, row)
+					} else {
+						format.writeRowRange(bandOut, visX, y, visW, row)
+					}
+				}
+			}
+			for yStep := range visH {
+				if err := checkContext(ctx); err != nil {
+					return true, err
+				}
+				y := yStep
+				if reverseY {
+					y = visH - 1 - yStep
+				}
+				if err := convertSamplerRowToNRGBA(ctx, sampler, &jxrCache, 0, y, int(width), flipX, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode, rowBuf); err != nil {
+					return true, err
+				}
+				if err := fn(outY, rowBuf); err != nil {
+					return true, err
+				}
+				outY++
+			}
+		}
+		return true, checkContext(ctx)
+	}
 	for step := range layout.blocksPerPlane {
 		if err := checkContext(ctx); err != nil {
 			return true, err
 		}
 		stripIdx := step
-		if reverseStrips {
+		if reverseY {
 			stripIdx = layout.blocksPerPlane - 1 - step
 		}
 		region := layout.region(stripIdx)
 		stripRows := region.Dy()
-		planeSize := layout.rowBytes * stripRows
-		for plane := range layout.planes {
-			offset, size := layout.block(d, plane*layout.blocksPerPlane+stripIdx)
-			strip := buffer[plane*planeSize : (plane+1)*planeSize]
-			if fax {
-				if err := faxStrip(strip, data[offset:offset+size], region.Dx(), compression, fillOrder, faxOptions); err != nil {
-					return true, err
-				}
-			} else if err := decodeTIFFStrip(strip, data[offset:offset+size], compression, layout.rowBytes); err != nil {
-				return true, err
-			}
+		planeOffsets, planeNeedRev, err := decodeTIFFBlockPlanes(buffer, data, d, layout, stripIdx, region, compression, fillOrder, fax, faxOptions, &reverseScratch)
+		if err != nil {
+			return true, err
 		}
+		planeSize := layout.rowBytes * stripRows
 		for rowStep := range stripRows {
 			if err := checkContext(ctx); err != nil {
 				return true, err
 			}
 			y := rowStep
-			if reverseStrips {
+			if reverseY {
 				y = stripRows - 1 - rowStep
 			}
-			for plane := range layout.planes {
-				row := buffer[plane*planeSize+y*layout.rowBytes : plane*planeSize+(y+1)*layout.rowBytes]
-				if fillOrder == 2 && !fax {
-					reverseTIFFBits(row)
-				}
-				if predictor == 2 {
-					restoreTIFFPredictor(row, layout.rowChannels, int(bits), d.order)
-				} else if predictor == 3 {
-					restoreTIFFFloatPredictor(row, floatScratch, layout.rowChannels, d.order)
-				}
-			}
-			row := buffer[y*layout.rowBytes : (y+1)*layout.rowBytes]
-			if layout.planes > 1 {
-				interleaveTIFFPlaneRows(combined, buffer, planeSize, layout.rowBytes, y, int(width), layout.planes, int(bits/8))
-				row = combined
-			}
-			if sampleFormat == 3 {
-				if err := format.writeFloatRange(rowRaster.native, 0, 0, int(width), row); err != nil {
-					return true, err
-				}
-			} else if rowRaster.native != nil {
-				format.writeComponentRange(rowRaster.native, 0, 0, int(width), row)
+			if subsampledYCbCr {
+				format.writeSubsampledYCbCrRow(bandOut, 0, 0, int(width), y, layout, buffer, planeOffsets)
 			} else {
-				format.writeRowRange(rowOut, 0, 0, int(width), row)
+				for plane := range layout.planes {
+					row := buffer[planeOffsets[plane]+y*layout.rowBytes : planeOffsets[plane]+(y+1)*layout.rowBytes]
+					if planeNeedRev[plane] {
+						reverseTIFFBits(row)
+					}
+					if predictor == 2 {
+						restoreTIFFPredictor(row, layout.rowChannels, int(bits), d.order)
+					} else if predictor == 3 {
+						restoreTIFFFloatPredictor(row, floatScratch, layout.rowChannels, d.order)
+					}
+				}
+				row := buffer[y*layout.rowBytes : (y+1)*layout.rowBytes]
+				if layout.planes > 1 {
+					interleaveTIFFPlaneRows(combined, buffer, planeSize, layout.rowBytes, y, int(width), layout.planes, int(bits/8))
+					row = combined
+				}
+				if sampleFormat == 3 {
+					if err := format.writeFloatRange(bandRaster.native, 0, 0, int(width), row); err != nil {
+						return true, err
+					}
+				} else if bandRaster.native != nil {
+					format.writeComponentRange(bandRaster.native, 0, 0, int(width), row)
+				} else {
+					format.writeRowRange(bandOut, 0, 0, int(width), row)
+				}
 			}
 			if err := convertSamplerRowToNRGBA(ctx, sampler, &jxrCache, 0, 0, int(width), flipX, hasBG, bgLinear, bgAlpha, cfg.Negative, cfg.ColorMode, rowBuf); err != nil {
 				return true, err
@@ -1264,16 +1644,43 @@ func reverseTIFFBits(row []byte) {
 	}
 }
 
-// decodeTIFFStrip 将条带解压到已限定大小的缓冲区，拒绝不足或超出的像素数据
+// decodeTIFFBlockPayload 解压非传真TIFF块载荷，1-bit低位优先压缩流同时兼容标准像素位序与libtiff流位反转编码
+// 入参: dst 目标字节, src 压缩块字节, compression 压缩标识, fillOrder 位序标识, rowBytes 每行字节数, reverseScratch 可复用位反转临时缓冲
+// 返回: bool 解压后像素行是否仍需执行reverseTIFFBits, error 数据或能力错误
+func decodeTIFFBlockPayload(dst, src []byte, compression, fillOrder uint32, rowBytes int, reverseScratch *[]byte) (bool, error) {
+	if fillOrder != 2 || compression == 1 {
+		err := decodeTIFFStrip(dst, src, compression, rowBytes)
+		return fillOrder == 2, err
+	}
+	if err := decodeTIFFStrip(dst, src, compression, rowBytes); err == nil {
+		return true, nil
+	}
+	buf := *reverseScratch
+	if cap(buf) < len(src) {
+		buf = make([]byte, len(src))
+	} else {
+		buf = buf[:len(src)]
+	}
+	for i, value := range src {
+		buf[i] = bits.Reverse8(value)
+	}
+	*reverseScratch = buf
+	if err := decodeTIFFStrip(dst, buf, compression, rowBytes); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// decodeTIFFStrip 将条带解压到已限定大小的缓冲区，未压缩条带允许尾部对齐填充，拒绝不足的数据
 // 入参: dst 目标字节, src 条带字节, compression 压缩标识, rowBytes 每行字节数
 // 返回: error 数据或能力错误
 func decodeTIFFStrip(dst, src []byte, compression uint32, rowBytes int) error {
 	switch compression {
 	case 1:
-		if len(src) != len(dst) {
+		if len(src) < len(dst) {
 			return fmt.Errorf("%w: TIFF uncompressed strip length", ErrInvalid)
 		}
-		copy(dst, src)
+		copy(dst, src[:len(dst)])
 		return nil
 	case 5:
 		return decodeTIFFLZW(dst, src)
@@ -1408,11 +1815,11 @@ func decodeTIFFLZW(dst, src []byte) error {
 	}
 }
 
-// imageLayout 校验条带与图块组织，计入分离平面及边界填充的解码工作量和临时内存
-// 入参: width 图像宽度, height 图像高度, channels 样本数, bits 样本位数, compression 压缩标识, planar 平面布局
+// imageLayout 校验条带与图块组织，计入分离平面、子采样YCbCr及边界填充的解码工作量和临时内存
+// 入参: width 图像宽度, height 图像高度, channels 样本数, bits 样本位数, compression 压缩标识, planar 平面布局, subX 水平色度子采样因子, subY 垂直色度子采样因子
 // 返回: tiffLayout 存储布局, error 字段或资源错误
-func (d *tiffDirectory) imageLayout(width, height, channels, bits, compression, planar uint32) (tiffLayout, error) {
-	l := tiffLayout{height: int(height), blockWidth: int(width), across: 1}
+func (d *tiffDirectory) imageLayout(width, height, channels, bits, compression, planar uint32, subX, subY int) (tiffLayout, error) {
+	l := tiffLayout{height: int(height), blockWidth: int(width), across: 1, ycbcrSubX: subX, ycbcrSubY: subY}
 	for _, tag := range []uint16{322, 323, 324, 325} {
 		l.tiled = l.tiled || d.entry[tag] != nil
 	}
@@ -1469,16 +1876,44 @@ func (d *tiffDirectory) imageLayout(width, height, channels, bits, compression, 
 	down := (uint64(height) + uint64(l.blockHeight) - 1) / uint64(l.blockHeight)
 	blocksPerPlane := uint64(l.across) * down
 	count := blocksPerPlane * planes
-	rowBytes := (uint64(l.blockWidth)*rowChannels*uint64(bits) + 7) / 8
-	blockBytes := rowBytes * uint64(l.blockHeight)
-	decodedBytes := rowBytes * uint64(height) * planes
-	if l.tiled {
-		decodedBytes = blockBytes * count
+	var rowBytes, chromaRowBytes, blockTotalBytes, decodedBytes uint64
+	if subX > 1 || subY > 1 {
+		sampleBytes := uint64(bits / 8)
+		if planes == 1 {
+			unitsX := (uint64(l.blockWidth) + uint64(subX) - 1) / uint64(subX)
+			unitsY := (uint64(l.blockHeight) + uint64(subY) - 1) / uint64(subY)
+			rowBytes = unitsX * (uint64(subX)*uint64(subY) + 2) * sampleBytes
+			blockTotalBytes = rowBytes * unitsY
+			if l.tiled {
+				decodedBytes = blockTotalBytes * blocksPerPlane
+			} else {
+				totalUnitsY := (uint64(height)+uint64(subY)-1)/uint64(subY) + down
+				decodedBytes = rowBytes * totalUnitsY
+			}
+		} else {
+			rowBytes = uint64(l.blockWidth) * sampleBytes
+			chromaRowBytes = ((uint64(l.blockWidth) + uint64(subX) - 1) / uint64(subX)) * sampleBytes
+			chromaBlockH := (uint64(l.blockHeight) + uint64(subY) - 1) / uint64(subY)
+			blockTotalBytes = rowBytes*uint64(l.blockHeight) + 2*chromaRowBytes*chromaBlockH
+			if l.tiled {
+				decodedBytes = blockTotalBytes * blocksPerPlane
+			} else {
+				totalChromaH := (uint64(height)+uint64(subY)-1)/uint64(subY) + down
+				decodedBytes = rowBytes*uint64(height) + 2*chromaRowBytes*totalChromaH
+			}
+		}
+	} else {
+		rowBytes = (uint64(l.blockWidth)*rowChannels*uint64(bits) + 7) / 8
+		blockTotalBytes = rowBytes * uint64(l.blockHeight) * planes
+		decodedBytes = rowBytes * uint64(height) * planes
+		if l.tiled {
+			decodedBytes = blockTotalBytes * blocksPerPlane
+		}
 	}
-	if blocksPerPlane > rasterMaxWork/planes || blockBytes > (64<<20)/planes || decodedBytes > rasterMaxWork || rowBytes > uint64(^uint(0)>>1)/planes {
+	if blocksPerPlane > rasterMaxWork/planes || blockTotalBytes > 64<<20 || decodedBytes > rasterMaxWork || rowBytes > uint64(^uint(0)>>1)/planes || chromaRowBytes > uint64(^uint(0)>>1) {
 		return l, fmt.Errorf("%w: TIFF block decoding budget", ErrLimit)
 	}
-	l.blocksPerPlane, l.planes, l.count, l.rowBytes, l.rowChannels = int(blocksPerPlane), int(planes), int(count), int(rowBytes), int(rowChannels)
+	l.blocksPerPlane, l.planes, l.count, l.rowBytes, l.rowChannels, l.chromaRowBytes = int(blocksPerPlane), int(planes), int(count), int(rowBytes), int(rowChannels), int(chromaRowBytes)
 	var err error
 	l.offsets, l.offsetWidth, err = d.field(offsetTag, l.count, true)
 	if err != nil {
@@ -1489,6 +1924,35 @@ func (d *tiffDirectory) imageLayout(width, height, channels, bits, compression, 
 		return l, err
 	}
 	return l, nil
+}
+
+// blockBufferSize 计算单个条带或图块包含全部平面时的最大解压缓冲字节数
+// 返回: int 最大解压缓冲字节数
+func (l tiffLayout) blockBufferSize() int {
+	total := 0
+	for plane := range l.planes {
+		size, _ := l.planeBufferSize(plane, l.blockHeight)
+		total += size
+	}
+	return total
+}
+
+// planeBufferSize 计算指定平面在给定块高度下的解压字节数及PackBits行宽
+// 入参: plane 平面序号, blockHeight 当前块高度
+// 返回: int 平面解压字节数, int PackBits单行字节数
+func (l tiffLayout) planeBufferSize(plane, blockHeight int) (int, int) {
+	if l.ycbcrSubX > 1 || l.ycbcrSubY > 1 {
+		if l.planes == 1 {
+			unitsY := (blockHeight + l.ycbcrSubY - 1) / l.ycbcrSubY
+			return l.rowBytes * unitsY, l.rowBytes
+		}
+		if plane == 0 {
+			return l.rowBytes * blockHeight, l.rowBytes
+		}
+		chromaH := (blockHeight + l.ycbcrSubY - 1) / l.ycbcrSubY
+		return l.chromaRowBytes * chromaH, l.chromaRowBytes
+	}
+	return l.rowBytes * blockHeight, l.rowBytes
 }
 
 // region 取得独立压缩块的完整矩形，图块保留图像边界外的填充范围
@@ -1889,6 +2353,83 @@ func (f *tiffPixelFormat) signedSample16(raw uint16, channel int, scale uint16) 
 	return uint16(math.Round(norm * 65535))
 }
 
+// tiffClampUint16 将浮点色彩值钳位并四舍五入为十六位无符号整数样本
+// 入参: v 待量化浮点样本值
+// 返回: uint16 十六位无符号样本
+func tiffClampUint16(v float64) uint16 {
+	if v <= 0 {
+		return 0
+	}
+	if v >= 65535 {
+		return 65535
+	}
+	return uint16(math.Round(v))
+}
+
+// ycbcrToNRGBA64 按TIFF 6.0第21节系数与参考黑白电平将YCbCr编码样本转换为十六位非预乘RGB像素
+// 入参: yCode 亮度编码值, cbCode 蓝色色差编码值, crCode 红色色差编码值, alpha 十六位透明度
+// 返回: color.NRGBA64 十六位非预乘颜色
+func (f *tiffPixelFormat) ycbcrToNRGBA64(yCode, cbCode, crCode float64, alpha uint16) color.NRGBA64 {
+	codingY, codingC, scaleOut := 255.0, 127.0, 257.0
+	if f.bits == 16 {
+		codingY, codingC, scaleOut = 65535.0, 32767.0, 1.0
+	}
+	yVal := (yCode - f.ycbcr.refBW[0]) * codingY / (f.ycbcr.refBW[1] - f.ycbcr.refBW[0])
+	cbVal := (cbCode - f.ycbcr.refBW[2]) * codingC / (f.ycbcr.refBW[3] - f.ycbcr.refBW[2])
+	crVal := (crCode - f.ycbcr.refBW[4]) * codingC / (f.ycbcr.refBW[5] - f.ycbcr.refBW[4])
+	rNorm := crVal*(2-2*f.ycbcr.lumaRed) + yVal
+	bNorm := cbVal*(2-2*f.ycbcr.lumaBlue) + yVal
+	gNorm := (yVal - f.ycbcr.lumaBlue*bNorm - f.ycbcr.lumaRed*rNorm) / f.ycbcr.lumaGreen
+	return color.NRGBA64{
+		R: tiffClampUint16(rNorm * scaleOut),
+		G: tiffClampUint16(gNorm * scaleOut),
+		B: tiffClampUint16(bNorm * scaleOut),
+		A: alpha,
+	}
+}
+
+// readSampleCode 按像素位深与文件字节序读取单个无符号整数编码值
+// 入参: buf 样本字节切片, offset 字节偏移
+// 返回: float64 原始样本编码值
+func (f *tiffPixelFormat) readSampleCode(buf []byte, offset int) float64 {
+	if f.bits == 16 {
+		return float64(f.order.Uint16(buf[offset:]))
+	}
+	return float64(buf[offset])
+}
+
+// writeSubsampledYCbCrRow 将子采样Chunky或Planar YCbCr块中的指定可见行转换为RGB并写入目标图像
+// 入参: out 目标图像, x0 目标起始列, dstY 目标行号, width 可见列数, srcY 块内源行号, layout 块布局, block 已解压块缓冲, planeOffsets 各平面偏移
+func (f *tiffPixelFormat) writeSubsampledYCbCrRow(out *image.NRGBA64, x0, dstY, width, srcY int, layout tiffLayout, block []byte, planeOffsets [5]int) {
+	subX, subY := layout.ycbcrSubX, layout.ycbcrSubY
+	sampleBytes := int(f.bits / 8)
+	if layout.planes == 1 {
+		uy, ly := srcY/subY, srcY%subY
+		unitSamples := subX*subY + 2
+		unitRowOff := uy * layout.rowBytes
+		for x := range width {
+			ux, lx := x/subX, x%subX
+			unitOff := unitRowOff + ux*unitSamples*sampleBytes
+			yCode := f.readSampleCode(block, unitOff+(ly*subX+lx)*sampleBytes)
+			cbCode := f.readSampleCode(block, unitOff+(subX*subY)*sampleBytes)
+			crCode := f.readSampleCode(block, unitOff+(subX*subY+1)*sampleBytes)
+			out.SetNRGBA64(x0+x, dstY, f.ycbcrToNRGBA64(yCode, cbCode, crCode, 65535))
+		}
+		return
+	}
+	cy := srcY / subY
+	yRowOff := planeOffsets[0] + srcY*layout.rowBytes
+	cbRowOff := planeOffsets[1] + cy*layout.chromaRowBytes
+	crRowOff := planeOffsets[2] + cy*layout.chromaRowBytes
+	for x := range width {
+		cx := x / subX
+		yCode := f.readSampleCode(block, yRowOff+x*sampleBytes)
+		cbCode := f.readSampleCode(block, cbRowOff+cx*sampleBytes)
+		crCode := f.readSampleCode(block, crRowOff+cx*sampleBytes)
+		out.SetNRGBA64(x0+x, dstY, f.ycbcrToNRGBA64(yCode, cbCode, crCode, 65535))
+	}
+}
+
 // writeRowRange 将压缩块中的可见行区间转换为非预乘16位颜色，不读取边界填充
 // 入参: out 目标图像, x0 目标起始列, y 目标行号, width 可见列数, row 完整存储行
 func (f *tiffPixelFormat) writeRowRange(out *image.NRGBA64, x0, y, width int, row []byte) {
@@ -1921,6 +2462,21 @@ func (f *tiffPixelFormat) writeRowRange(out *image.NRGBA64, x0, y, width int, ro
 			stride := 2 * (1 << f.bits)
 			index := int(sample[0]) * 2
 			pixel = color.NRGBA64{f.order.Uint16(f.palette[index:]), f.order.Uint16(f.palette[stride+index:]), f.order.Uint16(f.palette[2*stride+index:]), 65535}
+		} else if f.photo == 6 {
+			alpha := uint16(65535)
+			if f.alpha != 0 {
+				alpha = sample[f.channels-1] * scale
+			}
+			pixel = f.ycbcrToNRGBA64(float64(sample[0]), float64(sample[1]), float64(sample[2]), alpha)
+			if f.alpha == 1 {
+				if pixel.A == 0 {
+					pixel.R, pixel.G, pixel.B = 0, 0, 0
+				} else {
+					pixel.R = imageUnassociateSample(pixel.R, pixel.A)
+					pixel.G = imageUnassociateSample(pixel.G, pixel.A)
+					pixel.B = imageUnassociateSample(pixel.B, pixel.A)
+				}
+			}
 		} else {
 			if f.sampleFormat != 2 {
 				for c := range int(f.channels) {

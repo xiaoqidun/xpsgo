@@ -15,6 +15,7 @@
 package xpsgo
 
 import (
+	"context"
 	"encoding/xml"
 	"fmt"
 	"io/fs"
@@ -22,6 +23,24 @@ import (
 	"slices"
 	"strings"
 )
+
+// decodeStreamPrintTicket 在取消检查下解码PrintTicket并复用共享打印设置解析与输出命名空间审计
+// 入参: ctx 取消Context, data 原始票据XML字节, configuration 归一化打印设置解析参数
+// 返回: *PrintSettings 解析后的打印设置, error 解码、结构、命名空间或取消错误
+func decodeStreamPrintTicket(ctx context.Context, data []byte, configuration printSettingsConfig) (*PrintSettings, error) {
+	root, err := decodeXMLVisit(data, configuration.Limits, func(_ xml.Token, _ *xmlElement) error { return checkContext(ctx) })
+	if err != nil {
+		return nil, err
+	}
+	settings, err := parsePrintSettings(root, configuration)
+	if err != nil {
+		return nil, err
+	}
+	if err := xmlNamespaceTreeOutput(root, ctx); err != nil {
+		return nil, err
+	}
+	return settings, nil
+}
 
 // streamTicketScopeBit 返回打印票据作用域对应的校验位掩码，未知作用域返回零
 // 入参: scope 打印票据作用域
@@ -139,9 +158,11 @@ func (p *streamPackage) consumeRelationships(part *streamPart, event StreamXMLTo
 			needed := s.closed
 			ticketBound := false
 			structBound := false
+			storyBound := false
 			requiredType := formatNamespace(p.index.format) + "/required-resource"
 			ticketType := formatNamespace(p.index.format) + "/printticket"
 			structType := formatNamespace(p.index.format) + "/documentstructure"
+			storyType := formatNamespace(p.index.format) + "/storyfragments"
 			for _, item := range s.items[before:] {
 				if item.Type == requiredType {
 					needed = true
@@ -153,8 +174,11 @@ func (p *streamPackage) consumeRelationships(part *streamPart, event StreamXMLTo
 				if item.Type == structType {
 					structBound = true
 				}
+				if item.Type == storyType {
+					storyBound = true
+				}
 			}
-			if structBound || ticketBound || s.closed {
+			if structBound || storyBound || ticketBound || s.closed {
 				if err := p.recordRelationshipHints(relationshipSource(part.name), s.items); err != nil {
 					return err
 				}
@@ -243,12 +267,18 @@ func (p *streamPackage) relationshipSnapshot(source string) ([]Relationship, boo
 // 返回: error 类型、XML、预算或回调错误
 func (p *streamPackage) advanceRelationshipPart(name string) error {
 	part := p.parts[strings.ToLower(name)]
-	if part == nil {
+	if part == nil || part.reclaimed || p.types == nil {
 		return nil
 	}
 	media := p.types.declaredContentType(name)
+	if media == "" && !p.typesComplete {
+		return nil
+	}
 	if !strings.EqualFold(media, opcRelsType) {
 		return fmt.Errorf("%w: streamed relationship content type", ErrInvalid)
+	}
+	if part.resolvedMedia == "" {
+		part.resolvedMedia = media
 	}
 	return p.advanceXML(part, media)
 }
@@ -510,6 +540,21 @@ func (p *streamPackage) recordRelationshipHints(source string, items []Relations
 			p.ticketTargets = make(map[string]string)
 			p.ticketSources = make(map[string]string)
 		}
+		prevTicket := p.ticketTargets[sourceKey]
+		if !strings.EqualFold(prevTicket, ticket) {
+			if p.ticketRefCounts == nil {
+				p.ticketRefCounts = make(map[string]int)
+			}
+			if prevTicket != "" {
+				prevKey := strings.ToLower(prevTicket)
+				if count := p.ticketRefCounts[prevKey] - 1; count <= 0 {
+					delete(p.ticketRefCounts, prevKey)
+				} else {
+					p.ticketRefCounts[prevKey] = count
+				}
+			}
+			p.ticketRefCounts[strings.ToLower(ticket)]++
+		}
 		p.ticketTargets[sourceKey] = ticket
 		p.ticketSources[sourceKey] = source
 		if strings.EqualFold(source, p.index.sequence) {
@@ -533,6 +578,16 @@ func (p *streamPackage) recordRelationshipHints(source string, items []Relations
 			p.docStructTargets = make(map[string]string)
 		}
 		p.docStructTargets[sourceKey] = structTarget
+	}
+	storyTarget, err := streamReadStoryFragmentsTarget(source, items, p.index.format)
+	if err != nil {
+		return err
+	}
+	if storyTarget != "" {
+		if p.storyFragTargets == nil {
+			p.storyFragTargets = make(map[string]string)
+		}
+		p.storyFragTargets[sourceKey] = storyTarget
 	}
 	return nil
 }
@@ -661,14 +716,7 @@ func (p *streamPackage) verifyConsumeTicketPart(target string, scope PrintScope)
 	if err != nil {
 		return err
 	}
-	root, err := decodeXML(data, configuration.Limits)
-	if err != nil {
-		return &PartError{Part: target, Err: err}
-	}
-	if _, err := parsePrintSettings(root, configuration); err != nil {
-		return &PartError{Part: target, Err: err}
-	}
-	if err := xmlNamespaceTreeOutput(root, p.context); err != nil {
+	if _, err := decodeStreamPrintTicket(p.context, data, configuration); err != nil {
 		return &PartError{Part: target, Err: err}
 	}
 	part.ticketVerifiedScopes |= bit
@@ -746,6 +794,21 @@ func (p *streamPackage) verifyConsumeMetadataBounds() error {
 				continue
 			}
 			target := p.docStructTargets[strings.ToLower(doc.Part)]
+			if target == "" {
+				continue
+			}
+			key := strings.ToLower(target)
+			if p.parts[key] == nil {
+				return &PartError{Part: target, Err: fmt.Errorf("%w: part %q: %w", ErrNotFound, key, fs.ErrNotExist)}
+			}
+		}
+	}
+	if p.options.OnStoryFragments != nil {
+		for pageIdx, page := range p.index.pages {
+			if p.storyFragDelivered != nil && p.storyFragDelivered[pageIdx] {
+				continue
+			}
+			target := p.storyFragTargets[strings.ToLower(page.Part)]
 			if target == "" {
 				continue
 			}

@@ -256,7 +256,7 @@ type printMediaPlacement struct {
 
 // PrintLayoutOptions 设置页面打印的基础票据、物理介质及解析预算，Settings.Scope须为Unknown
 // Defaults提供消费者基础设置，文档中更具体的票据项优先
-// IgnoreUnsupportedFeatures开启时跳过不影响页面几何与拼版的设备控制Feature
+// IgnoreUnsupportedFeatures开启时跳过私有扩展与不影响页面几何及拼版的未支持Feature
 type PrintLayoutOptions struct {
 	Defaults                  *PrintSettings
 	Media                     PrintMedia
@@ -496,7 +496,7 @@ func printSetMediaSize(media *PrintMedia, width, height float64) error {
 	return nil
 }
 
-// PrintSettings 合并基础设置和指定页面的作业、文档及页面票据，不执行设备约束或选择默认Option
+// PrintSettings 读取并按作业、文档及页面顺序合并基础设置与指定页面的有效打印设置，不执行设备约束或推断默认值
 // 每份票据先按关联层级过滤，较具体的设置整项覆盖同名或低优先级同族根设置；默认保留所有有效层级
 // 入参: ctx 取消Context，nil采用Background, pageIndex 从零开始的全局页号, defaults 基础设置，nil为空设置, options 输出作用域及资源参数
 // 返回: *PrintSettings 独立有效设置, error 序号、票据格式、关联、资源或取消错误
@@ -506,13 +506,20 @@ func (r *Reader) PrintSettings(ctx context.Context, pageIndex int, defaults *Pri
 		return nil, err
 	}
 	defer r.mu.RUnlock()
-	return r.readPrintSettings(ctx, pageIndex, defaults, options)
+	return r.readPrintSettingsBudget(ctx, pageIndex, defaults, options, true)
 }
 
 // readPrintSettings 在调用方持有读锁时合并票据链，不重复获取阅读器锁或修改输入设置
 // 入参: ctx 取消Context, index 页面序号, defaults 基础设置, options 输出过滤及资源参数
 // 返回: *PrintSettings 合并设置, error 状态、读取、合并或取消错误
 func (r *Reader) readPrintSettings(ctx context.Context, index int, defaults *PrintSettings, options *PrintSettingsOptions) (*PrintSettings, error) {
+	return r.readPrintSettingsBudget(ctx, index, defaults, options, false)
+}
+
+// readPrintSettingsBudget 在持有读锁时使用内部免重复校验合并路径按层级合并票据链，按需执行最终字节预算校验
+// 入参: ctx 取消Context, index 页面序号, defaults 基础设置, options 输出过滤及资源参数, checkBudget 是否校验最终XML输出字节预算
+// 返回: *PrintSettings 合并设置, error 状态、读取、合并、预算或取消错误
+func (r *Reader) readPrintSettingsBudget(ctx context.Context, index int, defaults *PrintSettings, options *PrintSettingsOptions, checkBudget bool) (*PrintSettings, error) {
 	if r.closed {
 		return nil, ErrClosed
 	}
@@ -525,13 +532,12 @@ func (r *Reader) readPrintSettings(ctx context.Context, index int, defaults *Pri
 	}
 	outputScope := configuration.Scope
 	configuration.Scope = PrintScopeUnknown
-	empty := &PrintSettings{Version: 1}
-	if defaults == nil {
-		defaults = empty
-	}
-	result, err := MergePrintSettings(configuration.context, empty, defaults, &configuration.PrintSettingsOptions)
-	if err != nil {
-		return nil, err
+	result := &PrintSettings{Version: 1}
+	if defaults != nil {
+		result, err = validatePrintSettingsModel(defaults, configuration, printDocumentTicket)
+		if err != nil {
+			return nil, err
+		}
 	}
 	tickets, err := r.readPrintTicketHierarchyOptions(index, configuration.Limits, configuration.context)
 	if err != nil {
@@ -544,14 +550,26 @@ func (r *Reader) readPrintSettings(ctx context.Context, index int, defaults *Pri
 		if err != nil {
 			return nil, &PartError{Part: ticket.Part, Err: err}
 		}
-		result, err = MergePrintSettings(configuration.context, result, settings, &configuration.PrintSettingsOptions)
+		result, err = mergePrintSettingsInternal(result, settings, configuration)
 		if err != nil {
 			return nil, &PartError{Part: ticket.Part, Err: err}
 		}
 	}
 	if outputScope != PrintScopeUnknown {
-		configuration.Scope = outputScope
-		return MergePrintSettings(configuration.context, result, empty, &configuration.PrintSettingsOptions)
+		filtered := make([]PrintSetting, 0, len(result.Elements))
+		for _, element := range result.Elements {
+			scope := printKeywordScope(element.Name)
+			if scope != PrintScopeUnknown && scope < outputScope {
+				continue
+			}
+			filtered = append(filtered, element)
+		}
+		result = &PrintSettings{Version: result.Version, Elements: filtered}
+	}
+	if checkBudget {
+		if err := validatePrintSettingsOutputBudget(result, configuration, printDocumentTicket); err != nil {
+			return nil, err
+		}
 	}
 	return result, checkContext(configuration.context)
 }
@@ -595,6 +613,10 @@ func (r *Reader) readPrintPageHeader(ctx context.Context, index int, options Pri
 	if options.Settings.Scope != PrintScopeUnknown {
 		return nil, nil, nil, fmt.Errorf("%w: scope on print page layout", ErrInvalid)
 	}
+	configuration, err := printSettingsOptions(ctx, &options.Settings)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	settings, err := r.readPrintSettings(ctx, index, options.Defaults, &options.Settings)
 	if err != nil {
 		return nil, nil, nil, err
@@ -607,7 +629,10 @@ func (r *Reader) readPrintPageHeader(ctx context.Context, index int, options Pri
 	if options.IgnoreUnsupportedFeatures {
 		effective = printStripPrivateExtensions(settings)
 	}
-	layout, err := effective.Layout(ctx, page, options.Media, &options.Settings)
+	if err := validatePrintLayoutPageMedia(configuration, page, options.Media); err != nil {
+		return nil, nil, nil, err
+	}
+	layout, _, err := newPrintLayoutSettings(effective, configuration).layoutWithRotation(page, options.Media)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -1170,9 +1195,9 @@ func (s *printLayoutSettings) alignment(feature *PrintSetting) (Point, bool, err
 		return Point{X: 1, Y: 1}, true, nil
 	case "Center":
 		return Point{X: 0.5, Y: 0.5}, true, nil
-	case "CenterLeft":
+	case "LeftCenter":
 		return Point{Y: 0.5}, true, nil
-	case "CenterRight":
+	case "RightCenter":
 		return Point{X: 1, Y: 0.5}, true, nil
 	case "TopCenter":
 		return Point{X: 0.5}, true, nil
@@ -1282,8 +1307,8 @@ func printLayoutNoOpSheetFeature(feature PrintSetting) bool {
 	return true
 }
 
-// validatePrintLayoutFeatures 校验有效票据不含单页布局未支持的Feature，开启ignoreUnsupported时跳过设备控制及恒等无操作插页Feature
-// 入参: settings 有效票据, ignoreUnsupported 是否忽略不影响几何与拼版的设备控制Feature
+// validatePrintLayoutFeatures 校验有效票据不含单页布局未支持的Feature，放行纯物理设备控制Feature，开启ignoreUnsupported时亦跳过私有扩展与恒等无操作插页Feature
+// 入参: settings 有效票据, ignoreUnsupported 是否忽略不影响几何与拼版的扩展Feature
 // 返回: error 未支持设置错误
 func validatePrintLayoutFeatures(settings *PrintSettings, ignoreUnsupported bool) error {
 	for _, value := range settings.Elements {
@@ -1299,6 +1324,16 @@ func validatePrintLayoutFeatures(settings *PrintSettings, ignoreUnsupported bool
 		switch value.Name.Local {
 		case "PageMediaSize", "PageOrientation", "PageScaling", "PageMirrorImage", "PageBorderless":
 		default:
+			if printDeviceControlFeatures[value.Name.Local] {
+				if !ignoreUnsupported {
+					for _, child := range value.Children {
+						if child.Kind == PrintSettingFeature {
+							return fmt.Errorf("%w: print rendering subfeature {%s}%s", ErrUnsupported, child.Name.Space, child.Name.Local)
+						}
+					}
+				}
+				continue
+			}
 			if ignoreUnsupported && (!printLayoutGeometryFeature(value.Name) || printLayoutNoOpSheetFeature(value)) {
 				continue
 			}

@@ -1538,6 +1538,9 @@ func (p *compatibilityProcessor) element(node *xmlElement, inherited compatibili
 			if err := compatibilityNoXMLContext(node); err != nil {
 				return compatibilityFragment{}, err
 			}
+			if err := p.validateAttributes(node, scope, false); err != nil {
+				return compatibilityFragment{}, err
+			}
 			return p.contents(node, scope)
 		}
 		if !p.ignorePreservation && scope.preservesElement(node.Name) {
@@ -2125,6 +2128,9 @@ func (p *compatibilityProcessor) alternative(node *xmlElement, inherited compati
 		if err := compatibilityNoXMLContext(node); err != nil {
 			return err
 		}
+		if err := p.validateAttributes(node, scope, false); err != nil {
+			return err
+		}
 		if len(compatibilityWords(node.Text)) != 0 {
 			return fmt.Errorf("%w: processed text directly inside AlternateContent", ErrInvalid)
 		}
@@ -2444,11 +2450,10 @@ func canonicalElementScope(inherited map[string]string, attrs []xml.Attr) (map[s
 		if isPrefixed {
 			prefix = attr.Name.Local
 		}
-		if attr.Value == "" {
-			delete(ns, prefix)
-		} else {
-			ns[prefix] = attr.Value
+		if err := xmlNamespaceBinding(prefix, attr.Value); err != nil {
+			return nil, nil, err
 		}
+		ns[prefix] = attr.Value
 	}
 	rawAttrs := make([]xml.Attr, 0, len(attrs))
 	for _, attr := range attrs {
@@ -2598,7 +2603,13 @@ func (w *canonicalWriter) start(token xml.StartElement, node *xmlElement, select
 		}
 	} else {
 		nextRendered = node.Namespaces
+		if parent[""] != "" && node.Namespaces[""] == "" {
+			prefixes = append(prefixes, "")
+		}
 		for prefix, namespace := range node.Namespaces {
+			if prefix == "" && namespace == "" {
+				continue
+			}
 			if prefix != "xml" && namespace != parent[prefix] {
 				prefixes = append(prefixes, prefix)
 			}

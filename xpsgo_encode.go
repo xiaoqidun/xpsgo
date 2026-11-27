@@ -763,7 +763,7 @@ func encodePageNode(encoder *xml.Encoder, node *xmlElement, ctx context.Context)
 	return encoder.EncodeToken(start.End())
 }
 
-// color 按源色彩空间编码颜色分量，sRGB要求精确8位分量，其余保留浮点精度
+// color 按源色彩空间编码颜色分量，sRGB分量校验[0,1]后四舍五入量化为8位，其余保留浮点精度
 // 入参: value 源颜色, part 颜色的定义部件
 // 返回: string 标准颜色表达式, error 颜色、URI或表示范围错误
 func (p *pageEncoder) color(value Color, part string) (string, error) {
@@ -794,11 +794,10 @@ func (p *pageEncoder) color(value Color, part string) (string, error) {
 	if value.Space == ColorSRGB {
 		var bytes [4]uint8
 		for index, component := range append([]float64{value.Alpha}, value.Components...) {
-			code := math.Round(component * 255)
-			if component < 0 || component > 1 || component != code/255 {
-				return "", fmt.Errorf("%w: sRGB component cannot be represented exactly as 8-bit", ErrInvalid)
+			if component < 0 || component > 1 {
+				return "", fmt.Errorf("%w: sRGB component range", ErrInvalid)
 			}
-			bytes[index] = uint8(code)
+			bytes[index] = uint8(math.Round(component * 255))
 		}
 		if bytes[0] == 0xff {
 			return fmt.Sprintf("#%02X%02X%02X", bytes[1], bytes[2], bytes[3]), nil
@@ -1593,8 +1592,16 @@ func (p *pageEncoder) geometryWithMode(value *Geometry, depth int, allowAbbrevia
 		if err != nil {
 			return nil, err
 		}
-		for _, attr := range []struct{ name, value string }{{"StartPoint", encodePoint(figure.StartPoint)}, {"IsClosed", strconv.FormatBool(figure.IsClosed)}, {"IsFilled", strconv.FormatBool(figure.IsFilled)}} {
-			if err := p.attr(child, attr.name, attr.value); err != nil {
+		if err := p.attr(child, "StartPoint", encodePoint(figure.StartPoint)); err != nil {
+			return nil, err
+		}
+		if figure.IsClosed {
+			if err := p.attr(child, "IsClosed", "true"); err != nil {
+				return nil, err
+			}
+		}
+		if !figure.IsFilled {
+			if err := p.attr(child, "IsFilled", "false"); err != nil {
 				return nil, err
 			}
 		}
